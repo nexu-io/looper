@@ -426,7 +426,7 @@ func TestBuildReleaseManifestURL(t *testing.T) {
 func TestDecodeReleaseMetadataAcceptsManifestAndGitHubPayloads(t *testing.T) {
 	t.Parallel()
 
-	githubPayload, err := decodeReleaseMetadata([]byte(`{"tag_name":"v1.2.3","assets":[{"name":"looperd-darwin-arm64","browser_download_url":"https://evil.example/looperd-darwin-arm64"}]}`), false)
+	githubPayload, err := decodeReleaseMetadata([]byte(`{"tag_name":"v1.2.3","assets":[{"name":"looperd-darwin-arm64","browser_download_url":"https://evil.example/looperd-darwin-arm64"}]}`), buildGitHubReleaseAPIURL(defaultReleaseOwner, defaultReleaseRepo, ""))
 	if err != nil {
 		t.Fatalf("decode GitHub payload error = %v", err)
 	}
@@ -439,6 +439,7 @@ func TestDecodeReleaseMetadataAcceptsManifestAndGitHubPayloads(t *testing.T) {
 
 	manifestPayload, err := decodeReleaseMetadata([]byte(`{
 		"manifestVersion": 1,
+		"channel": "stable",
 		"version": "1.2.3",
 		"tag": "v1.2.3",
 		"artifacts": {
@@ -448,7 +449,7 @@ func TestDecodeReleaseMetadataAcceptsManifestAndGitHubPayloads(t *testing.T) {
 				"size": 12
 			}
 		}
-	}`), true)
+	}`), buildReleaseManifestURL(defaultReleaseManifestBaseURL, "v1.2.3"))
 	if err != nil {
 		t.Fatalf("decode manifest payload error = %v", err)
 	}
@@ -543,7 +544,7 @@ func TestDecodeReleaseMetadataRejectsUnsupportedManifestVersion(t *testing.T) {
 				"size": 12
 			}
 		}
-	}`), true)
+	}`), buildReleaseManifestURL(defaultReleaseManifestBaseURL, "v1.2.3"))
 	if err == nil {
 		t.Fatal("decodeReleaseMetadata() error = nil, want unsupported version")
 	}
@@ -564,6 +565,7 @@ func TestFetchReleaseMetadataPrefersCDNManifest(t *testing.T) {
 			}
 			return jsonResponse(t, http.StatusOK, `{
 				"manifestVersion": 1,
+				"channel": "stable",
 				"version": "1.2.3",
 				"tag": "v1.2.3",
 				"artifacts": {
@@ -642,6 +644,7 @@ func TestFetchReleaseMetadataRejectsMismatchedVersionedTag(t *testing.T) {
 			case defaultReleaseManifestBaseURL + "/v1.2.3/manifest.json":
 				return jsonResponse(t, http.StatusOK, `{
 					"manifestVersion": 1,
+					"channel": "stable",
 					"version": "9.9.9",
 					"tag": "v9.9.9",
 					"artifacts": {
@@ -684,6 +687,7 @@ func TestFetchReleaseMetadataFallsBackWhenCDNAssetsIncomplete(t *testing.T) {
 			case defaultReleaseManifestBaseURL + "/channels/stable.json":
 				return jsonResponse(t, http.StatusOK, `{
 					"manifestVersion": 1,
+					"channel": "stable",
 					"version": "1.2.3",
 					"tag": "v1.2.3",
 					"artifacts": {
@@ -703,9 +707,9 @@ func TestFetchReleaseMetadataFallsBackWhenCDNAssetsIncomplete(t *testing.T) {
 		})},
 	})
 	runtime := newCommandRuntime(app, nil)
-	payload, err := runtime.fetchReleaseMetadataMatching(context.Background(), "", func(payload githubReleasePayload) error {
+	payload, err := runtime.fetchReleaseMetadataMatching(context.Background(), "", func(payload githubReleasePayload) (bool, error) {
 		_, err := findReleaseAssetSet(payload, "looperd-darwin-arm64")
-		return err
+		return true, err
 	})
 	if err != nil {
 		t.Fatalf("fetchReleaseMetadataMatching() error = %v", err)

@@ -24,6 +24,7 @@ on:
           - beta
 
 concurrency:
+  queue: max
   group: release-${{ github.event_name == 'workflow_dispatch' && format('{0}-{1}-{2}', github.ref_name, inputs.version_bump, inputs.release_channel) || github.ref_name }}
 
 permissions:
@@ -544,6 +545,7 @@ jobs:
       - publish-loopernet-image
     runs-on: ubuntu-latest
     concurrency:
+      queue: max
       group: looper-r2-pointer-${{ needs.prepare-go-release.outputs.release-channel }}
       cancel-in-progress: false
 

@@ -132,6 +132,8 @@ Current behavior:
 - after a daemon upgrade, restart manually with `looper daemon restart`
 - each GitHub release also publishes `manifest.json` to Cloudflare R2 at `https://releases.looper.powerformer.com/`
 - `looper upgrade --check` reads latest versions from that CDN first (`/channels/stable.json`), then falls back to GitHub Releases metadata
+- stable CDN metadata must declare `channel: stable` and a non-prerelease tag; explicitly requested versions can still select beta releases
+- install and upgrade retry GitHub metadata if CDN-selected binaries cannot be downloaded, verified, or extracted; upgrades recheck the fallback version before replacing files, and fixed-version installs keep their requested tag
 - each metadata source has a 5-second timeout and a 1 MiB response limit; malformed, unsupported, oversized, or stalled CDN metadata falls back to GitHub
 - manifest-gated rollback and channel switching are not implemented yet
 

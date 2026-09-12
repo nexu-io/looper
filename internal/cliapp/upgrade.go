@@ -962,55 +962,61 @@ func (r *commandRuntime) prepareDaemonUpgrade(cmd *cobra.Command) (preparedDaemo
 		return preparedDaemonUpgrade{}, err
 	}
 	current := selectUpgradeDaemonVersionState(statusPayload, managedDaemon, pathDaemon)
-	latestRelease, err := r.fetchLatestDaemonRelease(ctx)
-	if err != nil {
-		return preparedDaemonUpgrade{}, err
-	}
-
-	var currentVersion *string
-	if managedDaemon != nil {
-		currentVersion = stringPtr(managedDaemon.Version)
-	} else if current != nil {
-		currentVersion = stringPtr(current.Version)
-	}
-
-	needsInstall := managedDaemon == nil
-	needsUpgrade := needsInstall || currentVersion == nil
-	if !needsUpgrade {
-		available, err := isSemverUpgradeAvailable(*currentVersion, latestRelease.Version)
-		if err != nil {
-			return preparedDaemonUpgrade{}, fmt.Errorf("compare daemon versions: %w", err)
+	var prepared preparedDaemonUpgrade
+	_, err = r.fetchReleaseMetadataMatching(ctx, "", func(payload githubReleasePayload) (bool, error) {
+		latestVersion := normalizeVersion(payload.TagName)
+		if latestVersion == "" {
+			return true, fmt.Errorf("latest looperd release metadata is missing tag_name")
 		}
-		needsUpgrade = available
-	}
-	if !needsUpgrade {
-		output := daemonUpgradeOutput{
-			Changed:        false,
-			CurrentVersion: currentVersion,
-			LatestVersion:  latestRelease.Version,
-		}
+
+		var currentVersion *string
 		if managedDaemon != nil {
-			output.BinaryPath = managedDaemon.BinaryPath
+			currentVersion = stringPtr(managedDaemon.Version)
 		} else if current != nil {
-			output.BinaryPath = current.BinaryPath
+			currentVersion = stringPtr(current.Version)
 		}
-		return preparedDaemonUpgrade{output: output, managedDaemon: managedDaemon, pathDaemon: pathDaemon}, nil
-	}
 
-	result, err := r.prepareManagedDaemonInstall(ctx, true, latestRelease.Tag, cmd.ErrOrStderr())
-	if err != nil {
-		return preparedDaemonUpgrade{}, fmt.Errorf("Failed to upgrade looperd: %w", err)
-	}
+		needsInstall := managedDaemon == nil
+		needsUpgrade := needsInstall || currentVersion == nil
+		if !needsUpgrade {
+			available, err := isSemverUpgradeAvailable(*currentVersion, latestVersion)
+			if err != nil {
+				return true, fmt.Errorf("compare daemon versions: %w", err)
+			}
+			needsUpgrade = available
+		}
+		if !needsUpgrade {
+			output := daemonUpgradeOutput{
+				Changed:        false,
+				CurrentVersion: currentVersion,
+				LatestVersion:  latestVersion,
+			}
+			if managedDaemon != nil {
+				output.BinaryPath = managedDaemon.BinaryPath
+			} else if current != nil {
+				output.BinaryPath = current.BinaryPath
+			}
+			prepared = preparedDaemonUpgrade{output: output, managedDaemon: managedDaemon, pathDaemon: pathDaemon}
+			return false, nil
+		}
 
-	output := daemonUpgradeOutput{
-		Changed:         true,
-		PreviousVersion: daemonVersionPointer(current),
-		LatestVersion:   latestRelease.Version,
-		InstallPath:     stringPtr(result.result.InstallPath),
-		DownloadedFrom:  result.result.DownloadedFrom,
-		Skipped:         boolPtr(result.result.Skipped),
-	}
-	return preparedDaemonUpgrade{output: output, managedDaemon: managedDaemon, pathDaemon: pathDaemon, install: &result}, nil
+		result, err := r.prepareManagedDaemonInstallFromRelease(ctx, payload, cmd.ErrOrStderr())
+		if err != nil {
+			return true, fmt.Errorf("Failed to upgrade looperd: %w", err)
+		}
+
+		output := daemonUpgradeOutput{
+			Changed:         true,
+			PreviousVersion: daemonVersionPointer(current),
+			LatestVersion:   latestVersion,
+			InstallPath:     stringPtr(result.result.InstallPath),
+			DownloadedFrom:  result.result.DownloadedFrom,
+			Skipped:         boolPtr(result.result.Skipped),
+		}
+		prepared = preparedDaemonUpgrade{output: output, managedDaemon: managedDaemon, pathDaemon: pathDaemon, install: &result}
+		return false, nil
+	})
+	return prepared, err
 }
 
 func (r *commandRuntime) finishPreparedDaemonUpgrade(cmd *cobra.Command, prepared preparedDaemonUpgrade, emitOutput bool) (daemonUpgradeOutput, error) {
@@ -1292,18 +1298,50 @@ func (r *commandRuntime) upgradeCLIWithOutput(cmd *cobra.Command, emitOutput boo
 		}
 		return result, &cliUpgradeRefusedError{message: guidance}
 	}
-	latestRelease, err := r.fetchReleaseMetadata(ctx, "")
+	var (
+		latestVersion string
+		available     bool
+		asset         downloadAsset
+		binaryBytes   []byte
+		refusal       cliUpgradeOutput
+	)
+	_, err = r.fetchReleaseMetadataMatching(ctx, "", func(payload githubReleasePayload) (bool, error) {
+		latestVersion = normalizeVersion(payload.TagName)
+		var err error
+		available, err = isSemverUpgradeAvailable(version.Current().Version, latestVersion)
+		if err != nil {
+			return true, fmt.Errorf("compare CLI versions: %w", err)
+		}
+		if !available {
+			return false, nil
+		}
+		if err := preflightSelfUpgradeReplace(execPath); err != nil {
+			refused := true
+			guidance := cliSelfUpgradeWriteGuidance(execPath, err)
+			refusal = cliUpgradeOutput{Changed: false, CurrentVersion: version.Current().Version, LatestVersion: latestVersion, BinaryPath: stringPtr(execPath), InstallSource: string(installSource), Refused: &refused, RefusedGuidance: &guidance}
+			return false, &cliUpgradeRefusedError{message: guidance}
+		}
+		target, err := resolveLooperTarget(r.platform(), r.arch())
+		if err != nil {
+			return false, err
+		}
+		asset, err = findReleaseAssetSet(payload, "looper-"+target)
+		if err != nil {
+			return true, fmt.Errorf("looper release: %w", err)
+		}
+		binaryBytes, err = r.fetchAndExtractBinary(ctx, asset, cmd.ErrOrStderr())
+		if err != nil {
+			return true, fmt.Errorf("failed to fetch looper release: %w", err)
+		}
+		return false, nil
+	})
 	if err != nil {
-		return cliUpgradeOutput{}, err
-	}
-	latestVersion := normalizeVersion(latestRelease.TagName)
-	if latestVersion == "" {
-		return cliUpgradeOutput{}, fmt.Errorf("latest looper release metadata is missing tag_name")
-	}
-
-	available, err := isSemverUpgradeAvailable(version.Current().Version, latestVersion)
-	if err != nil {
-		return cliUpgradeOutput{}, fmt.Errorf("compare CLI versions: %w", err)
+		if refusal.Refused != nil && emitOutput && getBoolFlag(cmd, "json") {
+			if writeErr := writeJSON(cmd.OutOrStdout(), refusal); writeErr != nil {
+				return cliUpgradeOutput{}, writeErr
+			}
+		}
+		return refusal, err
 	}
 	if !available {
 		skipped := true
@@ -1320,41 +1358,7 @@ func (r *commandRuntime) upgradeCLIWithOutput(cmd *cobra.Command, emitOutput boo
 		}
 		return result, nil
 	}
-	if err := preflightSelfUpgradeReplace(execPath); err != nil {
-		refused := true
-		guidance := cliSelfUpgradeWriteGuidance(execPath, err)
-		result := cliUpgradeOutput{Changed: false, CurrentVersion: version.Current().Version, LatestVersion: latestVersion, BinaryPath: stringPtr(execPath), InstallSource: string(installSource), Refused: &refused, RefusedGuidance: &guidance}
-		if emitOutput && getBoolFlag(cmd, "json") {
-			if err := writeJSON(cmd.OutOrStdout(), result); err != nil {
-				return cliUpgradeOutput{}, err
-			}
-		}
-		return result, &cliUpgradeRefusedError{message: guidance}
-	}
 
-	target, err := resolveLooperTarget(r.platform(), r.arch())
-	if err != nil {
-		return cliUpgradeOutput{}, err
-	}
-	binaryName := "looper-" + target
-	asset, err := findReleaseAssetSet(latestRelease, binaryName)
-	if err != nil {
-		latestRelease, err = r.fetchReleaseMetadataMatching(ctx, latestRelease.TagName, func(payload githubReleasePayload) error {
-			_, findErr := findReleaseAssetSet(payload, binaryName)
-			return findErr
-		})
-		if err != nil {
-			return cliUpgradeOutput{}, fmt.Errorf("looper release: %w", err)
-		}
-		asset, err = findReleaseAssetSet(latestRelease, binaryName)
-	}
-	if err != nil {
-		return cliUpgradeOutput{}, fmt.Errorf("looper release: %w", err)
-	}
-	binaryBytes, err := r.fetchAndExtractBinary(ctx, asset, cmd.ErrOrStderr())
-	if err != nil {
-		return cliUpgradeOutput{}, fmt.Errorf("failed to fetch looper release: %w", err)
-	}
 	if err := replaceBinaryAtomically(execPath, binaryBytes); err != nil {
 		return cliUpgradeOutput{}, err
 	}

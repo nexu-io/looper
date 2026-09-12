@@ -110,15 +110,29 @@ func (r *commandRuntime) prepareManagedDaemonInstall(ctx context.Context, force 
 		}
 	}
 
-	release, err := r.fetchReleaseMetadataMatching(ctx, tag, func(payload githubReleasePayload) error {
-		_, err := findReleaseAssetSet(payload, looperdBinaryName+"-"+target)
-		return err
+	var prepared preparedDaemonInstall
+	_, err = r.fetchReleaseMetadataMatching(ctx, tag, func(payload githubReleasePayload) (bool, error) {
+		var err error
+		prepared, err = r.prepareManagedDaemonInstallFromRelease(ctx, payload, progress)
+		return true, err
 	})
+	return prepared, err
+}
+
+// Preparation includes download and checksum verification; installation happens
+// only after a source has successfully supplied the complete release.
+func (r *commandRuntime) prepareManagedDaemonInstallFromRelease(ctx context.Context, payload githubReleasePayload, progress io.Writer) (preparedDaemonInstall, error) {
+	homeDir, err := r.homeDir()
 	if err != nil {
 		return preparedDaemonInstall{}, err
 	}
+	target, err := resolveLooperdTarget(r.platform(), r.arch())
+	if err != nil {
+		return preparedDaemonInstall{}, err
+	}
+	installPath := filepath.Join(homeDir, ".looper", "bin", looperdBinaryName)
 
-	asset, err := findReleaseAssetSet(release, looperdBinaryName+"-"+target)
+	asset, err := findReleaseAssetSet(payload, looperdBinaryName+"-"+target)
 	if err != nil {
 		return preparedDaemonInstall{}, fmt.Errorf("looperd release: %w", err)
 	}
@@ -168,7 +182,9 @@ func (r *commandRuntime) fetchReleaseMetadata(ctx context.Context, tag string) (
 	return r.fetchReleaseMetadataMatching(ctx, tag, nil)
 }
 
-func (r *commandRuntime) fetchReleaseMetadataMatching(ctx context.Context, tag string, accept func(githubReleasePayload) error) (githubReleasePayload, error) {
+// accept may prepare a download before accepting a source. retry distinguishes
+// a failed release source from a local refusal (for example, an unwritable CLI).
+func (r *commandRuntime) fetchReleaseMetadataMatching(ctx context.Context, tag string, accept func(githubReleasePayload) (retry bool, err error)) (githubReleasePayload, error) {
 	var lastErr error
 	for _, releaseURL := range releaseMetadataURLs(tag) {
 		if err := ctx.Err(); err != nil {
@@ -184,7 +200,10 @@ func (r *commandRuntime) fetchReleaseMetadataMatching(ctx context.Context, tag s
 			continue
 		}
 		if accept != nil {
-			if err := accept(payload); err != nil {
+			if retry, err := accept(payload); err != nil {
+				if !retry {
+					return githubReleasePayload{}, err
+				}
 				lastErr = err
 				continue
 			}
@@ -241,7 +260,7 @@ func (r *commandRuntime) fetchReleaseMetadataFromURL(ctx context.Context, releas
 	if len(body) > maxReleaseMetadataBytes {
 		return githubReleasePayload{}, fmt.Errorf("release metadata from %s exceeds %d bytes", releaseURL, maxReleaseMetadataBytes)
 	}
-	payload, err := decodeReleaseMetadata(body, isCDNReleaseMetadataURL(releaseURL))
+	payload, err := decodeReleaseMetadata(body, releaseURL)
 	if err != nil {
 		return githubReleasePayload{}, fmt.Errorf("decode release metadata from %s: %w", releaseURL, err)
 	}
@@ -369,10 +388,10 @@ func buildGitHubReleaseAPIURL(owner, repo, tag string) string {
 	return base + "/latest"
 }
 
-func decodeReleaseMetadata(body []byte, fromCDN bool) (githubReleasePayload, error) {
+func decodeReleaseMetadata(body []byte, sourceURL string) (githubReleasePayload, error) {
 	// The endpoint determines the schema. Never interpret CDN content as a
 	// GitHub API response, whose download URLs are trusted by callers.
-	if fromCDN {
+	if isCDNReleaseMetadataURL(sourceURL) {
 		var manifest release.Manifest
 		if err := json.Unmarshal(body, &manifest); err != nil {
 			return githubReleasePayload{}, err
@@ -384,8 +403,12 @@ func decodeReleaseMetadata(body []byte, fromCDN bool) (githubReleasePayload, err
 		if err := release.ValidateTag(tag); err != nil {
 			return githubReleasePayload{}, err
 		}
-		if _, err := parseSemver(tag); err != nil {
+		parsed, err := parseSemver(tag)
+		if err != nil {
 			return githubReleasePayload{}, err
+		}
+		if sourceURL == buildReleaseManifestURL(defaultReleaseManifestBaseURL, "") && (manifest.Channel != "stable" || parsed.preRelease != "") {
+			return githubReleasePayload{}, fmt.Errorf("stable release metadata must declare channel stable and a non-prerelease tag")
 		}
 		payload := githubReleaseFromManifest(manifest)
 		if len(payload.Assets) == 0 {

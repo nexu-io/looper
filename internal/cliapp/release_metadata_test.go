@@ -16,12 +16,12 @@ func TestLatestVersionsFallBackFromMalformedCDNManifest(t *testing.T) {
 	t.Parallel()
 	for name, body := range map[string]string{
 		"schema only":       `{"manifestVersion":1}`,
-		"empty version":     `{"manifestVersion":1,"tag":" ","version":" "}`,
-		"invalid tag":       `{"manifestVersion":1,"tag":"not-a-version","artifacts":{"looperd-darwin-arm64":{}}}`,
-		"unsafe tag":        `{"manifestVersion":1,"tag":"v1.2.3-beta/../../other","artifacts":{"looperd-darwin-arm64":{}}}`,
-		"missing artifacts": `{"manifestVersion":1,"tag":"v1.2.3"}`,
-		"empty artifacts":   `{"manifestVersion":1,"tag":"v1.2.3","artifacts":{}}`,
-		"invalid artifacts": `{"manifestVersion":1,"tag":"v1.2.3","artifacts":{"../escape":{}}}`,
+		"empty version":     `{"manifestVersion":1,"channel":"stable","tag":" ","version":" "}`,
+		"invalid tag":       `{"manifestVersion":1,"channel":"stable","tag":"not-a-version","artifacts":{"looperd-darwin-arm64":{}}}`,
+		"unsafe tag":        `{"manifestVersion":1,"channel":"stable","tag":"v1.2.3-beta/../../other","artifacts":{"looperd-darwin-arm64":{}}}`,
+		"missing artifacts": `{"manifestVersion":1,"channel":"stable","tag":"v1.2.3"}`,
+		"empty artifacts":   `{"manifestVersion":1,"channel":"stable","tag":"v1.2.3","artifacts":{}}`,
+		"invalid artifacts": `{"manifestVersion":1,"channel":"stable","tag":"v1.2.3","artifacts":{"../escape":{}}}`,
 		"future schema":     `{"manifestVersion":2,"tag":"v1.2.3","artifacts":{"looperd-darwin-arm64":{}}}`,
 		"GitHub shape":      `{"tag_name":"v1.2.3","assets":[]}`,
 	} {
@@ -59,7 +59,7 @@ func TestReleaseMetadataFallsBackFromStalledCDN(t *testing.T) {
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 				if stage == "body" {
 					w.WriteHeader(http.StatusOK)
-					_, _ = io.WriteString(w, `{"manifestVersion":1,`)
+					_, _ = io.WriteString(w, `{"manifestVersion":1,"channel":"stable",`)
 					w.(http.Flusher).Flush()
 				}
 				<-req.Context().Done()
@@ -117,7 +117,7 @@ func TestReleaseMetadataResponseSizeLimit(t *testing.T) {
 				t.Parallel()
 				body := `{"tag_name":"v1.2.3","assets":[]}`
 				if isCDNReleaseMetadataURL(source) {
-					body = `{"manifestVersion":1,"tag":"v1.2.3","artifacts":{"looperd-darwin-arm64":{}}}`
+					body = `{"manifestVersion":1,"channel":"stable","tag":"v1.2.3","artifacts":{"looperd-darwin-arm64":{}}}`
 				}
 				reader := &metadataCountingBody{Reader: strings.NewReader(body + strings.Repeat(" ", size-len(body)))}
 				app := New(Deps{HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
@@ -144,7 +144,7 @@ func TestReleaseMetadataFallsBackFromOversizedCDN(t *testing.T) {
 	app := New(Deps{HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		seen = append(seen, req.URL.Host)
 		if isCDNReleaseMetadataURL(req.URL.String()) {
-			return jsonResponse(t, http.StatusOK, strings.Repeat(" ", 1<<20)+`{"manifestVersion":1,"tag":"v1.2.3","artifacts":{"looperd-darwin-arm64":{}}}`), nil
+			return jsonResponse(t, http.StatusOK, strings.Repeat(" ", 1<<20)+`{"manifestVersion":1,"channel":"stable","tag":"v1.2.3","artifacts":{"looperd-darwin-arm64":{}}}`), nil
 		}
 		return jsonResponse(t, http.StatusOK, `{"tag_name":"v1.2.4","assets":[]}`), nil
 	})}})
