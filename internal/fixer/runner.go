@@ -26,6 +26,7 @@ import (
 	"github.com/nexu-io/looper/internal/domain"
 	"github.com/nexu-io/looper/internal/eventlog"
 	"github.com/nexu-io/looper/internal/forge"
+	"github.com/nexu-io/looper/internal/hostingidentity"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/infra/shell"
 	"github.com/nexu-io/looper/internal/infra/specpr"
@@ -1369,6 +1370,11 @@ func New(options Options) *Runner {
 }
 
 func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput) (DiscoveryResult, error) {
+	bound, bindErr := hostingidentity.Bind(ctx, r.customInstructions, input.ProjectID, "fixer")
+	if bindErr != nil {
+		return DiscoveryResult{}, bindErr
+	}
+	ctx = bound
 	ctx = githubinfra.ContextWithDiscoverySnapshot(ctx, input.Snapshot)
 	if r.repos == nil || r.repos.Projects == nil || r.repos.Loops == nil || r.repos.Queue == nil || r.repos.Runs == nil || r.repos.Locks == nil {
 		return DiscoveryResult{}, fmt.Errorf("fixer repositories are not configured")
@@ -1440,6 +1446,11 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 }
 
 func (r *Runner) DiscoverPullRequest(ctx context.Context, input TargetedDiscoveryInput) (DiscoveryResult, error) {
+	bound, bindErr := hostingidentity.Bind(ctx, r.customInstructions, input.ProjectID, "fixer")
+	if bindErr != nil {
+		return DiscoveryResult{}, bindErr
+	}
+	ctx = bound
 	if input.PRNumber <= 0 {
 		return DiscoveryResult{}, fmt.Errorf("prNumber must be positive")
 	}
@@ -1502,6 +1513,11 @@ func (r *Runner) DiscoverPullRequest(ctx context.Context, input TargetedDiscover
 }
 
 func (r *Runner) DiscoverPullRequestsForBaseBranchUpdate(ctx context.Context, input BaseBranchDiscoveryInput) (DiscoveryResult, error) {
+	bound, bindErr := hostingidentity.Bind(ctx, r.customInstructions, input.ProjectID, "fixer")
+	if bindErr != nil {
+		return DiscoveryResult{}, bindErr
+	}
+	ctx = bound
 	baseRefName := strings.TrimSpace(input.BaseRefName)
 	if baseRefName == "" {
 		return DiscoveryResult{}, fmt.Errorf("baseRefName is required")
@@ -2142,6 +2158,11 @@ func (r *Runner) ProcessNext(ctx context.Context, claimedBy string) (*ProcessRes
 }
 
 func (r *Runner) ProcessClaimedQueueItem(ctx context.Context, queueItem storage.QueueItemRecord) (*ProcessResult, error) {
+	bound, bindErr := r.bindClaimedHostingIdentity(ctx, queueItem)
+	if bindErr != nil {
+		return nil, bindErr
+	}
+	ctx = bound
 	result, err := r.ProcessClaimedItem(ctx, queueItem)
 	if err != nil {
 		return r.recoverClaimedItem(ctx, queueItem, err)
@@ -2205,6 +2226,11 @@ func (r *Runner) reconcileRecoveredLoop(ctx context.Context, queueItem storage.Q
 }
 
 func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.QueueItemRecord) (result ProcessResult, retErr error) {
+	bound, bindErr := r.bindClaimedHostingIdentity(ctx, queueItem)
+	if bindErr != nil {
+		return ProcessResult{}, bindErr
+	}
+	ctx = bound
 	if queueItem.Type != "fixer" {
 		return ProcessResult{}, fmt.Errorf("unsupported queue item type: %s", queueItem.Type)
 	}
@@ -2326,12 +2352,12 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			if scheduled, err := r.schedulePendingRediscoveryAfterRun(ctx, *loop, *queueItem.Repo, *queueItem.PRNumber); err != nil {
 				return ProcessResult{}, err
 			} else if scheduled {
-				r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, &latest)
+				r.cleanupFixerWorktreeIfTerminal(context.WithoutCancel(ctx), *project, &latest)
 				return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "failed", Summary: failure.message, FailureKind: failure.kind}, nil
 			}
 		}
 		if queueResultIsTerminalForCleanup(failedQueue) {
-			r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, &latest)
+			r.cleanupFixerWorktreeIfTerminal(context.WithoutCancel(ctx), *project, &latest)
 		}
 		return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "failed", Summary: failure.message, FailureKind: failure.kind}, nil
 	}
@@ -2362,7 +2388,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		if scheduled, err := r.schedulePendingRediscoveryAfterRun(ctx, *loop, *queueItem.Repo, *queueItem.PRNumber); err != nil {
 			return ProcessResult{}, err
 		} else if scheduled {
-			r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, &checkpoint)
+			r.cleanupFixerWorktreeIfTerminal(context.WithoutCancel(ctx), *project, &checkpoint)
 			return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "skipped", Summary: reason}, nil
 		}
 		if _, err := r.updateLoop(ctx, *loop, func(updated *storage.LoopRecord) {
@@ -2372,7 +2398,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		}); err != nil {
 			return ProcessResult{}, err
 		}
-		r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, &checkpoint)
+		r.cleanupFixerWorktreeIfTerminal(context.WithoutCancel(ctx), *project, &checkpoint)
 		return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "skipped", Summary: reason}, nil
 	}
 	if resumedRun.Resumed && resumedRun.StartStep != stepDiscoverPR || (!resumedRun.Resumed && resumedRun.StartStep == stepDiscoverPR && len(prQueryLabels(r.discoveryPolicyForProject(project.ID).Labels)) > 0) {
@@ -2401,7 +2427,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			}); err != nil {
 				return ProcessResult{}, err
 			}
-			r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, &checkpoint)
+			r.cleanupFixerWorktreeIfTerminal(context.WithoutCancel(ctx), *project, &checkpoint)
 			return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "skipped", Summary: reason}, nil
 		}
 	}
@@ -2474,12 +2500,12 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 				if scheduled, err := r.schedulePendingRediscoveryAfterRun(ctx, *loop, *queueItem.Repo, *queueItem.PRNumber); err != nil {
 					return ProcessResult{}, err
 				} else if scheduled {
-					r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, &latest)
+					r.cleanupFixerWorktreeIfTerminal(context.WithoutCancel(ctx), *project, &latest)
 					return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "failed", Summary: failure.message, FailureKind: failure.kind}, nil
 				}
 			}
 			if queueResultIsTerminalForCleanup(failedQueue) {
-				r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, &latest)
+				r.cleanupFixerWorktreeIfTerminal(context.WithoutCancel(ctx), *project, &latest)
 			}
 			return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "failed", Summary: failure.message, FailureKind: failure.kind}, nil
 		}
@@ -2507,7 +2533,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 	r.appendEvent(ctx, eventInput{eventType: "run.completed", projectID: loop.ProjectID, loopID: loop.ID, runID: run.ID, entityType: "run", entityID: run.ID, payload: map[string]any{"summary": summary}})
 	if err := r.repos.Queue.Complete(ctx, queueItem.ID, r.nowISO()); err != nil {
 		if errors.Is(err, storage.ErrQueueItemNotActive) {
-			r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, &checkpoint)
+			r.cleanupFixerWorktreeIfTerminal(context.WithoutCancel(ctx), *project, &checkpoint)
 			return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: statusForSkip(checkpoint.SkipReason), Summary: summary}, nil
 		}
 		return ProcessResult{}, err
@@ -2520,7 +2546,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		if scheduled, err := r.schedulePendingRediscoveryAfterRun(ctx, *loop, *queueItem.Repo, *queueItem.PRNumber); err != nil {
 			return ProcessResult{}, err
 		} else if scheduled {
-			r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, &checkpoint)
+			r.cleanupFixerWorktreeIfTerminal(context.WithoutCancel(ctx), *project, &checkpoint)
 			status := statusForSkip(checkpoint.SkipReason)
 			return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: status, Summary: summary}, nil
 		}
@@ -2529,26 +2555,26 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			return ProcessResult{}, err
 		}
 		if paused {
-			r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, &checkpoint)
+			r.cleanupFixerWorktreeIfTerminal(context.WithoutCancel(ctx), *project, &checkpoint)
 			return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: statusForSkip(checkpoint.SkipReason), Summary: summary}, nil
 		}
 	}
 	if parked, err := r.parkFixerBudgetAfterSuccessfulRun(ctx, *project, *loop); err != nil {
 		return ProcessResult{}, err
 	} else if parked {
-		r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, &checkpoint)
+		r.cleanupFixerWorktreeIfTerminal(context.WithoutCancel(ctx), *project, &checkpoint)
 		return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: statusForSkip(checkpoint.SkipReason), Summary: summary}, nil
 	}
 	if current, err := r.repos.Loops.GetByID(ctx, loop.ID); err != nil {
 		return ProcessResult{}, err
 	} else if current != nil && (current.Status == "terminated" || current.Status == "stopped") {
-		r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, &checkpoint)
+		r.cleanupFixerWorktreeIfTerminal(context.WithoutCancel(ctx), *project, &checkpoint)
 		return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: statusForSkip(checkpoint.SkipReason), Summary: summary}, nil
 	}
 	if scheduled, err := r.schedulePendingRediscoveryAfterRun(ctx, *loop, *queueItem.Repo, *queueItem.PRNumber); err != nil {
 		return ProcessResult{}, err
 	} else if scheduled {
-		r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, &checkpoint)
+		r.cleanupFixerWorktreeIfTerminal(context.WithoutCancel(ctx), *project, &checkpoint)
 		status := statusForSkip(checkpoint.SkipReason)
 		return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: status, Summary: summary}, nil
 	}
@@ -2563,7 +2589,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			return ProcessResult{}, err
 		}
 	}
-	r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, &checkpoint)
+	r.cleanupFixerWorktreeIfTerminal(context.WithoutCancel(ctx), *project, &checkpoint)
 	status := statusForSkip(checkpoint.SkipReason)
 	return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: status, Summary: summary}, nil
 }
@@ -3301,7 +3327,7 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 		}
 	}
 	executionID := eventlog.NewEventID("agent")
-	prompt, instructionBlock := buildFixerPrompt(input.Project.ID, r.customInstructions, input.Repo, input.PRNumber, checkpoint.Detail, checkpoint.FixItems, r.allowAutoPush && !r.hitlEnabled && !continuingHITL, r.disclosure, agentVendor, derefString(agentModel))
+	prompt, instructionBlock := buildFixerPrompt(input.Project.ID, r.customInstructions, input.Repo, input.PRNumber, checkpoint.Detail, checkpoint.FixItems, r.allowAutoPush && !r.hitlEnabled && !continuingHITL, r.disclosure, agentVendor, derefString(agentModel), hostingKindForContext(ctx))
 	if r.hitlEnabled {
 		if instruction := fixerHITLPromptFor(checkpoint.FixItems); instruction != "" {
 			prompt += "\n\n" + instruction
@@ -3470,7 +3496,16 @@ func (r *Runner) runPushStep(ctx context.Context, input stepInput) (fixerCheckpo
 		return checkpoint, nil
 	}
 	if checkpoint.Push != nil && checkpoint.Push.Pushed {
-		return r.ensureFixerPushBudgetCounted(ctx, input, checkpoint)
+		updated, err := r.ensureFixerPushBudgetCounted(ctx, input, checkpoint)
+		if err != nil {
+			return updated, err
+		}
+		if hostingKindForContext(ctx) != "" {
+			if err := r.reRequestReviewersAfterFix(ctx, input); err != nil {
+				return updated, err
+			}
+		}
+		return updated, nil
 	}
 	// Admission at the mutation seam: refuse a counted push when already at the
 	// live cap (observe mid-run cap lowers). PR-closed still wins later.
@@ -3600,7 +3635,9 @@ func (r *Runner) runPushStep(ctx context.Context, input stepInput) (fixerCheckpo
 	}
 	// After pushing a fix, re-request the reviewers who weighed in so the PR gets
 	// re-reviewed promptly instead of waiting for the coordinator lane.
-	r.reRequestReviewersAfterFix(ctx, input)
+	if err := r.reRequestReviewersAfterFix(ctx, input); err != nil {
+		return checkpoint, err
+	}
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
 	return checkpoint, nil
 }
@@ -7017,20 +7054,48 @@ func (r *Runner) runValidation(ctx context.Context, input ValidationInput) (Vali
 	if r.validationRunner != nil {
 		return r.validationRunner(ctx, input)
 	}
+	return r.runValidationCommands(ctx, input, shell.Run)
+}
+
+func (r *Runner) runValidationCommands(ctx context.Context, input ValidationInput, run func(context.Context, shell.Options) (shell.Result, error)) (ValidationResult, error) {
 	if len(input.Commands) == 0 {
 		return ValidationResult{Passed: true, Summary: "No validation commands configured"}, nil
 	}
 
+	var validationEnv map[string]string
+	var commandRunErr error
+	if session, selected := hostingidentity.FromContext(ctx); selected {
+		validationEnv = make(map[string]string)
+		for _, entry := range os.Environ() {
+			if name, value, ok := strings.Cut(entry, "="); ok {
+				validationEnv[name] = value
+			}
+		}
+		validationConfig := config.CloneConfig(r.customInstructions)
+		if validationConfig.Identities == nil {
+			validationConfig.Identities = make(map[string]config.HostingIdentityConfig)
+		}
+		validationConfig.Identities[session.Name()] = session.Snapshot().Definition
+		var cleanup func(error)
+		var err error
+		validationEnv, cleanup, err = agent.PrepareHostingValidationEnv(validationConfig, validationEnv)
+		if err != nil {
+			return ValidationResult{}, err
+		}
+		defer func() { cleanup(commandRunErr) }()
+	}
 	outputs := make([]string, 0, len(input.Commands)*2)
 	for _, command := range input.Commands {
-		result, err := shell.Run(ctx, shell.Options{
+		result, err := run(ctx, shell.Options{
 			Command: "/bin/sh",
 			Args:    []string{"-c", command},
 			CWD:     input.CWD,
+			Env:     validationEnv,
 			// Supervisor-owned validation: track handle so shutdown retain-storage
 			// sees Kill/Drain failures even when validation collapses them to Passed=false.
 			Tracker: r.containmentTracker,
 		})
+		commandRunErr = err
 		if err != nil {
 			output := "Unknown validation failure"
 			var commandErr *shell.CommandExecutionError
@@ -7853,7 +7918,11 @@ func fixerAgentSideFetchContract(repo string, prNumber int64, detail *checkpoint
 	}, "\n")
 }
 
-func buildFixerPrompt(projectID string, instructionConfig config.Config, repo string, prNumber int64, detail *checkpointDetail, fixItems []FixItem, allowAutoPush bool, disclosureCfg config.DisclosureConfig, agentRuntime string, agentModel string) (string, config.CustomInstructionBlock) {
+func buildFixerPrompt(projectID string, instructionConfig config.Config, repo string, prNumber int64, detail *checkpointDetail, fixItems []FixItem, allowAutoPush bool, disclosureCfg config.DisclosureConfig, agentRuntime string, agentModel string, hostingKinds ...config.HostingIdentityKind) (string, config.CustomInstructionBlock) {
+	hostingKind := config.HostingIdentityKind("")
+	if len(hostingKinds) > 0 {
+		hostingKind = hostingKinds[0]
+	}
 	if providerURL := forge.ConfiguredPullRequestURL(instructionConfig, projectID, repo, prNumber); providerURL != "" && (detail == nil || detail.URL == "") {
 		copy := checkpointDetail{}
 		if detail != nil {
@@ -7862,8 +7931,12 @@ func buildFixerPrompt(projectID string, instructionConfig config.Config, repo st
 		copy.URL = providerURL
 		detail = &copy
 	}
-	parts := []string{fmt.Sprintf("Fix pull request %s#%d.", repo, prNumber), buildFixerMinimalPRSeed(repo, prNumber, detail, fixItems), fixerAgentSideFetchContract(repo, prNumber, detail, fixItems)}
-	if providerContext := forge.ForgejoAgentContext(instructionConfig, projectID, repo, prNumber); providerContext != "" {
+	fetchContract := fixerAgentSideFetchContract(repo, prNumber, detail, fixItems)
+	if hostingKind != "" {
+		fetchContract = forge.HostingAgentContext(hostingKind, "fixer", repo, prNumber) + "\nBefore editing and again before final conclusions, fetch live PR metadata and verify head.sha, base.ref and open/draft status against the seeded handoff. Fail with structured auth/network/rate_limit/pr_drift error when access fails or the target changes. Fetch the diff and read all PR conversation and reviews before editing."
+	}
+	parts := []string{fmt.Sprintf("Fix pull request %s#%d.", repo, prNumber), buildFixerMinimalPRSeed(repo, prNumber, detail, fixItems), fetchContract}
+	if providerContext := forge.ForgejoAgentContext(instructionConfig, projectID, repo, prNumber); hostingKind == "" && providerContext != "" {
 		parts = append(parts, providerContext)
 	}
 	if headSHA := detailHeadSHA(detail); headSHA != "" {
@@ -7889,7 +7962,9 @@ func buildFixerPrompt(projectID string, instructionConfig config.Config, repo st
 	if instructionBlock.Text != "" {
 		parts = append(parts, instructionBlock.Text)
 	}
-	if allowAutoPush {
+	if hostingKind != "" {
+		parts = append(parts, botPublicationPrompt())
+	} else if allowAutoPush {
 		parts = append(parts, "Commit and push the repair changes to the current PR branch when you can do so safely; Looper will reconcile any missing repository actions after your edits.")
 		parts = append(parts, lifecycle.PromptInstruction("fixer", "", "", true, false, disclosureCfg, agentRuntime, agentModel))
 	} else {
@@ -9649,15 +9724,23 @@ func buildPullRequestLockKey(item storage.QueueItemRecord) string {
 // reRequestReviewersAfterFix re-requests the human reviewers who left a review
 // (changes-requested or commented) so a fresh fix gets re-reviewed promptly,
 // rather than waiting for the coordinator lane to notice. Best-effort.
-func (r *Runner) reRequestReviewersAfterFix(ctx context.Context, input stepInput) {
+func (r *Runner) reRequestReviewersAfterFix(ctx context.Context, input stepInput) error {
 	if r.github == nil || input.PRNumber <= 0 {
-		return
+		return nil
 	}
 	reviews, err := r.github.ListPullRequestReviews(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.Project.RepoPath})
 	if err != nil {
-		return
+		if _, selected := hostingidentity.FromContext(ctx); selected {
+			return err
+		}
+		return nil
 	}
-	self, _ := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
+	self, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
+	if err != nil {
+		if _, selected := hostingidentity.FromContext(ctx); selected {
+			return err
+		}
+	}
 	seen := map[string]bool{}
 	reviewers := make([]string, 0, len(reviews))
 	for _, rv := range reviews {
@@ -9672,18 +9755,27 @@ func (r *Runner) reRequestReviewersAfterFix(ctx context.Context, input stepInput
 		reviewers = append(reviewers, author)
 	}
 	if len(reviewers) == 0 {
-		return
+		return nil
 	}
 	detail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.Project.RepoPath})
 	if err != nil {
-		return
+		if _, selected := hostingidentity.FromContext(ctx); selected {
+			return err
+		}
+		return nil
 	}
 	if !isManualFixerLoop(input.Loop) && domain.IsAutoLaneHeld(domain.LoopTypeFixer, detail.Labels) {
-		return
+		return nil
 	}
-	if err := r.github.AddPullRequestReviewers(ctx, PullRequestReviewersInput{Repo: input.Repo, PRNumber: input.PRNumber, Reviewers: reviewers, CWD: input.Project.RepoPath}); err != nil && r.logger != nil {
-		r.logger.Warn("fixer: re-request reviewers after fix failed", map[string]any{"repo": input.Repo, "pr": input.PRNumber, "error": err.Error()})
+	if err := r.github.AddPullRequestReviewers(ctx, PullRequestReviewersInput{Repo: input.Repo, PRNumber: input.PRNumber, Reviewers: reviewers, CWD: input.Project.RepoPath}); err != nil {
+		if _, selected := hostingidentity.FromContext(ctx); selected {
+			return err
+		}
+		if r.logger != nil {
+			r.logger.Warn("fixer: re-request reviewers after fix failed", map[string]any{"repo": input.Repo, "pr": input.PRNumber, "error": err.Error()})
+		}
 	}
+	return nil
 }
 
 // fixerDismissSentinel is what the fixer agent writes to .looper/dismiss.json when

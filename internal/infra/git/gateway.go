@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/nexu-io/looper/internal/hostingidentity"
 	"github.com/nexu-io/looper/internal/infra/shell"
 	"github.com/nexu-io/looper/internal/storage"
 	"github.com/nexu-io/looper/internal/worktreesafety"
@@ -1288,9 +1289,18 @@ func (g *Gateway) runGitResultOnce(ctx context.Context, cwd string, env map[stri
 }
 
 func (g *Gateway) runGitResultOnceWithStartGate(ctx context.Context, cwd string, env map[string]string, startGate func(start func() error) error, args ...string) (shell.Result, error) {
-	result, err := shell.Run(ctx, shell.Options{Command: g.gitPath, Args: args, CWD: cwd, Env: env, StartGate: startGate})
+	result, err := hostingidentity.RunGit(ctx, shell.Options{Command: g.gitPath, Args: args, CWD: cwd, Env: env, StartGate: startGate}, nil)
 	if err == nil {
 		return result, nil
+	}
+	commandLabel := strings.Join(args, " ")
+	if _, selected := hostingidentity.FromContext(ctx); selected {
+		// A rejected destination may itself contain credentials. Keep it out
+		// of the gateway's outer error as well as the transport's diagnostics.
+		commandLabel = "operation"
+		if len(args) > 0 {
+			commandLabel = args[0]
+		}
 	}
 
 	var commandErr *shell.CommandExecutionError
@@ -1304,10 +1314,10 @@ func (g *Gateway) runGitResultOnceWithStartGate(ctx context.Context, cwd string,
 		}
 		formatted := *commandErr
 		formatted.Message = message
-		return formatted.Result, fmt.Errorf("git %s: %w", strings.Join(args, " "), &formatted)
+		return formatted.Result, fmt.Errorf("git %s: %w", commandLabel, &formatted)
 	}
 
-	return result, fmt.Errorf("git %s: %w", strings.Join(args, " "), err)
+	return result, fmt.Errorf("git %s: %w", commandLabel, err)
 }
 
 func isRetryableFetchRefLockRace(args []string, err error) bool {

@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/nexu-io/looper/internal/hostingidentity"
 	"github.com/nexu-io/looper/internal/infra/shell"
 )
 
@@ -110,11 +111,11 @@ func shouldPreserveReservedScratch(ctx context.Context, gitPath, worktreePath, n
 }
 
 func gitListsPath(ctx context.Context, gitPath, worktreePath, name string, args []string) (bool, error) {
-	result, err := shell.Run(ctx, shell.Options{
+	result, err := hostingidentity.RunGit(ctx, shell.Options{
 		Command: gitPath,
-		Args:    append([]string{"-C", worktreePath}, args...),
+		Args:    args,
 		CWD:     worktreePath,
-	})
+	}, nil)
 	if err != nil {
 		return false, err
 	}

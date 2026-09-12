@@ -157,8 +157,13 @@ func (r *commandRuntime) maybeRunAutoUpgrade(cmd *cobra.Command, args []string) 
 	// one-shot config snapshot FD. Auto-upgrade must not run here: it is
 	// unrelated to publication and historically consumed the FD before
 	// `review submit` could load the daemon-bound snapshot (EBADF).
-	if forge.TrustedReviewProxyChildConfigured() {
+	if forge.TrustedReviewProxyChildConfigured() || forge.TrustedReviewSockConfigured() {
 		return nil
+	}
+	for parent := cmd; parent != nil; parent = parent.Parent() {
+		if parent.Name() == "host" {
+			return nil
+		}
 	}
 	if shouldSkipAutoUpgrade(cmd) {
 		return nil

@@ -303,33 +303,7 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 			if !isAbsoluteHTTPURL(provider.BaseURL) {
 				issues = append(issues, ValidationIssue{Path: prefix + ".baseUrl", Message: "must be an absolute http(s) URL for forgejo providers"})
 			}
-			auth := EffectiveProviderAuth(provider)
-			switch auth {
-			case ProviderAuthTea:
-				if isNilOrEmptyString(provider.TeaLogin) {
-					issues = append(issues, ValidationIssue{Path: prefix + ".teaLogin", Message: "is required when auth is tea"})
-				}
-				if !isNilOrEmptyString(provider.TokenEnv) {
-					issues = append(issues, ValidationIssue{Path: prefix + ".tokenEnv", Message: "must be omitted when auth is tea"})
-				}
-			case ProviderAuthTokenEnv:
-				if isNilOrEmptyString(provider.TokenEnv) {
-					issues = append(issues, ValidationIssue{Path: prefix + ".tokenEnv", Message: "is required when auth is token-env"})
-				}
-				if !isNilOrEmptyString(provider.TeaLogin) {
-					issues = append(issues, ValidationIssue{Path: prefix + ".teaLogin", Message: "must be omitted when auth is token-env"})
-				}
-			case "":
-				if provider.Auth != "" {
-					issues = append(issues, ValidationIssue{Path: prefix + ".auth", Message: fmt.Sprintf("must be one of: %s, %s", ProviderAuthTokenEnv, ProviderAuthTea)})
-				} else if !isNilOrEmptyString(provider.TokenEnv) && !isNilOrEmptyString(provider.TeaLogin) {
-					issues = append(issues, ValidationIssue{Path: prefix + ".auth", Message: "must be set explicitly when both tokenEnv and teaLogin are present"})
-				} else {
-					issues = append(issues, ValidationIssue{Path: prefix + ".auth", Message: fmt.Sprintf("must be %s (with tokenEnv) or %s (with teaLogin)", ProviderAuthTokenEnv, ProviderAuthTea)})
-				}
-			default:
-				issues = append(issues, ValidationIssue{Path: prefix + ".auth", Message: fmt.Sprintf("must be one of: %s, %s", ProviderAuthTokenEnv, ProviderAuthTea)})
-			}
+			validateForgejoProviderAuth(config, provider, prefix, &issues)
 		}
 		if provider.Kind == ProviderKindPlane {
 			// baseUrl is optional (a default Plane host is used when omitted); if
@@ -453,6 +427,8 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 		}
 	}
 
+	validateHostingIdentities(config, &issues)
+
 	if len(issues) > 0 {
 		return &ConfigValidationError{Issues: issues}
 	}
@@ -506,6 +482,36 @@ func validateRoutedProjectPrerequisites(config Config, roles RoleConfigs, prefix
 
 func isValidNetworkMode(mode NetworkMode) bool {
 	return normalizeNetworkMode(mode) == NetworkModeOff || normalizeNetworkMode(mode) == NetworkModeRouted
+}
+
+func validateForgejoProviderAuth(cfg Config, provider ProviderConfig, prefix string, issues *[]ValidationIssue) {
+	auth := EffectiveProviderAuth(provider)
+	switch auth {
+	case ProviderAuthTea:
+		if isNilOrEmptyString(provider.TeaLogin) {
+			*issues = append(*issues, ValidationIssue{Path: prefix + ".teaLogin", Message: "is required when auth is tea"})
+		}
+		if !isNilOrEmptyString(provider.TokenEnv) {
+			*issues = append(*issues, ValidationIssue{Path: prefix + ".tokenEnv", Message: "must be omitted when auth is tea"})
+		}
+	case ProviderAuthTokenEnv:
+		if isNilOrEmptyString(provider.TokenEnv) {
+			*issues = append(*issues, ValidationIssue{Path: prefix + ".tokenEnv", Message: "is required when auth is token-env"})
+		}
+		if !isNilOrEmptyString(provider.TeaLogin) {
+			*issues = append(*issues, ValidationIssue{Path: prefix + ".teaLogin", Message: "must be omitted when auth is token-env"})
+		}
+	case "":
+		if provider.Auth != "" {
+			*issues = append(*issues, ValidationIssue{Path: prefix + ".auth", Message: fmt.Sprintf("must be one of: %s, %s", ProviderAuthTokenEnv, ProviderAuthTea)})
+		} else if !isNilOrEmptyString(provider.TokenEnv) && !isNilOrEmptyString(provider.TeaLogin) {
+			*issues = append(*issues, ValidationIssue{Path: prefix + ".auth", Message: "must be set explicitly when both tokenEnv and teaLogin are present"})
+		} else if !forgejoProviderUsesOnlyHostingIdentities(cfg, provider) {
+			*issues = append(*issues, ValidationIssue{Path: prefix + ".auth", Message: fmt.Sprintf("must be %s (with tokenEnv) or %s (with teaLogin)", ProviderAuthTokenEnv, ProviderAuthTea)})
+		}
+	default:
+		*issues = append(*issues, ValidationIssue{Path: prefix + ".auth", Message: fmt.Sprintf("must be one of: %s, %s", ProviderAuthTokenEnv, ProviderAuthTea)})
+	}
 }
 
 func isValidProviderKind(kind ProviderKind) bool {

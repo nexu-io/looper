@@ -18,6 +18,7 @@ import (
 	"github.com/nexu-io/looper/internal/diffanchor"
 	"github.com/nexu-io/looper/internal/disclosure"
 	"github.com/nexu-io/looper/internal/domain"
+	"github.com/nexu-io/looper/internal/hostingidentity"
 	"github.com/nexu-io/looper/internal/infra/shell"
 	"github.com/nexu-io/looper/internal/infra/specpr"
 	"github.com/nexu-io/looper/internal/outboundguard"
@@ -715,8 +716,12 @@ func New(options Options) *Gateway {
 		discoveryPRCache:       map[string]discoveryPullRequestListCacheEntry{},
 		discoveryReviewPRCache: map[string]discoveryPullRequestListCacheEntry{},
 		discoveryIssueCache:    map[string]discoveryIssueListCacheEntry{},
-		ghRun:                  ghRun,
-		gitRun:                 gitRun,
+		ghRun: func(ctx context.Context, input shell.Options) (shell.Result, error) {
+			return hostingidentity.RunGH(ctx, input, ghRun)
+		},
+		gitRun: func(ctx context.Context, input shell.Options) (shell.Result, error) {
+			return hostingidentity.RunGit(ctx, input, gitRun)
+		},
 		reviewSubmitDiagnostic: options.ReviewSubmitDiagnostic,
 	}
 }
@@ -2869,6 +2874,10 @@ func (g *Gateway) UpdatePullRequestBody(ctx context.Context, input UpdatePullReq
 }
 
 func (g *Gateway) IsAuthenticated(ctx context.Context, cwd, hostname string) (bool, error) {
+	if session, selected := hostingidentity.FromContext(ctx); selected {
+		_, err := session.Credentials(ctx)
+		return err == nil, err
+	}
 	args := []string{"auth", "status"}
 	if strings.TrimSpace(hostname) != "" {
 		args = append(args, "--hostname", strings.TrimSpace(hostname))
@@ -2892,6 +2901,10 @@ func (g *Gateway) GetCurrentUserLogin(ctx context.Context, cwd string) (string, 
 }
 
 func (g *Gateway) GetCurrentUserIdentity(ctx context.Context, cwd string) (CurrentUserIdentity, error) {
+	if session, ok := hostingidentity.FromContext(ctx); ok {
+		credential, err := session.Credentials(ctx)
+		return CurrentUserIdentity{Login: credential.Login, NumericID: credential.NumericID}, err
+	}
 	result, err := g.runGh(ctx, cwd, "", "api", "user", "--jq", `{login: .login, id: .id}`)
 	if err != nil {
 		if isUserLoginUnsupportedForCurrentToken(err) {
@@ -2911,6 +2924,10 @@ func (g *Gateway) GetCurrentUserIdentity(ctx context.Context, cwd string) (Curre
 }
 
 func (g *Gateway) getCurrentUserLoginRaw(ctx context.Context, cwd string) (string, error) {
+	if session, ok := hostingidentity.FromContext(ctx); ok {
+		credential, err := session.Credentials(ctx)
+		return credential.Login, err
+	}
 	result, err := g.runGh(ctx, cwd, "", "api", "user", "--jq", ".login")
 	if err != nil {
 		if isUserLoginUnsupportedForCurrentToken(err) {
@@ -2922,6 +2939,18 @@ func (g *Gateway) getCurrentUserLoginRaw(ctx context.Context, cwd string) (strin
 }
 
 func (g *Gateway) GetCurrentUserLoginForRepo(ctx context.Context, repo string, cwd string) (string, error) {
+	if session, ok := hostingidentity.FromContext(ctx); ok {
+		hostname, targetRepo := splitRepoHostname(repo)
+		base, _ := url.Parse(session.Target().BaseURL)
+		if hostname != "" && !strings.EqualFold(hostname, base.Host) {
+			return "", fmt.Errorf("hosting identity %q: repository host differs from the bound target", session.Name())
+		}
+		if err := session.CheckRepository(targetRepo); err != nil {
+			return "", err
+		}
+		credential, err := session.Credentials(ctx)
+		return credential.Login, err
+	}
 	hostname, _ := splitRepoHostname(repo)
 	args := []string{"api", "user", "--jq", ".login"}
 	if hostname != "" {
@@ -4014,7 +4043,7 @@ func extractReviewRequestUser(value any) (GitHubUser, bool) {
 	if !ok {
 		return GitHubUser{}, false
 	}
-	if asString(row["__typename"]) == "User" {
+	if kind := asString(row["__typename"]); kind == "User" || kind == "Bot" {
 		login := asString(row["login"])
 		if login == "" {
 			return GitHubUser{}, false
@@ -4022,7 +4051,7 @@ func extractReviewRequestUser(value any) (GitHubUser, bool) {
 		return GitHubUser{Login: login, ID: asInt64(firstNonNil(row["databaseId"], row["id"]))}, true
 	}
 	reviewer, _ := row["requestedReviewer"].(map[string]any)
-	if asString(reviewer["__typename"]) == "User" {
+	if kind := asString(reviewer["__typename"]); kind == "User" || kind == "Bot" {
 		login := asString(reviewer["login"])
 		if login == "" {
 			return GitHubUser{}, false

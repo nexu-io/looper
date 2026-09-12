@@ -103,6 +103,7 @@ type Service struct {
 }
 
 type AddInput struct {
+	Identity     *string
 	ID           string
 	Name         string
 	RepoPath     string
@@ -220,12 +221,6 @@ func (s *Service) AddProject(ctx context.Context, input AddInput) (AddResult, er
 		return AddResult{}, ProjectValidationError{Message: "provider is set but repo is missing; pass --repo owner/name or use a checkout with a detectable origin remote"}
 	}
 
-	if !isForgejoProvider(cfg, provider) {
-		if err := s.validateReviewerAutoMergeForProject(ctx, projectID, repo, input.BaseBranch, cfg); err != nil {
-			return AddResult{}, err
-		}
-	}
-
 	nowISO := currentISO(s.Now)
 	metadata := parseMetadata(nil)
 	if existing != nil {
@@ -248,10 +243,24 @@ func (s *Service) AddProject(ctx context.Context, input AddInput) (AddResult, er
 	} else {
 		delete(metadata, "provider")
 	}
+	if input.Identity != nil {
+		if identity := strings.TrimSpace(*input.Identity); identity != "" {
+			metadata["identity"] = identity
+		} else {
+			delete(metadata, "identity")
+		}
+	}
+	var previousRoles *config.PartialRoleConfigs
+	if err := decodeMetadataValue(metadata, "roles", &previousRoles); err != nil {
+		return AddResult{}, ProjectValidationError{Message: fmt.Sprintf("decode existing project role policy: %v", err)}
+	}
+	roles := projectRoleIdentityOverrides(previousRoles)
 	if isForgejoProvider(cfg, provider) {
-		profile := config.ProjectRefConfig{}
+		profile := config.ProjectRefConfig{Roles: roles}
 		config.ApplyForgejoProjectProfile(&profile)
 		metadata["roles"] = profile.Roles
+	} else if roles != nil {
+		metadata["roles"] = roles
 	} else {
 		delete(metadata, "roles")
 	}
@@ -287,6 +296,19 @@ func (s *Service) AddProject(ctx context.Context, input AddInput) (AddResult, er
 	}
 	if existing != nil {
 		record.CreatedAt = existing.CreatedAt
+	}
+	validationProjects, validationErr := s.materializeCandidate(ctx, &record, "")
+	if validationErr != nil {
+		return AddResult{}, ProjectValidationError{Message: validationErr.Error()}
+	}
+	validationConfig := cfg
+	validationConfig.Projects = validationProjects
+	warning, validationErr := s.validateHostingReviewerAutoMerge(ctx, projectID, repo, input.BaseBranch, validationConfig)
+	if validationErr != nil {
+		return AddResult{}, validationErr
+	}
+	if warning != "" {
+		warnings = append(warnings, warning)
 	}
 	var nextProjects []config.ProjectRefConfig
 	publishedProjects := false
@@ -333,6 +355,40 @@ func (s *Service) AddProject(ctx context.Context, input AddInput) (AddResult, er
 		CapturedSnapshots:      capturedSnapshots,
 		Warnings:               warnings,
 	}, nil
+}
+
+// Re-adding a project keeps explicit hosting selections while the existing
+// provider-specific role profile continues to be rebuilt from its provider.
+func projectRoleIdentityOverrides(previous *config.PartialRoleConfigs) *config.PartialRoleConfigs {
+	if previous == nil {
+		return nil
+	}
+	roles := &config.PartialRoleConfigs{}
+	set := false
+	if previous.Planner != nil && previous.Planner.Identity != nil {
+		roles.Planner = &config.PartialPlannerRoleConfig{Identity: cloneStringPointer(previous.Planner.Identity)}
+		set = true
+	}
+	if previous.Reviewer != nil && previous.Reviewer.Identity != nil {
+		roles.Reviewer = &config.PartialReviewerRoleConfig{Identity: cloneStringPointer(previous.Reviewer.Identity)}
+		set = true
+	}
+	if previous.Worker != nil && previous.Worker.Identity != nil {
+		roles.Worker = &config.PartialWorkerRoleConfig{Identity: cloneStringPointer(previous.Worker.Identity)}
+		set = true
+	}
+	if previous.Fixer != nil && previous.Fixer.Identity != nil {
+		roles.Fixer = &config.PartialFixerRoleConfig{Identity: cloneStringPointer(previous.Fixer.Identity)}
+		set = true
+	}
+	if previous.Coordinator != nil && previous.Coordinator.Identity != nil {
+		roles.Coordinator = &config.PartialCoordinatorRoleConfig{Identity: cloneStringPointer(previous.Coordinator.Identity)}
+		set = true
+	}
+	if !set {
+		return nil
+	}
+	return roles
 }
 
 func (s *Service) Get(ctx context.Context, id string) (*storage.ProjectRecord, error) {
@@ -477,6 +533,10 @@ func (s *Service) SyncConfigured(ctx context.Context, cfg config.Config, now tim
 	}
 	s.mutationMu.Lock()
 	defer s.mutationMu.Unlock()
+	// Explicit-identity external diagnostics share one startup budget across
+	// projects; independent legacy validation retains its existing behavior.
+	botProbeCtx, cancelBotProbes := context.WithTimeout(ctx, 3*time.Second)
+	defer cancelBotProbes()
 
 	nowISO := currentISO(func() time.Time { return now })
 	cancelReason := "project archived"
@@ -516,8 +576,18 @@ func (s *Service) SyncConfigured(ctx context.Context, cfg config.Config, now tim
 		if project.BaseBranch != nil {
 			baseBranch = *project.BaseBranch
 		}
-		if err := s.validateReviewerAutoMergeForProject(ctx, project.ID, repo, baseBranch, cfg); err != nil {
-			return err
+		validationCtx := ctx
+		if _, selected, resolveErr := config.ResolveHostingIdentity(cfg, project.ID, "reviewer"); resolveErr != nil {
+			return resolveErr
+		} else if selected {
+			validationCtx = botProbeCtx
+		}
+		warning, validationErr := s.validateHostingReviewerAutoMerge(validationCtx, project.ID, repo, baseBranch, cfg)
+		if validationErr != nil {
+			return validationErr
+		}
+		if warning != "" && s.Logger != nil {
+			s.Logger.Warn("project hosting identity probe failed", map[string]any{"projectId": project.ID, "role": "reviewer", "error": warning})
 		}
 
 		createdAt := nowISO
@@ -736,6 +806,9 @@ func buildProjectMetadataJSON(existing *storage.ProjectRecord, project config.Pr
 		return nil
 	}
 	if err := setProjectMetadata("provider", strings.TrimSpace(project.Provider), strings.TrimSpace(project.Provider) != ""); err != nil {
+		return "", err
+	}
+	if err := setProjectMetadata("identity", strings.TrimSpace(project.Identity), strings.TrimSpace(project.Identity) != ""); err != nil {
 		return "", err
 	}
 	if err := setProjectMetadata("path", strings.TrimSpace(project.Path), strings.TrimSpace(project.Path) != ""); err != nil {

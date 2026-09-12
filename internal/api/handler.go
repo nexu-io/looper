@@ -29,6 +29,7 @@ import (
 	"github.com/nexu-io/looper/internal/domain"
 	"github.com/nexu-io/looper/internal/eventlog"
 	"github.com/nexu-io/looper/internal/forge"
+	"github.com/nexu-io/looper/internal/hostingidentity"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/infra/shell"
 	"github.com/nexu-io/looper/internal/loops"
@@ -1462,6 +1463,8 @@ func asConfigRequestError(err error) (ConfigRequestError, bool) {
 }
 
 type configResponse struct {
+	Identities map[string]config.HostingIdentityConfig `json:"identities,omitempty"`
+
 	Server        configServerResponse      `json:"server"`
 	Storage       config.StorageConfig      `json:"storage"`
 	Scheduler     config.SchedulerConfig    `json:"scheduler"`
@@ -1516,6 +1519,7 @@ func (h *Handler) buildConfigResponse() configResponse {
 	cfg := h.context.Config
 
 	return configResponse{
+		Identities: cfg.Identities,
 		Server: configServerResponse{
 			Host:     cfg.Server.Host,
 			Port:     cfg.Server.Port,
@@ -4925,13 +4929,18 @@ func (h *Handler) validateManualHoldBypassForLoopTarget(ctx context.Context, pro
 		return nil
 	}
 	cfg := h.effectiveConfig()
+	ctx, err = hostingidentity.Bind(ctx, cfg, projectID, string(loopType))
+	if err != nil {
+		return apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("resolve identity before manual loop create: %v", err)}
+	}
+	_, selectedIdentity := hostingidentity.FromContext(ctx)
 	provider, ok := resolveProjectProviderConfig(cfg, projectID, parseJSONObject(project.MetadataJSON))
 	if !ok {
 		return apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("refresh target before manual loop create: provider for project %q is not configured", projectID)}
 	}
 	labels := []string(nil)
 	if provider.Kind == config.ProviderKindForgejo {
-		client, clientErr := forge.NewForgejoClientFromConfig(provider, target.Repo)
+		client, clientErr := forge.NewForgejoClientForContext(ctx, provider, target.Repo)
 		err = clientErr
 		if err == nil {
 			switch target.TargetType {
@@ -4953,25 +4962,29 @@ func (h *Handler) validateManualHoldBypassForLoopTarget(ctx context.Context, pro
 		// Preserve the GitHub preflight's best-effort local setup behavior.
 		// Forgejo authenticates directly through its provider and does not need gh
 		// or a local checkout to read the target's current hold labels.
-		if strings.TrimSpace(project.RepoPath) == "" {
-			return nil
-		}
-		if _, err := os.Stat(project.RepoPath); err != nil {
-			return nil
+		cwd := strings.TrimSpace(project.RepoPath)
+		if _, statErr := os.Stat(cwd); cwd == "" || statErr != nil {
+			if !selectedIdentity {
+				return nil
+			}
+			cwd = ""
 		}
 		ghPath := strings.TrimSpace(derefString(cfg.Tools.GHPath))
 		if ghPath == "" {
+			if selectedIdentity {
+				return apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: "refresh target before manual loop create: bot GitHub operations require gh"}
+			}
 			return nil
 		}
-		gh := githubinfra.New(githubinfra.Options{GHPath: ghPath, CWD: project.RepoPath, GHRun: shell.Run})
+		gh := githubinfra.New(githubinfra.Options{GHPath: ghPath, CWD: cwd, GHRun: shell.Run})
 		switch target.TargetType {
 		case domain.LoopTargetTypeIssue:
 			var detail githubinfra.IssueDetail
-			detail, err = gh.ViewIssue(ctx, githubinfra.ViewIssueInput{Repo: target.Repo, IssueNumber: target.IssueNumber, CWD: project.RepoPath})
+			detail, err = gh.ViewIssue(ctx, githubinfra.ViewIssueInput{Repo: target.Repo, IssueNumber: target.IssueNumber, CWD: cwd})
 			labels = detail.Labels
 		case domain.LoopTargetTypePullRequest:
 			var detail githubinfra.PullRequestDetail
-			detail, err = gh.ViewPullRequest(ctx, githubinfra.ViewPullRequestInput{Repo: target.Repo, PRNumber: target.PRNumber, CWD: project.RepoPath})
+			detail, err = gh.ViewPullRequest(ctx, githubinfra.ViewPullRequestInput{Repo: target.Repo, PRNumber: target.PRNumber, CWD: cwd})
 			labels = detail.Labels
 		}
 	}
@@ -8009,6 +8022,7 @@ func urlPathSegment(parts []string, index int) (string, error) {
 }
 
 type createProjectRequest struct {
+	Identity     *string `json:"identity"`
 	RepoPath     *string `json:"repoPath"`
 	ID           *string `json:"id"`
 	Name         *string `json:"name"`
@@ -8057,6 +8071,7 @@ func (h *Handler) buildCreateProjectResponse(r *http.Request, service projectSer
 	}
 
 	result, err := service.AddProject(r.Context(), projects.AddInput{
+		Identity:     body.Identity,
 		ID:           projectID,
 		Name:         name,
 		RepoPath:     repoPath,

@@ -67,6 +67,7 @@ type Config struct {
 }
 
 type Input struct {
+	ProjectID   string
 	Issue       Issue
 	RepoContext RepoContext
 	Config      Config
@@ -74,6 +75,7 @@ type Input struct {
 }
 
 type Request struct {
+	ProjectID        string
 	Prompt           string
 	WorkingDirectory string
 }
@@ -107,7 +109,7 @@ func Decide(ctx context.Context, llm LLM, input Input) Decision {
 	if llm == nil {
 		return NoOpDecision()
 	}
-	raw, err := llm.Complete(ctx, Request{Prompt: BuildPrompt(input), WorkingDirectory: input.RepoContext.WorkingDirectory})
+	raw, err := llm.Complete(ctx, Request{ProjectID: input.ProjectID, Prompt: BuildPrompt(input), WorkingDirectory: input.RepoContext.WorkingDirectory})
 	if err != nil {
 		return NoOpDecision()
 	}

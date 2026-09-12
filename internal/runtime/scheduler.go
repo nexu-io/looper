@@ -23,6 +23,7 @@ import (
 	"github.com/nexu-io/looper/internal/disclosure"
 	"github.com/nexu-io/looper/internal/fixer"
 	"github.com/nexu-io/looper/internal/forge"
+	"github.com/nexu-io/looper/internal/hostingidentity"
 	gitinfra "github.com/nexu-io/looper/internal/infra/git"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/infra/notify"
@@ -344,6 +345,31 @@ func mintTrustedReviewProxyForPR(realLooper string, trustedEnv map[string]string
 		return "", nil, fmt.Errorf("make trusted looper path absolute: %w", err)
 	}
 	return forge.StartTrustedReviewProxy(resolvedLooper, trustedEnv, allowedPRRef, allowedCwd, configSnapshot, policy, tracker)
+}
+
+// forgejoClientForContext uses the captured target before any legacy provider
+// lookup, including credential-less bot-only providers and same-slug repos.
+func forgejoClientForContext(ctx context.Context, cfg *config.Config, repo string, cwd ...string) (*forge.ForgejoClient, bool, error) {
+	if session, selected := hostingidentity.FromContext(ctx); selected {
+		if session.Kind() != config.HostingIdentityForgejoToken {
+			return nil, false, nil
+		}
+		target := session.Target()
+		if strings.TrimSpace(repo) == "" {
+			repo = target.Repo
+		}
+		provider := config.ProviderConfig{ID: target.ProviderID, Kind: config.ProviderKindForgejo, BaseURL: target.BaseURL}
+		client, err := forge.NewForgejoClientForContext(ctx, provider, strings.TrimSpace(repo))
+		return client, true, err
+	}
+	return forgeClientForLocation(cfg, repo, cwd, forgejoClientForCWD, forgejoClientForRepo)
+}
+
+func forgejoClientForIssueContext(ctx context.Context, cfg *config.Config, repo, cwd string) (*forge.ForgejoClient, bool, error) {
+	if _, selected := hostingidentity.FromContext(ctx); selected {
+		return forgejoClientForContext(ctx, cfg, repo, cwd)
+	}
+	return forgejoClientForIssueLookup(cfg, repo, cwd)
 }
 
 func forgejoClientForRepo(cfg *config.Config, repo string) (*forge.ForgejoClient, bool, error) {
@@ -832,7 +858,7 @@ func forgeNetworkPolicyUsers(users []forge.Identity) []networkpolicy.GitHubUser 
 }
 
 func (a plannerGitHubAdapter) forgejo(ctx context.Context, repo string, cwd ...string) (*forge.ForgejoClient, bool, error) {
-	client, ok, err := forgeClientForLocation(a.config, repo, cwd, forgejoClientForCWD, forgejoClientForRepo)
+	client, ok, err := forgejoClientForContext(ctx, a.config, repo, cwd...)
 	return client, ok, err
 }
 
@@ -980,7 +1006,7 @@ func (a plannerGitHubAdapter) GetCurrentUserLogin(ctx context.Context, cwd strin
 		identity, err := client.CurrentUser(ctx)
 		return identity.Login, err
 	}
-	if client, ok, err := forgejoClientForCWD(a.config, cwd); ok || err != nil {
+	if client, ok, err := forgejoClientForContext(ctx, a.config, "", cwd); ok || err != nil {
 		if err != nil {
 			return "", err
 		}
@@ -1202,7 +1228,7 @@ type reviewerGitHubAdapter struct {
 }
 
 func (a reviewerGitHubAdapter) forgejo(ctx context.Context, repo string, cwd ...string) (*forge.ForgejoClient, bool, error) {
-	client, ok, err := forgeClientForLocation(a.config, repo, cwd, forgejoClientForCWD, forgejoClientForRepo)
+	client, ok, err := forgejoClientForContext(ctx, a.config, repo, cwd...)
 	return client, ok, err
 }
 
@@ -1283,7 +1309,7 @@ func (a reviewerGitHubAdapter) ListReviewRequestedPullRequests(ctx context.Conte
 }
 
 func (a reviewerGitHubAdapter) GetCurrentUserLogin(ctx context.Context, cwd string) (string, error) {
-	if client, ok, err := forgejoClientForCWD(a.config, cwd); ok || err != nil {
+	if client, ok, err := forgejoClientForContext(ctx, a.config, "", cwd); ok || err != nil {
 		if err != nil {
 			return "", err
 		}
@@ -1364,7 +1390,7 @@ func (a reviewerGitHubAdapter) LoadPullRequestReviews(ctx context.Context, input
 }
 
 func (a reviewerGitHubAdapter) ViewIssue(ctx context.Context, input githubinfra.ViewIssueInput) (githubinfra.IssueDetail, error) {
-	if client, ok, err := forgejoClientForIssueLookup(a.config, input.Repo, input.CWD); ok || err != nil {
+	if client, ok, err := forgejoClientForIssueContext(ctx, a.config, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return githubinfra.IssueDetail{}, err
 		}
@@ -2125,6 +2151,8 @@ func (a reviewerAgentExecutorAdapter) Start(ctx context.Context, input reviewer.
 	// (comment-only) runs reuse this adapter but must not receive review-publish
 	// capability via LOOPER_TRUSTED_REVIEW_SOCK.
 	sock := ""
+	var trustedReview *forge.TrustedReviewAuthority
+	_, hostingSelected := hostingidentity.FromContext(ctx)
 	proxyCleanup := func() {}
 	if reviewerAllowsTrustedReviewProxy(a.config, input.ProjectID, input.Metadata) {
 		allowedPR := reviewerAllowedPRRef(input.Metadata)
@@ -2133,12 +2161,16 @@ func (a reviewerAgentExecutorAdapter) Start(ctx context.Context, input reviewer.
 		if policy.ReviewerRunID != "" && policy.ReviewerRunID != strings.TrimSpace(input.RunID) {
 			return nil, fmt.Errorf("install run-bound trusted review proxy: reviewer run id does not match agent run")
 		}
-		vendor, model := reviewerTrustedReviewAgentIdentity(input, a.agentVendor, a.agentModel)
-		configSnapshot := materializeTrustedReviewAgentIdentity(*a.config, vendor, model)
-		var err error
-		sock, proxyCleanup, err = mintTrustedReviewProxyForPR(a.realLooper, a.trustedEnv, allowedPR, allowedCwd, configSnapshot, policy, a.tracker)
-		if err != nil {
-			return nil, fmt.Errorf("install run-bound trusted review proxy: %w", err)
+		if hostingSelected {
+			trustedReview = &forge.TrustedReviewAuthority{PRRef: allowedPR, Policy: policy}
+		} else {
+			vendor, model := reviewerTrustedReviewAgentIdentity(input, a.agentVendor, a.agentModel)
+			configSnapshot := materializeTrustedReviewAgentIdentity(*a.config, vendor, model)
+			var err error
+			sock, proxyCleanup, err = mintTrustedReviewProxyForPR(a.realLooper, a.trustedEnv, allowedPR, allowedCwd, configSnapshot, policy, a.tracker)
+			if err != nil {
+				return nil, fmt.Errorf("install run-bound trusted review proxy: %w", err)
+			}
 		}
 	}
 	execution, err := a.executor.Start(ctx, agent.RunInput{
@@ -2154,6 +2186,7 @@ func (a reviewerAgentExecutorAdapter) Start(ctx context.Context, input reviewer.
 		Metadata:           input.Metadata,
 		IdempotencyKey:     input.IdempotencyKey,
 		Env:                reviewerTrustedReviewEnv(sock),
+		TrustedReview:      trustedReview,
 		UseSnapshot:        input.UseSnapshot,
 		SnapshotVendor:     input.SnapshotVendor,
 		SnapshotModel:      input.SnapshotModel,
@@ -2186,12 +2219,12 @@ type fixerGitHubAdapter struct {
 }
 
 func (a fixerGitHubAdapter) forgejo(ctx context.Context, repo string, cwd ...string) (*forge.ForgejoClient, bool, error) {
-	client, ok, err := forgeClientForLocation(a.config, repo, cwd, forgejoClientForCWD, forgejoClientForRepo)
+	client, ok, err := forgejoClientForContext(ctx, a.config, repo, cwd...)
 	return client, ok, err
 }
 
 func (a fixerGitHubAdapter) forgejoForCWD(ctx context.Context, cwd string) (*forge.ForgejoClient, bool, error) {
-	client, ok, err := forgejoClientForCWD(a.config, cwd)
+	client, ok, err := forgejoClientForContext(ctx, a.config, "", cwd)
 	return client, ok, err
 }
 
@@ -2754,7 +2787,7 @@ type workerGitHubAdapter struct {
 }
 
 func (a workerGitHubAdapter) forgejo(ctx context.Context, repo string, cwd ...string) (*forge.ForgejoClient, bool, error) {
-	client, ok, err := forgeClientForLocation(a.config, repo, cwd, forgejoClientForCWD, forgejoClientForRepo)
+	client, ok, err := forgejoClientForContext(ctx, a.config, repo, cwd...)
 	return client, ok, err
 }
 
@@ -2846,7 +2879,7 @@ func (a workerGitHubAdapter) GetCurrentUserLogin(ctx context.Context, cwd string
 		identity, err := client.CurrentUser(ctx)
 		return identity.Login, err
 	}
-	if client, ok, err := forgejoClientForCWD(a.config, cwd); ok || err != nil {
+	if client, ok, err := forgejoClientForContext(ctx, a.config, "", cwd); ok || err != nil {
 		if err != nil {
 			return "", err
 		}
@@ -3505,6 +3538,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 		// retries that restore the owner vendor keep command/args (resolveCommand
 		// prefers params.command over vendor defaults).
 		return agent.New(agent.ExecutorOptions{
+			HostingConfig: &cfg, TrustedLooperPath: looperCLIPath, HostingTracker: activeExecutions,
 			Config: agent.ExecutorConfig{
 				Vendor:              resolved.Vendor,
 				Model:               resolved.Model,
@@ -3601,6 +3635,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 		// ParamsForRoleVendor nil-owner path strips wrappers and coordinator
 		// triage launches bare vendor defaults while role executors keep them.
 		globalExecutor := agent.New(agent.ExecutorOptions{
+			HostingConfig: &cfg, TrustedLooperPath: looperCLIPath, HostingTracker: activeExecutions,
 			Config: agent.ExecutorConfig{
 				Vendor:              *cfg.Agent.Vendor,
 				Model:               cfg.Agent.Model,
@@ -5187,6 +5222,13 @@ func processSnapshotQueueItem(ctx context.Context, item storage.QueueItemRecord,
 	now := input.Now
 	if now == nil {
 		now = time.Now
+	}
+	if input.Config != nil {
+		bound, bindErr := hostingidentity.Bind(ctx, *input.Config, project.ID, "reviewer")
+		if bindErr != nil {
+			return failSnapshotQueueItem(ctx, item, input, bindErr.Error(), "non_retryable")
+		}
+		ctx = bound
 	}
 	snapshot, err := input.Snapshotter.CapturePullRequestSnapshot(ctx, githubinfra.CapturePullRequestSnapshotInput{ProjectID: project.ID, Repo: *item.Repo, PRNumber: *item.PRNumber, CWD: cwd, CapturedAt: formatJavaScriptISOString(now().UTC())})
 	if err != nil {

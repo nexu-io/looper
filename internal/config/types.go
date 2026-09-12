@@ -526,6 +526,7 @@ type FixerRoleTriggersConfig struct {
 }
 
 type PlannerRoleConfig struct {
+	Identity      string                  `json:"identity,omitempty"`
 	AutoDiscovery bool                    `json:"autoDiscovery"`
 	Triggers      IssueRoleTriggersConfig `json:"triggers"`
 	Instructions  string                  `json:"instructions,omitempty"`
@@ -533,6 +534,7 @@ type PlannerRoleConfig struct {
 }
 
 type WorkerRoleConfig struct {
+	Identity      string                  `json:"identity,omitempty"`
 	AutoDiscovery bool                    `json:"autoDiscovery"`
 	Triggers      IssueRoleTriggersConfig `json:"triggers"`
 	Instructions  string                  `json:"instructions,omitempty"`
@@ -540,6 +542,7 @@ type WorkerRoleConfig struct {
 }
 
 type ReviewerRoleConfig struct {
+	Identity     string                      `json:"identity,omitempty"`
 	Discovery    ReviewerRoleDiscoveryConfig `json:"discovery"`
 	Behavior     ReviewerConfig              `json:"behavior"`
 	AutoMerge    ReviewerAutoMergeConfig     `json:"autoMerge"`
@@ -560,6 +563,7 @@ type FixerBehaviorConfig struct {
 }
 
 type FixerRoleConfig struct {
+	Identity      string                  `json:"identity,omitempty"`
 	AutoDiscovery bool                    `json:"autoDiscovery"`
 	Triggers      FixerRoleTriggersConfig `json:"triggers"`
 	Behavior      FixerBehaviorConfig     `json:"behavior"`
@@ -609,6 +613,7 @@ type CoordinatorMergeWatchConfig struct {
 }
 
 type CoordinatorRoleConfig struct {
+	Identity     string                        `json:"identity,omitempty"`
 	Enabled      bool                          `json:"enabled"`
 	PollInterval string                        `json:"pollInterval"`
 	Triage       CoordinatorTriageConfig       `json:"triage"`
@@ -626,6 +631,7 @@ type RoleConfigs struct {
 }
 
 type ProjectRefConfig struct {
+	Identity     string               `json:"identity,omitempty"`
 	ID           string               `json:"id"`
 	Name         string               `json:"name"`
 	Provider     string               `json:"provider,omitempty"`
@@ -644,6 +650,7 @@ type ProjectWebhookConfig struct {
 }
 
 type PartialProjectRefConfig struct {
+	Identity     *string                      `json:"identity,omitempty"`
 	ID           string                       `json:"id"`
 	Name         string                       `json:"name"`
 	Provider     *string                      `json:"provider,omitempty"`
@@ -680,6 +687,8 @@ type PartialProviderConfig struct {
 }
 
 type Config struct {
+	Identities map[string]HostingIdentityConfig `json:"identities,omitempty"`
+
 	Server        ServerConfig       `json:"server"`
 	Storage       StorageConfig      `json:"storage"`
 	Scheduler     SchedulerConfig    `json:"scheduler"`
@@ -1038,6 +1047,7 @@ type PartialFixerRoleTriggersConfig struct {
 }
 
 type PartialPlannerRoleConfig struct {
+	Identity      *string                         `json:"identity,omitempty"`
 	AutoDiscovery *bool                           `json:"autoDiscovery,omitempty"`
 	Triggers      *PartialIssueRoleTriggersConfig `json:"triggers,omitempty"`
 	Instructions  *string                         `json:"instructions,omitempty"`
@@ -1045,6 +1055,7 @@ type PartialPlannerRoleConfig struct {
 }
 
 type PartialWorkerRoleConfig struct {
+	Identity      *string                         `json:"identity,omitempty"`
 	AutoDiscovery *bool                           `json:"autoDiscovery,omitempty"`
 	Triggers      *PartialIssueRoleTriggersConfig `json:"triggers,omitempty"`
 	Instructions  *string                         `json:"instructions,omitempty"`
@@ -1052,6 +1063,7 @@ type PartialWorkerRoleConfig struct {
 }
 
 type PartialReviewerRoleConfig struct {
+	Identity     *string                             `json:"identity,omitempty"`
 	Discovery    *PartialReviewerRoleDiscoveryConfig `json:"discovery,omitempty"`
 	Behavior     *PartialReviewerConfig              `json:"behavior,omitempty"`
 	AutoMerge    *PartialReviewerAutoMergeConfig     `json:"autoMerge,omitempty"`
@@ -1073,6 +1085,7 @@ type PartialFixerBehaviorConfig struct {
 }
 
 type PartialFixerRoleConfig struct {
+	Identity      *string                         `json:"identity,omitempty"`
 	AutoDiscovery *bool                           `json:"autoDiscovery,omitempty"`
 	Triggers      *PartialFixerRoleTriggersConfig `json:"triggers,omitempty"`
 	Behavior      *PartialFixerBehaviorConfig     `json:"behavior,omitempty"`
@@ -1122,6 +1135,7 @@ type PartialCoordinatorMergeWatchConfig struct {
 }
 
 type PartialCoordinatorRoleConfig struct {
+	Identity     *string                               `json:"identity,omitempty"`
 	Enabled      *bool                                 `json:"enabled,omitempty"`
 	PollInterval *string                               `json:"pollInterval,omitempty"`
 	Triage       *PartialCoordinatorTriageConfig       `json:"triage,omitempty"`
@@ -1141,6 +1155,8 @@ type PartialRoleConfigs struct {
 }
 
 type PartialConfig struct {
+	Identities *map[string]HostingIdentityConfig `json:"identities,omitempty"`
+
 	Server         *PartialServerConfig       `json:"server,omitempty"`
 	Storage        *PartialStorageConfig      `json:"storage,omitempty"`
 	Scheduler      *PartialSchedulerConfig    `json:"scheduler,omitempty"`

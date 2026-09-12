@@ -152,7 +152,33 @@ func IsHotEditablePath(path string) bool {
 	if isHotRoleAgentPath(path) {
 		return true
 	}
+	if isHotHostingIdentityPath(path) {
+		return true
+	}
 	return false
+}
+
+// Identity definitions and global role selections are captured for new work.
+// Project selections stay on the SQLite project API/import boundary.
+func isHotHostingIdentityPath(path string) bool {
+	segments := strings.Split(path, ".")
+	if len(segments) == 3 && segments[0] == "roles" && segments[2] == "identity" {
+		_, known := roleHostingIdentity(RoleConfigs{}, segments[1])
+		return known
+	}
+	if len(segments) < 2 || segments[0] != "identities" || !agentProfileIDPattern.MatchString(segments[1]) {
+		return false
+	}
+	if len(segments) == 2 {
+		return true
+	}
+	if len(segments) == 3 {
+		switch segments[2] {
+		case "kind", "baseUrl", "appId", "installationId", "privateKeyFile", "tokenEnv", "commit":
+			return true
+		}
+	}
+	return len(segments) == 4 && segments[2] == "commit" && (segments[3] == "name" || segments[3] == "email")
 }
 
 // isHotAgentProfilePath allows shape-aware leaves under agent.profiles:

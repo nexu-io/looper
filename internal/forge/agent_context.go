@@ -83,3 +83,46 @@ func ForgejoAgentContext(cfg config.Config, projectID, repo string, prNumber int
 func agentContextShellQuote(value string) string {
 	return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
 }
+
+// HostingAgentContext is the complete bot-mode replacement for legacy gh/tea
+// authentication instructions. The CLI and socket reveal no credentials.
+// targetNumber is the issue number for planners and the PR number for other
+// roles; zero means no remote target exists yet. Role prompts own seed checks.
+func HostingAgentContext(kind config.HostingIdentityKind, role, repo string, targetNumber int64) string {
+	parts := []string{
+		fmt.Sprintf("Hosting context: role=%s repository=%s. Use the trusted absolute CLI from LOOPER_HOST_CLI and the current execution's socket for hosting reads. Authentication is daemon-owned; no token, key, personal gh/tea login or SSH agent is available to you.", role, repo),
+		`Identity: "$LOOPER_HOST_CLI" host whoami. API commands below accept only repository-relative GET paths; they cannot select a different repository or host. --paginate returns one combined JSON collection with all supported pages, or an explicit error. A failed read or response-limit error is not an empty or clean result.`,
+	}
+	hasPR := role != "planner" && targetNumber > 0
+	if role == "planner" && targetNumber > 0 {
+		parts = append(parts, fmt.Sprintf(`Issue context: "$LOOPER_HOST_CLI" host api issues/%d. Conversation: "$LOOPER_HOST_CLI" host api issues/%d/comments --paginate. Read these when current issue context is needed.`, targetNumber, targetNumber))
+	} else if hasPR {
+		parts = append(parts,
+			fmt.Sprintf(`PR metadata: "$LOOPER_HOST_CLI" host api pulls/%d. Patch: "$LOOPER_HOST_CLI" host api pulls/%d --diff. Read these when current PR context is needed, and inspect only relevant files.`, targetNumber, targetNumber),
+			fmt.Sprintf(`Conversation: "$LOOPER_HOST_CLI" host api issues/%d/comments --paginate. Reviews: "$LOOPER_HOST_CLI" host api pulls/%d/reviews --paginate.`, targetNumber, targetNumber),
+		)
+	}
+	parts = append(parts,
+		`Use the prepared local checkout for local Git inspection, edits, add and commits. If refs are missing, use "$LOOPER_HOST_CLI" host git fetch <ref>, then inspect FETCH_HEAD locally. Do not clone another checkout, push, create/edit a PR, change labels/reviewers, or make remote review-state changes. After validation, Looper publishes local commits and applies the run's PR metadata. Native reviewer review publication, when explicitly authorized later, uses only the existing trusted review submit command.`,
+		`Include the ordinary final __LOOPER_RESULT__ JSON with an accurate summary, changedFiles and commits when available. git_pr_lifecycle is optional; if included, report only local commits as agent actions and remote push/PR actions as none. Preserve any role-specific structured review or repair decisions.`,
+	)
+	if kind == config.HostingIdentityForgejoToken {
+		if hasPR {
+			parts = append(parts, fmt.Sprintf(`Forgejo native inline comments: "$LOOPER_HOST_CLI" host api pulls/%d/reviews/<review_id>/comments --paginate. These are individual native review comments, not GitHub GraphQL threads.`, targetNumber))
+		}
+		parts = append(parts,
+			`Forgejo CI: host api "statuses/<head_sha>?sort=highestindex" --paginate and host api "actions/runs?head_sha=<head_sha>" --paginate; workflow_runs is an array. Use run.id for host api actions/runs/<run_id>/jobs --paginate (bare array), then host api actions/jobs/<job_id>/logs (optional ?attempt=N) for required failure diagnostics. Prefix every command with "$LOOPER_HOST_CLI".`,
+		)
+	} else {
+		if hasPR {
+			parts = append(parts, fmt.Sprintf(`GitHub inline comments: "$LOOPER_HOST_CLI" host api pulls/%d/comments --paginate. Complete thread snapshots: "$LOOPER_HOST_CLI" host threads %d, or host thread %d <thread_node_id>. The result preserves comment id (GraphQL node ID), updatedAt, body, author.login and thread resolution state. Raw GraphQL is unavailable.`, targetNumber, targetNumber, targetNumber))
+			if role == "fixer" {
+				parts = append(parts, `Use these IDs/timestamps for threadCommentsObserved; never substitute REST numeric IDs.`)
+			}
+		}
+		parts = append(parts,
+			`GitHub CI: "$LOOPER_HOST_CLI" host api commits/<head_sha>/check-runs --paginate and host api commits/<head_sha>/status. For diagnostics use host api actions/runs/<run_id>/jobs --paginate and host api actions/jobs/<job_id>/logs, always prefixed with "$LOOPER_HOST_CLI".`,
+		)
+	}
+	return strings.Join(parts, "\n")
+}

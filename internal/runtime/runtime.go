@@ -19,6 +19,7 @@ import (
 	"github.com/nexu-io/looper/internal/bootstrap"
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/domain"
+	"github.com/nexu-io/looper/internal/hostingidentity"
 	gitinfra "github.com/nexu-io/looper/internal/infra/git"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/infra/specpr"
@@ -949,12 +950,22 @@ func (r *Runtime) start(ctx context.Context) error {
 			return detectProjectRepo(ctx, gitGateway, r.projectCatalog.Snapshot(), repoPath)
 		},
 		GetRepositorySettings: func(ctx context.Context, input githubinfra.RepositorySettingsInput) (githubinfra.RepositorySettings, error) {
+			bound, err := bindProjectHostingOperation(ctx, r.projectCatalog.Snapshot(), "", input.Repo, "", "worker")
+			if err != nil {
+				return githubinfra.RepositorySettings{}, err
+			}
+			ctx = bound
 			if githubGateway == nil {
 				return githubinfra.RepositorySettings{}, fmt.Errorf("github gateway is not configured")
 			}
 			return githubGateway.GetRepositorySettings(ctx, input)
 		},
 		GetBranchProtection: func(ctx context.Context, input githubinfra.BranchProtectionInput) (githubinfra.BranchProtection, error) {
+			bound, err := bindProjectHostingOperation(ctx, r.projectCatalog.Snapshot(), "", input.Repo, "", "worker")
+			if err != nil {
+				return githubinfra.BranchProtection{}, err
+			}
+			ctx = bound
 			if githubGateway == nil {
 				return githubinfra.BranchProtection{}, fmt.Errorf("github gateway is not configured")
 			}
@@ -972,6 +983,11 @@ func (r *Runtime) start(ctx context.Context) error {
 			return items, nil
 		},
 		ListOpenPullRequests: func(ctx context.Context, input projects.ListOpenPullRequestsInput) ([]projects.PullRequestSummary, error) {
+			bound, err := bindProjectHostingOperation(ctx, r.projectCatalog.Snapshot(), "", input.Repo, input.CWD, "worker")
+			if err != nil {
+				return nil, err
+			}
+			ctx = bound
 			if githubGateway == nil {
 				return nil, fmt.Errorf("github gateway is not configured")
 			}
@@ -986,6 +1002,11 @@ func (r *Runtime) start(ctx context.Context) error {
 			return items, nil
 		},
 		CapturePullRequestSnapshot: func(ctx context.Context, input projects.CapturePullRequestSnapshotInput) (storage.PullRequestSnapshotRecord, error) {
+			bound, err := bindProjectHostingOperation(ctx, r.projectCatalog.Snapshot(), input.ProjectID, input.Repo, input.CWD, "reviewer")
+			if err != nil {
+				return storage.PullRequestSnapshotRecord{}, err
+			}
+			ctx = bound
 			if githubGateway == nil {
 				return storage.PullRequestSnapshotRecord{}, fmt.Errorf("github gateway is not configured")
 			}
@@ -1179,6 +1200,8 @@ func (r *Runtime) validateCoordinatorDependencyGates(ctx context.Context, reposi
 		return err
 	}
 	catalog := r.Config()
+	botProbeCtx, cancelBotProbes := context.WithTimeout(ctx, 3*time.Second)
+	defer cancelBotProbes()
 	for _, project := range projectsList {
 		if project.Archived {
 			continue
@@ -1191,14 +1214,36 @@ func (r *Runtime) validateCoordinatorDependencyGates(ctx context.Context, reposi
 		if repo == "" {
 			return fmt.Errorf("coordinator dependency gate enabled but repository metadata unavailable for project %s", project.ID)
 		}
-		issueNumber, err := r.firstDependencyProbeIssue(ctx, githubGateway, repo, project.RepoPath)
+		probeCtx := ctx
+		if _, selected, resolveErr := config.ResolveHostingIdentity(catalog, project.ID, "coordinator"); resolveErr != nil {
+			return resolveErr
+		} else if selected {
+			probeCtx = botProbeCtx
+		}
+		bound, err := hostingidentity.Bind(probeCtx, catalog, project.ID, "coordinator")
 		if err != nil {
+			return err
+		}
+		issueNumber, err := r.firstDependencyProbeIssue(bound, githubGateway, repo, project.RepoPath)
+		if err != nil {
+			if session, selected := hostingidentity.FromContext(bound); selected {
+				if r.logger != nil {
+					r.logger.Warn("coordinator hosting identity probe failed", map[string]any{"identity": session.Name(), "projectId": project.ID, "error": err.Error()})
+				}
+				continue
+			}
 			return err
 		}
 		if issueNumber == 0 {
 			continue
 		}
-		if err := r.probeDependencyAPI(ctx, githubGateway, repo, project.RepoPath, issueNumber, roleCfg.Dependencies); err != nil {
+		if err := r.probeDependencyAPI(bound, githubGateway, repo, project.RepoPath, issueNumber, roleCfg.Dependencies); err != nil {
+			if session, selected := hostingidentity.FromContext(bound); selected {
+				if r.logger != nil {
+					r.logger.Warn("coordinator hosting identity capability probe failed", map[string]any{"identity": session.Name(), "projectId": project.ID, "error": err.Error()})
+				}
+				continue
+			}
 			return err
 		}
 	}
@@ -1410,6 +1455,11 @@ func (r *Runtime) startSchedulerLoop() {
 	r.schedulerCancel = schedulerCancel
 	r.schedulerTasks = taskTracker
 	r.mu.Unlock()
+
+	if len(r.config.Identities) > 0 {
+		probeConfig := r.Config()
+		taskTracker.Go(func() { r.probeHostingIdentities(schedulerCtx, probeConfig) })
+	}
 
 	if r.defaultSchedulerClaim != nil {
 		taskTracker.Go(func() {
@@ -3480,7 +3530,11 @@ func (r *Runtime) currentReviewerLoginForRecovery(ctx context.Context, repositor
 	if project == nil || strings.TrimSpace(project.RepoPath) == "" {
 		return "", false
 	}
-	loginCtx, cancel := context.WithTimeout(ctx, reviewerRecoveryLoginTimeout)
+	bound, bindErr := hostingidentity.Bind(ctx, r.Config(), loop.ProjectID, "reviewer")
+	if bindErr != nil {
+		return "", false
+	}
+	loginCtx, cancel := context.WithTimeout(bound, reviewerRecoveryLoginTimeout)
 	defer cancel()
 	login, err := githubGateway.GetCurrentUserLogin(loginCtx, project.RepoPath)
 	if err != nil {

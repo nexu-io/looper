@@ -9,6 +9,7 @@ import (
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/disclosure"
 	"github.com/nexu-io/looper/internal/eventlog"
+	"github.com/nexu-io/looper/internal/hostingidentity"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/loops"
 	"github.com/nexu-io/looper/internal/storage"
@@ -89,6 +90,7 @@ func detectGitHubHITLAnswerMatchingWithID(comments []githubAnswerComment, askCom
 // githubHITLDeliveryDeps are the injected dependencies for posting an undelivered
 // review-fix budget ask onto its PR so the answer-poll lane can later consume it.
 type githubHITLDeliveryDeps struct {
+	bindContext   func(contextType, string, string) (contextType, error)
 	createComment func(ctx contextType, repo string, prNumber int64, body, cwd string) (int64, error)
 	listComments  func(ctx contextType, repo string, prNumber int64, cwd string) ([]githubAnswerComment, error)
 	addLabel      func(ctx contextType, repo string, prNumber int64, label, cwd string)
@@ -110,6 +112,18 @@ func deliverUndeliveredGitHubBudgetAsks(ctx contextType, projectID string, recor
 		awaitingLabel = "looper:awaiting-human"
 	}
 	for _, loop := range records {
+		ctx := ctx
+		if deps.bindContext != nil {
+			bound, err := deps.bindContext(ctx, loop.ProjectID, loop.Type)
+			if err != nil {
+				if deps.logWarn != nil {
+					deps.logWarn("hitl hosting identity binding failed", map[string]any{"projectId": loop.ProjectID, "role": loop.Type, "error": err.Error()})
+				}
+				continue
+			}
+			ctx = bound
+		}
+
 		if loop.ProjectID != projectID || loop.Status != "awaiting_human" {
 			continue
 		}
@@ -324,6 +338,7 @@ func derefLoopPRNumber(loop storage.LoopRecord) int64 {
 // githubHITLPollDeps are the injected dependencies of the answer-poll lane, kept
 // as functions so the lane is testable and decoupled from the scheduler wiring.
 type githubHITLPollDeps struct {
+	bindContext func(contextType, string, string) (contextType, error)
 	// listComments returns a PR's issue comments (oldest-first is fine; the
 	// detector orders by id).
 	listComments func(ctx contextType, repo string, prNumber int64, cwd string) ([]githubAnswerComment, error)
@@ -348,6 +363,7 @@ type githubHITLPollDeps struct {
 
 // githubHITLAwaitingLoop is the minimal loop shape the lane needs.
 type githubHITLAwaitingLoop struct {
+	Role         string
 	ID           string
 	ProjectID    string
 	Repo         string
@@ -465,6 +481,18 @@ func pollGitHubHITLAnswersOnce(ctx contextType, awaiting []githubHITLAwaitingLoo
 	consumedDecisionPairs := make(map[string]struct{})
 	consumedDecisionComments := make(map[int64]struct{})
 	for i, loop := range awaiting {
+		ctx := ctx
+		if deps.bindContext != nil {
+			bound, err := deps.bindContext(ctx, loop.ProjectID, loop.Role)
+			if err != nil {
+				if deps.logWarn != nil {
+					deps.logWarn("hitl hosting identity binding failed", map[string]any{"projectId": loop.ProjectID, "role": loop.Role, "error": err.Error()})
+				}
+				continue
+			}
+			ctx = bound
+		}
+
 		if !strings.EqualFold(strings.TrimSpace(loop.Transport), "github") || loop.PRNumber == 0 {
 			continue
 		}
@@ -967,6 +995,9 @@ func runGitHubHITLPoll(ctx context.Context, input defaultSchedulerTickInput, pro
 	}
 	nowISO := eventlog.FormatJavaScriptISOString(input.Now().UTC())
 	deliveryDeps := githubHITLDeliveryDeps{
+		bindContext: func(ctx contextType, projectID, role string) (contextType, error) {
+			return hostingidentity.Bind(ctx, *input.Config, projectID, role)
+		},
 		createComment: func(ctx contextType, repo string, pr int64, body, cwd string) (int64, error) {
 			res, err := input.GitHubGateway.CreateIssueComment(ctx, githubinfra.IssueCommentInput{Repo: repo, IssueNumber: pr, Body: body, CWD: cwd})
 			if err != nil {
@@ -1019,7 +1050,7 @@ func runGitHubHITLPoll(ctx context.Context, input defaultSchedulerTickInput, pro
 			repo = *l.Repo
 		}
 		awaiting = append(awaiting, githubHITLAwaitingLoop{
-			ID: l.ID, ProjectID: l.ProjectID, Repo: repo,
+			ID: l.ID, ProjectID: l.ProjectID, Repo: repo, Role: l.Type,
 			Transport: ask.Transport, AskStatus: ask.Status, PRNumber: ask.PRNumber, AskCommentID: ask.AskCommentID,
 			// Scope asks and scope overlays share Continue/Stop-only filtering
 			// with budget asks so unrelated PR chatter does not poison the
@@ -1035,6 +1066,9 @@ func runGitHubHITLPoll(ctx context.Context, input defaultSchedulerTickInput, pro
 	gw := input.GitHubGateway
 
 	deps := githubHITLPollDeps{
+		bindContext: func(ctx contextType, projectID, role string) (contextType, error) {
+			return hostingidentity.Bind(ctx, *input.Config, projectID, role)
+		},
 		listComments: func(ctx contextType, repo string, pr int64, cwd string) ([]githubAnswerComment, error) {
 			cs, err := gw.ListIssueComments(ctx, githubinfra.ViewIssueInput{Repo: repo, IssueNumber: pr, CWD: cwd})
 			if err != nil {

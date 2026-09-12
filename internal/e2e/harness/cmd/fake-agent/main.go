@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -107,7 +108,10 @@ func main() {
 		path := envOr(envFakeAgentModifyFile, "README.md")
 		mustAppendFile(path, []byte("modified by fake agent\n"))
 		printCompletion(marker, map[string]any{"summary": "fake agent modified file", "changedFiles": []string{path}})
-	case "commit":
+	case "commit", "bot-commit":
+		if mode == "bot-commit" {
+			verifyBotCapabilities(artifactDir)
+		}
 		path := envOr(envFakeAgentWriteFile, "agent-commit.txt")
 		mustWriteFile(path, []byte("commit from fake agent\n"))
 		gitPath := envOr(envFakeAgentGitPath, "git")
@@ -172,6 +176,36 @@ func collectEnv() map[string]string {
 		}
 	}
 	return result
+}
+
+func verifyBotCapabilities(artifactDir string) {
+	for _, key := range []string{
+		"GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN",
+		"LOOPER_E2E_OTHER_BOT_TOKEN", "LOOPER_CONFIG", "LOOPER_TRUSTED_ENV_FILE",
+		"LOOPER_TRUSTED_REVIEW_CONFIG_FD", "LOOPER_TRUSTED_REVIEW_PROXY_CHILD", "SSH_AUTH_SOCK",
+		"LOOPER_E2E_GITHUB_APP_PRIVATE_KEY_FILE", "LOOPER_E2E_GITHUB_APP_PRIVATE_KEY",
+	} {
+		if os.Getenv(key) != "" {
+			panic("bot agent received forbidden environment key: " + key)
+		}
+	}
+	cli := os.Getenv("LOOPER_HOST_CLI")
+	if !filepath.IsAbs(cli) {
+		panic("bot agent has no absolute host CLI capability")
+	}
+	var actor struct {
+		Login string `json:"login"`
+		Repo  string `json:"repo"`
+	}
+	if err := json.Unmarshal([]byte(mustOutput(cli, "host", "whoami")), &actor); err != nil || actor.Login == "" || actor.Repo == "" {
+		panic("bot host whoami returned no repository-bound identity")
+	}
+	var pulls []json.RawMessage
+	if err := json.Unmarshal([]byte(mustOutput(cli, "host", "api", "pulls?state=open")), &pulls); err != nil {
+		panic("bot host repository read returned invalid JSON")
+	}
+	payload, _ := json.Marshal(map[string]any{"login": actor.Login, "repo": actor.Repo, "credentialKeysAbsent": true, "repositoryRead": true})
+	mustWriteFile(filepath.Join(artifactDir, "bot-capabilities.json"), payload)
 }
 
 func hashCommentIDs(ids ...string) string {
@@ -306,6 +340,30 @@ func parsePromptFixItems(prompt string) []promptFixItem {
 
 func fetchObservedThreadHashes(items []promptFixItem) map[string]string {
 	threadHashes := make(map[string]string, len(items))
+	if cli := strings.TrimSpace(os.Getenv("LOOPER_HOST_CLI")); cli != "" && len(items) > 0 {
+		match := regexp.MustCompile(`"pr_number"\s*:\s*(\d+)`).FindStringSubmatch(os.Getenv(envLooperPrompt))
+		if len(match) != 2 {
+			panic("bot fixer prompt has no PR number for thread reads")
+		}
+		for _, item := range items {
+			threadID := strings.TrimSpace(item.ThreadID)
+			if threadID == "" {
+				continue
+			}
+			if _, ok := threadHashes[threadID]; ok {
+				continue
+			}
+			var thread struct {
+				ID       string            `json:"id"`
+				Comments []ghThreadComment `json:"comments"`
+			}
+			if err := json.Unmarshal([]byte(mustOutput(cli, "host", "thread", match[1], threadID)), &thread); err != nil || thread.ID != threadID {
+				panic("bot thread read failed to return the requested thread")
+			}
+			threadHashes[threadID] = hashObservedThreadComments(thread.Comments)
+		}
+		return threadHashes
+	}
 	ghPath := strings.TrimSpace(os.Getenv(envFakeAgentGHPath))
 	if ghPath == "" {
 		return threadHashes

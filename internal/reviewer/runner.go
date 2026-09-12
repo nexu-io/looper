@@ -27,6 +27,7 @@ import (
 	"github.com/nexu-io/looper/internal/domain"
 	"github.com/nexu-io/looper/internal/eventlog"
 	"github.com/nexu-io/looper/internal/forge"
+	"github.com/nexu-io/looper/internal/hostingidentity"
 	gitinfra "github.com/nexu-io/looper/internal/infra/git"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/infra/specpr"
@@ -846,6 +847,11 @@ func New(options Options) *Runner {
 }
 
 func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput) (DiscoveryResult, error) {
+	bound, bindErr := hostingidentity.Bind(ctx, r.customInstructions, input.ProjectID, "reviewer")
+	if bindErr != nil {
+		return DiscoveryResult{}, bindErr
+	}
+	ctx = bound
 	ctx = githubinfra.ContextWithDiscoverySnapshot(ctx, input.Snapshot)
 	if r.repos == nil || r.repos.Projects == nil || r.repos.Loops == nil || r.repos.Queue == nil || r.repos.Runs == nil {
 		return DiscoveryResult{}, fmt.Errorf("reviewer repositories are not configured")
@@ -994,6 +1000,11 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 }
 
 func (r *Runner) DiscoverPullRequest(ctx context.Context, input TargetedDiscoveryInput) (DiscoveryResult, error) {
+	bound, bindErr := hostingidentity.Bind(ctx, r.customInstructions, input.ProjectID, "reviewer")
+	if bindErr != nil {
+		return DiscoveryResult{}, bindErr
+	}
+	ctx = bound
 
 	ctx = githubinfra.ContextWithDiscoverySnapshot(ctx, input.Snapshot)
 
@@ -1991,6 +2002,11 @@ func (r *Runner) ProcessNext(ctx context.Context, claimedBy string) (*ProcessRes
 }
 
 func (r *Runner) ProcessClaimedQueueItem(ctx context.Context, queueItem storage.QueueItemRecord) (*ProcessResult, error) {
+	bound, bindErr := r.bindClaimedHostingIdentity(ctx, queueItem)
+	if bindErr != nil {
+		return nil, bindErr
+	}
+	ctx = bound
 	result, err := r.ProcessClaimedItem(ctx, queueItem)
 	if err != nil {
 		if cleanupErr := r.finalizeClaimSetupFailure(ctx, queueItem, err); cleanupErr != nil {
@@ -2043,6 +2059,11 @@ func (r *Runner) finalizeClaimSetupFailure(ctx context.Context, queueItem storag
 }
 
 func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.QueueItemRecord) (ProcessResult, error) {
+	bound, bindErr := r.bindClaimedHostingIdentity(ctx, queueItem)
+	if bindErr != nil {
+		return ProcessResult{}, bindErr
+	}
+	ctx = bound
 	if queueItem.Type != "reviewer" {
 		return ProcessResult{}, fmt.Errorf("unsupported queue item type: %s", queueItem.Type)
 	}
@@ -2310,7 +2331,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 				failedQueue.Status = "failed"
 			}
 			if queueResultIsTerminalForCleanup(failedQueue) {
-				r.cleanupReviewerWorktreeIfTerminal(context.Background(), *project, &latest)
+				r.cleanupReviewerWorktreeIfTerminal(context.WithoutCancel(ctx), *project, &latest)
 			}
 			return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: runStatus, Summary: failure.message, FailureKind: failure.kind}, nil
 		}
@@ -2431,7 +2452,7 @@ func (r *Runner) finalizeSuccessfulReviewerQueue(ctx context.Context, project st
 	if parked, parkErr := r.parkReviewerBudgetAfterSuccessfulRun(ctx, project, updatedLoop); parkErr != nil {
 		return r.failReviewerFinalizeAfterComplete(ctx, priorForContinuation, parkErr)
 	} else if parked {
-		r.cleanupReviewerWorktreeIfTerminal(context.Background(), project, &checkpoint)
+		r.cleanupReviewerWorktreeIfTerminal(context.WithoutCancel(ctx), project, &checkpoint)
 		// Still schedule disposition / partial-batch continuation on budget hold.
 		// Convergence full-review (pendingDisp=false without partial cursor) waits.
 		if needsContinuation && hasPending && (pendingDisp || partialCont != nil) {
@@ -2450,7 +2471,7 @@ func (r *Runner) finalizeSuccessfulReviewerQueue(ctx context.Context, project st
 			return r.failReviewerFinalizeAfterComplete(ctx, priorForContinuation, err)
 		}
 	}
-	r.cleanupReviewerWorktreeIfTerminal(context.Background(), project, &checkpoint)
+	r.cleanupReviewerWorktreeIfTerminal(context.WithoutCancel(ctx), project, &checkpoint)
 	return ProcessResult{LoopID: loop.ID, RunID: runID, QueueItemID: queueItem.ID, Status: status, Summary: summary}, nil
 }
 
@@ -2699,7 +2720,7 @@ func (r *Runner) skipMissingPullRequest(ctx context.Context, input stepInput, ch
 	checkpoint.SkipReason = fmt.Sprintf("Skipped missing pull request %s#%d: %s", input.Repo, input.PRNumber, githubinfra.ErrorMessage(err))
 	checkpoint.SkipKind = "pr_not_found"
 	checkpoint.ResumePolicy = ""
-	r.cleanupReviewerWorktreeIfTerminal(context.Background(), input.Project, &checkpoint)
+	r.cleanupReviewerWorktreeIfTerminal(context.WithoutCancel(ctx), input.Project, &checkpoint)
 	if terminateErr := r.terminateLoop(ctx, input.Loop, "pr_not_found"); terminateErr != nil {
 		return checkpoint, true, terminateErr
 	}
@@ -4899,7 +4920,7 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 		return checkpoint, fmt.Errorf("resolve run agent identity: %w", err)
 	}
 	lastPublishedHeadSHA, _ := stringFromAny(parseJSONObject(input.Loop.MetadataJSON)["lastPublishedHeadSha"])
-	prompt, instructionBlock := buildReviewPromptWithInstructions(input.Project.ID, r.customInstructions, input.Repo, input.PRNumber, checkpoint, input.Run.ID, idempotencyKey, reviewEvents, isManualReviewerLoop(input.Loop), requireReviewRequest, reviewRequestBypassReason, r.scope, r.disclosure, agentVendor, derefString(agentModel), r.looperCLIPath, r.reviewerAutoMergeConfigForProject(input.Project.ID).Enabled, commentOnlyCompletion, lastPublishedHeadSHA)
+	prompt, instructionBlock := buildReviewPromptWithInstructions(input.Project.ID, r.customInstructions, input.Repo, input.PRNumber, checkpoint, input.Run.ID, idempotencyKey, reviewEvents, isManualReviewerLoop(input.Loop), requireReviewRequest, reviewRequestBypassReason, r.scope, r.disclosure, agentVendor, derefString(agentModel), r.looperCLIPath, r.reviewerAutoMergeConfigForProject(input.Project.ID).Enabled, commentOnlyCompletion, lastPublishedHeadSHA, hostingKindForContext(ctx))
 	nativeResumePrompt := r.nativeResumePromptForReview(ctx, input, checkpoint.Snapshot.HeadSHA, idempotencyKey, lastPublishedHeadSHA)
 	metadata := map[string]any{
 		"loopType":            "reviewer",
@@ -9680,7 +9701,11 @@ func reviewerProjectProviderKind(cfg config.Config, projectID string) config.Pro
 	return config.ProviderKindGitHub
 }
 
-func buildReviewPromptWithInstructions(projectID string, instructionConfig config.Config, repo string, prNumber int64, checkpoint reviewerCheckpoint, runID string, idempotencyKey string, reviewEvents config.ReviewerReviewEventsConfig, manual bool, requireReviewRequest bool, reviewRequestBypassReason string, scope config.ReviewerScope, disclosureCfg config.DisclosureConfig, agentRuntime string, agentModel string, looperCLIPath string, autoMergeEnabled bool, commentOnlyPublish bool, lastPublishedHeadSHA string) (string, config.CustomInstructionBlock) {
+func buildReviewPromptWithInstructions(projectID string, instructionConfig config.Config, repo string, prNumber int64, checkpoint reviewerCheckpoint, runID string, idempotencyKey string, reviewEvents config.ReviewerReviewEventsConfig, manual bool, requireReviewRequest bool, reviewRequestBypassReason string, scope config.ReviewerScope, disclosureCfg config.DisclosureConfig, agentRuntime string, agentModel string, looperCLIPath string, autoMergeEnabled bool, commentOnlyPublish bool, lastPublishedHeadSHA string, hostingKinds ...config.HostingIdentityKind) (string, config.CustomInstructionBlock) {
+	hostingKind := config.HostingIdentityKind("")
+	if len(hostingKinds) > 0 {
+		hostingKind = hostingKinds[0]
+	}
 	looperCLIPath = normalizeLooperCLIPath(looperCLIPath)
 	looperCLICommand := shellQuote(looperCLIPath)
 	phase := resolvePullRequestPhase(detailLabels(checkpoint.Detail))
@@ -9717,8 +9742,15 @@ func buildReviewPromptWithInstructions(projectID string, instructionConfig confi
 		cleanResultCompletionInstruction = "Group findings only when they share the same root cause; keep unrelated concerns separate. Accumulate every independent in-scope must_fix before finalizing. If there is no concrete must_fix feedback, start the final summary with `No actionable findings`. Do not invent feedback."
 		fetchContract = "Provider-supplied Forgejo review context: Looper fetched PR metadata and diff before invoking you. Use the prepared local worktree plus the supplied metadata/diff as the review context; do not use GitHub CLI/API commands or native review/thread features."
 	}
-	parts := []string{fmt.Sprintf("Review pull request %s#%d.", repo, prNumber), buildReviewerMinimalPRSeed(repo, prNumber, checkpoint, scope, forge.ConfiguredPullRequestURL(instructionConfig, projectID, repo, prNumber)), fetchContract, "Phase: " + phase, phaseInstruction, reviewerScopeInstruction(scope), publishInstruction, fmt.Sprintf("Review idempotency marker prefix: <!-- looper:review id=%s head=%s outcome=clean|non_blocking|blocking -->", idempotencyKey, currentHeadSHA), outcomeInstruction, "Run ID for logging only, not for idempotency: " + runID}
-	if providerContext := forge.ForgejoAgentContext(instructionConfig, projectID, repo, prNumber); providerContext != "" {
+	if hostingKind != "" {
+		fetchContract = forge.HostingAgentContext(hostingKind, "reviewer", repo, prNumber) + "\nBefore reviewing and again before conclusions or publication, read live PR metadata; verify seeded head/base/state/draft and stop on drift or access failures. Fetch the diff and read all PR conversation and reviews before reviewing."
+	}
+	scopeInstruction := reviewerScopeInstruction(scope)
+	if hostingKind != "" {
+		scopeInstruction = strings.ReplaceAll(scopeInstruction, "fetched through `gh` according to the agent-side GitHub fetch contract", "fetched through the trusted Looper host commands")
+	}
+	parts := []string{fmt.Sprintf("Review pull request %s#%d.", repo, prNumber), buildReviewerMinimalPRSeed(repo, prNumber, checkpoint, scope, forge.ConfiguredPullRequestURL(instructionConfig, projectID, repo, prNumber)), fetchContract, "Phase: " + phase, phaseInstruction, scopeInstruction, publishInstruction, fmt.Sprintf("Review idempotency marker prefix: <!-- looper:review id=%s head=%s outcome=clean|non_blocking|blocking -->", idempotencyKey, currentHeadSHA), outcomeInstruction, "Run ID for logging only, not for idempotency: " + runID}
+	if providerContext := forge.ForgejoAgentContext(instructionConfig, projectID, repo, prNumber); hostingKind == "" && providerContext != "" {
 		parts = append(parts, providerContext)
 	}
 	if checkpoint.Detail != nil && checkpoint.Detail.ChecksSummary != "" && (checkpoint.Snapshot == nil || checkpoint.Snapshot.ChecksSummary == "") {
@@ -9832,6 +9864,11 @@ func buildReviewPromptWithInstructions(projectID string, instructionConfig confi
 		idempotencyInstruction = "Idempotency requirement: submit only through the trusted Looper wrapper. The wrapper lists existing native Forgejo reviews and reuses an exact id/head/outcome/state marker match; after the agent exits, the runner verifies the same marker before recording publication. Never call the Forgejo review endpoint directly."
 		freshnessInstruction = "Before posting, rely on the trusted Looper wrapper to confirm the Forgejo PR is still open and the head SHA still matches. If it reports drift, exit non-zero with the exact message `PR head changed before publish`."
 		anchorInstruction = "Before posting, validate every inline review comment against the supplied Forgejo diff and local worktree. Preserve exact changed-file anchors. If a must_fix location is not exactly on the supplied diff, attach it to the nearest anchorable changed-file location. Do not downgrade must_fix findings to a top-level review-body item; every must_fix must remain an inline comment."
+	}
+	if hostingKind != "" {
+		idempotencyInstruction = strings.ReplaceAll(idempotencyInstruction, "use `gh api` to list existing PR reviews for this PR", fmt.Sprintf("use `\"$LOOPER_HOST_CLI\" host api pulls/%d/reviews --paginate` to list existing PR reviews", prNumber))
+		freshnessInstruction = strings.ReplaceAll(freshnessInstruction, "use `gh` to confirm", fmt.Sprintf("use `\"$LOOPER_HOST_CLI\" host api pulls/%d` to confirm", prNumber))
+		anchorInstruction = strings.ReplaceAll(anchorInstruction, "fetched with `gh pr diff`", fmt.Sprintf("fetched with `\"$LOOPER_HOST_CLI\" host api pulls/%d --diff`", prNumber))
 	}
 	if looperCLIPath == "" {
 		githubOperationContract = fmt.Sprintf("%s operation contract: a trusted Looper CLI path was not detected for this reviewer run, so review publication is unavailable. Do not call PATH-based `looper`, repository-local `go run ./cmd/looper`, or the provider review API directly; exit non-zero with the exact message `trusted looper review submit wrapper unavailable`.", forgeName)

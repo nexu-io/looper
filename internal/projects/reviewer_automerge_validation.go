@@ -2,11 +2,14 @@ package projects
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/forge"
+	"github.com/nexu-io/looper/internal/hostingidentity"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/reviewer/automerge"
 )
@@ -35,7 +38,7 @@ func (s *Service) validateReviewerAutoMergeForProject(ctx context.Context, proje
 			if provider.ID != project.Provider {
 				continue
 			}
-			client, err := forge.NewForgejoClientFromConfig(provider, strings.TrimSpace(stringValue(repo)))
+			client, err := forge.NewForgejoClientForContext(ctx, provider, strings.TrimSpace(stringValue(repo)))
 			if err != nil {
 				return err
 			}
@@ -106,4 +109,30 @@ func stringValue(value *string) string {
 		return ""
 	}
 	return *value
+}
+
+// validateHostingReviewerAutoMerge preserves semantic configuration failures.
+// An explicit bot's unavailable external settings are diagnostics; runtime
+// publication still performs its normal remote protection checks. Bind the
+// reviewer role so admission uses the account that will perform auto-merge.
+func (s *Service) validateHostingReviewerAutoMerge(ctx context.Context, projectID string, repo *string, baseBranch string, cfg config.Config) (string, error) {
+	bound, err := hostingidentity.Bind(ctx, cfg, projectID, "reviewer")
+	if err != nil {
+		return "", err
+	}
+	session, selected := hostingidentity.FromContext(bound)
+	if selected {
+		var cancel context.CancelFunc
+		bound, cancel = context.WithTimeout(bound, 3*time.Second)
+		defer cancel()
+	}
+	err = s.validateReviewerAutoMergeForProject(bound, projectID, repo, baseBranch, cfg)
+	if err == nil {
+		return "", nil
+	}
+	var semantic ProjectValidationError
+	if !selected || errors.As(err, &semantic) {
+		return "", err
+	}
+	return fmt.Sprintf("hosting identity %q: %s", session.Name(), session.Redact(err.Error())), nil
 }

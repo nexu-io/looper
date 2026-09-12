@@ -22,6 +22,8 @@ import (
 	"github.com/nexu-io/looper/internal/disclosure"
 	"github.com/nexu-io/looper/internal/domain"
 	"github.com/nexu-io/looper/internal/eventlog"
+	"github.com/nexu-io/looper/internal/forge"
+	"github.com/nexu-io/looper/internal/hostingidentity"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/infra/shell"
 	"github.com/nexu-io/looper/internal/infra/specpr"
@@ -850,6 +852,11 @@ func New(options Options) *Runner {
 }
 
 func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (DiscoveryResult, error) {
+	bound, bindErr := hostingidentity.Bind(ctx, r.customInstructions, input.ProjectID, "worker")
+	if bindErr != nil {
+		return DiscoveryResult{}, bindErr
+	}
+	ctx = bound
 	ctx = githubinfra.ContextWithDiscoverySnapshot(ctx, input.Snapshot)
 	if r.repos == nil || r.repos.Projects == nil || r.repos.Loops == nil || r.repos.Queue == nil || r.github == nil {
 		return DiscoveryResult{}, fmt.Errorf("worker discovery is not configured")
@@ -995,6 +1002,11 @@ func (r *Runner) ProcessNext(ctx context.Context, claimedBy string) (*ProcessRes
 }
 
 func (r *Runner) ProcessClaimedQueueItem(ctx context.Context, queueItem storage.QueueItemRecord) (*ProcessResult, error) {
+	bound, bindErr := r.bindClaimedHostingIdentity(ctx, queueItem)
+	if bindErr != nil {
+		return nil, bindErr
+	}
+	ctx = bound
 	result, err := r.ProcessClaimedItem(ctx, queueItem)
 	if err != nil {
 		return r.recoverClaimedItem(ctx, queueItem, err)
@@ -1045,6 +1057,11 @@ func (r *Runner) reconcileRecoveredLoop(ctx context.Context, queueItem storage.Q
 }
 
 func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.QueueItemRecord) (ProcessResult, error) {
+	bound, bindErr := r.bindClaimedHostingIdentity(ctx, queueItem)
+	if bindErr != nil {
+		return ProcessResult{}, bindErr
+	}
+	ctx = bound
 	if queueItem.Type != "worker" {
 		return ProcessResult{}, fmt.Errorf("unsupported queue item type: %s", queueItem.Type)
 	}
@@ -1795,7 +1812,7 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 		if err != nil {
 			return checkpoint, fmt.Errorf("resolve run agent identity: %w", err)
 		}
-		prompt, instructionBlock, err := buildWorkerPromptWithInstructions(worktree.Path, input.Project.ID, r.customInstructions, work, checkpoint.Plan, r.canAgentCreatePR(ctx, work, input.Project.RepoPath), r.disclosure, agentVendor, derefString(agentModel))
+		prompt, instructionBlock, err := buildWorkerPromptWithInstructions(worktree.Path, input.Project.ID, r.customInstructions, work, checkpoint.Plan, r.canAgentCreatePR(ctx, work, input.Project.RepoPath), r.disclosure, agentVendor, derefString(agentModel), hostingKindForContext(ctx))
 		if err != nil {
 			return checkpoint, err
 		}
@@ -2075,7 +2092,7 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 					return checkpoint, loopErr
 				}
 			}
-			if err != nil && input.Loop.PRNumber == nil {
+			if err != nil && (input.Loop.PRNumber == nil || hostingKindForContext(ctx) != "") {
 				return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 			}
 		}
@@ -2126,6 +2143,11 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 		if err := r.normalizePullRequestDisclosure(ctx, input.Run, work.Repo, checkpoint.PullRequest.Number, input.Project.RepoPath, checkpoint.Lifecycle != nil && checkpoint.Lifecycle.Actions.PR == lifecycle.ActionSourceAgent); err != nil {
 			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 		}
+		if hostingKindForContext(ctx) != "" {
+			if err := r.assignReviewersIfNeeded(ctx, work, checkpoint.PullRequest.Number, input.Project.RepoPath); err != nil {
+				return checkpoint, err
+			}
+		}
 		checkpoint.ResumePolicy = "advance_from_checkpoint"
 		r.syncIssueClaim(ctx, input, &checkpoint, issueClaimStatusPRLinked, "")
 		return checkpoint, nil
@@ -2152,12 +2174,16 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 		} else if held {
 			return checkpoint, &holdSkipError{summary: summary}
 		}
-		_ = r.renamePlannerSpecPullRequestAfterTakeover(ctx, work, input.Project.RepoPath)
+		if err := r.renamePlannerSpecPullRequestAfterTakeover(ctx, work, input.Project.RepoPath); err != nil && hostingKindForContext(ctx) != "" {
+			return checkpoint, err
+		}
 		if err := r.normalizePullRequestDisclosure(ctx, input.Run, work.Repo, work.PRNumber, input.Project.RepoPath, false); err != nil {
 			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 		}
 		if len(work.Reviewers) > 0 && work.PRNumber > 0 && r.github != nil {
-			_ = r.github.AddPullRequestReviewers(ctx, PullRequestReviewersInput{Repo: work.Repo, PRNumber: work.PRNumber, Reviewers: append([]string(nil), work.Reviewers...), CWD: input.Project.RepoPath})
+			if err := r.assignReviewersIfNeeded(ctx, work, work.PRNumber, input.Project.RepoPath); err != nil && hostingKindForContext(ctx) != "" {
+				return checkpoint, err
+			}
 		}
 		checkpoint.ResumePolicy = "advance_from_checkpoint"
 		r.syncIssueClaim(ctx, input, &checkpoint, issueClaimStatusPRLinked, "")
@@ -2185,7 +2211,9 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 	if rootErr != nil {
 		return checkpoint, rootErr
 	}
-	if existing, err := r.findOpenPullRequestForBranch(ctx, work.Repo, aliases, work.BaseBranch, input.Project.RepoPath); err == nil && existing != nil {
+	if existing, err := r.findOpenPullRequestForBranch(ctx, work.Repo, aliases, work.BaseBranch, input.Project.RepoPath); err != nil && hostingKindForContext(ctx) != "" {
+		return checkpoint, err
+	} else if err == nil && existing != nil {
 		if err := r.git.Push(ctx, PushInput{RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktree.Path, Branch: firstNonEmpty(existing.HeadRefName, worktree.Branch), ProtectedBranches: compactStrings([]string{work.BaseBranch})}); err != nil {
 			if shouldRestartWorkerFromDiscoverAfterPushFailure(err) {
 				checkpoint.ResumePolicy = loops.ResumePolicyRestartFromDiscover
@@ -2200,7 +2228,9 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 		} else if held {
 			return checkpoint, &holdSkipError{summary: summary}
 		}
-		_ = r.assignReviewersIfNeeded(ctx, work, existing.Number, input.Project.RepoPath)
+		if err := r.assignReviewersIfNeeded(ctx, work, existing.Number, input.Project.RepoPath); err != nil && hostingKindForContext(ctx) != "" {
+			return checkpoint, err
+		}
 		if err := r.normalizePullRequestDisclosure(ctx, input.Run, work.Repo, existing.Number, input.Project.RepoPath, true); err != nil {
 			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 		}
@@ -2232,7 +2262,9 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 		checkpoint.ResumePolicy = loops.ResumePolicyAdvanceFromCheckpoint
 		return checkpoint, nil
 	}
-	if existing, err := r.findOpenPullRequestForBranch(ctx, work.Repo, aliases, work.BaseBranch, input.Project.RepoPath); err == nil && existing != nil {
+	if existing, err := r.findOpenPullRequestForBranch(ctx, work.Repo, aliases, work.BaseBranch, input.Project.RepoPath); err != nil && hostingKindForContext(ctx) != "" {
+		return checkpoint, err
+	} else if err == nil && existing != nil {
 		adoptedWork := workerWorkForPullRequest(work, *existing)
 		if held, summary, err := r.workerHoldSummaryForWork(ctx, input.Project, adoptedWork, true); err != nil {
 			return checkpoint, err
@@ -2241,7 +2273,9 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 			checkpoint.markLifecyclePushAndPR(firstNonEmpty(existing.HeadRefName, worktree.Branch), work.BaseBranch, existing.Number, existing.URL, true, true)
 			return checkpoint, &holdSkipError{summary: summary}
 		}
-		_ = r.assignReviewersIfNeeded(ctx, work, existing.Number, input.Project.RepoPath)
+		if err := r.assignReviewersIfNeeded(ctx, work, existing.Number, input.Project.RepoPath); err != nil && hostingKindForContext(ctx) != "" {
+			return checkpoint, err
+		}
 		if err := r.normalizePullRequestDisclosure(ctx, input.Run, work.Repo, existing.Number, input.Project.RepoPath, true); err != nil {
 			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 		}
@@ -2275,7 +2309,9 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 		checkpoint.markLifecyclePushAndPR(worktree.Branch, work.BaseBranch, created.Number, created.URL, true, false)
 		return checkpoint, &holdSkipError{summary: summary}
 	}
-	_ = r.assignReviewersIfNeeded(ctx, work, created.Number, input.Project.RepoPath)
+	if err := r.assignReviewersIfNeeded(ctx, work, created.Number, input.Project.RepoPath); err != nil && hostingKindForContext(ctx) != "" {
+		return checkpoint, err
+	}
 	if err := r.persistPullRequestReference(ctx, input.Loop, input.QueueItem, work.Repo, pr); err != nil {
 		return checkpoint, err
 	}
@@ -2689,20 +2725,48 @@ func (r *Runner) runValidation(ctx context.Context, input ValidationInput) (Vali
 	if r.validationRunner != nil {
 		return r.validationRunner(ctx, input)
 	}
+	return r.runValidationCommands(ctx, input, shell.Run)
+}
+
+func (r *Runner) runValidationCommands(ctx context.Context, input ValidationInput, run func(context.Context, shell.Options) (shell.Result, error)) (ValidationResult, error) {
 	if len(input.Commands) == 0 {
 		return ValidationResult{Passed: true, Summary: "No validation commands configured"}, nil
 	}
 
+	var validationEnv map[string]string
+	var commandRunErr error
+	if session, selected := hostingidentity.FromContext(ctx); selected {
+		validationEnv = make(map[string]string)
+		for _, entry := range os.Environ() {
+			if name, value, ok := strings.Cut(entry, "="); ok {
+				validationEnv[name] = value
+			}
+		}
+		validationConfig := config.CloneConfig(r.customInstructions)
+		if validationConfig.Identities == nil {
+			validationConfig.Identities = make(map[string]config.HostingIdentityConfig)
+		}
+		validationConfig.Identities[session.Name()] = session.Snapshot().Definition
+		var cleanup func(error)
+		var err error
+		validationEnv, cleanup, err = agent.PrepareHostingValidationEnv(validationConfig, validationEnv)
+		if err != nil {
+			return ValidationResult{}, err
+		}
+		defer func() { cleanup(commandRunErr) }()
+	}
 	outputs := make([]string, 0, len(input.Commands)*2)
 	for _, command := range input.Commands {
-		result, err := shell.Run(ctx, shell.Options{
+		result, err := run(ctx, shell.Options{
 			Command: "/bin/sh",
 			Args:    []string{"-c", command},
 			CWD:     input.CWD,
+			Env:     validationEnv,
 			// Supervisor-owned validation: track handle so shutdown retain-storage
 			// sees Kill/Drain failures even when validation collapses them to Passed=false.
 			Tracker: r.containmentTracker,
 		})
+		commandRunErr = err
 		if err != nil {
 			output := "Unknown validation failure"
 			var commandErr *shell.CommandExecutionError
@@ -3229,6 +3293,9 @@ func pullRequestURL(pr *checkpointPullPR) string {
 }
 
 func (r *Runner) canAgentCreatePR(ctx context.Context, work workerInput, cwd string) bool {
+	if _, selected := hostingidentity.FromContext(ctx); selected {
+		return false
+	}
 	return work.ExecutionMode == "create-pr" &&
 		r.openPRStrategy != config.OpenPRStrategyManual &&
 		r.allowAutoPush &&
@@ -3631,7 +3698,11 @@ func providerKindForProject(cfg config.Config, projectID string) config.Provider
 	return config.ProviderKindGitHub
 }
 
-func buildWorkerPromptWithInstructions(repoRootPath string, projectID string, instructionConfig config.Config, work workerInput, plan *checkpointPlan, allowAgentPRCreation bool, disclosureCfg config.DisclosureConfig, agentRuntime string, agentModel string) (string, config.CustomInstructionBlock, error) {
+func buildWorkerPromptWithInstructions(repoRootPath string, projectID string, instructionConfig config.Config, work workerInput, plan *checkpointPlan, allowAgentPRCreation bool, disclosureCfg config.DisclosureConfig, agentRuntime string, agentModel string, hostingKinds ...config.HostingIdentityKind) (string, config.CustomInstructionBlock, error) {
+	hostingKind := config.HostingIdentityKind("")
+	if len(hostingKinds) > 0 {
+		hostingKind = hostingKinds[0]
+	}
 	providerKind := providerKindForProject(instructionConfig, projectID)
 	parts := []string{}
 	if work.ExecutionMode == "push-existing" {
@@ -3660,7 +3731,9 @@ func buildWorkerPromptWithInstructions(repoRootPath string, projectID string, in
 	if instructionBlock.Text != "" {
 		parts = append(parts, instructionBlock.Text)
 	}
-	if allowAgentPRCreation {
+	if hostingKind != "" {
+		parts = append(parts, forge.HostingAgentContext(hostingKind, "worker", work.Repo, work.PRNumber), botPublicationPrompt())
+	} else if allowAgentPRCreation {
 		parts = append(parts, buildAgentPullRequestInstruction(work, providerKind))
 		parts = append(parts, "Make the necessary code changes, validate them, and ensure the branch and pull request are left in a consistent state.")
 		parts = append(parts, lifecycle.PromptInstruction("worker", work.Branch, work.BaseBranch, true, true, disclosureCfg, agentRuntime, agentModel))
