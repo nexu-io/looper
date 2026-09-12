@@ -4,7 +4,6 @@
 # Layout (bucket looper-releases, public host releases.looper.powerformer.com):
 #   <tag>/manifest.json       per-release copy, refreshed on reruns
 #   channels/<channel>.json   mutable latest pointer for that channel
-#   manifest.json             alias of the latest stable pointer
 #
 # Required: wrangler (or npx wrangler) authenticated to the Powerformer
 # Cloudflare account. CI supplies CLOUDFLARE_API_TOKEN + CLOUDFLARE_ACCOUNT_ID.
@@ -139,9 +138,6 @@ put_object "${TAG}/manifest.json"
 
 if should_update_pointer "$CHANNEL" "$TAG"; then
   put_object "channels/${CHANNEL}.json"
-  if [ "$CHANNEL" = "stable" ]; then
-    put_object "manifest.json"
-  fi
 else
   echo "skipping channel pointer update: existing ${CHANNEL} pointer is newer than ${TAG}"
 fi

@@ -40,7 +40,6 @@ func TestReleasePublisherMatchesUpdaterVersionOrdering(t *testing.T) {
 				t.Fatalf("publisher failed: %v\n%s", err, output)
 			}
 			pointer := filepath.Join(bucket, "test-releases", "channels", tc.channel+".json")
-			alias := filepath.Join(bucket, "test-releases", "manifest.json")
 
 			comparison, err := compareSemver(tc.existing, tc.incoming)
 			if err != nil {
@@ -57,12 +56,6 @@ func TestReleasePublisherMatchesUpdaterVersionOrdering(t *testing.T) {
 				got, err := os.ReadFile(path)
 				if err != nil || !bytes.Equal(got, expected) {
 					t.Fatalf("%s = %s, error=%v; want %s (Go comparison=%d)\npublisher: %s", path, got, err, expected, comparison, output)
-				}
-			}
-			if tc.channel == "stable" {
-				got, err := os.ReadFile(alias)
-				if err != nil || !bytes.Equal(got, want) {
-					t.Fatalf("stable alias=%s error=%v want=%s", got, err, want)
 				}
 			}
 		})
@@ -86,7 +79,7 @@ func runTestReleasePublisher(t *testing.T, current []byte, tag, channel, getErro
 		t.Fatal(err)
 	}
 	if current != nil {
-		for _, path := range []string{pointer, filepath.Join(bucket, "test-releases", "manifest.json"), filepath.Join(bucket, "test-releases", tag, "manifest.json")} {
+		for _, path := range []string{pointer, filepath.Join(bucket, "test-releases", tag, "manifest.json")} {
 			if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 				t.Fatal(err)
 			}
@@ -149,7 +142,7 @@ func TestReleasePublisherRepairsMalformedPointers(t *testing.T) {
 			if err != nil {
 				t.Fatalf("publisher failed: %v\n%s", err, output)
 			}
-			for _, key := range []string{"channels/stable.json", "manifest.json", "v1.2.4/manifest.json"} {
+			for _, key := range []string{"channels/stable.json", "v1.2.4/manifest.json"} {
 				got, err := os.ReadFile(filepath.Join(bucket, "test-releases", key))
 				if err != nil || !bytes.Equal(got, incoming) {
 					t.Fatalf("%s=%s err=%v want=%s", key, got, err, incoming)
@@ -179,7 +172,7 @@ func TestReleasePublisherRerunsUseRefreshableManifests(t *testing.T) {
 	if err != nil {
 		t.Fatalf("publisher failed: %v\n%s", err, output)
 	}
-	for _, key := range []string{"channels/stable.json", "manifest.json", "v1.2.4/manifest.json"} {
+	for _, key := range []string{"channels/stable.json", "v1.2.4/manifest.json"} {
 		object := filepath.Join(bucket, "test-releases", key)
 		got, err := os.ReadFile(object)
 		if err != nil || !bytes.Equal(got, incoming) {
@@ -202,5 +195,21 @@ func TestReleasePublisherRejectsInvalidIncomingVersionDuringRepair(t *testing.T)
 	got, err := os.ReadFile(filepath.Join(bucket, "test-releases", "channels", "stable.json"))
 	if err != nil || !bytes.Equal(got, current) {
 		t.Fatalf("pointer=%s error=%v; invalid incoming version must not replace it", got, err)
+	}
+}
+
+func TestReleasePublisherUsesOnlyCanonicalChannelPointer(t *testing.T) {
+	t.Parallel()
+	bucket, _, output, err := runTestReleasePublisher(t, nil, "v1.2.4", "stable", "")
+	if err != nil {
+		t.Fatalf("publisher failed: %v\n%s", err, output)
+	}
+	if _, err := os.Stat(filepath.Join(bucket, "test-releases", "manifest.json")); !os.IsNotExist(err) {
+		t.Fatalf("publisher created a second stable pointer: %v\n%s", err, output)
+	}
+	for _, key := range []string{"channels/stable.json", "v1.2.4/manifest.json"} {
+		if _, err := os.Stat(filepath.Join(bucket, "test-releases", key)); err != nil {
+			t.Fatalf("missing published manifest %s: %v", key, err)
+		}
 	}
 }

@@ -141,8 +141,7 @@ Current behavior:
 
 CDN object layout:
 
-- `https://releases.looper.powerformer.com/manifest.json` — latest stable pointer
-- `https://releases.looper.powerformer.com/channels/stable.json` — same stable pointer
+- `https://releases.looper.powerformer.com/channels/stable.json` — canonical latest stable pointer
 - `https://releases.looper.powerformer.com/channels/beta.json` — latest beta pointer
 - `https://releases.looper.powerformer.com/<tag>/manifest.json` — per-release copy, refreshed on reruns (60-second cache)
 
