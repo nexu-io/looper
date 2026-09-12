@@ -437,7 +437,7 @@ func TestDecodeReleaseMetadataAcceptsManifestAndGitHubPayloads(t *testing.T) {
 		t.Fatalf("github asset URL = %q", githubPayload.Assets[0].BrowserDownloadURL)
 	}
 
-	manifestPayload, err := decodeReleaseMetadata([]byte(`{
+	manifestPayload, err := decodeReleaseMetadata([]byte(withPublishedArtifacts(t, `{
 		"manifestVersion": 1,
 		"channel": "stable",
 		"version": "1.2.3",
@@ -449,7 +449,7 @@ func TestDecodeReleaseMetadataAcceptsManifestAndGitHubPayloads(t *testing.T) {
 				"size": 12
 			}
 		}
-	}`), buildReleaseManifestURL(defaultReleaseManifestBaseURL, "v1.2.3"))
+	}`)), buildReleaseManifestURL(defaultReleaseManifestBaseURL, "v1.2.3"))
 	if err != nil {
 		t.Fatalf("decode manifest payload error = %v", err)
 	}
@@ -563,7 +563,7 @@ func TestFetchReleaseMetadataPrefersCDNManifest(t *testing.T) {
 			if req.URL.String() != defaultReleaseManifestBaseURL+"/channels/stable.json" {
 				t.Fatalf("unexpected request URL %q", req.URL.String())
 			}
-			return jsonResponse(t, http.StatusOK, `{
+			return jsonResponse(t, http.StatusOK, withPublishedArtifacts(t, `{
 				"manifestVersion": 1,
 				"channel": "stable",
 				"version": "1.2.3",
@@ -575,7 +575,7 @@ func TestFetchReleaseMetadataPrefersCDNManifest(t *testing.T) {
 						"size": 12
 					}
 				}
-			}`), nil
+			}`)), nil
 		})},
 	})
 	runtime := newCommandRuntime(app, nil)
@@ -642,7 +642,7 @@ func TestFetchReleaseMetadataRejectsMismatchedVersionedTag(t *testing.T) {
 			seen = append(seen, req.URL.String())
 			switch req.URL.String() {
 			case defaultReleaseManifestBaseURL + "/v1.2.3/manifest.json":
-				return jsonResponse(t, http.StatusOK, `{
+				return jsonResponse(t, http.StatusOK, withPublishedArtifacts(t, `{
 					"manifestVersion": 1,
 					"channel": "stable",
 					"version": "9.9.9",
@@ -654,7 +654,7 @@ func TestFetchReleaseMetadataRejectsMismatchedVersionedTag(t *testing.T) {
 							"size": 12
 						}
 					}
-				}`), nil
+				}`)), nil
 			case "https://api.github.com/repos/nexu-io/looper/releases/tags/v1.2.3":
 				return jsonResponse(t, http.StatusOK, `{"tag_name":"v1.2.3","assets":[{"name":"looperd-darwin-arm64.tar.gz","browser_download_url":"https://github.com/nexu-io/looper/releases/download/v1.2.3/looperd-darwin-arm64.tar.gz"}]}`), nil
 			default:

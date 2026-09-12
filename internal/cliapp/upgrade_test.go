@@ -1391,7 +1391,7 @@ func TestUpgradeCLIPreflightsInstallPathBeforeDownload(t *testing.T) {
 				HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 					if isCDNReleaseMetadataURL(req.URL.String()) {
 						if fromCDN {
-							return jsonResponse(t, http.StatusOK, `{"manifestVersion":1,"channel":"stable","tag":"v0.3.0","artifacts":{"looper-darwin-arm64":{}}}`), nil
+							return jsonResponse(t, http.StatusOK, withPublishedArtifacts(t, `{"manifestVersion":1,"channel":"stable","tag":"v0.3.0","artifacts":{"looper-darwin-arm64":{}}}`)), nil
 						}
 						return jsonResponse(t, http.StatusNotFound, `{}`), nil
 					}

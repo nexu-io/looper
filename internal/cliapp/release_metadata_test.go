@@ -117,7 +117,7 @@ func TestReleaseMetadataResponseSizeLimit(t *testing.T) {
 				t.Parallel()
 				body := `{"tag_name":"v1.2.3","assets":[]}`
 				if isCDNReleaseMetadataURL(source) {
-					body = `{"manifestVersion":1,"channel":"stable","tag":"v1.2.3","artifacts":{"looperd-darwin-arm64":{}}}`
+					body = withPublishedArtifacts(t, `{"manifestVersion":1,"channel":"stable","tag":"v1.2.3","artifacts":{"looperd-darwin-arm64":{}}}`)
 				}
 				reader := &metadataCountingBody{Reader: strings.NewReader(body + strings.Repeat(" ", size-len(body)))}
 				app := New(Deps{HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
@@ -144,7 +144,7 @@ func TestReleaseMetadataFallsBackFromOversizedCDN(t *testing.T) {
 	app := New(Deps{HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		seen = append(seen, req.URL.Host)
 		if isCDNReleaseMetadataURL(req.URL.String()) {
-			return jsonResponse(t, http.StatusOK, strings.Repeat(" ", 1<<20)+`{"manifestVersion":1,"channel":"stable","tag":"v1.2.3","artifacts":{"looperd-darwin-arm64":{}}}`), nil
+			return jsonResponse(t, http.StatusOK, strings.Repeat(" ", 1<<20)+withPublishedArtifacts(t, `{"manifestVersion":1,"channel":"stable","tag":"v1.2.3","artifacts":{"looperd-darwin-arm64":{}}}`)), nil
 		}
 		return jsonResponse(t, http.StatusOK, `{"tag_name":"v1.2.4","assets":[]}`), nil
 	})}})

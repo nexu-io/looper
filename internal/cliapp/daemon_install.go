@@ -411,8 +411,15 @@ func decodeReleaseMetadata(body []byte, sourceURL string) (githubReleasePayload,
 			return githubReleasePayload{}, fmt.Errorf("stable release metadata must declare channel stable and a non-prerelease tag")
 		}
 		payload := githubReleaseFromManifest(manifest)
-		if len(payload.Assets) == 0 {
-			return githubReleasePayload{}, fmt.Errorf("release manifest is missing usable artifacts")
+		// A release publishes both binaries for both supported targets. Validate
+		// that contract here so checks and installs reject the same partial CDN
+		// object; raw binaries remain valid for older release manifests.
+		for _, target := range []string{"darwin-arm64", "linux-amd64"} {
+			for _, binary := range []string{"looper", "looperd"} {
+				if _, err := findReleaseAssetSet(payload, binary+"-"+target); err != nil {
+					return githubReleasePayload{}, fmt.Errorf("incomplete release manifest: %w", err)
+				}
+			}
 		}
 		return payload, nil
 	}

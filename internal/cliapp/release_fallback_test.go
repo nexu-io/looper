@@ -27,7 +27,7 @@ func TestStableMetadataRejectsOtherChannels(t *testing.T) {
 			app := New(Deps{HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 				seen = append(seen, req.URL.String())
 				if isCDNReleaseMetadataURL(req.URL.String()) {
-					return jsonResponse(t, 200, fmt.Sprintf(`{"manifestVersion":1,"channel":%q,"tag":%q,"artifacts":{"looper-darwin-arm64":{}}}`, tc.channel, tc.tag)), nil
+					return jsonResponse(t, 200, withPublishedArtifacts(t, fmt.Sprintf(`{"manifestVersion":1,"channel":%q,"tag":%q,"artifacts":{"looper-darwin-arm64":{}}}`, tc.channel, tc.tag))), nil
 				}
 				return jsonResponse(t, 200, `{"tag_name":"v1.2.2","assets":[]}`), nil
 			})}})
@@ -46,7 +46,7 @@ func TestVersionedMetadataStillAcceptsBeta(t *testing.T) {
 		if req.URL.String() != defaultReleaseManifestBaseURL+"/v1.2.3-beta.1/manifest.json" {
 			t.Fatalf("unexpected URL %s", req.URL)
 		}
-		return jsonResponse(t, 200, `{"manifestVersion":1,"channel":"beta","tag":"v1.2.3-beta.1","artifacts":{"looperd-darwin-arm64":{}}}`), nil
+		return jsonResponse(t, 200, withPublishedArtifacts(t, `{"manifestVersion":1,"channel":"beta","tag":"v1.2.3-beta.1","artifacts":{"looperd-darwin-arm64":{}}}`)), nil
 	})}})
 	got, err := newCommandRuntime(app, nil).fetchReleaseMetadata(context.Background(), "v1.2.3-beta.1")
 	if err != nil || got.TagName != "v1.2.3-beta.1" {
@@ -96,7 +96,7 @@ func TestUpgradeFallsBackAfterCDNSelectedDownloadFails(t *testing.T) {
 							return nil, fmt.Errorf("daemon offline")
 						}
 						if isCDNReleaseMetadataURL(u) {
-							return jsonResponse(t, 200, fmt.Sprintf(`{"manifestVersion":1,"channel":"stable","tag":"v999.0.0","artifacts":{%q:{}}}`, cdnName)), nil
+							return jsonResponse(t, 200, withPublishedArtifacts(t, fmt.Sprintf(`{"manifestVersion":1,"channel":"stable","tag":"v999.0.0","artifacts":{%q:{}}}`, cdnName))), nil
 						}
 						if strings.HasPrefix(u, "https://api.github.com/") {
 							if u != buildGitHubReleaseAPIURL(defaultReleaseOwner, defaultReleaseRepo, "") {
@@ -191,7 +191,7 @@ func TestVersionedDaemonInstallDownloadFallbackKeepsRequestedTag(t *testing.T) {
 		}
 		switch u {
 		case buildReleaseManifestURL(defaultReleaseManifestBaseURL, tag):
-			return jsonResponse(t, 200, fmt.Sprintf(`{"manifestVersion":1,"channel":"beta","tag":%q,"artifacts":{%q:{}}}`, tag, name)), nil
+			return jsonResponse(t, 200, withPublishedArtifacts(t, fmt.Sprintf(`{"manifestVersion":1,"channel":"beta","tag":%q,"artifacts":{%q:{}}}`, tag, name))), nil
 		case githubReleaseDownloadURL(defaultReleaseOwner, defaultReleaseRepo, tag, name):
 			return textResponse(t, 404, "missing"), nil
 		case buildGitHubReleaseAPIURL(defaultReleaseOwner, defaultReleaseRepo, tag):
