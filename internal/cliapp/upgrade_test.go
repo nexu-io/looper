@@ -1369,42 +1369,56 @@ func TestUpgradeCLIRefusesHomebrewSymlinkWithGuidance(t *testing.T) {
 
 func TestUpgradeCLIPreflightsInstallPathBeforeDownload(t *testing.T) {
 	t.Parallel()
+	for _, fromCDN := range []bool{false, true} {
+		t.Run(fmt.Sprintf("CDN=%v", fromCDN), func(t *testing.T) {
+			t.Parallel()
 
-	root := t.TempDir()
-	blockingPath := filepath.Join(root, ".looper")
-	if err := os.WriteFile(blockingPath, []byte("not a directory"), 0o644); err != nil {
-		t.Fatalf("WriteFile(blockingPath) error = %v", err)
-	}
-	execPath := filepath.Join(root, ".looper", "bin", "looper")
-
-	stdout := &bytes.Buffer{}
-	stderr := &bytes.Buffer{}
-	app := New(Deps{
-		Stdout:         stdout,
-		Stderr:         stderr,
-		HomeDir:        t.TempDir(),
-		ExecutablePath: execPath,
-		CLIChannel:     cliInstallChannelStable,
-		HTTPClient: newTestHTTPClient(func(req *http.Request) (*http.Response, error) {
-			switch req.URL.String() {
-			case "https://api.github.com/repos/nexu-io/looper/releases/latest":
-				return jsonResponse(t, http.StatusOK, `{"tag_name":"v0.3.0","assets":[{"name":"looper-darwin-arm64","browser_download_url":"https://example.invalid/looper-darwin-arm64"},{"name":"looper-darwin-arm64.sha256","browser_download_url":"https://example.invalid/looper-darwin-arm64.sha256"}]}`), nil
-			default:
-				t.Fatalf("unexpected request URL %q", req.URL.String())
-				return nil, nil
+			root := t.TempDir()
+			blockingPath := filepath.Join(root, ".looper")
+			if err := os.WriteFile(blockingPath, []byte("not a directory"), 0o644); err != nil {
+				t.Fatalf("WriteFile(blockingPath) error = %v", err)
 			}
-		}),
-	})
+			execPath := filepath.Join(root, ".looper", "bin", "looper")
 
-	exitCode := app.Run(context.Background(), []string{"upgrade", "--cli"})
-	if exitCode != 1 {
-		t.Fatalf("Run([upgrade --cli]) exit code = %d, want 1", exitCode)
-	}
-	if !strings.Contains(stderr.String(), "install location is not writable") {
-		t.Fatalf("stderr = %q, want writable guidance", stderr.String())
-	}
-	if strings.Contains(stderr.String(), "download") {
-		t.Fatalf("stderr = %q, did not expect download failure", stderr.String())
+			stdout := &bytes.Buffer{}
+			stderr := &bytes.Buffer{}
+			app := New(Deps{
+				Stdout:         stdout,
+				Stderr:         stderr,
+				HomeDir:        t.TempDir(),
+				ExecutablePath: execPath,
+				CLIChannel:     cliInstallChannelStable,
+				HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+					if isCDNReleaseMetadataURL(req.URL.String()) {
+						if fromCDN {
+							return jsonResponse(t, http.StatusOK, withPublishedArtifacts(t, `{"manifestVersion":1,"channel":"stable","tag":"v0.3.0","artifacts":{"looper-darwin-arm64":{}}}`)), nil
+						}
+						return jsonResponse(t, http.StatusNotFound, `{}`), nil
+					}
+					if fromCDN {
+						t.Fatalf("local refusal must not try GitHub: %s", req.URL)
+					}
+					switch req.URL.String() {
+					case "https://api.github.com/repos/nexu-io/looper/releases/latest":
+						return jsonResponse(t, http.StatusOK, `{"tag_name":"v0.3.0","assets":[{"name":"looper-darwin-arm64","browser_download_url":"https://example.invalid/looper-darwin-arm64"},{"name":"looper-darwin-arm64.sha256","browser_download_url":"https://example.invalid/looper-darwin-arm64.sha256"}]}`), nil
+					default:
+						t.Fatalf("unexpected request URL %q", req.URL.String())
+						return nil, nil
+					}
+				})},
+			})
+
+			exitCode := app.Run(context.Background(), []string{"upgrade", "--cli"})
+			if exitCode != 1 {
+				t.Fatalf("Run([upgrade --cli]) exit code = %d, want 1", exitCode)
+			}
+			if !strings.Contains(stderr.String(), "install location is not writable") {
+				t.Fatalf("stderr = %q, want writable guidance", stderr.String())
+			}
+			if strings.Contains(stderr.String(), "download") {
+				t.Fatalf("stderr = %q, did not expect download failure", stderr.String())
+			}
+		})
 	}
 }
 

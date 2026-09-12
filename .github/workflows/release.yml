@@ -23,7 +23,9 @@ on:
           - stable
           - beta
 
+# Native multi-pending queues: https://github.blog/changelog/2026-05-07-github-actions-concurrency-groups-now-allow-larger-queues/
 concurrency:
+  queue: max
   group: release-${{ github.event_name == 'workflow_dispatch' && format('{0}-{1}-{2}', github.ref_name, inputs.version_bump, inputs.release_channel) || github.ref_name }}
 
 permissions:
@@ -543,6 +545,10 @@ jobs:
       - build-looperd
       - publish-loopernet-image
     runs-on: ubuntu-latest
+    concurrency:
+      queue: max
+      group: looper-r2-pointer-${{ needs.prepare-go-release.outputs.release-channel }}
+      cancel-in-progress: false
 
     steps:
       - name: Check out repository
@@ -676,3 +682,17 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ needs.prepare-go-release.outputs.release-tag }}
         run: gh release edit "$RELEASE_TAG" --draft=false
+
+      - name: Publish release manifest to Cloudflare R2
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          RELEASE_TAG: ${{ needs.prepare-go-release.outputs.release-tag }}
+          RELEASE_CHANNEL: ${{ needs.prepare-go-release.outputs.release-channel }}
+          RELEASE_MANIFEST: release-assets/manifest.json
+        run: |
+          if [ -z "${CLOUDFLARE_API_TOKEN:-}" ] || [ -z "${CLOUDFLARE_ACCOUNT_ID:-}" ]; then
+            echo "CLOUDFLARE_API_TOKEN secret and CLOUDFLARE_ACCOUNT_ID variable are required to publish the release manifest to R2." >&2
+            exit 1
+          fi
+          ./scripts/publish-release-manifest-r2.sh

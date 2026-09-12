@@ -10,15 +10,20 @@ import (
 	"path/filepath"
 	goruntime "runtime"
 	"strings"
+	"time"
 
+	"github.com/nexu-io/looper/internal/release"
 	"github.com/spf13/cobra"
 )
 
 const (
-	defaultReleaseOwner = "nexu-io"
-	defaultReleaseRepo  = "looper"
-	looperdBinaryName   = "looperd"
-	looperdUserAgent    = "looper-cli"
+	defaultReleaseOwner           = "nexu-io"
+	defaultReleaseRepo            = "looper"
+	defaultReleaseManifestBaseURL = "https://releases.looper.powerformer.com"
+	looperdBinaryName             = "looperd"
+	looperdUserAgent              = "looper-cli"
+	releaseMetadataTimeout        = 5 * time.Second
+	maxReleaseMetadataBytes       = 1 << 20
 )
 
 type daemonInstallResult struct {
@@ -105,12 +110,29 @@ func (r *commandRuntime) prepareManagedDaemonInstall(ctx context.Context, force 
 		}
 	}
 
-	release, err := r.fetchReleaseMetadata(ctx, tag)
+	var prepared preparedDaemonInstall
+	_, err = r.fetchReleaseMetadataMatching(ctx, tag, func(payload githubReleasePayload) (bool, error) {
+		var err error
+		prepared, err = r.prepareManagedDaemonInstallFromRelease(ctx, payload, progress)
+		return true, err
+	})
+	return prepared, err
+}
+
+// Preparation includes download and checksum verification; installation happens
+// only after a source has successfully supplied the complete release.
+func (r *commandRuntime) prepareManagedDaemonInstallFromRelease(ctx context.Context, payload githubReleasePayload, progress io.Writer) (preparedDaemonInstall, error) {
+	homeDir, err := r.homeDir()
 	if err != nil {
 		return preparedDaemonInstall{}, err
 	}
+	target, err := resolveLooperdTarget(r.platform(), r.arch())
+	if err != nil {
+		return preparedDaemonInstall{}, err
+	}
+	installPath := filepath.Join(homeDir, ".looper", "bin", looperdBinaryName)
 
-	asset, err := findReleaseAssetSet(release, looperdBinaryName+"-"+target)
+	asset, err := findReleaseAssetSet(payload, looperdBinaryName+"-"+target)
 	if err != nil {
 		return preparedDaemonInstall{}, fmt.Errorf("looperd release: %w", err)
 	}
@@ -157,17 +179,73 @@ func commitPreparedDaemonInstall(prepared preparedDaemonInstall) error {
 }
 
 func (r *commandRuntime) fetchReleaseMetadata(ctx context.Context, tag string) (githubReleasePayload, error) {
-	releaseURL := buildGitHubReleaseAPIURL(defaultReleaseOwner, defaultReleaseRepo, tag)
+	return r.fetchReleaseMetadataMatching(ctx, tag, nil)
+}
+
+// accept may prepare a download before accepting a source. retry distinguishes
+// a failed release source from a local refusal (for example, an unwritable CLI).
+func (r *commandRuntime) fetchReleaseMetadataMatching(ctx context.Context, tag string, accept func(githubReleasePayload) (retry bool, err error)) (githubReleasePayload, error) {
+	var lastErr error
+	for _, releaseURL := range releaseMetadataURLs(tag) {
+		if err := ctx.Err(); err != nil {
+			return githubReleasePayload{}, err
+		}
+		payload, err := r.fetchReleaseMetadataFromURL(ctx, releaseURL)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if err := requireMatchingReleaseTag(payload, tag); err != nil {
+			lastErr = err
+			continue
+		}
+		if accept != nil {
+			if retry, err := accept(payload); err != nil {
+				if !retry {
+					return githubReleasePayload{}, err
+				}
+				lastErr = err
+				continue
+			}
+		}
+		return payload, nil
+	}
+	if lastErr == nil {
+		return githubReleasePayload{}, fmt.Errorf("Failed to fetch GitHub release metadata from %s (status missing)", buildGitHubReleaseAPIURL(defaultReleaseOwner, defaultReleaseRepo, tag))
+	}
+	return githubReleasePayload{}, lastErr
+}
+
+func requireMatchingReleaseTag(payload githubReleasePayload, requested string) error {
+	requested = strings.TrimSpace(requested)
+	if requested == "" {
+		return nil
+	}
+	got := strings.TrimSpace(payload.TagName)
+	if got == "" {
+		return fmt.Errorf("release metadata is missing tag_name")
+	}
+	if normalizeVersion(got) != normalizeVersion(requested) {
+		return fmt.Errorf("release metadata tag %q does not match requested %q", got, requested)
+	}
+	return nil
+}
+
+func (r *commandRuntime) fetchReleaseMetadataFromURL(ctx context.Context, releaseURL string) (githubReleasePayload, error) {
+	// Bound each source independently, including reading its response body,
+	// so a stalled CDN leaves the caller's context usable for GitHub.
+	ctx, cancel := context.WithTimeout(ctx, releaseMetadataTimeout)
+	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, releaseURL, nil)
 	if err != nil {
 		return githubReleasePayload{}, fmt.Errorf("build release metadata request: %w", err)
 	}
 	req.Header.Set("User-Agent", looperdUserAgent)
-	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("Accept", "application/json, application/vnd.github+json")
 
 	resp, err := r.httpClient().Do(req)
 	if err != nil {
-		return githubReleasePayload{}, fmt.Errorf("fetch GitHub release metadata: %w", err)
+		return githubReleasePayload{}, fmt.Errorf("fetch release metadata from %s: %w", releaseURL, err)
 	}
 	defer resp.Body.Close()
 
@@ -175,9 +253,16 @@ func (r *commandRuntime) fetchReleaseMetadata(ctx context.Context, tag string) (
 		return githubReleasePayload{}, fmt.Errorf("Failed to fetch GitHub release metadata from %s (status %s)", releaseURL, resp.Status)
 	}
 
-	var payload githubReleasePayload
-	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
-		return githubReleasePayload{}, fmt.Errorf("decode GitHub release payload: %w", err)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxReleaseMetadataBytes+1))
+	if err != nil {
+		return githubReleasePayload{}, fmt.Errorf("read release metadata from %s: %w", releaseURL, err)
+	}
+	if len(body) > maxReleaseMetadataBytes {
+		return githubReleasePayload{}, fmt.Errorf("release metadata from %s exceeds %d bytes", releaseURL, maxReleaseMetadataBytes)
+	}
+	payload, err := decodeReleaseMetadata(body, releaseURL)
+	if err != nil {
+		return githubReleasePayload{}, fmt.Errorf("decode release metadata from %s: %w", releaseURL, err)
 	}
 	if payload.Assets == nil {
 		return githubReleasePayload{}, fmt.Errorf("GitHub release payload is missing assets array: %s", releaseURL)
@@ -279,12 +364,117 @@ func resolveLooperdTarget(platform string, arch string) (string, error) {
 	return "", fmt.Errorf("Unsupported platform/arch for looperd install: %s-%s. Supported targets: darwin-arm64, linux-amd64", platform, arch)
 }
 
+func releaseMetadataURLs(tag string) []string {
+	return []string{
+		buildReleaseManifestURL(defaultReleaseManifestBaseURL, tag),
+		buildGitHubReleaseAPIURL(defaultReleaseOwner, defaultReleaseRepo, tag),
+	}
+}
+
+func buildReleaseManifestURL(base, tag string) string {
+	base = strings.TrimRight(strings.TrimSpace(base), "/")
+	tag = strings.TrimSpace(tag)
+	if tag == "" {
+		return base + "/channels/stable.json"
+	}
+	return base + "/" + tag + "/manifest.json"
+}
+
 func buildGitHubReleaseAPIURL(owner, repo, tag string) string {
 	base := fmt.Sprintf("https://api.github.com/repos/%s/%s/releases", owner, repo)
 	if strings.TrimSpace(tag) != "" {
 		return base + "/tags/" + tag
 	}
 	return base + "/latest"
+}
+
+func decodeReleaseMetadata(body []byte, sourceURL string) (githubReleasePayload, error) {
+	// The endpoint determines the schema. Never interpret CDN content as a
+	// GitHub API response, whose download URLs are trusted by callers.
+	if isCDNReleaseMetadataURL(sourceURL) {
+		var manifest release.Manifest
+		if err := json.Unmarshal(body, &manifest); err != nil {
+			return githubReleasePayload{}, err
+		}
+		if manifest.ManifestVersion != release.ManifestVersion {
+			return githubReleasePayload{}, fmt.Errorf("unsupported release manifest version %d", manifest.ManifestVersion)
+		}
+		tag := canonicalReleaseTag(manifest.Tag, manifest.Version)
+		if err := release.ValidateTag(tag); err != nil {
+			return githubReleasePayload{}, err
+		}
+		parsed, err := parseSemver(tag)
+		if err != nil {
+			return githubReleasePayload{}, err
+		}
+		if sourceURL == buildReleaseManifestURL(defaultReleaseManifestBaseURL, "") && (manifest.Channel != "stable" || parsed.preRelease != "") {
+			return githubReleasePayload{}, fmt.Errorf("stable release metadata must declare channel stable and a non-prerelease tag")
+		}
+		payload := githubReleaseFromManifest(manifest)
+		// A release publishes both binaries for both supported targets. Validate
+		// that contract here so checks and installs reject the same partial CDN
+		// object; raw binaries remain valid for older release manifests.
+		for _, target := range []string{"darwin-arm64", "linux-amd64"} {
+			for _, binary := range []string{"looper", "looperd"} {
+				if _, err := findReleaseAssetSet(payload, binary+"-"+target); err != nil {
+					return githubReleasePayload{}, fmt.Errorf("incomplete release manifest: %w", err)
+				}
+			}
+		}
+		return payload, nil
+	}
+	var payload githubReleasePayload
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return githubReleasePayload{}, err
+	}
+	return payload, nil
+}
+
+func isCDNReleaseMetadataURL(raw string) bool {
+	return strings.HasPrefix(raw, defaultReleaseManifestBaseURL+"/")
+}
+
+func githubReleaseFromManifest(manifest release.Manifest) githubReleasePayload {
+	tag := canonicalReleaseTag(manifest.Tag, manifest.Version)
+	assets := make([]githubReleaseAsset, 0, len(manifest.Artifacts)*2)
+	for name := range manifest.Artifacts {
+		name = strings.TrimSpace(name)
+		if tag == "" || !isGitHubReleaseAssetName(name) {
+			continue
+		}
+		assets = append(assets, githubReleaseAsset{
+			Name:               name,
+			BrowserDownloadURL: githubReleaseDownloadURL(defaultReleaseOwner, defaultReleaseRepo, tag, name),
+		})
+		if strings.HasSuffix(name, ".sha256") {
+			continue
+		}
+		assets = append(assets, githubReleaseAsset{
+			Name:               name + ".sha256",
+			BrowserDownloadURL: githubReleaseDownloadURL(defaultReleaseOwner, defaultReleaseRepo, tag, name+".sha256"),
+		})
+	}
+	return githubReleasePayload{TagName: tag, Assets: assets}
+}
+
+func githubReleaseDownloadURL(owner, repo, tag, name string) string {
+	return fmt.Sprintf("https://github.com/%s/%s/releases/download/%s/%s", owner, repo, tag, name)
+}
+
+func isGitHubReleaseAssetName(name string) bool {
+	return name != "" && !strings.ContainsAny(name, "/\\") && !strings.Contains(name, "..")
+}
+
+func canonicalReleaseTag(tag, version string) string {
+	tag = strings.TrimSpace(tag)
+	if tag == "" {
+		tag = strings.TrimSpace(version)
+	}
+	tag = strings.TrimPrefix(tag, "v")
+	if tag == "" {
+		return ""
+	}
+	return "v" + tag
 }
 
 func parseChecksum(value string) (string, error) {
