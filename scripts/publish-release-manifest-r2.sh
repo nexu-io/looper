@@ -2,7 +2,7 @@
 # Publish the generated release manifest to Cloudflare R2.
 #
 # Layout (bucket looper-releases, public host releases.looper.powerformer.com):
-#   <tag>/manifest.json       immutable per-release copy
+#   <tag>/manifest.json       per-release copy, refreshed on reruns
 #   channels/<channel>.json   mutable latest pointer for that channel
 #   manifest.json             alias of the latest stable pointer
 #
@@ -14,8 +14,9 @@ set -eu
 BUCKET="${R2_RELEASES_BUCKET:-looper-releases}"
 MANIFEST="${RELEASE_MANIFEST:-release-assets/manifest.json}"
 CONTENT_TYPE="application/json; charset=utf-8"
-VERSIONED_CACHE="public, max-age=31536000, immutable"
-POINTER_CACHE="public, max-age=60"
+# Release reruns rebuild and replace GitHub assets, so their metadata must
+# refresh too. Apply one short cache policy to every manifest.
+MANIFEST_CACHE="public, max-age=60"
 
 if [ ! -f "$MANIFEST" ]; then
   echo "release manifest not found: $MANIFEST" >&2
@@ -44,17 +45,16 @@ wrangler_bin() {
 
 put_object() {
   key="$1"
-  cache="$2"
   echo "uploading $MANIFEST -> r2://${BUCKET}/${key}"
   wrangler_bin r2 object put "${BUCKET}/${key}" \
     --file "$MANIFEST" \
     --content-type "$CONTENT_TYPE" \
-    --cache-control "$cache" \
+    --cache-control "$MANIFEST_CACHE" \
     --remote
 }
 
 # Return 0 if the channel pointer should be replaced with TAG.
-# Missing pointer or an older/equal existing tag → update.
+# Missing/invalid pointer or an older/equal existing tag → update.
 # A strictly newer existing tag → skip, so a rerun of an old release
 # cannot pin upgrades backwards. Reads R2 directly so CDN max-age=60
 # cannot feed a stale pointer into the check.
@@ -103,13 +103,21 @@ def version_key(tag):
         pre_key = (0,) + tuple(parts)
     return (int(match.group(1)), int(match.group(2)), int(match.group(3)), pre_key)
 
-existing = json.load(open(sys.argv[1], encoding="utf-8"))
-existing_key = version_key(existing.get("tag") or existing.get("version") or "")
 incoming_key = version_key(sys.argv[2])
-if existing_key is None or incoming_key is None:
-    sys.stderr.write("cannot compare channel pointer versions\n")
+if incoming_key is None:
+    sys.stderr.write("cannot compare incoming release version\n")
     raise SystemExit(2)
-raise SystemExit(0 if incoming_key >= existing_key else 1)
+
+# A successfully fetched but malformed object has no usable version to protect.
+# Transport/auth errors still fail in the R2 read above; local I/O errors are
+# intentionally not caught here either.
+try:
+    with open(sys.argv[1], encoding="utf-8") as current:
+        existing = json.load(current)
+except (json.JSONDecodeError, UnicodeDecodeError):
+    existing = None
+existing_key = version_key(existing.get("tag") or existing.get("version") or "") if isinstance(existing, dict) else None
+raise SystemExit(0 if existing_key is None or incoming_key >= existing_key else 1)
 PY
   rm -f "$existing_file"
   case "$python_status" in
@@ -127,12 +135,12 @@ PY
 }
 
 
-put_object "${TAG}/manifest.json" "$VERSIONED_CACHE"
+put_object "${TAG}/manifest.json"
 
 if should_update_pointer "$CHANNEL" "$TAG"; then
-  put_object "channels/${CHANNEL}.json" "$POINTER_CACHE"
+  put_object "channels/${CHANNEL}.json"
   if [ "$CHANNEL" = "stable" ]; then
-    put_object "manifest.json" "$POINTER_CACHE"
+    put_object "manifest.json"
   fi
 else
   echo "skipping channel pointer update: existing ${CHANNEL} pointer is newer than ${TAG}"

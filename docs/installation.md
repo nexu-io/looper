@@ -144,7 +144,7 @@ CDN object layout:
 - `https://releases.looper.powerformer.com/manifest.json` — latest stable pointer
 - `https://releases.looper.powerformer.com/channels/stable.json` — same stable pointer
 - `https://releases.looper.powerformer.com/channels/beta.json` — latest beta pointer
-- `https://releases.looper.powerformer.com/<tag>/manifest.json` — immutable per-release copy
+- `https://releases.looper.powerformer.com/<tag>/manifest.json` — per-release copy, refreshed on reruns (60-second cache)
 
 ## Compatibility and version policy
 
