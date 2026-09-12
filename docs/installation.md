@@ -135,6 +135,7 @@ Current behavior:
 - CDN manifests must list both `looper` and `looperd` for `darwin-arm64` and `linux-amd64` (raw or archived); incomplete manifests fall back to GitHub for both version checks and installation
 - stable CDN metadata must declare `channel: stable` and a non-prerelease tag; explicitly requested versions can still select beta releases
 - install and upgrade retry GitHub metadata if CDN-selected binaries cannot be downloaded, verified, or extracted; upgrades recheck the fallback version before replacing files, and fixed-version installs keep their requested tag
+- each candidate binary and its checksum share a 2-minute download deadline; a timeout permits trying the next release source while preserving any shorter caller deadline
 - each metadata source has a 5-second timeout and a 1 MiB response limit; malformed, unsupported, oversized, or stalled CDN metadata falls back to GitHub
 - manifest-gated rollback and channel switching are not implemented yet
 
