@@ -21,6 +21,7 @@ func TestHostingIdentityProjectProbesAreScopedOutsidePublicationBoundary(t *test
 				cfg := projectHostingIdentityConfig(t)
 				cfg.Roles.Reviewer.AutoMerge.Enabled = true
 				cfg.Roles.Reviewer.AutoMerge.RequireBranchProtection = false
+				cfg.Roles.Reviewer.Identity = "reviewer-bot"
 				project := config.ProjectRefConfig{ID: "project", Name: "Project", Repo: "owner/repo", RepoPath: t.TempDir(), Identity: "worker-bot"}
 				if operation == "startup_sync" {
 					cfg.Projects = []config.ProjectRefConfig{project}
@@ -34,7 +35,7 @@ func TestHostingIdentityProjectProbesAreScopedOutsidePublicationBoundary(t *test
 					GetRepositorySettings: func(ctx context.Context, input githubinfra.RepositorySettingsInput) (githubinfra.RepositorySettings, error) {
 						calls++
 						session, selected := hostingidentity.FromContext(ctx)
-						if !selected || session.Name() != "worker-bot" || session.ProjectID() != "project" || session.Role() != "worker" || input.Repo != "owner/repo" {
+						if !selected || session.Name() != "reviewer-bot" || session.ProjectID() != "project" || session.Role() != "reviewer" || input.Repo != "owner/repo" {
 							t.Fatalf("project probe has wrong selection: %v, %#v", session, input)
 						}
 						if !boundary.TryLock() {
@@ -51,7 +52,7 @@ func TestHostingIdentityProjectProbesAreScopedOutsidePublicationBoundary(t *test
 				if operation == "add" {
 					var result AddResult
 					result, err = service.AddProject(context.Background(), AddInput{ID: project.ID, Name: project.Name, RepoPath: project.RepoPath, Repo: &project.Repo, Identity: &project.Identity})
-					if !semantic && (len(result.Warnings) == 0 || !strings.Contains(strings.Join(result.Warnings, " "), `hosting identity "worker-bot"`)) {
+					if !semantic && (len(result.Warnings) == 0 || !strings.Contains(strings.Join(result.Warnings, " "), `hosting identity "reviewer-bot"`)) {
 						t.Fatalf("missing affected identity diagnostics: %#v, %v", result, err)
 					}
 				} else {

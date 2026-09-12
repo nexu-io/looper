@@ -220,6 +220,22 @@ func TestValidateHostingIdentitiesReportsEveryStaticIssueWithoutReadingCredentia
 	}
 }
 
+func TestValidateHostingIdentitiesRejectsHTTPBaseURL(t *testing.T) {
+	cfg := hostingIdentityFixture(t)
+	cfg.Identities["http-bot"] = HostingIdentityConfig{Kind: HostingIdentityForgejoToken, BaseURL: "http://code.example", TokenEnv: "UNSET_BOT_TOKEN"}
+	err := ValidateHostingIdentities(cfg)
+	var validation *ConfigValidationError
+	if !errors.As(err, &validation) {
+		t.Fatalf("got %v, want ConfigValidationError", err)
+	}
+	assertValidationIssueForPaths(t, validation.Issues, []string{"identities.http-bot.baseUrl"})
+	for _, issue := range validation.Issues {
+		if issue.Path == "identities.http-bot.baseUrl" && !strings.Contains(issue.Message, "https") {
+			t.Fatalf("http identity error = %q, want https requirement", issue.Message)
+		}
+	}
+}
+
 func TestHostingIdentityInstanceBindingAndPlaneCodeRepository(t *testing.T) {
 	cfg := hostingIdentityFixture(t)
 	cfg.Identities["forgejo"] = HostingIdentityConfig{Kind: HostingIdentityForgejoToken, BaseURL: "https://code.example/team", TokenEnv: "UNSET_FORGEJO_IDENTITY_TOKEN"}

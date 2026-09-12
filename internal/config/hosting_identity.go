@@ -228,7 +228,7 @@ func validateHostingIdentityDefinition(definition HostingIdentityConfig, path st
 		*issues = append(*issues, ValidationIssue{Path: path + "." + field, Message: message})
 	}
 	if !validHostingIdentityBaseURL(definition.BaseURL) {
-		add("baseUrl", "must be an absolute http(s) instance URL without credentials, query, or fragment")
+		add("baseUrl", "must be an absolute https instance URL without credentials, query, or fragment")
 	}
 	switch definition.Kind {
 	case HostingIdentityGitHubApp:
@@ -280,7 +280,7 @@ func validateHostingIdentityDefinition(definition HostingIdentityConfig, path st
 
 func validHostingIdentityBaseURL(value string) bool {
 	parsed, err := url.Parse(value)
-	return err == nil && (parsed.Scheme == "http" || parsed.Scheme == "https") && parsed.Hostname() != "" && parsed.User == nil && parsed.RawQuery == "" && !parsed.ForceQuery && parsed.Fragment == "" && parsed.Opaque == ""
+	return err == nil && parsed.Scheme == "https" && parsed.Hostname() != "" && parsed.User == nil && parsed.RawQuery == "" && !parsed.ForceQuery && parsed.Fragment == "" && parsed.Opaque == ""
 }
 
 func hostingIdentityTargetError(definition HostingIdentityConfig, target RepositoryIdentity) string {

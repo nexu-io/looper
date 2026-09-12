@@ -461,9 +461,11 @@ its `baseUrl` defaults to `https://github.com`. For GitHub Enterprise, set the
 instance origin on both the identity and its provider, without `/api/v3`.
 `forgejo-token` requires the instance `baseUrl` and the name of the environment
 variable containing the dedicated account's token. Supply that variable to the
-daemon process. Do not place tokens or private-key contents in configuration or
-`agent.env`. Legacy provider `tokenEnv` and explicit `teaLogin` authentication
-remain available to projects without a selected identity.
+daemon process. Identity `baseUrl` values must be HTTPS; HTTP instances are
+static configuration errors because bot Git transport cannot use them. Do not
+place tokens or private-key contents in configuration or `agent.env`. Legacy
+provider `tokenEnv` and explicit `teaLogin` authentication remain available to
+projects without a selected identity.
 
 An identity must match the project's provider and instance, including a Forgejo
 deployment path prefix. Bot projects must specify `repo = "owner/name"`. Plane
@@ -491,7 +493,8 @@ selected identity; they never select personal credentials as a fallback.
 
 Startup probes report affected identity, project and role in daemon logs while
 other identities continue running. Repository settings/import operations use
-the project's worker identity policy, PR snapshots use reviewer policy,
+the project's worker identity policy, reviewer auto-merge admission uses
+reviewer policy, PR snapshots use reviewer policy,
 coordinator dependency probes use coordinator policy, and HITL comments/polls
 use the originating loop's role policy.
 

@@ -113,9 +113,10 @@ func stringValue(value *string) string {
 
 // validateHostingReviewerAutoMerge preserves semantic configuration failures.
 // An explicit bot's unavailable external settings are diagnostics; runtime
-// publication still performs its normal remote protection checks.
+// publication still performs its normal remote protection checks. Bind the
+// reviewer role so admission uses the account that will perform auto-merge.
 func (s *Service) validateHostingReviewerAutoMerge(ctx context.Context, projectID string, repo *string, baseBranch string, cfg config.Config) (string, error) {
-	bound, err := hostingidentity.Bind(ctx, cfg, projectID, "worker")
+	bound, err := hostingidentity.Bind(ctx, cfg, projectID, "reviewer")
 	if err != nil {
 		return "", err
 	}
