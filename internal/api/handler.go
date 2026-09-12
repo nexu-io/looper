@@ -2196,6 +2196,7 @@ type activeRunView struct {
 	ResumePolicy      *string            `json:"resumePolicy,omitempty"`
 	CurrentStep       *string            `json:"currentStep"`
 	StartedAt         *string            `json:"startedAt"`
+	AvailableAt       *string            `json:"availableAt,omitempty"`
 	EndedAt           *string            `json:"endedAt,omitempty"`
 	Target            activeRunTarget    `json:"target"`
 	Agent             *activeRunAgent    `json:"agent"`
@@ -3313,7 +3314,13 @@ func (h *Handler) buildActiveRunViews(ctx context.Context, includeRunningLoopsWi
 		if !ok {
 			continue
 		}
-		startedAt := firstNonEmptyString(loop.NextRunAt, stringPtrOrNil(loop.UpdatedAt), stringPtrOrNil(loop.CreatedAt))
+		// Queue creation measures this enqueue, even for an old loop or a
+		// debounce that keeps extending its eligibility time.
+		var startedAt, availableAt *string
+		if queue := latestQueueByLoopID[loop.ID]; queueIsActiveAutomation(queue) {
+			startedAt = stringPtrOrNil(queue.CreatedAt)
+			availableAt = stringPtrOrNil(queue.AvailableAt)
+		}
 		view := activeRunView{
 			Seq:         loop.Seq,
 			RunID:       nil,
@@ -3324,6 +3331,7 @@ func (h *Handler) buildActiveRunViews(ctx context.Context, includeRunningLoopsWi
 			LoopStatus:  loop.Status,
 			CurrentStep: nil,
 			StartedAt:   startedAt,
+			AvailableAt: availableAt,
 			Target:      target,
 			Agent:       nil,
 			Worktree:    nil,

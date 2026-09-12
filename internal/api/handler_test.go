@@ -5603,6 +5603,17 @@ func TestHandlerRunRoutesMatchFrozenSuccessArtifacts(t *testing.T) {
 
 			actual := normalizeResponseValue(parseJSONValue(t, recorder.Body.Bytes()), fixture.rootDir)
 			want := findResponseArtifactRoute(t, routes, tt.routeID)
+			if tt.routeID == "runs.active.list" {
+				// The frozen baseline predates explicit queue eligibility timing.
+				body := want.Body.(map[string]any)
+				items := body["data"].(map[string]any)["items"].([]any)
+				for _, value := range items {
+					item := value.(map[string]any)
+					if item["status"] == "queued" {
+						item["availableAt"] = "2026-04-11T12:03:00.000Z"
+					}
+				}
+			}
 			if !responseFixtureMatches(actual, want.Body) {
 				actualJSON, _ := json.MarshalIndent(actual, "", "  ")
 				wantJSON, _ := json.MarshalIndent(want.Body, "", "  ")
