@@ -203,7 +203,7 @@ func TestMaterializeCatalogUsesRecordsAsProjectAuthority(t *testing.T) {
 	baseBranch := "main"
 	metadata := `{"network":{"mode":"routed"},"provider":"forgejo-main","repo":"core/odcrew","source":"config","worktreeRoot":"/tmp/worktrees"}`
 	archivedMetadata := `{"repo":"acme/removed","source":"config"}`
-	imported := config.Config{Providers: []config.ProviderConfig{{ID: "forgejo-main", Kind: config.ProviderKindForgejo}}, Projects: []config.ProjectRefConfig{
+	imported := config.Config{Providers: []config.ProviderConfig{{ID: "forgejo-main", Kind: config.ProviderKindForgejo, TokenEnv: stringPointer("FORGEJO_TOKEN")}}, Projects: []config.ProjectRefConfig{
 		{ID: "odcrew", Name: "stale name", RepoPath: "/stale", Provider: "stale-provider", Repo: "stale/repo"},
 		{ID: "config-only", Name: "must not appear", RepoPath: "/config-only"},
 	}}
@@ -261,7 +261,7 @@ func TestMaterializeCatalogAllowsDuplicateReposAcrossProviders(t *testing.T) {
 
 	githubMetadata := `{"repo":"nexu-io/looper","source":"config"}`
 	forgejoMetadata := `{"provider":"forgejo-main","repo":"NEXU-IO/LOOPER","source":"api"}`
-	global := config.Config{Providers: []config.ProviderConfig{{ID: "forgejo-main", Kind: config.ProviderKindForgejo}}}
+	global := config.Config{Providers: []config.ProviderConfig{{ID: "forgejo-main", Kind: config.ProviderKindForgejo, TokenEnv: stringPointer("FORGEJO_TOKEN")}}}
 
 	got, err := MaterializeCatalog(global, []storage.ProjectRecord{
 		{ID: "github", MetadataJSON: &githubMetadata},
@@ -294,7 +294,7 @@ func TestMaterializeCatalogAppliesAndValidatesForgejoRoleProfile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DefaultConfig() error = %v", err)
 	}
-	global.Providers = []config.ProviderConfig{{ID: "forgejo-main", Kind: config.ProviderKindForgejo}}
+	global.Providers = []config.ProviderConfig{{ID: "forgejo-main", Kind: config.ProviderKindForgejo, TokenEnv: stringPointer("FORGEJO_TOKEN")}}
 	global.Roles.Coordinator.Enabled = true
 	global.Roles.Coordinator.Dependencies.Enabled = true
 	metadata := `{"provider":"forgejo-main","repo":"core/odcrew","source":"api"}`
@@ -338,7 +338,7 @@ func TestConfiguredProjectMetadataRoundTripsRuntimePolicy(t *testing.T) {
 	if err != nil {
 		t.Fatalf("buildProjectMetadataJSON() error = %v", err)
 	}
-	global := config.Config{Providers: []config.ProviderConfig{{ID: "forgejo-main", Kind: config.ProviderKindForgejo}}}
+	global := config.Config{Providers: []config.ProviderConfig{{ID: "forgejo-main", Kind: config.ProviderKindForgejo, TokenEnv: stringPointer("FORGEJO_TOKEN")}}}
 	got, err := MaterializeCatalog(global, []storage.ProjectRecord{{
 		ID: project.ID, Name: project.Name, RepoPath: project.RepoPath, MetadataJSON: &metadata,
 	}})

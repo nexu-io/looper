@@ -611,6 +611,7 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 	})
 
 	addFlags(root.PersistentFlags(), globalFlags())
+	root.AddCommand(runtime.hostCommand())
 	root.PersistentPreRunE = runtime.maybeRunAutoUpgrade
 	root.SetOut(a.stdout())
 	root.SetErr(a.stderr())

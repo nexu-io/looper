@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/nexu-io/looper/internal/config"
+	"github.com/nexu-io/looper/internal/hostingidentity"
 	"github.com/nexu-io/looper/internal/outboundguard"
 )
 
@@ -23,6 +24,7 @@ const maxForgejoResponseBodyBytes = 1 << 20
 type ForgejoClient struct {
 	baseURL         *url.URL
 	token           string
+	session         *hostingidentity.Session
 	httpClient      *http.Client
 	repo            RepositoryRef
 	capabilityMu    sync.Mutex
@@ -76,6 +78,27 @@ func WithLookPath(lookPath func(string) (string, error)) ForgejoOption {
 }
 
 func NewForgejoClient(ref RepositoryRef, token string, options ...ForgejoOption) (*ForgejoClient, error) {
+	return newForgejoClient(ref, token, nil, options...)
+}
+
+// NewForgejoClientForContext bypasses legacy token/tea lookup for an explicit
+// run binding. Its credential is refreshed before each request.
+func NewForgejoClientForContext(ctx context.Context, provider config.ProviderConfig, repo string, options ...ForgejoOption) (*ForgejoClient, error) {
+	session, selected := hostingidentity.FromContext(ctx)
+	if !selected {
+		return NewForgejoClientFromConfig(provider, repo, options...)
+	}
+	target := session.Target()
+	if session.Kind() != config.HostingIdentityForgejoToken || provider.Kind != config.ProviderKindForgejo || strings.TrimRight(provider.BaseURL, "/") != target.BaseURL {
+		return nil, fmt.Errorf("hosting identity %q: Forgejo provider differs from the bound target", session.Name())
+	}
+	if err := session.CheckRepository(repo); err != nil {
+		return nil, err
+	}
+	return newForgejoClient(RepositoryRef{ProviderID: target.ProviderID, Kind: ProviderKindForgejo, BaseURL: target.BaseURL, Repo: target.Repo}, "", session, options...)
+}
+
+func newForgejoClient(ref RepositoryRef, token string, session *hostingidentity.Session, options ...ForgejoOption) (*ForgejoClient, error) {
 	baseURL, err := parseForgejoBaseURL(ref.BaseURL)
 	if err != nil {
 		return nil, err
@@ -86,12 +109,13 @@ func NewForgejoClient(ref RepositoryRef, token string, options ...ForgejoOption)
 	if strings.TrimSpace(ref.Repo) == "" {
 		return nil, fmt.Errorf("forgejo client: repo is required")
 	}
-	if strings.TrimSpace(token) == "" {
+	if strings.TrimSpace(token) == "" && session == nil {
 		return nil, fmt.Errorf("forgejo client: token is required")
 	}
 	client := &ForgejoClient{
 		baseURL:    baseURL,
 		token:      token,
+		session:    session,
 		httpClient: &http.Client{Timeout: defaultForgejoTimeout},
 		repo: RepositoryRef{
 			ProviderID: strings.TrimSpace(ref.ProviderID),
@@ -110,6 +134,12 @@ func NewForgejoClient(ref RepositoryRef, token string, options ...ForgejoOption)
 	}
 	if client.httpClient.Timeout == 0 {
 		client.httpClient.Timeout = defaultForgejoTimeout
+	}
+	if session != nil {
+		copy := *client.httpClient
+		copy.Jar = nil
+		copy.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+		client.httpClient = &copy
 	}
 	return client, nil
 }
@@ -203,6 +233,10 @@ func (forgejo *ForgejoClient) Capabilities() Capabilities {
 }
 
 func (forgejo *ForgejoClient) CurrentUser(ctx context.Context) (Identity, error) {
+	if forgejo.session != nil {
+		credential, err := forgejo.session.Credentials(ctx)
+		return Identity{Login: credential.Login, ID: credential.NumericID}, err
+	}
 	var user forgejoUser
 	if err := forgejo.do(ctx, http.MethodGet, "user", nil, nil, &user); err != nil {
 		return Identity{}, err
@@ -777,10 +811,24 @@ func (forgejo *ForgejoClient) requireCapability(ctx context.Context, name, metho
 			statusCode = httpErr.StatusCode
 		}
 	} else {
-		response, probeErr := forgejoProbeGET(ctx, forgejo.httpClient, forgejoProbeURL(forgejo.baseURL, "swagger.v1.json"), forgejo.token, maxForgejoOpenAPIBytes)
+		token := forgejo.token
+		if forgejo.session != nil {
+			credential, credentialErr := forgejo.session.Credentials(ctx)
+			if credentialErr != nil {
+				return credentialErr
+			}
+			token = credential.Token
+		}
+		response, probeErr := forgejoProbeGET(ctx, forgejo.httpClient, forgejoProbeURL(forgejo.baseURL, "swagger.v1.json"), token, maxForgejoOpenAPIBytes)
 		err = probeErr
 		body = response.body
 		statusCode = response.statusCode
+		if forgejo.session != nil && err != nil && statusCode != http.StatusNotFound && statusCode != http.StatusMethodNotAllowed {
+			if statusCode == http.StatusUnauthorized || statusCode == http.StatusForbidden {
+				forgejo.session.Invalidate(token)
+			}
+			return &hostingidentity.Error{Identity: forgejo.session.Name(), Operation: "probe Forgejo capability", StatusCode: statusCode, Reason: "hosting server capability request failed"}
+		}
 	}
 	if err != nil {
 		state := ProbeStateUnknown
@@ -887,6 +935,9 @@ func (forgejo *ForgejoClient) do(ctx context.Context, method string, path string
 		return nil
 	}
 	if err := json.Unmarshal(response.body, out); err != nil {
+		if forgejo.session != nil {
+			return fmt.Errorf("hosting identity %q: Forgejo API returned invalid JSON", forgejo.session.Name())
+		}
 		return fmt.Errorf("forgejo API decode %s %s: %w", method, path, err)
 	}
 	return nil
@@ -901,6 +952,17 @@ func (forgejo *ForgejoClient) doRaw(ctx context.Context, method string, path str
 		return rawResponse{}, err
 	}
 	apiURL.RawQuery = query.Encode()
+	token := forgejo.token
+	if forgejo.session != nil {
+		if err := forgejo.session.CheckAPIURL(apiURL.String()); err != nil {
+			return rawResponse{}, err
+		}
+		credential, err := forgejo.session.Credentials(ctx)
+		if err != nil {
+			return rawResponse{}, err
+		}
+		token = credential.Token
+	}
 	var body io.Reader
 	if payload != nil {
 		encoded, err := json.Marshal(payload)
@@ -914,24 +976,46 @@ func (forgejo *ForgejoClient) doRaw(ctx context.Context, method string, path str
 		return rawResponse{}, fmt.Errorf("forgejo API build request %s %s: %w", method, path, err)
 	}
 	request.Header.Set("Accept", "application/json")
-	request.Header.Set("Authorization", "token "+forgejo.token)
+	request.Header.Set("Authorization", "token "+token)
 	if payload != nil {
 		request.Header.Set("Content-Type", "application/json")
 	}
 	response, err := forgejo.httpClient.Do(request)
 	if err != nil {
+		if forgejo.session != nil {
+			if ctx.Err() != nil {
+				return rawResponse{}, fmt.Errorf("hosting identity %q: Forgejo request: %w", forgejo.session.Name(), ctx.Err())
+			}
+			return rawResponse{}, fmt.Errorf("hosting identity %q: Forgejo hosting server request failed", forgejo.session.Name())
+		}
 		return rawResponse{}, fmt.Errorf("forgejo API %s %s failed: %w", method, path, err)
 	}
 	defer response.Body.Close()
 	responseBody, err := io.ReadAll(io.LimitReader(response.Body, maxForgejoResponseBodyBytes+1))
 	if err != nil {
+		if forgejo.session != nil {
+			return rawResponse{}, &hostingidentity.Error{Identity: forgejo.session.Name(), Operation: "read Forgejo response", Reason: "cannot read hosting server response"}
+		}
 		return rawResponse{}, fmt.Errorf("forgejo API read response %s %s: %w", method, path, err)
 	}
 	if len(responseBody) > maxForgejoResponseBodyBytes {
+		if forgejo.session != nil {
+			return rawResponse{}, &hostingidentity.Error{Identity: forgejo.session.Name(), Operation: "read Forgejo response", Reason: "hosting server response exceeds size limit"}
+		}
 		return rawResponse{}, fmt.Errorf("forgejo API %s %s response exceeds %d bytes", method, path, maxForgejoResponseBodyBytes)
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return rawResponse{}, &ForgejoHTTPError{Method: method, Path: path, StatusCode: response.StatusCode, Message: sanitizeForgejoErrorBody(responseBody, forgejo.token)}
+		message := sanitizeForgejoErrorBody(responseBody, token)
+		if forgejo.session != nil {
+			if response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden {
+				forgejo.session.Invalidate(token)
+			}
+			message = fmt.Sprintf("hosting identity %q: hosting server rejected the request", forgejo.session.Name())
+		}
+		return rawResponse{}, &ForgejoHTTPError{Method: method, Path: path, StatusCode: response.StatusCode, Message: message}
+	}
+	if forgejo.session != nil {
+		responseBody = []byte(forgejo.session.Redact(string(responseBody)))
 	}
 	return rawResponse{body: responseBody, header: response.Header.Clone()}, nil
 }

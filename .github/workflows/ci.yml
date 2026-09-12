@@ -64,6 +64,9 @@ jobs:
       - name: Test
         run: go test ./...
 
+      - name: Test hosting identity concurrency
+        run: go test -race ./internal/hostingidentity
+
       - name: Build
         env:
           LOOPER_BUILD_GIT_SHA: ${{ github.sha }}
@@ -98,6 +101,7 @@ jobs:
             all_e2e:
               - 'go.mod'
               - 'go.sum'
+              - 'internal/hostingidentity/**'
               - 'internal/e2e/harness/**'
               - 'internal/e2e/*.go'
             daemon_boot:

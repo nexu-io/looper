@@ -35,6 +35,7 @@ func (l agentLLM) Complete(ctx context.Context, req triage.Request) (string, err
 	}
 	execHandle, err := l.executor.Start(ctx, agent.RunInput{
 		ExecutionID:      eventlog.NewEventID("coordtriage"),
+		ProjectID:        req.ProjectID,
 		Prompt:           req.Prompt,
 		WorkingDirectory: workingDir,
 		Timeout:          l.timeout,

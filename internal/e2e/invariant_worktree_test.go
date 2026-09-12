@@ -267,6 +267,10 @@ func TestInvariantReusedActiveWorkerUsesIsolatedWorktreeAndAvoidsDuplicateLoop(t
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
 	client := newAPIClient(proc.BaseURL())
+	// This invariant exercises real daemon/Git processes under the full suite;
+	// request latency is not its contract. Allow scheduling contention without
+	// weakening the worktree isolation or duplicate-loop assertions below.
+	client.client.Timeout = 10 * time.Second
 	var created struct {
 		ID     string `json:"id"`
 		Status string `json:"status"`

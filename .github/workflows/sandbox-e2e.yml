@@ -21,6 +21,8 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -55,12 +57,49 @@ jobs:
         env:
           LOOPER_E2E_ARTIFACT_ROOT: ${{ runner.temp }}/looper-e2e/github-sandbox-e2e
           LOOPER_E2E_GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
-        run: go test ./internal/e2e -run '^TestGitHubSandbox' -count=1
+        run: go test ./internal/e2e -run '^TestGitHubSandbox' -skip '^TestGitHubSandboxAppIdentity$' -count=1
+
+      - name: Prepare daemon App credential reference
+        env:
+          SANDBOX_APP_PRIVATE_KEY: ${{ secrets.LOOPER_E2E_GITHUB_APP_PRIVATE_KEY }}
+        shell: bash
+        run: |
+          umask 077
+          app_key_dir="$(mktemp -d "${RUNNER_TEMP}/looper-app-key.XXXXXX")"
+          export SANDBOX_APP_KEY_FILE="${app_key_dir}/private.pem"
+          printf 'LOOPER_E2E_GITHUB_APP_PRIVATE_KEY_FILE=%s\n' "$SANDBOX_APP_KEY_FILE" >> "$GITHUB_ENV"
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          key = os.environ["SANDBOX_APP_PRIVATE_KEY"].replace("\\n", "\n")
+          if not key.strip():
+              raise SystemExit("sandbox App private key is missing")
+          Path(os.environ["SANDBOX_APP_KEY_FILE"]).write_text(key)
+          PY
+
+      - name: Verify daemon-owned GitHub App identity
+        env:
+          LOOPER_E2E_ARTIFACT_ROOT: ${{ runner.temp }}/looper-e2e/github-app-identity
+          LOOPER_E2E_GITHUB_APP: "1"
+          LOOPER_E2E_GITHUB_APP_ID: ${{ vars.LOOPER_E2E_GITHUB_APP_ID }}
+          LOOPER_E2E_GITHUB_INSTALLATION_ID: ${{ steps.app-token.outputs.installation-id }}
+        run: go test ./internal/e2e -run '^TestGitHubSandboxAppIdentity$' -count=1
+
+      - name: Remove daemon App private key
+        if: always()
+        shell: bash
+        run: |
+          if [ -n "${LOOPER_E2E_GITHUB_APP_PRIVATE_KEY_FILE:-}" ]; then
+            rm -f -- "$LOOPER_E2E_GITHUB_APP_PRIVATE_KEY_FILE"
+            rmdir -- "$(dirname -- "$LOOPER_E2E_GITHUB_APP_PRIVATE_KEY_FILE")"
+          fi
 
       - name: Upload sandbox artifacts on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: github-sandbox-e2e-artifacts
-          path: ${{ runner.temp }}/looper-e2e/github-sandbox-e2e
+          path: |
+            ${{ runner.temp }}/looper-e2e/github-sandbox-e2e
+            ${{ runner.temp }}/looper-e2e/github-app-identity
           if-no-files-found: ignore

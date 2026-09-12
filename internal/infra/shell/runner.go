@@ -37,9 +37,11 @@ type Result struct {
 }
 
 type Options struct {
-	Command          string
-	Args             []string
-	CWD              string
+	Command string
+	Args    []string
+	CWD     string
+	// Env replaces the child environment when non-nil, including an empty
+	// map. Nil retains the legacy behavior of inheriting the daemon environment.
 	Env              map[string]string
 	Stdin            string
 	Timeout          time.Duration
@@ -388,7 +390,7 @@ func startContainedCommand(ctx context.Context, options Options, gracefulShutdow
 
 		cmd := exec.Command(options.Command, options.Args...)
 		cmd.Dir = options.CWD
-		if len(options.Env) > 0 {
+		if options.Env != nil {
 			cmd.Env = envSlice(options.Env)
 		}
 		if options.Stdin != "" {

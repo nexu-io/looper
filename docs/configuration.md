@@ -99,6 +99,7 @@ The hot-safe surface is an explicit allowlist (see [ADR-0014](adr/0014-config-fi
 - `agent.vendor` (including adding the first vendor after daemon startup), `agent.model`, individual `agent.env` entries, and the canonical idle/max-runtime fields under `agent.timeouts.*`
 - named `agent.profiles.<id>` entries and their `vendor` / `model` leaves (whole-map `agent.profiles` is not a dashboard path; profile ids match `[A-Za-z0-9_-]+`)
 - coding-role agent bindings: `roles.{planner,worker,reviewer,fixer}.agent.{profile,vendor,model}`
+- named hosting `identities.<name>` definitions and `roles.{planner,reviewer,worker,fixer,coordinator}.identity`; active runs retain their captured hosting definition
 - `scheduler.maxConcurrentRuns` and `scheduler.slowLaneWarnThresholdMs`
 - `notifications.inApp` and the current `notifications.osascript.*` fields; notification webhooks and Feishu notification transport are restart-bound
 - the current `disclosure.*` fields
@@ -398,6 +399,191 @@ Authenticate via omp's own login/config. Prefer vendor authentication over stori
 For fresh unattended runs, Looper supplies `-p` with the generated task prompt, `--cwd <worktree>` when the workdir is non-empty, and `--auto-approve`. Configured arguments override defaults: if `-p`/`--print` is already present, Looper does not append its prompt; if `--cwd` is present, Looper does not add workdir; if `--auto-approve` or `--approval-mode` (including `--approval-mode=...`) is present, Looper does not add `--auto-approve`.
 
 Oh My Pi support is fresh-run only. Daemon native resume and interactive takeover through `looper resume` are unsupported. A retry uses a fresh checkpoint prompt.
+
+## Hosting bot identities
+
+Define reusable hosting accounts in `identities`, select a default with a project's
+`identity`, and override it with `roles.<role>.identity`. This policy applies to
+planner, reviewer, worker, fixer, and coordinator. Resolution is the effective
+role identity, then the project default, then existing authentication. Global
+role selections are inherited by projects; an explicit empty project role
+selection clears that global selection and inherits the project default.
+
+```toml
+[identities.github-worker]
+kind = "github-app"
+appId = 12345
+installationId = 67890
+privateKeyFile = "~/.looper/keys/worker.pem"
+
+[identities.github-reviewer]
+kind = "github-app"
+appId = 23456
+installationId = 78901
+privateKeyFile = "~/.looper/keys/reviewer.pem"
+
+[identities.github-worker.commit]
+name = "Team automation"
+email = "automation@example.com"
+
+[identities.forgejo-team]
+kind = "forgejo-token"
+baseUrl = "https://code.example.com"
+tokenEnv = "FORGEJO_TEAM_BOT_TOKEN"
+
+[[providers]]
+id = "team-forgejo"
+kind = "forgejo"
+baseUrl = "https://code.example.com"
+
+[[projects]]
+id = "github-project"
+name = "GitHub project"
+repoPath = "/repos/github-project"
+repo = "team/github-project"
+identity = "github-worker"
+
+[projects.roles.reviewer]
+identity = "github-reviewer"
+
+[[projects]]
+id = "forgejo-project"
+name = "Forgejo project"
+repoPath = "/repos/forgejo-project"
+provider = "team-forgejo"
+repo = "team/forgejo-project"
+identity = "forgejo-team"
+```
+
+Identity names use letters, digits, underscores, and hyphens. `github-app`
+requires positive App and installation IDs and a private-key file reference;
+its `baseUrl` defaults to `https://github.com`. For GitHub Enterprise, set the
+instance origin on both the identity and its provider, without `/api/v3`.
+`forgejo-token` requires the instance `baseUrl` and the name of the environment
+variable containing the dedicated account's token. Supply that variable to the
+daemon process. Do not place tokens or private-key contents in configuration or
+`agent.env`. Legacy provider `tokenEnv` and explicit `teaLogin` authentication
+remain available to projects without a selected identity.
+
+An identity must match the project's provider and instance, including a Forgejo
+deployment path prefix. Bot projects must specify `repo = "owner/name"`. Plane
+projects bind their hosting identity to the GitHub code repository; the Plane
+task-source credentials are separate. A Forgejo provider can omit legacy
+authentication when every bound project's coding roles select bot identities.
+If its projects exist only in SQLite, the file can omit legacy authentication
+when it defines a valid Forgejo bot for that instance. The materialized catalog
+must still cover every role with a bot selection; adding an uncovered project
+or clearing its final selection is rejected before changing SQLite.
+
+`commit.name` and `commit.email` independently override bot Git attribution.
+Omitted fields use the bot account's defaults. New commits use the executing
+identity as author and committer; amendments preserve the original author and
+use the executing identity as committer. Private-key paths beginning with `~/`
+expand to the daemon user's home directory; relative paths resolve against the
+daemon's configuration-loading working directory. Named definitions are replaced
+as complete entries across configuration layers, preventing old credential
+fields from being retained when an identity changes kind.
+
+Unknown references, incompatible targets, and malformed definitions are static
+configuration errors. Missing key files, unset token variables, revoked
+authorization, and token-refresh failures are authentication errors for the
+selected identity; they never select personal credentials as a fallback.
+
+Startup probes report affected identity, project and role in daemon logs while
+other identities continue running. Repository settings/import operations use
+the project's worker identity policy, PR snapshots use reviewer policy,
+coordinator dependency probes use coordinator policy, and HITL comments/polls
+use the originating loop's role policy.
+
+Definition changes and global role identity changes are hot policy for new
+runs. An active run retains its selected definition and repository, while its
+installation token may refresh. Project entries in the file retain the existing
+startup-import rules: changing `projects[].identity` or its role overrides takes
+effect through that import, not the global file watcher. API-managed projects
+can supply `identity` to `POST /api/v1/projects`; the reference is
+stored in SQLite and validated against live global definitions before catalog
+publication. Re-adding an API-managed project with an omitted identity keeps
+its selection; `identity: ""` clears the project default. Per-project role
+identity overrides are configured through file import. Config-managed projects
+remain managed by file import.
+
+### Agent operations and credentials
+
+In bot runs, the daemon performs Git fetch/push and PR publication over the
+configured repository's HTTPS URL. Existing remote configuration stays intact,
+including SSH origins. New local commits use the selected bot's attribution.
+Repository-local URL rewrites, HTTP credential overrides and custom remote
+helpers that could redirect bot authentication cause an explicit Git error.
+Credential-bearing Git/GitHub CLI commands have a four-minute ceiling (or a
+shorter caller deadline). App credentials refresh five minutes before expiry;
+the command deadline also respects the token's actual remaining lifetime.
+Bot GitHub CLI operations run from a private empty directory with an explicit
+repository target, so local repository helpers cannot inherit their token.
+Parent-repository discovery is disabled even when temporary files live inside
+a checkout.
+Agents use the supplied absolute `LOOPER_HOST_CLI` to read the repository:
+
+```bash
+"$LOOPER_HOST_CLI" host whoami
+"$LOOPER_HOST_CLI" host api pulls/42
+"$LOOPER_HOST_CLI" host api pulls/42 --diff
+"$LOOPER_HOST_CLI" host api 'pulls/42/reviews' --paginate
+"$LOOPER_HOST_CLI" host threads 42
+"$LOOPER_HOST_CLI" host git fetch refs/heads/main
+```
+
+These commands require the execution's private socket and cannot select another
+account or repository. API reads accept supported repository-relative GET paths.
+GitHub thread reads retain comment node IDs and update times. Native review
+publication uses the existing `looper review submit` policy for that execution's
+PR, expected head and review events. Worker, planner and fixer return their
+normal structured results and leave push/PR writes to daemon reconciliation.
+
+Hosting tokens, private-key references and personal GitHub/SSH authentication
+are removed after agent environment overrides merge. Validation commands also
+receive a sanitized environment. Model-provider credentials remain available to
+the configured agent. This is a credential and command-routing boundary; it
+does not introduce an operating-system sandbox for arbitrary same-user code.
+
+GitHub App permissions must cover the actions enabled for the role: commonly
+repository contents, issues and pull requests, with read access to checks and
+Actions for CI diagnosis. Enterprise instances may require an explicit
+`commit.email`. Forgejo bot tokens must support account lookup (`read:user`)
+and the repository operations in use; repository-only token scopes that exclude
+account lookup are insufficient. Platform review and self-approval restrictions
+continue to apply.
+
+### GitHub App sandbox verification
+
+The regular CI suite runs local contracts without App secrets, including the
+credential cache race checks. The separate `sandbox-e2e` workflow runs on main
+and manual dispatch, using the existing repository variable
+`LOOPER_E2E_GITHUB_APP_ID` and secret `LOOPER_E2E_GITHUB_APP_PRIVATE_KEY`.
+It obtains the installation ID from
+[`actions/create-github-app-token`](https://github.com/actions/create-github-app-token#outputs),
+then supplies a temporary private-key file to the daemon. That file has private
+permissions, lives outside uploaded artifacts, and is removed in an always-run
+cleanup step.
+
+To run only the App scenario in a configured sandbox:
+
+```bash
+LOOPER_E2E_GITHUB_APP=1 \
+LOOPER_E2E_GITHUB_SANDBOX_REPO=team/looper-sandbox \
+LOOPER_E2E_GITHUB_APP_ID=12345 \
+LOOPER_E2E_GITHUB_INSTALLATION_ID=67890 \
+LOOPER_E2E_GITHUB_APP_PRIVATE_KEY_FILE=/absolute/path/sandbox.pem \
+go test ./internal/e2e -run '^TestGitHubSandboxAppIdentity$' -count=1
+```
+
+The repository must have an initialized default branch. This scenario does its
+own JWT exchange, checks that the installation token is scoped to one repo,
+runs a real daemon worker with an SSH origin and credential-free agent, verifies
+bot PR/commit attribution, refreshes the captured installation, and verifies
+bot comments and native COMMENT reviews. It creates temporary issues, PRs and
+branches and cleans them afterward. It does not require the legacy sandbox's
+pre-minted `LOOPER_E2E_GITHUB_TOKEN`. Missing App references fail when the App
+scenario is explicitly enabled; otherwise it is skipped.
 
 ## Provider support
 

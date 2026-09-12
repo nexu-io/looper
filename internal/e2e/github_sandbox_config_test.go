@@ -1,8 +1,11 @@
 package e2e
 
 import (
+	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/nexu-io/looper/internal/config"
 )
 
 func TestGitHubSandboxRepoEnvCompatibility(t *testing.T) {
@@ -20,6 +23,28 @@ func TestGitHubSandboxRepoEnvCompatibility(t *testing.T) {
 			got := resolveGitHubSandboxRepoEnv(t, func(key string) string { return tc.env[key] })
 			if got != tc.want {
 				t.Fatalf("repo = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestGitHubSandboxAppCredentialReferences(t *testing.T) {
+	keyPath := filepath.Join(t.TempDir(), "not-read-by-parser.pem")
+	valid := map[string]string{envSandboxAppID: "123", envSandboxInstallationID: "456", envSandboxAppPrivateKeyFile: keyPath}
+	definition, err := parseSandboxAppIdentity(func(key string) string { return valid[key] })
+	if err != nil || definition.Kind != config.HostingIdentityGitHubApp || definition.AppID != 123 || definition.InstallationID != 456 || definition.PrivateKeyFile != keyPath {
+		t.Fatalf("App references = %+v, error = %v", definition, err)
+	}
+	for _, key := range []string{envSandboxAppID, envSandboxInstallationID, envSandboxAppPrivateKeyFile} {
+		t.Run(key, func(t *testing.T) {
+			_, err := parseSandboxAppIdentity(func(name string) string {
+				if name == key {
+					return "secret-shaped-invalid-value"
+				}
+				return valid[name]
+			})
+			if err == nil || !strings.Contains(err.Error(), key) || strings.Contains(err.Error(), "secret-shaped") {
+				t.Fatalf("missing safe diagnostic for %s: %v", key, err)
 			}
 		})
 	}

@@ -6,6 +6,8 @@ import (
 	"slices"
 	"strings"
 	"sync"
+
+	"github.com/nexu-io/looper/internal/hostingidentity"
 )
 
 type DiscoverySnapshotOptions struct {
@@ -26,12 +28,13 @@ type DiscoverySnapshot struct {
 	prLimit    int
 	issueLimit int
 
-	mu               sync.Mutex
-	openPRs          []PullRequestSummary
-	openPRsFetched   bool
-	openPRsFetchRepo string
-	openPRsFetchCWD  string
-	openPRsLimit     int
+	mu                sync.Mutex
+	identitySnapshots map[string]*DiscoverySnapshot
+	openPRs           []PullRequestSummary
+	openPRsFetched    bool
+	openPRsFetchRepo  string
+	openPRsFetchCWD   string
+	openPRsLimit      int
 
 	reviewRequestedPRs map[string]reviewRequestedPullRequestSnapshotEntry
 
@@ -70,7 +73,29 @@ func discoverySnapshotFromContext(ctx context.Context) *DiscoverySnapshot {
 		return nil
 	}
 	snapshot, _ := ctx.Value(discoverySnapshotContextKey{}).(*DiscoverySnapshot)
+	if snapshot != nil {
+		if session, ok := hostingidentity.FromContext(ctx); ok {
+			snapshot.mu.Lock()
+			defer snapshot.mu.Unlock()
+			if snapshot.identitySnapshots == nil {
+				snapshot.identitySnapshots = make(map[string]*DiscoverySnapshot)
+			}
+			selected := snapshot.identitySnapshots[session.CacheKey()]
+			if selected == nil {
+				selected = NewDiscoverySnapshot(snapshot.gateway, snapshot.tick, DiscoverySnapshotOptions{PullRequestLimit: snapshot.prLimit, IssueLimit: snapshot.issueLimit})
+				snapshot.identitySnapshots[session.CacheKey()] = selected
+			}
+			return selected
+		}
+	}
 	return snapshot
+}
+
+func discoveryIdentityKey(ctx context.Context, key string) string {
+	if session, ok := hostingidentity.FromContext(ctx); ok {
+		return session.CacheKey() + ":" + key
+	}
+	return "legacy:" + key
 }
 
 func (s *DiscoverySnapshot) listOpenPullRequests(ctx context.Context, input ListOpenPullRequestsInput) ([]PullRequestSummary, error) {
@@ -196,7 +221,7 @@ func (g *Gateway) listOpenPullRequestsForDiscovery(ctx context.Context, input Li
 	if g.discoveryCacheTTL <= 0 {
 		return g.listOpenPullRequestsWithFields(ctx, input, prDiscoveryListJSONFields)
 	}
-	key := discoveryPullRequestListCacheKey(input)
+	key := discoveryIdentityKey(ctx, discoveryPullRequestListCacheKey(input))
 	now := g.now().UTC()
 	g.discoveryCacheMu.Lock()
 	if entry, ok := g.discoveryPRCache[key]; ok && now.Before(entry.expiresAt) {
@@ -221,7 +246,7 @@ func (g *Gateway) listReviewRequestedPullRequestsForDiscovery(ctx context.Contex
 	if g.discoveryCacheTTL <= 0 {
 		return g.listReviewRequestedPullRequestsRaw(ctx, input)
 	}
-	key := discoveryReviewRequestedPullRequestListCacheKey(input)
+	key := discoveryIdentityKey(ctx, discoveryReviewRequestedPullRequestListCacheKey(input))
 	now := g.now().UTC()
 	g.discoveryCacheMu.Lock()
 	if entry, ok := g.discoveryReviewPRCache[key]; ok && now.Before(entry.expiresAt) {
@@ -246,7 +271,7 @@ func (g *Gateway) listOpenIssuesForDiscovery(ctx context.Context, input ListOpen
 	if g.discoveryCacheTTL <= 0 {
 		return g.listOpenIssuesRaw(ctx, input)
 	}
-	key := discoveryIssueListCacheKey(input)
+	key := discoveryIdentityKey(ctx, discoveryIssueListCacheKey(input))
 	now := g.now().UTC()
 	g.discoveryCacheMu.Lock()
 	if entry, ok := g.discoveryIssueCache[key]; ok && now.Before(entry.expiresAt) {
@@ -297,7 +322,7 @@ func (s *DiscoverySnapshot) getCurrentUserLogin(ctx context.Context, cwd string)
 	if s.tick == nil {
 		return s.gateway.getCurrentUserLoginRaw(ctx, cwd)
 	}
-	cacheKey := strings.TrimSpace(cwd)
+	cacheKey := discoveryIdentityKey(ctx, strings.TrimSpace(cwd))
 	s.tick.mu.Lock()
 	if login, ok := s.tick.userLogins[cacheKey]; ok {
 		s.tick.mu.Unlock()

@@ -17,6 +17,7 @@ import (
 	"github.com/nexu-io/looper/internal/disclosure"
 	"github.com/nexu-io/looper/internal/domain"
 	"github.com/nexu-io/looper/internal/forge"
+	"github.com/nexu-io/looper/internal/hostingidentity"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/infra/shell"
 	"github.com/nexu-io/looper/internal/loops"
@@ -229,6 +230,10 @@ func forgeReviewSubmitLabelNames(labels []forge.Label) []string {
 }
 
 func reviewSubmitGatewayForConfig(cfg config.Config, repo, cwd string, diagnostic func(string, map[string]any)) (reviewSubmitGateway, error) {
+	return reviewSubmitGatewayForContext(context.Background(), cfg, repo, cwd, diagnostic)
+}
+
+func reviewSubmitGatewayForContext(ctx context.Context, cfg config.Config, repo, cwd string, diagnostic func(string, map[string]any)) (reviewSubmitGateway, error) {
 	matched, err := reviewSubmitProjectForRepo(cfg, repo, cwd)
 	if err != nil {
 		return nil, err
@@ -244,7 +249,7 @@ func reviewSubmitGatewayForConfig(cfg config.Config, repo, cwd string, diagnosti
 		if provider == nil {
 			return nil, fmt.Errorf("forgejo provider %q is not configured", matched.Provider)
 		}
-		client, err := forge.NewForgejoClientFromConfig(*provider, matched.Repo)
+		client, err := forge.NewForgejoClientForContext(ctx, *provider, matched.Repo)
 		if err != nil {
 			return nil, err
 		}
@@ -408,16 +413,19 @@ func (r *commandRuntime) reviewSubmit(cmd *cobra.Command, args []string) error {
 	// of any agent-visible wrapper path. The proxy child clears the socket env
 	// and re-enters this command with tokens injected.
 	if forge.TrustedReviewSockConfigured() {
-		raw, err := io.ReadAll(cmd.InOrStdin())
+		raw, err := io.ReadAll(io.LimitReader(cmd.InOrStdin(), (1<<20)+1))
 		if err != nil {
 			return fmt.Errorf("read review payload from stdin: %w", err)
+		}
+		if len(raw) > 1<<20 {
+			return fmt.Errorf("review payload exceeds size limit")
 		}
 		cwd, err := r.getwd()
 		if err != nil {
 			return fmt.Errorf("determine current working directory: %w", err)
 		}
 		argv := reviewSubmitProxyArgv(os.Args)
-		return forge.ProxyReviewSubmit(argv, raw, cwd)
+		return forge.ProxyReviewSubmitContext(cmd.Context(), argv, raw, cwd)
 	}
 
 	repo, prNumber, err := parsePullRequestRef(args[0])
@@ -442,9 +450,28 @@ func (r *commandRuntime) reviewSubmit(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("parse review payload JSON from stdin: %w", err)
 	}
 
-	loaded, err := r.loadConfig()
-	if err != nil {
-		return err
+	var loaded config.LoadedFileConfig
+	if forge.TrustedReviewProxyChildConfigured() {
+		var resolved *config.ResolvedHostingIdentity
+		loaded, resolved, _, err = forge.LoadTrustedHostingSnapshot()
+		if err != nil {
+			return err
+		}
+		if resolved != nil {
+			if resolved.Role != "reviewer" || !strings.EqualFold(resolved.Target.Repo, repo) {
+				return errors.New("trusted review identity does not match the reviewer repository")
+			}
+			bound, err := hostingidentity.BindResolved(cmd.Context(), *resolved)
+			if err != nil {
+				return err
+			}
+			cmd.SetContext(bound)
+		}
+	} else {
+		loaded, err = r.loadConfig()
+		if err != nil {
+			return err
+		}
 	}
 	policy, err := effectiveReviewSubmitPolicy(
 		loaded.Config.Roles.Reviewer.Behavior.ReviewEvents,
@@ -461,11 +488,24 @@ func (r *commandRuntime) reviewSubmit(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("determine current working directory: %w", err)
 	}
+	if _, selected := hostingidentity.FromContext(cmd.Context()); !selected {
+		matched, err := reviewSubmitProjectForRepo(loaded.Config, repo, cwd)
+		if err != nil {
+			return err
+		}
+		if matched != nil {
+			bound, err := hostingidentity.Bind(cmd.Context(), reviewSubmitConfigWithMatchedProject(loaded.Config, matched), matched.ID, "reviewer")
+			if err != nil {
+				return err
+			}
+			cmd.SetContext(bound)
+		}
+	}
 
 	diagnosticWriter := func(event string, fields map[string]any) {
 		writeReviewSubmitDiagnosticEntry(cmd.ErrOrStderr(), event, fields)
 	}
-	gateway, err := reviewSubmitGatewayForConfig(loaded.Config, repo, cwd, diagnosticWriter)
+	gateway, err := reviewSubmitGatewayForContext(cmd.Context(), loaded.Config, repo, cwd, diagnosticWriter)
 	if err != nil {
 		return err
 	}

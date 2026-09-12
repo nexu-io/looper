@@ -9,6 +9,7 @@ import (
 
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/forge"
+	"github.com/nexu-io/looper/internal/hostingidentity"
 	"github.com/nexu-io/looper/internal/infra/shell"
 	"github.com/nexu-io/looper/internal/loops/failureclass"
 )
@@ -46,7 +47,7 @@ func forgejoHasMergeConflicts(ctx context.Context, gitPath, repoPath, baseSHA, h
 	if err := ensureForgejoCommits(ctx, gitPath, repoPath, commits); err != nil {
 		return false, err
 	}
-	result, err := shell.Run(ctx, shell.Options{Command: gitPath, CWD: repoPath, Args: []string{"merge-tree", "--write-tree", commits[0], commits[1]}})
+	result, err := hostingidentity.RunGit(ctx, shell.Options{Command: gitPath, CWD: repoPath, Args: []string{"merge-tree", "--write-tree", commits[0], commits[1]}}, shell.Run)
 	if err == nil {
 		return false, nil
 	}
@@ -76,7 +77,7 @@ func ensureForgejoCommits(ctx context.Context, gitPath, repoPath string, commits
 	if len(missing) > 0 {
 		// Empty refmap and no FETCH_HEAD write keep the caller's refs unchanged.
 		args := append([]string{"fetch", "--no-write-fetch-head", "--no-tags", "--refmap=", "origin"}, missing...)
-		if _, err := shell.Run(ctx, shell.Options{Command: gitPath, CWD: repoPath, Args: args}); err != nil {
+		if _, err := hostingidentity.RunGit(ctx, shell.Options{Command: gitPath, CWD: repoPath, Args: args}, shell.Run); err != nil {
 			boundary := failureclass.BoundaryGitRemote
 			if shell.IsStartFailure(err) && !shell.IsTransientStartFailure(err) {
 				boundary = failureclass.BoundaryGitLocal
@@ -98,12 +99,12 @@ func missingForgejoCommits(ctx context.Context, gitPath, repoPath string, commit
 	// Batch-check reports a missing object on stdout with exit zero. Ordinary
 	// git failures (bad CWD, permissions, unavailable binary) remain errors and
 	// do not incorrectly trigger a fetch or become a conflict verdict.
-	result, err := shell.Run(ctx, shell.Options{
+	result, err := hostingidentity.RunGit(ctx, shell.Options{
 		Command: gitPath, CWD: repoPath,
 		Args:  []string{"cat-file", "--batch-check=%(objectname) %(objecttype)"},
 		Stdin: strings.Join(commits, "\n") + "\n",
 		Env:   map[string]string{"GIT_NO_LAZY_FETCH": "1"},
-	})
+	}, shell.Run)
 	if err != nil {
 		return nil, fmt.Errorf("inspect commits for merge conflict check: %w", err)
 	}
