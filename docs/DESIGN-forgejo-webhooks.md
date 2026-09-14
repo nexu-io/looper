@@ -48,6 +48,6 @@ Hook 管理使用项目默认 identity；未配置时使用 provider token 或�
 | 管理身份、错误处理、签名 secret 不被错误输出/重定向泄漏 | `TestForgejoWebhookClientUsesProjectIdentityAndProviderAuthForOrphans`、`TestForgejoWebhookClientRejectsRedirectAndRedactsSecret`、`TestForgejoWebhookTeaRequiresHTTPStatusForMutations` |
 | GitHub 路径与完整仓库回归 | 既有 webhook 测试及仓库根检查 |
 
-2026-09-14 验证结果：`go vet ./...`、`go build ./...`、`go test -p 1 ./...` 均通过；四个 webhook 相关包的 race 检查通过，最后改动过的 runtime 和 CLI 路径也分别复跑通过。630 个当前仓库 Go 文件的 gofmt 检查及 `git diff --check` 通过。根目录 `gofmt -l .` 还遍历了忽略的 `.slim/worktrees/`，因此最终格式检查按 Git 当前仓库文件清单执行；没有修改其他 worktree。顺手修正了已有配置测试的格式，以及 GitHub webhook 测试夹具在清理时直接改写进程存活状态的 data race。
+2026-09-14 验证结果：`go vet ./...`、`go build ./...`、`go test -p 1 ./...` 均通过；四个 webhook 相关包的 race 检查通过，最后改动过的 runtime 和 CLI 路径也分别复跑通过。630 个当前仓库 Go 文件使用与 CI 一致的 Go 1.22.12 完成 gofmt 检查，`git diff --check` 通过。本机 Go 1.27 对既有配置测试的对齐格式与 CI 不同，已恢复该文件原样。根目录 `gofmt -l .` 还遍历了忽略的 `.slim/worktrees/`，因此本地格式检查按 Git 当前仓库文件清单执行；没有修改其他 worktree。另修正了 GitHub webhook 测试夹具在清理时直接改写进程存活状态的 data race。
 
 默认并行 `go test ./...` 首轮通过，后续全量复跑的 `TestHumanAttentionContract_PostClaimNotifyCanceledOnShutdown` 和 `TestHumanAttentionContract_NotifyDrainTimeoutRetainsStorage` 出现假 osascript 在三秒内未启动的超时；相关通知实现与测试未修改。两项单独复跑、runtime 整包 `-count=1`、串行全量均通过。保留这个并行测试限制，没有为取得通过而延长断言时限。本次未改动用户运行配置、注册线上 hook 或执行真实 Forgejo 联调。
