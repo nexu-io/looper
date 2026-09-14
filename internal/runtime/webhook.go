@@ -30,7 +30,7 @@ func isWebhookStopError(err error) bool {
 
 const webhookListenerPath = "/webhook/forward"
 
-const noConfiguredWebhookReposReason = "no configured GitHub repos are available for webhook forwarding"
+const noConfiguredWebhookReposReason = "no configured repos are available for webhook delivery"
 
 var webhookReconcileRetryDelay = 5 * time.Second
 
@@ -190,7 +190,7 @@ func newWebhookRuntime(cfg config.Config, logger bootstrap.Logger, now func() ti
 	if wModeNeedsGHForward(cfg) && !isLoopbackHost(cfg.Server.Host) {
 		rt.addDegradedReason("server.host is not loopback; webhook forwarders require a loopback daemon endpoint")
 	}
-	if (wModeNeedsGHForward(cfg) || wModeNeedsTunnel(cfg)) && rt.ghPath == "" {
+	if (wModeNeedsGHForward(cfg) || webhookTunnelNeedsGH(cfg)) && rt.ghPath == "" {
 		rt.addDegradedReason("gh is not configured or could not be resolved")
 	}
 	return rt
@@ -201,7 +201,7 @@ func (w *webhookRuntime) updateConfig(cfg config.Config) {
 		return
 	}
 	w.mu.Lock()
-	w.cfg.Projects = append([]config.ProjectRefConfig(nil), cfg.Projects...)
+	w.cfg = config.CloneConfig(cfg)
 	w.status.ConfiguredTunnelProjectIDs = configuredTunnelProjectIDs(cfg)
 	w.mu.Unlock()
 }

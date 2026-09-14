@@ -193,7 +193,7 @@ issue (looper:plan, assigned)
 
 Each role runs in its own worktree, coordinated by `looperd` and gated by labels. The planner opens the spec PR, the reviewer and fixer loop on it until it's clean, and `looper:spec-ready` is the signal that hands work to the worker — which implements on the same PR rather than opening a new one.
 
-Looper is poll-driven by default: keep `looperd` running and forge credentials available for the loop to fire. GitHub projects still use `gh`; Forgejo projects use the configured REST provider and do not require `gh` in Forgejo-only installs. Everything runs locally — no hosted control plane required.
+Looper is poll-driven by default: keep `looperd` running and forge credentials available for the loop to fire. GitHub projects still use `gh`; Forgejo projects use the configured REST provider and do not require `gh` in Forgejo-only installs. Native [tunnel webhooks](docs/configuration.md#forgejo-webhook-setup) can trigger GitHub and Forgejo discovery immediately, with polling as fallback. Everything runs locally — no hosted control plane required.
 
 ## Networked operation
 

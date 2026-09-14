@@ -93,12 +93,13 @@ type ListOpenPullRequestsInput struct {
 }
 
 type ListOpenIssuesInput struct {
-	Repo     string
-	CWD      string
-	Limit    int
-	Assignee string
-	Label    string
-	Labels   []string
+	IssueNumber int64
+	Repo        string
+	CWD         string
+	Limit       int
+	Assignee    string
+	Label       string
+	Labels      []string
 }
 
 type ViewIssueInput struct {
@@ -349,10 +350,12 @@ type Runner struct {
 }
 
 type DiscoveryInput struct {
-	ProjectID string
-	Repo      string
-	Limit     int
-	Snapshot  *githubinfra.DiscoverySnapshot
+	// IssueNumber targets a webhook issue without the polling list limit.
+	IssueNumber int64
+	ProjectID   string
+	Repo        string
+	Limit       int
+	Snapshot    *githubinfra.DiscoverySnapshot
 }
 
 type DiscoveryResult struct {
@@ -548,7 +551,7 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 	if policy.RequireAssigneeCurrentUser {
 		assigneeFilter = login
 	}
-	issues, err := r.listOpenIssuesForDiscovery(ctx, ListOpenIssuesInput{Repo: input.Repo, CWD: project.RepoPath, Limit: input.Limit, Assignee: assigneeFilter}, policy)
+	issues, err := r.listOpenIssuesForDiscovery(ctx, ListOpenIssuesInput{Repo: input.Repo, CWD: project.RepoPath, Limit: input.Limit, Assignee: assigneeFilter, IssueNumber: input.IssueNumber}, policy)
 	if err != nil {
 		return DiscoveryResult{}, err
 	}

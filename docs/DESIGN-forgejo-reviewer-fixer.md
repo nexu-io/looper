@@ -126,7 +126,9 @@ Sandbox 使用 `core/looper-sandbox`、独立配置 / 数据库 / worktree / 端
 
 真实验收覆盖原生主闭环、commit status、冲突和即时合并接口。503 / 响应丢失 / SQLite 重放、编辑与新 finding、force-push、混合旧协议、外部 reviewer、HITL 和合并授权策略由自动化合约测试覆盖。未声称真实运行 Forgejo Actions workflow；其读取、映射和失败状态通过 provider 合约验证。
 
-仍不支持远端 review-thread resolve、Forgejo coordinator、routed network/webhook 和 GitHub 的同 head decline adjudication。自动合并继续默认关闭、有界重试；不会使用 Forgejo 未保留审核 SHA 的 scheduled merge。
+Forgejo 原生 tunnel webhook 支持见 [实现与验收说明](DESIGN-forgejo-webhooks.md)。
+
+仍不支持远端 review-thread resolve、Forgejo coordinator、routed network 和 GitHub 的同 head decline adjudication。自动合并继续默认关闭、有界重试；不会使用 Forgejo 未保留审核 SHA 的 scheduled merge。
 
 已有 `tea` 登录和 Codex 登录时，可执行隔离的真实 agent 验收：
 

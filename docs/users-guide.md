@@ -115,7 +115,8 @@ Forgejo role support:
 - Reviewer supports native review requests and native `APPROVE`, `REQUEST_CHANGES`, and `COMMENT` reviews. A configured `summary_comment` publish mode retains the top-level comment protocol. Both modes use the same visible templates and disclosure as GitHub.
 - Fixer automatically consumes native inline findings and legacy summary items, repairs the code, validates, and pushes. Without a remote resolve API, it reports the fix in a PR comment and leaves the native comment open. Local acknowledgements prevent unchanged findings from repeating after a restart.
 - Reviewer auto-merge is available when explicitly enabled, subject to the existing review, scope, and branch policies. It defaults to disabled.
-- Coordinator, native thread resolution, routed network mode, and webhook modes remain unsupported for Forgejo.
+- Native tunnel webhooks trigger issue and PR discovery with polling fallback; see [Forgejo webhook setup](configuration.md#forgejo-webhook-setup).
+- Coordinator, native thread resolution, routed network mode, and `gh-forward` remain unsupported for Forgejo.
 - A Forgejo-only daemon can start without `gh`; mixed or GitHub projects still require `gh`.
 
 ## 4. Recommended flow

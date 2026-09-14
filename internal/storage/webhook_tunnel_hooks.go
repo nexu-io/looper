@@ -21,6 +21,41 @@ type WebhookTunnelHookRecord struct {
 
 type WebhookTunnelHooksRepository struct{ q sqliteQuerier }
 
+var ErrWebhookTunnelHookChanged = errors.New("managed webhook changed concurrently; retry the operation")
+
+// SaveIfCurrentHookID publishes a replacement or reconciliation only while the
+// recorded remote ID is still current. It prevents a concurrent CLI rotation
+// from being overwritten by a reconcile that read the previous hook.
+func (r *WebhookTunnelHooksRepository) SaveIfCurrentHookID(ctx context.Context, record WebhookTunnelHookRecord, expectedID int64) error {
+	var result sql.Result
+	var err error
+	if expectedID == 0 {
+		result, err = r.q.ExecContext(ctx, `INSERT INTO webhook_tunnel_hooks (repo, hook_id, managed_url, secret_ref, last_ping_at, consecutive_disables, last_disable_at, orphaned, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(repo) DO UPDATE SET hook_id = excluded.hook_id, managed_url = excluded.managed_url, secret_ref = excluded.secret_ref, last_ping_at = excluded.last_ping_at, consecutive_disables = excluded.consecutive_disables, last_disable_at = excluded.last_disable_at, orphaned = excluded.orphaned, updated_at = excluded.updated_at WHERE webhook_tunnel_hooks.hook_id = 0`, record.Repo, record.HookID, record.ManagedURL, record.SecretRef, record.LastPingAt, record.ConsecutiveDisables, record.LastDisableAt, record.Orphaned, record.CreatedAt, record.UpdatedAt)
+	} else {
+		result, err = r.q.ExecContext(ctx, `UPDATE webhook_tunnel_hooks SET hook_id = ?, managed_url = ?, secret_ref = ?, last_ping_at = ?, consecutive_disables = ?, last_disable_at = ?, orphaned = ?, updated_at = ? WHERE repo = ? AND hook_id = ?`, record.HookID, record.ManagedURL, record.SecretRef, record.LastPingAt, record.ConsecutiveDisables, record.LastDisableAt, record.Orphaned, record.UpdatedAt, record.Repo, expectedID)
+	}
+	if err != nil {
+		return err
+	}
+	count, err := result.RowsAffected()
+	if err == nil && count == 0 {
+		return ErrWebhookTunnelHookChanged
+	}
+	return err
+}
+
+func (r *WebhookTunnelHooksRepository) DeleteIfCurrentHookID(ctx context.Context, repo string, expectedID int64) error {
+	result, err := r.q.ExecContext(ctx, `DELETE FROM webhook_tunnel_hooks WHERE repo = ? AND hook_id = ?`, repo, expectedID)
+	if err != nil {
+		return err
+	}
+	count, err := result.RowsAffected()
+	if err == nil && count == 0 {
+		return ErrWebhookTunnelHookChanged
+	}
+	return err
+}
+
 func (r *WebhookTunnelHooksRepository) List(ctx context.Context) ([]WebhookTunnelHookRecord, error) {
 	rows, err := r.q.QueryContext(ctx, `SELECT repo, hook_id, managed_url, secret_ref, last_ping_at, consecutive_disables, last_disable_at, orphaned, created_at, updated_at FROM webhook_tunnel_hooks ORDER BY repo`)
 	if err != nil {

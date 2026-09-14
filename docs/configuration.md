@@ -44,8 +44,8 @@ For runtime deployment details — container image, required environment variabl
 
 `webhook.enabled=true` supports two delivery modes:
 
-- `gh-forward` (default): Looper starts `gh webhook forward` against each configured repo and receives deliveries on the daemon API route `/webhook/forward`.
-- `tunnel`: Looper creates an ordinary GitHub repository webhook per repo and expects the user to run a tunnel to `127.0.0.1:<webhook.listenPort>`.
+- `gh-forward` (default, GitHub only): Looper starts `gh webhook forward` against each configured repo and receives deliveries on the daemon API route `/webhook/forward`.
+- `tunnel`: Looper creates a native GitHub or Forgejo repository webhook per repo and expects the user to run a tunnel to `127.0.0.1:<webhook.listenPort>`.
 
 Tunnel-mode example:
 
@@ -74,10 +74,55 @@ Rules:
 
 - `webhook.mode` is the global default. A project may override with `projects[].webhook.mode`.
 - `tunnel` requires `webhook.listenPort` between `1024` and `65535` and an HTTPS `webhook.publicBaseUrl`.
-- The tunnel URL for repo `owner/repo` is `{publicBaseUrl}/webhook/owner/repo`.
+- The GitHub tunnel URL for `owner/repo` is `{publicBaseUrl}/webhook/owner/repo`. Forgejo uses `{publicBaseUrl}/webhook/forgejo/project/{escapedProjectId}`; `looper webhook status` shows the registered URL.
 - Looper binds only `127.0.0.1:<listenPort>`; it does not run or supervise `cloudflared`, `ngrok`, Tailscale Funnel, or any reverse proxy.
-- Looper stores the remote GitHub hook id in SQLite and the HMAC secret in `secrets/webhook_<owner>_<repo>.key` with mode `0600`.
-- Removing a project or switching it away from `tunnel` marks the local hook record orphaned; it does not delete the GitHub hook automatically.
+- Looper stores the remote hook ID in SQLite and the HMAC secret under the database directory’s `secrets/` with mode `0600`. Forgejo records use the full repository URL to separate identical repo names on different instances; their secret filenames are derived from that URL.
+- Removing a project or switching it away from `tunnel` marks the local hook record orphaned; it does not delete the remote hook automatically.
+
+### Forgejo webhook setup
+
+Merge the following into the configuration already used by `looperd`:
+
+```toml
+[webhook]
+enabled = true
+mode = "tunnel"
+listenPort = 8765
+publicBaseUrl = "https://hooks.example.com"
+fallbackPollIntervalSeconds = 300
+
+[[providers]]
+id = "forgejo-main"
+kind = "forgejo"
+baseUrl = "https://code.example.com"
+tokenEnv = "FORGEJO_TOKEN"
+
+[[projects]]
+id = "my-project"
+name = "My project"
+provider = "forgejo-main"
+repo = "owner/repo"
+repoPath = "/Users/me/src/my-project"
+```
+
+Expose `127.0.0.1:8765` through the configured HTTPS endpoint, make the provider credentials available to the daemon, then restart `looperd`. Looper registers and reconciles the hook automatically. For a mixed installation that keeps GitHub on `gh-forward`, leave the global mode unchanged and set `[projects.webhook] mode = "tunnel"` only on each Forgejo project. Forgejo projects inheriting `gh-forward` continue polling; explicitly selecting `gh-forward` on Forgejo is rejected.
+
+Hook administration uses the project's default `identity` when configured, otherwise the provider's `token-env` or explicit `tea` login. That account needs repository admin access and a token permitting repository writes. Role-specific identities still own their own discovery and execution. Set `baseUrl` to the canonical Forgejo URL, including any installation subpath. Direct HTTP hook management refuses redirects; `tea` transport retains the installed CLI's redirect behavior.
+
+Issue creation, edits, labels, assignments, milestones and comments wake Planner/Worker for that issue. PR changes, synchronization, review requests, reviews and comments wake Reviewer/Fixer for that PR. Branch pushes wake Fixer's existing base-branch update discovery; tag pushes and branch deletions are ignored. Forgejo Actions success/failure/recovery wake PR discovery, targeting the PR in the original workflow trigger when available. All discovery keeps existing role switches, labels, assignee rules, holds and queue deduplication.
+
+Stable Forgejo does not emit GitHub `check_run` or commit-status webhooks. Keep fallback polling for external CI status changes, Actions without a PR reference, failed deliveries and daemon downtime. Actions without a PR reference use the existing bounded repository discovery. Webhook work is accepted asynchronously with HTTP 202; admission refusal and a full discovery queue return HTTP 503. Signed deliveries are deduplicated within the existing in-memory retention window, while durable role queues retain their existing dedupe behavior.
+
+```bash
+looper webhook status
+looper webhook rotate https://code.example.com/owner/repo
+looper webhook list-orphans
+looper webhook delete https://code.example.com/owner/repo --confirm
+```
+
+Use the full Forgejo repo URL shown in status, including the installation subpath. Disable/remove the project's tunnel configuration before permanent deletion; otherwise reconciliation recreates the hook. Rotation replaces the remote hook because Forgejo PATCH cannot change its signing secret. If deleting the previous hook fails, the command reports its ID for manual cleanup and leaves the replacement active. `delete --confirm --forget` removes only the local record when remote credentials are no longer available. `webhook cleanup` remains specific to stale GitHub CLI forwarders.
+
+The contract tests cover Forgejo 14.0.2, 15.0.8 and 16.0.4 payload/API shapes. See [implementation and verification notes](DESIGN-forgejo-webhooks.md).
 
 ## How config loading works
 
@@ -676,8 +721,8 @@ Forgejo rules:
 - Tea-backed API calls use `tea api --login <teaLogin>`; Looper never parses tea credential storage or copies the token into config, logs, argv, event payloads, or environment variables.
 - Actionable tea auth failures surface as `tea_missing`, `tea_login_missing`, `tea_login_host_mismatch`, or `tea_auth_failed` (and never fall through to GitHub).
 - Forgejo projects require a `provider` and repo (`owner/name`). They can be written in config, persisted by `looper project add --provider <id>`, or created with `--forgejo-url` plus either `--forgejo-token-env` or `--auth tea --tea-login`. The repo may be detected only from an origin matching that provider. CLI/API-added provider bindings become active immediately through the atomic Project Catalog; already-started work retains its previous snapshot.
-- Config validation rejects duplicate configured `repo` values case-insensitively, even across different providers, because current runtime records are still keyed by bare repo.
-- Forgejo uses polling only. Omit `projects[].webhook.mode` and keep `projects[].network.mode` unset or `off`.
+- Duplicate repository identities are rejected case-insensitively. The same `owner/repo` may be used on different Forgejo instances or on GitHub and Forgejo.
+- Forgejo supports native `tunnel` webhooks with polling fallback; see [Forgejo webhook setup](#forgejo-webhook-setup). Keep `projects[].network.mode` unset or `off`.
 - Forgejo projects get a provider profile that makes minimal config safe: planner and worker stay enabled, worker only processes issues already assigned to the current provider user, reviewer uses native review-request discovery and native review publication, and fixer automatically consumes native findings and legacy summary items. Auto-merge defaults to disabled and can be enabled explicitly; coordinator and thread resolution remain unsupported.
 - Explicitly re-enabling unsupported Forgejo behavior fails config validation instead of silently downgrading behavior.
 - `looper status` reads the Forgejo version, identity, repository permissions, and OpenAPI document with a bounded timeout and no mutations. Capability output separates Looper's configured support from the server-observed contract; missing or disabled OpenAPI is `unknown`. The probe is fresh for each status request and is not persisted or used as a daemon startup gate.
@@ -1458,7 +1503,7 @@ Forgejo provider profile differences:
 - reviewer defaults to native review requests and native PR review events; configured labels can be used alone or combined, and `publishMode = "summary_comment"` retains the legacy summary flow
 - fixer automatically consumes native review comments and legacy summary items; validated fixes are acknowledged locally and in a common PR comment while native comments remain open
 - auto-merge defaults to disabled and can be enabled explicitly under the same review, scope, and branch policies
-- coordinator, review-thread resolution, routed network mode, and webhook modes remain unsupported for Forgejo and fail fast if explicitly enabled
+- coordinator, review-thread resolution, routed network mode, and `gh-forward` remain unsupported for Forgejo and fail fast if explicitly enabled
 
 Common fields:
 

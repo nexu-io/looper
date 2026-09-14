@@ -309,9 +309,9 @@ func (t *teaTransport) doRaw(ctx context.Context, method string, path string, qu
 	}
 	statusCode, headers, err := parseTeaIncludeHeaders(result.Stderr)
 	if err != nil {
-		// Some tea versions may put status on stderr only when -i is used; if
-		// headers are missing but body is present and exit is 0, treat as 200.
-		if strings.TrimSpace(result.Stderr) == "" && len(bytes.TrimSpace([]byte(result.Stdout))) > 0 {
+		// Preserve legacy reads, but mutations require an explicit HTTP status:
+		// tea can exit zero even when the server rejected the request.
+		if method == http.MethodGet && strings.TrimSpace(result.Stderr) == "" && len(bytes.TrimSpace([]byte(result.Stdout))) > 0 {
 			statusCode = http.StatusOK
 			headers = make(http.Header)
 		} else {

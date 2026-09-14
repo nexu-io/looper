@@ -170,8 +170,9 @@ Forgejo validation notes:
 - `baseUrl` must be an absolute `http(s)` URL.
 - Choose `auth = "token-env"` with `tokenEnv`, or `auth = "tea"` with explicit `teaLogin` matching `baseUrl`. Never rely on tea's default login when multiple identities exist. Do not write token values into config.
 - Forgejo projects require a `provider` and repo. Configure them in `[[projects]]`, or persist and activate them immediately with `looper project add --provider <id>`; the repo may be detected only from an origin matching that provider.
-- Duplicate `repo` values are rejected case-insensitively, even across providers.
-- Forgejo uses polling only; omit project `webhook.mode` and keep `network.mode` off.
+- Duplicate repository identities are rejected case-insensitively; the same slug on different hosting instances is allowed.
+- Forgejo supports native `tunnel` webhooks with polling fallback. Set `webhook.enabled=true`, HTTPS `publicBaseUrl`, `listenPort`, and global or project `mode="tunnel"`; keep `network.mode` off. Inheriting global `gh-forward` preserves polling; an explicit Forgejo `gh-forward` override is rejected.
+- Hook management uses the project default identity or provider auth and needs repository admin/write permission. Status, rotate, delete and list-orphans support Forgejo; use its full repo URL for rotate/delete. See `docs/configuration.md#forgejo-webhook-setup` in the source repository.
 - The provider profile disables unsupported GitHub-shaped defaults. Explicit opt-ins to Forgejo-unsupported behavior fail fast.
 
 Forgejo role support:
@@ -183,7 +184,7 @@ Forgejo role support:
 - both native and `summary_comment` compatibility modes use the GitHub message templates and disclosure, without visible protocol titles or round metadata.
 - reviewer auto-merge defaults off. Explicit opt-in retains clean review, Looper scope, linked issue / criteria, strategy and protection requirements. Self-review `COMMENT` does not authorize merge. Forgejo uses an immediate request bound to the reviewed head and existing bounded retries, not the server's unguarded scheduled-merge queue.
 - current-head commit statuses and Actions are available to reviewer/fixer. Exact conflict and ancestry checks require Git 2.38+ and sufficient repository history.
-- coordinator, review-thread resolution, GitHub's same-head decline adjudication, routed network mode, and webhooks remain unsupported for Forgejo.
+- coordinator, review-thread resolution, GitHub's same-head decline adjudication, routed network mode, and `gh-forward` remain unsupported for Forgejo.
 
 ## Role model guidance
 

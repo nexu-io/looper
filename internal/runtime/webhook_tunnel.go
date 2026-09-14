@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/nexu-io/looper/internal/config"
+	"github.com/nexu-io/looper/internal/forge"
 	"github.com/nexu-io/looper/internal/storage"
 	"github.com/nexu-io/looper/internal/webhookforward"
 )
@@ -31,20 +32,7 @@ const webhookTunnelDisableLatchThreshold = 3
 const webhookTunnelDisableLatchWindow = 24 * time.Hour
 const maxWebhookTunnelPayloadBytes = 1 << 20
 
-type webhookTunnelGitHubHook struct {
-	ID     int64    `json:"id"`
-	Active bool     `json:"active"`
-	Events []string `json:"events"`
-	Config struct {
-		URL         string `json:"url"`
-		ContentType string `json:"content_type"`
-		InsecureSSL string `json:"insecure_ssl"`
-		Secret      string `json:"secret"`
-	} `json:"config"`
-	LastResponse *struct {
-		Code int `json:"code"`
-	} `json:"last_response"`
-}
+type webhookTunnelGitHubHook = forge.RepositoryHook
 
 type webhookTunnelGitHubClient interface {
 	GetHook(ctx context.Context, repo string, id int64) (webhookTunnelGitHubHook, bool, error)
@@ -175,10 +163,6 @@ func (w *webhookRuntime) reconcileTunnelHooks(ctx context.Context, repos *storag
 		w.stopTunnelServer()
 	}
 	w.clearTunnelDegradedReasons()
-	if len(repoSet) > 0 && w.ghPath == "" {
-		w.addDegradedReason("webhook tunnel hooks require gh to create or reconcile repository webhooks")
-		return nil
-	}
 	store := repos.WebhookTunnelHooks
 	existing, err := store.List(ctx)
 	if err != nil {
@@ -190,18 +174,18 @@ func (w *webhookRuntime) reconcileTunnelHooks(ctx context.Context, repos *storag
 	for _, record := range existing {
 		_, desired := repoSet[record.Repo]
 		if !desired && !record.Orphaned {
-			if err := store.MarkOrphaned(ctx, record.Repo, true, now); err != nil {
+			record.Orphaned, record.UpdatedAt = true, now
+			if err := store.SaveIfCurrentHookID(ctx, record, record.HookID); err != nil {
 				states = append(states, WebhookTunnelState{Repo: record.Repo, HookID: &record.HookID, ManagedURL: record.ManagedURL, LastError: fmt.Sprintf("mark hook orphaned: %v", err)})
 				continue
 			}
-			record.Orphaned = true
 		}
 		if record.Orphaned && !desired {
 			states = append(states, tunnelStateFromRecord(record, ""))
 		}
 	}
 	for repo := range repoSet {
-		if strings.Count(repo, "/") != 1 {
+		if !isForgejoWebhookRepository(cfg, repo) && strings.Count(repo, "/") != 1 {
 			states = append(states, WebhookTunnelState{Repo: repo, LastError: "tunnel mode does not support host-qualified repo names"})
 			continue
 		}
@@ -240,20 +224,32 @@ func (w *webhookRuntime) deleteTunnelHookForRollback(client webhookTunnelGitHubC
 }
 
 func (w *webhookRuntime) reconcileTunnelHook(ctx context.Context, store *storage.WebhookTunnelHooksRepository, cfg config.Config, repo string, record storage.WebhookTunnelHookRecord, ok bool, now int64) WebhookTunnelState {
-	client := w.tunnelGitHubClient()
+	expectedHookID := record.HookID
+	client, err := w.tunnelClientForRepository(ctx, cfg, repo)
+	if err != nil {
+		return WebhookTunnelState{Repo: repo, LastError: err.Error()}
+	}
+	events := webhookForwardEvents
+	forgejoRepo := isForgejoWebhookRepository(cfg, repo)
+	if forgejoRepo {
+		events = forge.ForgejoWebhookEvents()
+	}
 	url := webhookTunnelManagedURL(cfg, repo)
 	secretRef := webhookTunnelSecretRef(repo)
+	if ok && record.SecretRef != "" {
+		secretRef = record.SecretRef
+	}
 	if !ok || record.HookID == 0 {
 		secret, err := ensureWebhookTunnelSecret(cfg.Storage.DBPath, secretRef)
 		if err != nil {
 			return WebhookTunnelState{Repo: repo, ManagedURL: url, LastError: err.Error()}
 		}
-		hook, err := client.CreateHook(ctx, repo, url, secret, webhookForwardEvents)
+		hook, err := client.CreateHook(ctx, repo, url, secret, events)
 		if err != nil {
 			return WebhookTunnelState{Repo: repo, ManagedURL: url, LastError: err.Error()}
 		}
 		record = storage.WebhookTunnelHookRecord{Repo: repo, HookID: hook.ID, ManagedURL: url, SecretRef: secretRef, ConsecutiveDisables: 0, CreatedAt: now, UpdatedAt: now}
-		if err := store.Upsert(ctx, record); err != nil {
+		if err := store.SaveIfCurrentHookID(ctx, record, expectedHookID); err != nil {
 			// Rollback must not inherit a stop-cancelled reconcile ctx: CreateHook
 			// already succeeded, so a dead parent would leave an unrecorded remote hook.
 			if deleteErr := w.deleteTunnelHookForRollback(client, repo, hook.ID); deleteErr != nil {
@@ -272,7 +268,7 @@ func (w *webhookRuntime) reconcileTunnelHook(ctx context.Context, store *storage
 		return tunnelStateFromRecord(record, fmt.Sprintf("get hook by id: %v", err))
 	}
 	if !found {
-		hook, err := client.CreateHook(ctx, repo, url, secret, webhookForwardEvents)
+		hook, err := client.CreateHook(ctx, repo, url, secret, events)
 		if err != nil {
 			return tunnelStateFromRecord(record, fmt.Sprintf("recreate missing hook: %v", err))
 		}
@@ -283,7 +279,7 @@ func (w *webhookRuntime) reconcileTunnelHook(ctx context.Context, store *storage
 		record.LastDisableAt = nil
 		record.Orphaned = false
 		record.UpdatedAt = now
-		if err := store.Upsert(ctx, record); err != nil {
+		if err := store.SaveIfCurrentHookID(ctx, record, expectedHookID); err != nil {
 			// Same create→persist race as initial create: use stop-independent cleanup.
 			if deleteErr := w.deleteTunnelHookForRollback(client, repo, hook.ID); deleteErr != nil {
 				return tunnelStateFromRecord(record, fmt.Sprintf("persist recreated hook: %v; rollback delete of remote hook %d failed: %v", err, hook.ID, deleteErr))
@@ -293,9 +289,12 @@ func (w *webhookRuntime) reconcileTunnelHook(ctx context.Context, store *storage
 		return tunnelStateFromRecord(record, "")
 	}
 	if strings.TrimSpace(hook.Config.URL) != "" && strings.TrimSpace(hook.Config.URL) != strings.TrimSpace(record.ManagedURL) && strings.TrimSpace(hook.Config.URL) != url {
-		_ = store.MarkOrphaned(ctx, repo, true, now)
-		record.Orphaned = true
-		return tunnelStateFromRecord(record, "remote hook URL drifted; record marked orphaned and not mutated")
+		orphan := record
+		orphan.Orphaned, orphan.UpdatedAt = true, now
+		if err := store.SaveIfCurrentHookID(ctx, orphan, expectedHookID); err != nil {
+			return tunnelStateFromRecord(record, fmt.Sprintf("persist orphaned hook: %v", err))
+		}
+		return tunnelStateFromRecord(orphan, "remote hook URL drifted; record marked orphaned and not mutated")
 	}
 	reactivateOrphan := record.Orphaned
 	if reactivateOrphan {
@@ -309,21 +308,49 @@ func (w *webhookRuntime) reconcileTunnelHook(ctx context.Context, store *storage
 	if record.ConsecutiveDisables >= webhookTunnelDisableLatchThreshold && !hook.Active {
 		return tunnelStateLatched(record, "remote hook disabled repeatedly; not re-enabling")
 	}
-	needPatch := !hook.Active || strings.TrimSpace(hook.Config.URL) != url || !sameWebhookEvents(hook.Events, webhookForwardEvents) || !strings.EqualFold(strings.TrimSpace(hook.Config.ContentType), "json") || strings.TrimSpace(hook.Config.InsecureSSL) != "0" || strings.TrimSpace(hook.Config.Secret) == ""
-	if needPatch {
-		if !hook.Active {
-			record.ConsecutiveDisables++
-			last := now
-			record.LastDisableAt = &last
-			if record.ConsecutiveDisables >= webhookTunnelDisableLatchThreshold {
-				record.UpdatedAt = now
-				if err := store.Upsert(ctx, record); err != nil {
-					return tunnelStateFromRecord(record, fmt.Sprintf("persist latch state: %v", err))
-				}
-				return tunnelStateLatched(record, "remote hook disabled repeatedly; not re-enabling")
+	if !hook.Active {
+		record.ConsecutiveDisables++
+		last := now
+		record.LastDisableAt = &last
+		if record.ConsecutiveDisables >= webhookTunnelDisableLatchThreshold {
+			record.UpdatedAt = now
+			if err := store.SaveIfCurrentHookID(ctx, record, expectedHookID); err != nil {
+				return tunnelStateFromRecord(record, fmt.Sprintf("persist latch state: %v", err))
 			}
+			return tunnelStateLatched(record, "remote hook disabled repeatedly; not re-enabling")
 		}
-		_, err := client.UpdateHook(ctx, repo, record.HookID, url, secret, webhookForwardEvents, true)
+	}
+	// Forgejo PATCH cannot repair Actions subscriptions or change hook type.
+	// Reuse the existing create/persist/rollback lifecycle with the same secret
+	// so delivery keeps working throughout replacement of our recorded hook.
+	if forgejoRepo && (!sameWebhookEvents(hook.Events, events) || (hook.Type != "forgejo" && hook.Type != "gitea")) {
+		oldID := record.HookID
+		replacement, err := client.CreateHook(ctx, repo, url, secret, events)
+		if err != nil {
+			return tunnelStateFromRecord(record, fmt.Sprintf("replace webhook subscription: %v", err))
+		}
+		updated := record
+		updated.HookID, updated.ManagedURL, updated.Orphaned, updated.UpdatedAt = replacement.ID, url, false, now
+		if err := store.SaveIfCurrentHookID(ctx, updated, expectedHookID); err != nil {
+			if cleanupErr := w.deleteTunnelHookForRollback(client, repo, replacement.ID); cleanupErr != nil {
+				return tunnelStateFromRecord(record, fmt.Sprintf("persist replacement: %v; delete replacement hook %d: %v", err, replacement.ID, cleanupErr))
+			}
+			return tunnelStateFromRecord(record, fmt.Sprintf("persist replacement: %v", err))
+		}
+		if err := client.DeleteHook(ctx, repo, oldID); err != nil {
+			return tunnelStateFromRecord(updated, fmt.Sprintf("hook replaced; remove previous remote hook %d manually: %v", oldID, err))
+		}
+		return tunnelStateFromRecord(updated, "")
+	}
+	needPatch := !hook.Active || strings.TrimSpace(hook.Config.URL) != url || !sameWebhookEvents(hook.Events, events) || !strings.EqualFold(strings.TrimSpace(hook.Config.ContentType), "json")
+	if forgejoRepo {
+		needPatch = needPatch || hook.BranchFilter != ""
+	}
+	if !forgejoRepo {
+		needPatch = needPatch || strings.TrimSpace(hook.Config.InsecureSSL) != "0" || strings.TrimSpace(hook.Config.Secret) == ""
+	}
+	if needPatch {
+		_, err := client.UpdateHook(ctx, repo, record.HookID, url, secret, events, true)
 		if err != nil {
 			return tunnelStateFromRecord(record, fmt.Sprintf("update hook by id: %v", err))
 		}
@@ -331,14 +358,14 @@ func (w *webhookRuntime) reconcileTunnelHook(ctx context.Context, store *storage
 		record.SecretRef = secretRef
 		record.Orphaned = false
 		record.UpdatedAt = now
-		if err := store.Upsert(ctx, record); err != nil {
+		if err := store.SaveIfCurrentHookID(ctx, record, expectedHookID); err != nil {
 			return tunnelStateFromRecord(record, fmt.Sprintf("persist hook update: %v", err))
 		}
 	} else if reactivateOrphan || refreshManagedRecord {
 		record.ManagedURL = url
 		record.SecretRef = secretRef
 		record.UpdatedAt = now
-		if err := store.Upsert(ctx, record); err != nil {
+		if err := store.SaveIfCurrentHookID(ctx, record, expectedHookID); err != nil {
 			return tunnelStateFromRecord(record, fmt.Sprintf("persist hook state: %v", err))
 		}
 	}
@@ -396,12 +423,19 @@ func (s *webhookTunnelServer) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 		http.NotFound(w, r)
 		return
 	}
-	path, ok := webhookTunnelRequestPath(s.runtime.cfg, r.URL.Path)
+	cfg := s.runtime.configSnapshot()
+	path, ok := webhookTunnelRequestPath(cfg, r.URL.Path)
 	if !ok {
 		http.NotFound(w, r)
 		return
 	}
 	repo, ok := repoFromWebhookTunnelPath(path)
+	var identity *config.RepositoryIdentity
+	if target, found := forgejoWebhookTargetForPath(cfg, path); found {
+		resolved, _ := config.ProjectRepositoryIdentity(cfg, target)
+		identity = &resolved
+		repo, ok = config.WebhookRepositoryKey(cfg, target), true
+	}
 	if !ok {
 		http.NotFound(w, r)
 		return
@@ -420,7 +454,7 @@ func (s *webhookTunnelServer) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 		http.NotFound(w, r)
 		return
 	}
-	secret, err := readWebhookTunnelSecret(s.runtime.cfg.Storage.DBPath, record.SecretRef)
+	secret, err := readWebhookTunnelSecret(cfg.Storage.DBPath, record.SecretRef)
 	if err != nil {
 		http.Error(w, "webhook secret unavailable", http.StatusServiceUnavailable)
 		return
@@ -435,21 +469,30 @@ func (s *webhookTunnelServer) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, "read body", http.StatusBadRequest)
 		return
 	}
-	if !validGitHubSignature(secret, body, r.Header.Get("X-Hub-Signature-256")) {
+	deliveryID, eventType := r.Header.Get("X-GitHub-Delivery"), r.Header.Get("X-GitHub-Event")
+	validSignature := validGitHubSignature(secret, body, r.Header.Get("X-Hub-Signature-256"))
+	if identity != nil {
+		deliveryID, eventType, validSignature = forgejoWebhookHeaders(r.Header, secret, body)
+	}
+	if !validSignature {
 		if s.runtime.logger != nil {
-			s.runtime.logger.Warn("webhook.tunnel.signature_failed", map[string]any{"repo": repo, "delivery_id": r.Header.Get("X-GitHub-Delivery")})
+			s.runtime.logger.Warn("webhook.tunnel.signature_failed", map[string]any{"repo": repo, "delivery_id": deliveryID})
 		}
 		http.Error(w, "invalid signature", http.StatusUnauthorized)
 		return
 	}
-	if strings.EqualFold(r.Header.Get("X-GitHub-Event"), "ping") {
+	if strings.EqualFold(eventType, "ping") {
 		_ = store.UpdatePing(r.Context(), repo, s.runtime.currentTime().UnixNano())
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
 		return
 	}
-	payloadRepo := githubPayloadRepo(body)
-	if payloadRepo != "" && !strings.EqualFold(payloadRepo, repo) {
+	payloadRepo := webhookPayloadRepo(body)
+	expectedRepo := repo
+	if identity != nil {
+		expectedRepo = identity.Repo
+	}
+	if (identity != nil && payloadRepo == "") || (payloadRepo != "" && !strings.EqualFold(payloadRepo, expectedRepo)) {
 		http.Error(w, "repository mismatch", http.StatusBadRequest)
 		return
 	}
@@ -461,7 +504,7 @@ func (s *webhookTunnelServer) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 		if s.runtime.logger != nil {
 			s.runtime.logger.Warn("webhook.tunnel.admission_refused", map[string]any{
 				"repo":        repo,
-				"delivery_id": r.Header.Get("X-GitHub-Delivery"),
+				"delivery_id": deliveryID,
 				"error":       err.Error(),
 			})
 		}
@@ -473,19 +516,22 @@ func (s *webhookTunnelServer) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, "webhook forwarder unavailable", http.StatusServiceUnavailable)
 		return
 	}
-	result, err := forwarder.Forward(r.Context(), webhookforward.DeliveryRequest{DeliveryID: r.Header.Get("X-GitHub-Delivery"), EventType: r.Header.Get("X-GitHub-Event"), Payload: body})
+	result, err := forwarder.Forward(r.Context(), webhookforward.DeliveryRequest{DeliveryID: deliveryID, EventType: eventType, Payload: body, Repository: identity})
 	if err != nil {
 		// Post-gate admission refusal (race after allowTunnelForward) is temporary
 		// unavailability; do not treat as an invalid delivery (400).
 		status := http.StatusBadRequest
-		if errors.Is(err, webhookforward.ErrAdmissionRefused) {
+		if errors.Is(err, webhookforward.ErrAdmissionRefused) || errors.Is(err, webhookforward.ErrQueueFull) {
 			status = http.StatusServiceUnavailable
 		}
 		http.Error(w, err.Error(), status)
 		return
 	}
 	if strings.EqualFold(result.Status, "accepted") || result.WorkItems > 0 {
-		s.runtime.RecordDelivery(r.Header.Get("X-GitHub-Event"), r.Header.Get("X-GitHub-Delivery"))
+		s.runtime.RecordDelivery(eventType, deliveryID)
+		if identity != nil {
+			_ = store.UpdatePing(r.Context(), repo, s.runtime.currentTime().UnixNano())
+		}
 	}
 	w.WriteHeader(http.StatusAccepted)
 	_ = json.NewEncoder(w).Encode(result)
@@ -572,10 +618,10 @@ func configuredWebhookReposForMode(cfg config.Config, mode config.WebhookMode) [
 	seen := map[string]struct{}{}
 	repos := make([]string, 0, len(cfg.Projects))
 	for _, project := range cfg.Projects {
-		if config.ResolvedProjectProviderKind(cfg, project) == config.ProviderKindForgejo || webhookModeForProject(cfg, project.ID) != mode {
+		if config.ProjectWebhookMode(cfg, project) != mode {
 			continue
 		}
-		repo := strings.TrimSpace(project.Repo)
+		repo := config.WebhookRepositoryKey(cfg, project)
 		if repo == "" {
 			continue
 		}
@@ -590,29 +636,16 @@ func configuredWebhookReposForMode(cfg config.Config, mode config.WebhookMode) [
 }
 
 func webhookModeForProject(cfg config.Config, projectID string) config.WebhookMode {
-	mode := cfg.Webhook.Mode
 	for _, project := range cfg.Projects {
-		if project.ID == projectID && project.Webhook.Mode != "" {
-			mode = project.Webhook.Mode
-			break
+		if project.ID == projectID {
+			return config.ProjectWebhookMode(cfg, project)
 		}
 	}
-	if mode == "" {
-		return config.WebhookModeGHForward
-	}
-	return mode
+	return config.ProjectWebhookMode(cfg, config.ProjectRefConfig{})
 }
 
 func wModeNeedsGHForward(cfg config.Config) bool {
-	if cfg.Webhook.Mode == config.WebhookModeGHForward || cfg.Webhook.Mode == "" {
-		return true
-	}
-	for _, project := range cfg.Projects {
-		if project.Webhook.Mode == config.WebhookModeGHForward {
-			return true
-		}
-	}
-	return false
+	return config.WebhookNeedsGHForward(cfg)
 }
 
 func wModeNeedsTunnel(cfg config.Config) bool {
@@ -630,14 +663,7 @@ func wModeNeedsTunnel(cfg config.Config) bool {
 func configuredTunnelProjectIDs(cfg config.Config) []string {
 	ids := make([]string, 0, len(cfg.Projects))
 	for _, project := range cfg.Projects {
-		mode := cfg.Webhook.Mode
-		if project.Webhook.Mode != "" {
-			mode = project.Webhook.Mode
-		}
-		if mode == "" {
-			mode = config.WebhookModeGHForward
-		}
-		if mode != config.WebhookModeTunnel {
+		if config.ProjectWebhookMode(cfg, project) != config.WebhookModeTunnel {
 			continue
 		}
 		ids = append(ids, project.ID)
@@ -654,6 +680,9 @@ func webhookTunnelListenerURL(cfg config.Config) string {
 }
 
 func webhookTunnelManagedURL(cfg config.Config, repo string) string {
+	if project, ok := config.WebhookProject(cfg, repo); ok && config.ResolvedProjectProviderKind(cfg, project) == config.ProviderKindForgejo {
+		return strings.TrimRight(strings.TrimSpace(cfg.Webhook.PublicBaseURL), "/") + "/webhook/forgejo/project/" + url.PathEscape(project.ID)
+	}
 	return strings.TrimRight(strings.TrimSpace(cfg.Webhook.PublicBaseURL), "/") + "/webhook/" + strings.Trim(strings.TrimSpace(repo), "/")
 }
 
@@ -686,16 +715,24 @@ func repoFromWebhookTunnelPath(path string) (string, bool) {
 	return parts[1] + "/" + parts[2], true
 }
 
-func githubPayloadRepo(payload []byte) string {
+func webhookPayloadRepo(payload []byte) string {
 	var parsed struct {
 		Repository struct {
 			FullName string `json:"full_name"`
 		} `json:"repository"`
+		Run struct {
+			Repository struct {
+				FullName string `json:"full_name"`
+			} `json:"repository"`
+		} `json:"run"`
 	}
 	if err := json.Unmarshal(payload, &parsed); err != nil {
 		return ""
 	}
-	return strings.TrimSpace(parsed.Repository.FullName)
+	if parsed.Repository.FullName != "" {
+		return strings.TrimSpace(parsed.Repository.FullName)
+	}
+	return strings.TrimSpace(parsed.Run.Repository.FullName)
 }
 
 func validGitHubSignature(secret string, body []byte, signature string) bool {
@@ -713,6 +750,13 @@ func validGitHubSignature(secret string, body []byte, signature string) bool {
 }
 
 func webhookTunnelSecretRef(repo string) string {
+	if strings.HasPrefix(repo, "https://") || strings.HasPrefix(repo, "http://") {
+		// URL/path character replacement can alias distinct Forgejo instances
+		// and slugs. Hash only the file name; repository identity stays explicit
+		// in the existing record and signed-delivery binding.
+		digest := sha256.Sum256([]byte(repo))
+		return "webhook-forgejo-" + hex.EncodeToString(digest[:]) + ".key"
+	}
 	replacer := strings.NewReplacer("/", "_", ":", "_", "\\", "_")
 	return "webhook_" + replacer.Replace(strings.TrimSpace(repo)) + ".key"
 }

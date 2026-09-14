@@ -943,7 +943,7 @@ func (a plannerGitHubAdapter) ListOpenIssues(ctx context.Context, input planner.
 		if err != nil {
 			return nil, err
 		}
-		issues, err := client.ListOpenIssues(ctx, forge.ListIssuesInput{Labels: input.Labels, Assignee: input.Assignee, Limit: input.Limit})
+		issues, err := forgejoDiscoveryIssues(ctx, client, forge.ListIssuesInput{Labels: input.Labels, Assignee: input.Assignee, Limit: input.Limit}, input.IssueNumber)
 		if err != nil {
 			return nil, err
 		}
@@ -2847,7 +2847,7 @@ func (a workerGitHubAdapter) ListOpenIssues(ctx context.Context, input worker.Li
 		if err != nil {
 			return nil, err
 		}
-		issues, err := client.ListOpenIssues(ctx, forge.ListIssuesInput{Labels: input.Labels, Assignee: input.Assignee, Limit: input.Limit})
+		issues, err := forgejoDiscoveryIssues(ctx, client, forge.ListIssuesInput{Labels: input.Labels, Assignee: input.Assignee, Limit: input.Limit}, input.IssueNumber)
 		if err != nil {
 			return nil, err
 		}
@@ -3295,6 +3295,10 @@ func buildCatalogSchedulerHandlers(source projects.ConfigSource, claimBoundary *
 			Fixer: catalogWebhookFixer{snapshot: func() fixerScheduler {
 				return handlers.snapshot().fixer
 			}},
+			DiscoverProject: func(ctx context.Context, request webhookforward.ProjectDiscovery) error {
+				input := handlers.snapshot().input(Services{Repositories: repos, Coordinator: coordinator})
+				return discoverWebhookProject(ctx, input, request)
+			},
 			Logger: logger,
 			Now:    now,
 			// Accept-time gate only: once Forward returns accepted/202 the
@@ -3930,8 +3934,11 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			ConfigSource: configSource,
 			Reviewer:     webhookReviewer,
 			Fixer:        webhookFixer,
-			Logger:       logger,
-			Now:          now,
+			DiscoverProject: func(ctx context.Context, request webhookforward.ProjectDiscovery) error {
+				return discoverWebhookProject(ctx, inputForServices(Services{Repositories: repos, Coordinator: coordinator}), request)
+			},
+			Logger: logger,
+			Now:    now,
 		})
 	}
 	return handlers

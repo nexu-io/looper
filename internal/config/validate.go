@@ -385,8 +385,8 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 		if project.Path != "" && project.RepoPath != "" && project.Path != project.RepoPath {
 			issues = append(issues, ValidationIssue{Path: prefix + ".path", Message: "must match repoPath when both path and repoPath are set"})
 		}
-		if providerKind == ProviderKindForgejo && project.Webhook.Mode != "" {
-			issues = append(issues, ValidationIssue{Path: prefix + ".webhook.mode", Message: "must be omitted for forgejo projects; forgejo MVP uses polling only"})
+		if providerKind == ProviderKindForgejo && project.Webhook.Mode == WebhookModeGHForward {
+			issues = append(issues, ValidationIssue{Path: prefix + ".webhook.mode", Message: "must be tunnel or omitted for forgejo projects; gh-forward is GitHub-only"})
 		}
 		if providerKind == ProviderKindForgejo && normalizeNetworkMode(project.Network.Mode) == NetworkModeRouted {
 			issues = append(issues, ValidationIssue{Path: prefix + ".network.mode", Message: "must be off for forgejo projects; routed network mode is not supported"})

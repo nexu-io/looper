@@ -129,7 +129,7 @@ func (r *commandRuntime) webhookEnable(cmd *cobra.Command, args []string) error 
 			ghPath = strings.TrimSpace(resolved)
 		}
 	}
-	if ghPath != "" {
+	if ghPath != "" && webhookConfigNeedsGHForward(loaded.Config) {
 		available, checkErr := r.ghWebhookCommandAvailable(cmd.Context(), ghPath)
 		if checkErr != nil {
 			ghWebhookWarning = fmt.Sprintf("could not check gh webhook command: %v", checkErr)
@@ -348,7 +348,7 @@ func (r *commandRuntime) webhookListOrphans(cmd *cobra.Command, args []string) e
 }
 
 func (r *commandRuntime) webhookDelete(cmd *cobra.Command, args []string) error {
-	repo, err := normalizeWebhookRepo(args[0])
+	repo, err := normalizeManagedWebhookRepo(args[0])
 	if err != nil {
 		return err
 	}
@@ -368,17 +368,13 @@ func (r *commandRuntime) webhookDelete(cmd *cobra.Command, args []string) error 
 			if !record.Orphaned {
 				return fmt.Errorf("refusing to forget active tunnel webhook record for %s; remove the repo from tunnel mode first so the record becomes orphaned", repo)
 			}
-			if err := repos.WebhookTunnelHooks.Delete(cmd.Context(), repo); err != nil {
+			if err := repos.WebhookTunnelHooks.DeleteIfCurrentHookID(cmd.Context(), repo, record.HookID); err != nil {
 				return err
 			}
 			_, err := fmt.Fprintf(cmd.OutOrStdout(), "Forgot local tunnel webhook record for %s (hookId=%d); remote hook was not deleted.\n", repo, record.HookID)
 			return err
 		}
-		ghPath, err := r.resolveGHPath(cfg)
-		if err != nil {
-			return err
-		}
-		hook, found, err := r.getWebhookHook(cmd.Context(), ghPath, repo, record.HookID)
+		hook, found, err := r.getManagedWebhookHook(cmd.Context(), cfg, repo, record.HookID)
 		if err != nil {
 			return err
 		}
@@ -386,11 +382,11 @@ func (r *commandRuntime) webhookDelete(cmd *cobra.Command, args []string) error 
 			return fmt.Errorf("refusing to delete hook %d for %s: remote URL %q does not match managed URL %q", record.HookID, repo, hook.Config.URL, record.ManagedURL)
 		}
 		if found {
-			if err := r.deleteWebhookHook(cmd.Context(), ghPath, repo, record.HookID); err != nil {
+			if err := r.deleteManagedWebhookHook(cmd.Context(), cfg, repo, record.HookID); err != nil {
 				return err
 			}
 		}
-		if err := repos.WebhookTunnelHooks.Delete(cmd.Context(), repo); err != nil {
+		if err := repos.WebhookTunnelHooks.DeleteIfCurrentHookID(cmd.Context(), repo, record.HookID); err != nil {
 			return err
 		}
 		_, err = fmt.Fprintf(cmd.OutOrStdout(), "Deleted managed tunnel webhook for %s (hookId=%d).\n", repo, record.HookID)
@@ -399,7 +395,7 @@ func (r *commandRuntime) webhookDelete(cmd *cobra.Command, args []string) error 
 }
 
 func (r *commandRuntime) webhookRotate(cmd *cobra.Command, args []string) error {
-	repo, err := normalizeWebhookRepo(args[0])
+	repo, err := normalizeManagedWebhookRepo(args[0])
 	if err != nil {
 		return err
 	}
@@ -410,6 +406,9 @@ func (r *commandRuntime) webhookRotate(cmd *cobra.Command, args []string) error 
 		}
 		if !ok || record.Orphaned {
 			return fmt.Errorf("no active managed tunnel webhook record found for %s", repo)
+		}
+		if isForgejoManagedWebhookRepo(repo) {
+			return r.rotateForgejoWebhook(cmd, cfg, repos, record)
 		}
 		ghPath, err := r.resolveGHPath(cfg)
 		if err != nil {
@@ -509,15 +508,7 @@ func webhookConfigUsesTunnel(cfg config.Config) bool {
 }
 
 func webhookConfigNeedsGHForward(cfg config.Config) bool {
-	if cfg.Webhook.Mode == "" || cfg.Webhook.Mode == config.WebhookModeGHForward {
-		return true
-	}
-	for _, project := range cfg.Projects {
-		if project.Webhook.Mode == config.WebhookModeGHForward {
-			return true
-		}
-	}
-	return false
+	return config.WebhookNeedsGHForward(cfg)
 }
 
 func webhookRuntimeHasActiveTunnelHooks(runtime *webhookRuntimeView) bool {
