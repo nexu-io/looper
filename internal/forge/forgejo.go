@@ -1064,14 +1064,14 @@ func (forgejo *ForgejoClient) doRaw(ctx context.Context, method string, path str
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		sanitized := sanitizeForgejoErrorBody(responseBody, token)
-		message := sanitized
+		httpErr := &ForgejoHTTPError{Method: method, Path: path, StatusCode: response.StatusCode, Message: sanitized, body: sanitized}
 		if forgejo.session != nil {
-			if response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden {
+			if response.StatusCode == http.StatusUnauthorized || (response.StatusCode == http.StatusForbidden && !forgejoReactionAlreadyPresent(httpErr)) {
 				forgejo.session.Invalidate(token)
 			}
-			message = fmt.Sprintf("hosting identity %q: hosting server rejected the request", forgejo.session.Name())
+			httpErr.Message = fmt.Sprintf("hosting identity %q: hosting server rejected the request", forgejo.session.Name())
 		}
-		return rawResponse{}, &ForgejoHTTPError{Method: method, Path: path, StatusCode: response.StatusCode, Message: message, body: sanitized}
+		return rawResponse{}, httpErr
 	}
 	if forgejo.session != nil {
 		responseBody = []byte(forgejo.session.Redact(string(responseBody)))

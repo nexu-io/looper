@@ -298,9 +298,11 @@ func TestForgejoAddIssueReactionSessionBoundDuplicate(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
+			userHits := 0
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				switch {
 				case r.Method == http.MethodGet && r.URL.Path == "/api/v1/user":
+					userHits++
 					writeJSON(t, w, http.StatusOK, map[string]any{"id": 77, "login": "looper-bot", "full_name": "Loop Bot", "email": "bot@example.test"})
 				case r.Method == http.MethodGet && r.URL.Path == "/api/v1/repos/acme/looper":
 					writeJSON(t, w, http.StatusOK, map[string]any{"full_name": "acme/looper"})
@@ -341,6 +343,12 @@ func TestForgejoAddIssueReactionSessionBoundDuplicate(t *testing.T) {
 			}
 			if err != nil {
 				t.Fatalf("AddIssueReaction() error = %v, want duplicate treated as success", err)
+			}
+			if err := client.AddIssueReaction(bound, 54, "+1"); err != nil {
+				t.Fatalf("AddIssueReaction(repeat) error = %v", err)
+			}
+			if userHits != 1 {
+				t.Fatalf("user probes = %d, want cached credential after duplicate 403", userHits)
 			}
 		})
 	}
