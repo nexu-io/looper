@@ -1016,6 +1016,45 @@ func TestProcessClaimedItemSelfAssignsIssue(t *testing.T) {
 	}
 }
 
+func TestProcessClaimedItemGitHubAppSkipsSelfAssign(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	issue := IssueSummary{Number: 42, Title: "Plan this"}
+	loopResult, err := (&Runner{repos: fixture.repos, now: fixture.now}).ensureLoopForIssue(context.Background(), storage.ProjectRecord{ID: "project_1"}, "acme/looper", issue, buildPlannerDiscoveryFingerprint("acme/looper", fixture.now(), issue))
+	if err != nil {
+		t.Fatalf("ensureLoopForIssue() error = %v", err)
+	}
+	queueItem, err := (&Runner{repos: fixture.repos, now: fixture.now, retryMaxAttempts: 3}).enqueue(context.Background(), enqueueInput{ProjectID: "project_1", LoopID: loopResult.record.ID, Repo: "acme/looper", IssueNumber: issue.Number, Payload: map[string]any{"issueNumber": issue.Number, "manual": true}})
+	if err != nil {
+		t.Fatalf("enqueue() error = %v", err)
+	}
+	cfg := config.Config{
+		Projects:   []config.ProjectRefConfig{{ID: "project_1", Repo: "acme/looper", Identity: "planner-bot"}},
+		Identities: map[string]config.HostingIdentityConfig{"planner-bot": {Kind: config.HostingIdentityGitHubApp, AppID: 1, InstallationID: 2, PrivateKeyFile: "/not-read-by-fake-transports.pem"}},
+	}
+	github := &fakeGitHubGateway{login: "looper-sandbox-e2e[bot]", issueDetail: IssueDetail{Number: 42, Title: "Plan this", Body: "details", URL: "https://example/issues/42", Assignees: []string{"teammate"}, Labels: []string{"looper:plan"}}, addAssigneeErr: fmt.Errorf("Forbidden (HTTP 403)"), createPRResult: CreatePullRequestResult{Number: 101, URL: "https://example/pr/101"}}
+	git := &fakeGitGateway{createResult: CreateWorktreeResult{ID: "worktree_1", WorktreePath: filepath.Join(t.TempDir(), "wt"), Branch: "looper/planner/42-plan-this", BaseBranch: "main"}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, AgentExecutor: &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "wrote spec"}}}, Logger: fixture.logger, Now: fixture.now, AllowAutoPush: boolPtr(true), CustomInstructions: &cfg})
+
+	claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "planner-worker-1", "planner")
+	if err != nil || claim == nil {
+		t.Fatalf("ClaimNextOfType() = (%#v, %v), want claimed item", claim, err)
+	}
+	if claim.ID != queueItem.ID {
+		t.Fatalf("claim.ID = %q, want %q", claim.ID, queueItem.ID)
+	}
+	result, err := runner.ProcessClaimedItem(context.Background(), *claim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "success" {
+		t.Fatalf("result = %#v, want success without GitHub App self-assignment", result)
+	}
+	if len(github.addAssigneeCalls) != 0 {
+		t.Fatalf("addAssigneeCalls = %#v, want no GitHub App self-assignment", github.addAssigneeCalls)
+	}
+}
+
 func TestProcessClaimedItemSurfacesIssueSelfAssignmentFailure(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)

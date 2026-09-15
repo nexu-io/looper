@@ -609,7 +609,9 @@ does not introduce an operating-system sandbox for arbitrary same-user code.
 GitHub App permissions must cover the actions enabled for the role: commonly
 repository contents, issues and pull requests, with read access to checks and
 Actions for CI diagnosis. Enterprise instances may require an explicit
-`commit.email`. Forgejo bot tokens must support account lookup (`read:user`)
+`commit.email`. GitHub forbids App installations from assigning themselves as
+issue assignees, so worker and planner skip that claim step for App identities
+and `[bot]` logins. Forgejo bot tokens must support account lookup (`read:user`)
 and the repository operations in use; repository-only token scopes that exclude
 account lookup are insufficient. Platform review and self-approval restrictions
 continue to apply.

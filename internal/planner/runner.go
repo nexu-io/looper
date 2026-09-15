@@ -908,7 +908,7 @@ func (r *Runner) runDiscoverIssueStep(ctx context.Context, input stepInput) (pla
 		releaseOnError = false
 		return checkpoint, nil
 	}
-	if manual && currentLogin != "" && !includesLogin(detail.Assignees, currentLogin) {
+	if manual && currentLogin != "" && !includesLogin(detail.Assignees, currentLogin) && hostingKindForContext(ctx) != config.HostingIdentityGitHubApp && !strings.HasSuffix(currentLogin, "[bot]") {
 		if err := r.github.AddIssueAssignees(ctx, IssueAssigneesInput{Repo: repo, IssueNumber: issueNumber, Assignees: []string{currentLogin}, CWD: input.Project.RepoPath}); err != nil {
 			return input.Checkpoint, &loopError{message: fmt.Sprintf("Unable to assign issue %s#%d to %s: %v", repo, issueNumber, currentLogin, err), kind: FailureRetryableAfterResume}
 		}

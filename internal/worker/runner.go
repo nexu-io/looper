@@ -1507,6 +1507,9 @@ func (r *Runner) selfAssignIssue(ctx context.Context, work workerInput, cwd stri
 	if r.github == nil || work.IssueNumber <= 0 {
 		return nil
 	}
+	if hostingKindForContext(ctx) == config.HostingIdentityGitHubApp {
+		return nil
+	}
 	repo := issueLookupRepo(work)
 	if repo == "" {
 		return nil
@@ -1516,7 +1519,7 @@ func (r *Runner) selfAssignIssue(ctx context.Context, work workerInput, cwd stri
 		return &loopError{message: fmt.Sprintf("Unable to resolve GitHub login for worker issue self-assignment on %s#%d: %v", repo, work.IssueNumber, err), kind: FailureRetryableAfterResume}
 	}
 	login = normalizeLogin(login)
-	if login == "" {
+	if login == "" || strings.HasSuffix(login, "[bot]") {
 		return nil
 	}
 	if err := r.github.AddIssueAssignees(ctx, IssueAssigneesInput{Repo: repo, IssueNumber: work.IssueNumber, Assignees: []string{login}, CWD: cwd}); err != nil {

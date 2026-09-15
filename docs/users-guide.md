@@ -242,14 +242,14 @@ So the most common GitHub-side trigger is:
 
 Planner will:
 
-- add the current GitHub user as an issue assignee when the issue is claimed, preserving any existing assignees
+- add the current GitHub user as an issue assignee when the issue is claimed, preserving any existing assignees. GitHub App identities skip this step: GitHub forbids App installations from assigning themselves
 - create a worktree
 - write the spec file
 - push a spec PR
 - add the `looper:spec-reviewing` label to that PR
 - request reviewers when appropriate
 
-If planner cannot assign the issue in GitHub, it reports a retryable failure rather than continuing with ambiguous ownership.
+If planner cannot assign the issue in GitHub, it reports a retryable failure rather than continuing with ambiguous ownership. That failure does not apply to GitHub App identities.
 
 ## 7. Reviewer: review a spec PR or a normal PR
 
