@@ -242,7 +242,7 @@ So the most common GitHub-side trigger is:
 
 Planner will:
 
-- add the current GitHub user as an issue assignee when the issue is claimed, preserving any existing assignees. GitHub App identities skip this step: GitHub forbids App installations from assigning themselves
+- add the current GitHub user as an issue assignee when the issue is claimed, preserving any existing assignees. GitHub App identities skip this step for GitHub issues: GitHub forbids App installations from assigning themselves
 - create a worktree
 - write the spec file
 - push a spec PR
@@ -418,7 +418,7 @@ If that issue already has a related planner loop, worker will try to reuse plann
 
 That means issue → planner → worker can flow through without manually copying the spec path.
 
-When worker claims an issue, it adds the current GitHub user as an assignee and preserves any existing assignees. If GitHub assignment fails, the claim reports a retryable failure instead of silently continuing with ambiguous ownership.
+When worker claims an issue, it adds the current GitHub user as an assignee and preserves any existing assignees. GitHub App identities skip this step for GitHub issues: GitHub forbids App installations from assigning themselves. If GitHub assignment fails, the claim reports a retryable failure instead of silently continuing with ambiguous ownership. That failure does not apply to GitHub App identities.
 
 For Forgejo projects, Worker does not claim issues by mutating assignees. The issue must already be assigned to the current Forgejo provider user, and Worker re-checks that assignment before side effects.
 

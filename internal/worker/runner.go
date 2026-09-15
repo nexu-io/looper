@@ -1487,7 +1487,7 @@ func (r *Runner) runPrepareWorkStep(ctx context.Context, input stepInput) (worke
 			return checkpoint, nil
 		}
 	} else if work.IssueNumber > 0 && r.github != nil && (!work.AutoDiscovered || policy.RequireAssigneeCurrentUser) {
-		if err := r.selfAssignIssue(ctx, work, input.Project.RepoPath); err != nil {
+		if err := r.selfAssignIssue(ctx, work, input.Project.RepoPath, input.Project.ID); err != nil {
 			_ = r.repos.Locks.Release(context.Background(), lockKey)
 			return checkpoint, err
 		}
@@ -1503,11 +1503,11 @@ func (r *Runner) runPrepareWorkStep(ctx context.Context, input stepInput) (worke
 	return checkpoint, nil
 }
 
-func (r *Runner) selfAssignIssue(ctx context.Context, work workerInput, cwd string) error {
+func (r *Runner) selfAssignIssue(ctx context.Context, work workerInput, cwd, projectID string) error {
 	if r.github == nil || work.IssueNumber <= 0 {
 		return nil
 	}
-	if hostingKindForContext(ctx) == config.HostingIdentityGitHubApp {
+	if r.providerKindForProject(projectID) == config.ProviderKindGitHub && hostingKindForContext(ctx) == config.HostingIdentityGitHubApp {
 		return nil
 	}
 	repo := issueLookupRepo(work)
