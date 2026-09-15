@@ -2827,6 +2827,60 @@ func TestProcessClaimedItemSelfAssignsIssue(t *testing.T) {
 	}
 }
 
+func TestProcessClaimedItemGitHubAppSkipsSelfAssign(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	fixture.cfg.Projects = []config.ProjectRefConfig{{ID: "project_1", Repo: "acme/looper", Identity: "worker-bot"}}
+	fixture.cfg.Identities = map[string]config.HostingIdentityConfig{"worker-bot": {Kind: config.HostingIdentityGitHubApp, AppID: 1, InstallationID: 2, PrivateKeyFile: "/not-read-by-fake-transports.pem"}}
+	github := &fakeGitHubGateway{currentLogin: "looper-sandbox-e2e[bot]", issueDetail: IssueDetail{Number: 27, Title: "Implement worker loop", State: "open"}, addAssigneeErr: fmt.Errorf("Forbidden (HTTP 403)")}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, CustomInstructions: fixture.cfg})
+
+	claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "worker-1", "worker")
+	if err != nil || claim == nil {
+		t.Fatalf("ClaimNextOfType() = (%#v, %v), want claimed item", claim, err)
+	}
+	result, err := runner.ProcessClaimedQueueItem(context.Background(), *claim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedQueueItem() error = %v", err)
+	}
+	if result == nil || result.Status == "failed" {
+		t.Fatalf("result = %#v, want GitHub App worker to continue without self-assignment", result)
+	}
+	if len(github.addAssigneeCalls) != 0 {
+		t.Fatalf("addAssigneeCalls = %#v, want no GitHub App self-assignment", github.addAssigneeCalls)
+	}
+}
+
+func TestProcessClaimedItemGitHubAppPlaneStillSelfAssigns(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	fixture.cfg.Providers = []config.ProviderConfig{{ID: "plane-open-design", Kind: config.ProviderKindPlane}}
+	fixture.cfg.Projects = []config.ProjectRefConfig{{ID: "project_1", Provider: "plane-open-design", Repo: "acme/looper", Identity: "worker-bot"}}
+	fixture.cfg.Identities = map[string]config.HostingIdentityConfig{"worker-bot": {Kind: config.HostingIdentityGitHubApp, AppID: 1, InstallationID: 2, PrivateKeyFile: "/not-read-by-fake-transports.pem"}}
+	const planeLogin = "11111111-2222-3333-4444-555555555555"
+	github := &fakeGitHubGateway{currentLogin: planeLogin, issueDetail: IssueDetail{Number: 27, Title: "Implement worker loop", State: "open"}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, CustomInstructions: fixture.cfg})
+
+	claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "worker-1", "worker")
+	if err != nil || claim == nil {
+		t.Fatalf("ClaimNextOfType() = (%#v, %v), want claimed item", claim, err)
+	}
+	result, err := runner.ProcessClaimedQueueItem(context.Background(), *claim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedQueueItem() error = %v", err)
+	}
+	if result == nil || result.Status == "failed" {
+		t.Fatalf("result = %#v, want Plane assignment to proceed under a GitHub App identity", result)
+	}
+	if len(github.addAssigneeCalls) != 1 {
+		t.Fatalf("addAssigneeCalls = %#v, want Plane self-assignment despite GitHub App hosting identity", github.addAssigneeCalls)
+	}
+	call := github.addAssigneeCalls[0]
+	if call.IssueNumber != 27 || len(call.Assignees) != 1 || call.Assignees[0] != planeLogin {
+		t.Fatalf("add assignee call = %#v, want Plane login on issue 27", call)
+	}
+}
+
 func TestProcessClaimedItemAutoDiscoveredIssueSkipsSelfAssignWhenAssigneePolicyDisabled(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)

@@ -1487,7 +1487,7 @@ func (r *Runner) runPrepareWorkStep(ctx context.Context, input stepInput) (worke
 			return checkpoint, nil
 		}
 	} else if work.IssueNumber > 0 && r.github != nil && (!work.AutoDiscovered || policy.RequireAssigneeCurrentUser) {
-		if err := r.selfAssignIssue(ctx, work, input.Project.RepoPath); err != nil {
+		if err := r.selfAssignIssue(ctx, work, input.Project.RepoPath, input.Project.ID); err != nil {
 			_ = r.repos.Locks.Release(context.Background(), lockKey)
 			return checkpoint, err
 		}
@@ -1503,8 +1503,11 @@ func (r *Runner) runPrepareWorkStep(ctx context.Context, input stepInput) (worke
 	return checkpoint, nil
 }
 
-func (r *Runner) selfAssignIssue(ctx context.Context, work workerInput, cwd string) error {
+func (r *Runner) selfAssignIssue(ctx context.Context, work workerInput, cwd, projectID string) error {
 	if r.github == nil || work.IssueNumber <= 0 {
+		return nil
+	}
+	if r.providerKindForProject(projectID) == config.ProviderKindGitHub && hostingKindForContext(ctx) == config.HostingIdentityGitHubApp {
 		return nil
 	}
 	repo := issueLookupRepo(work)
@@ -1516,7 +1519,7 @@ func (r *Runner) selfAssignIssue(ctx context.Context, work workerInput, cwd stri
 		return &loopError{message: fmt.Sprintf("Unable to resolve GitHub login for worker issue self-assignment on %s#%d: %v", repo, work.IssueNumber, err), kind: FailureRetryableAfterResume}
 	}
 	login = normalizeLogin(login)
-	if login == "" {
+	if login == "" || strings.HasSuffix(login, "[bot]") {
 		return nil
 	}
 	if err := r.github.AddIssueAssignees(ctx, IssueAssigneesInput{Repo: repo, IssueNumber: work.IssueNumber, Assignees: []string{login}, CWD: cwd}); err != nil {
