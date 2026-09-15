@@ -508,6 +508,49 @@ func TestReviewerGitHubAdapterForgejoCommentOnlyFlow(t *testing.T) {
 	}
 }
 
+func TestReviewerGitHubAdapterForgejoPullRequestReactions(t *testing.T) {
+	t.Setenv("FORGEJO_TOKEN", "secret")
+	var added map[string]string
+	var removed map[string]string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/repos/acme/looper/issues/54/reactions":
+			if err := json.NewDecoder(r.Body).Decode(&added); err != nil {
+				t.Fatalf("decode add reaction: %v", err)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"content": "+1"})
+		case r.Method == http.MethodDelete && r.URL.Path == "/api/v1/repos/acme/looper/issues/54/reactions":
+			if err := json.NewDecoder(r.Body).Decode(&removed); err != nil {
+				t.Fatalf("decode remove reaction: %v", err)
+			}
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	repoPath := filepath.Join(t.TempDir(), "repo")
+	cfg := config.Config{
+		Providers: []config.ProviderConfig{{ID: "forgejo-main", Kind: config.ProviderKindForgejo, BaseURL: server.URL, TokenEnv: stringPtr("FORGEJO_TOKEN")}},
+		Projects:  []config.ProjectRefConfig{{ID: "project_1", Provider: "forgejo-main", Repo: "acme/looper", RepoPath: repoPath}},
+	}
+	adapter := reviewerGitHubAdapter{stamper: disclosure.FromConfig(cfg), config: &cfg}
+	ctx := context.Background()
+	if err := adapter.AddPullRequestReaction(ctx, reviewer.PullRequestReactionInput{Repo: "acme/looper", PRNumber: 54, Content: "+1", CWD: repoPath}); err != nil {
+		t.Fatalf("AddPullRequestReaction() error = %v", err)
+	}
+	if added["content"] != "+1" {
+		t.Fatalf("added = %#v, want +1", added)
+	}
+	if err := adapter.RemovePullRequestReaction(ctx, reviewer.PullRequestReactionInput{Repo: "acme/looper", PRNumber: 54, Content: "+1", CWD: repoPath}); err != nil {
+		t.Fatalf("RemovePullRequestReaction() error = %v", err)
+	}
+	if removed["content"] != "+1" {
+		t.Fatalf("removed = %#v, want +1", removed)
+	}
+}
+
 func TestReviewerGitHubAdapterForgejoThreadResolutionShortCircuits(t *testing.T) {
 	t.Setenv("FORGEJO_TOKEN", "secret")
 	repoPath := filepath.Join(t.TempDir(), "repo")

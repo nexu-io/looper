@@ -323,11 +323,13 @@ func (t *teaTransport) doRaw(ctx context.Context, method string, path string, qu
 		return rawResponse{}, fmt.Errorf("forgejo tea API %s %s response exceeds %d bytes", method, path, maxForgejoResponseBodyBytes)
 	}
 	if statusCode < 200 || statusCode >= 300 {
+		sanitized := sanitizeForgejoErrorBody(body, "")
 		return rawResponse{}, &ForgejoHTTPError{
 			Method:     method,
 			Path:       path,
 			StatusCode: statusCode,
-			Message:    sanitizeForgejoErrorBody(body, ""),
+			Message:    sanitized,
+			body:       sanitized,
 		}
 	}
 	return rawResponse{body: body, header: headers}, nil
@@ -399,15 +401,18 @@ func classifyTeaAPIFailure(method, path string, result shell.Result) error {
 	case strings.Contains(lower, "unauthorized") || strings.Contains(lower, "401") || strings.Contains(lower, "bad credentials") || strings.Contains(lower, "authentication failed"):
 		return &TeaAuthError{Code: TeaErrorAuthFailed, Message: "tea authentication failed for the selected login"}
 	case strings.Contains(lower, "forbidden") || strings.Contains(lower, "403"):
-		return &ForgejoHTTPError{Method: method, Path: path, StatusCode: http.StatusForbidden, Message: sanitizeTeaCLIError(result.Stderr, result.Stdout)}
+		body := sanitizeForgejoErrorBody([]byte(result.Stdout), "")
+		return &ForgejoHTTPError{Method: method, Path: path, StatusCode: http.StatusForbidden, Message: sanitizeTeaCLIError(result.Stderr, result.Stdout), body: body}
 	default:
 		// Try parse -i headers even on non-zero exit.
 		if statusCode, _, err := parseTeaIncludeHeaders(result.Stderr); err == nil && statusCode >= 400 {
+			sanitized := sanitizeForgejoErrorBody([]byte(result.Stdout), "")
 			return &ForgejoHTTPError{
 				Method:     method,
 				Path:       path,
 				StatusCode: statusCode,
-				Message:    sanitizeForgejoErrorBody([]byte(result.Stdout), ""),
+				Message:    sanitized,
+				body:       sanitized,
 			}
 		}
 		return &TeaAuthError{Code: TeaErrorAuthFailed, Message: sanitizeTeaCLIError(result.Stderr, result.Stdout)}

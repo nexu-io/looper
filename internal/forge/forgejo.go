@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -434,6 +435,7 @@ type ForgejoHTTPError struct {
 	Path       string
 	StatusCode int
 	Message    string
+	body       string
 }
 
 func (err *ForgejoHTTPError) Error() string {
@@ -644,6 +646,56 @@ func (forgejo *ForgejoClient) AddIssueAssignees(ctx context.Context, issueNumber
 
 func (forgejo *ForgejoClient) RemoveIssueAssignees(ctx context.Context, issueNumber int64, assignees []string) error {
 	return forgejo.do(ctx, http.MethodDelete, forgejo.repoPath("issues", strconv.FormatInt(issueNumber, 10), "assignees"), nil, map[string][]string{"assignees": assignees}, nil)
+}
+
+func (forgejo *ForgejoClient) AddIssueReaction(ctx context.Context, issueNumber int64, content string) error {
+	content = strings.TrimSpace(content)
+	if content == "" {
+		return nil
+	}
+	err := forgejo.do(ctx, http.MethodPost, forgejo.repoPath("issues", strconv.FormatInt(issueNumber, 10), "reactions"), nil, map[string]string{"content": content}, nil)
+	if forgejoReactionAlreadyPresent(err) {
+		return nil
+	}
+	return err
+}
+
+func (forgejo *ForgejoClient) RemoveIssueReaction(ctx context.Context, issueNumber int64, content string) error {
+	content = strings.TrimSpace(content)
+	if content == "" {
+		return nil
+	}
+	err := forgejo.do(ctx, http.MethodDelete, forgejo.repoPath("issues", strconv.FormatInt(issueNumber, 10), "reactions"), nil, map[string]string{"content": content}, nil)
+	if forgejoReactionMissing(err) {
+		return nil
+	}
+	return err
+}
+
+func forgejoReactionAlreadyPresent(err error) bool {
+	var httpErr *ForgejoHTTPError
+	if !errors.As(err, &httpErr) {
+		return false
+	}
+	if httpErr.StatusCode == http.StatusConflict {
+		return true
+	}
+	return httpErr.StatusCode == http.StatusForbidden && strings.Contains(strings.ToLower(httpErr.responseBody()), "already")
+}
+
+func (err *ForgejoHTTPError) responseBody() string {
+	if err == nil {
+		return ""
+	}
+	if strings.TrimSpace(err.body) != "" {
+		return err.body
+	}
+	return err.Message
+}
+
+func forgejoReactionMissing(err error) bool {
+	var httpErr *ForgejoHTTPError
+	return errors.As(err, &httpErr) && httpErr.StatusCode == http.StatusNotFound
 }
 
 func (forgejo *ForgejoClient) CreateIssueComment(ctx context.Context, input CreateCommentInput) (Comment, error) {
@@ -1011,14 +1063,15 @@ func (forgejo *ForgejoClient) doRaw(ctx context.Context, method string, path str
 		return rawResponse{}, fmt.Errorf("forgejo API %s %s response exceeds %d bytes", method, path, maxForgejoResponseBodyBytes)
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		message := sanitizeForgejoErrorBody(responseBody, token)
+		sanitized := sanitizeForgejoErrorBody(responseBody, token)
+		message := sanitized
 		if forgejo.session != nil {
 			if response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden {
 				forgejo.session.Invalidate(token)
 			}
 			message = fmt.Sprintf("hosting identity %q: hosting server rejected the request", forgejo.session.Name())
 		}
-		return rawResponse{}, &ForgejoHTTPError{Method: method, Path: path, StatusCode: response.StatusCode, Message: message}
+		return rawResponse{}, &ForgejoHTTPError{Method: method, Path: path, StatusCode: response.StatusCode, Message: message, body: sanitized}
 	}
 	if forgejo.session != nil {
 		responseBody = []byte(forgejo.session.Redact(string(responseBody)))

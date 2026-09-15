@@ -1829,15 +1829,21 @@ func (a reviewerGitHubAdapter) EnableAutoMerge(ctx context.Context, input github
 }
 
 func (a reviewerGitHubAdapter) AddPullRequestReaction(ctx context.Context, input reviewer.PullRequestReactionInput) error {
-	if _, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
-		return err
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
+		if err != nil {
+			return err
+		}
+		return client.AddIssueReaction(ctx, input.PRNumber, input.Content)
 	}
 	return a.gateway.AddPullRequestReaction(ctx, githubinfra.PullRequestReactionInput{Repo: input.Repo, PRNumber: input.PRNumber, Content: input.Content, CWD: input.CWD})
 }
 
 func (a reviewerGitHubAdapter) RemovePullRequestReaction(ctx context.Context, input reviewer.PullRequestReactionInput) error {
-	if _, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
-		return err
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
+		if err != nil {
+			return err
+		}
+		return client.RemoveIssueReaction(ctx, input.PRNumber, input.Content)
 	}
 	return a.gateway.RemovePullRequestReaction(ctx, githubinfra.PullRequestReactionInput{Repo: input.Repo, PRNumber: input.PRNumber, Content: input.Content, CWD: input.CWD})
 }
