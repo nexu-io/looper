@@ -196,6 +196,7 @@ func TestValidateTopLevelLocationFlagsMissingContext(t *testing.T) {
 		"This has concerns and should be improved.",
 		"This needs work on these lines.",
 		"The function needs work.",
+		"App identity sandbox review looper-e2e:xyz App identity",
 	} {
 		if got := ValidateTopLevelLocation(body); !got.QualityFlagged {
 			t.Fatalf("expected missing location to be quality flagged for %q: %#v", body, got)
@@ -209,6 +210,7 @@ func TestValidateTopLevelLocationFlagsMissingContext(t *testing.T) {
 		"function ValidateTopLevelLocation should reject vague line references.",
 		"lines 12-14 should use the parsed anchor range.",
 		"section Reviewer anchors needs a validation example.",
+		"agent-commit.txt: App identity sandbox review looper-e2e:xyz App identity",
 	} {
 		if got := ValidateTopLevelLocation(body); !got.Valid {
 			t.Fatalf("expected exact location context to pass for %q: %#v", body, got)

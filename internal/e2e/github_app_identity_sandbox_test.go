@@ -206,6 +206,8 @@ func TestGitHubSandboxAppIdentity(t *testing.T) {
 	// Refresh the same captured installation, then exercise actual publication
 	// through the shared gateway. COMMENT is permitted on the bot's own PR;
 	// this test does not change self-approval/review-request policy.
+	// SubmitReview quality-gates marker-less top-level bodies, so name the
+	// committed file or the identity check dies locally as top-level-location-missing.
 	session.Invalidate(actor.Token)
 	refreshed, err := session.Credentials(ctx)
 	if err != nil || refreshed.Login != actor.Login || refreshed.NumericID != actor.NumericID {
@@ -216,7 +218,7 @@ func TestGitHubSandboxAppIdentity(t *testing.T) {
 	if err := gateway.AddPullRequestComment(ctx, githubinfra.PullRequestCommentInput{Repo: repoSlug, PRNumber: prNumber, Body: comment, CWD: repo.Path}); err != nil {
 		t.Fatal(err)
 	}
-	review := "App identity sandbox review " + title
+	review := "agent-commit.txt: App identity sandbox review " + title
 	if err := gateway.SubmitReview(ctx, githubinfra.SubmitReviewInput{Repo: repoSlug, PRNumber: prNumber, Event: "COMMENT", Body: review, CommitID: published.Head.SHA, CWD: repo.Path}); err != nil {
 		t.Fatal(err)
 	}
