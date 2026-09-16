@@ -1521,13 +1521,11 @@ func preflightSelfUpgradeReplace(installPath string) error {
 }
 
 func resolveLooperTarget(platform string, arch string) (string, error) {
-	if platform == "darwin" && arch == "arm64" {
-		return "darwin-arm64", nil
+	target, ok := resolvePublishedTarget(platform, arch)
+	if !ok {
+		return "", fmt.Errorf("unsupported platform/arch for looper upgrade: %s-%s. Supported targets: %s", platform, arch, strings.Join(publishedReleaseTargets, ", "))
 	}
-	if platform == "linux" && arch == "amd64" {
-		return "linux-amd64", nil
-	}
-	return "", fmt.Errorf("unsupported platform/arch for looper upgrade: %s-%s. Supported targets: darwin-arm64, linux-amd64", platform, arch)
+	return target, nil
 }
 
 func replaceBinaryAtomically(installPath string, binaryBytes []byte) error {

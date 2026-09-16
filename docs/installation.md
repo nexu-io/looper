@@ -6,7 +6,7 @@ This document contains the detailed install, upgrade, uninstall, and source-buil
 
 For the default supported install path:
 
-- macOS (`darwin-arm64`) or Linux (`linux-amd64`)
+- macOS (`darwin-arm64`) or Linux (`linux-amd64`, `linux-arm64`)
 - `git`
 - `gh` for GitHub projects; Forgejo-only installs do not require `gh`
 
@@ -40,7 +40,7 @@ looper bootstrap --yes --project-path /path/to/repo --agent-vendor opencode
 2. Rename it to `looper` if needed.
 3. Place it on your `PATH`, for example `/usr/local/bin/looper` or `~/.local/bin/looper`.
 
-GitHub Releases publish standalone Go binaries for both `looper` and `looperd` on `darwin-arm64` and `linux-amd64`.
+GitHub Releases publish standalone Go binaries for both `looper` and `looperd` on `darwin-arm64`, `linux-amd64`, and `linux-arm64`.
 
 ### Install the daemon manually
 
@@ -132,7 +132,7 @@ Current behavior:
 - after a daemon upgrade, restart manually with `looper daemon restart`
 - each GitHub release also publishes `manifest.json` to Cloudflare R2 at `https://releases.looper.powerformer.com/`
 - `looper upgrade --check` reads latest versions from that CDN first (`/channels/stable.json`), then falls back to GitHub Releases metadata
-- CDN manifests must list both `looper` and `looperd` for `darwin-arm64` and `linux-amd64` (raw or archived); incomplete manifests fall back to GitHub for both version checks and installation
+- CDN manifests must list both `looper` and `looperd` for `darwin-arm64`, `linux-amd64`, and `linux-arm64` (raw or archived); incomplete manifests fall back to GitHub for both version checks and installation
 - stable CDN metadata must declare `channel: stable` and a non-prerelease tag; explicitly requested versions can still select beta releases
 - install and upgrade retry GitHub metadata if CDN-selected binaries cannot be downloaded, verified, or extracted; upgrades recheck the fallback version before replacing files, and fixed-version installs keep their requested tag
 - each candidate binary and its checksum share a 2-minute download deadline; a timeout permits trying the next release source while preserving any shorter caller deadline

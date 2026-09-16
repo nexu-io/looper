@@ -1881,15 +1881,21 @@ func TestHandlerMatchesFrozenSuccessArtifactsForCoreRoutes(t *testing.T) {
 	}
 }
 
-func TestLooperdArtifactNameSupportsLinuxAMD64(t *testing.T) {
+func TestLooperdArtifactNameSupportsPublishedTargets(t *testing.T) {
 	t.Parallel()
 
-	got := looperdArtifactName("linux-amd64")
-	if got == nil {
-		t.Fatal("looperdArtifactName(linux-amd64) = nil, want non-nil")
+	for _, target := range []string{"darwin-arm64", "linux-amd64", "linux-arm64"} {
+		got := looperdArtifactName(target)
+		if got == nil {
+			t.Fatalf("looperdArtifactName(%s) = nil, want non-nil", target)
+		}
+		want := "looperd-" + target
+		if *got != want {
+			t.Fatalf("looperdArtifactName(%s) = %q, want %q", target, *got, want)
+		}
 	}
-	if *got != "looperd-linux-amd64" {
-		t.Fatalf("looperdArtifactName(linux-amd64) = %q, want %q", *got, "looperd-linux-amd64")
+	if got := looperdArtifactName("windows-amd64"); got != nil {
+		t.Fatalf("looperdArtifactName(windows-amd64) = %q, want nil", *got)
 	}
 }
 

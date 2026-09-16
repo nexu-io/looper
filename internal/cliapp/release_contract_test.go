@@ -23,14 +23,17 @@ func withPublishedArtifacts(t *testing.T, body string) string {
 	if manifest.Artifacts == nil {
 		manifest.Artifacts = map[string]release.Artifact{}
 	}
-	for _, name := range []string{"looper-darwin-arm64", "looper-linux-amd64", "looperd-darwin-arm64", "looperd-linux-amd64"} {
-		if _, raw := manifest.Artifacts[name]; raw {
-			continue
+	for _, target := range publishedReleaseTargets {
+		for _, binary := range []string{"looper", "looperd"} {
+			name := binary + "-" + target
+			if _, raw := manifest.Artifacts[name]; raw {
+				continue
+			}
+			if _, archive := manifest.Artifacts[name+".tar.gz"]; archive {
+				continue
+			}
+			manifest.Artifacts[name] = release.Artifact{}
 		}
-		if _, archive := manifest.Artifacts[name+".tar.gz"]; archive {
-			continue
-		}
-		manifest.Artifacts[name] = release.Artifact{}
 	}
 	encoded, err := json.Marshal(manifest)
 	if err != nil {
@@ -41,7 +44,11 @@ func withPublishedArtifacts(t *testing.T, body string) string {
 
 func TestUpgradeCheckRequiresCompletePublishedManifest(t *testing.T) {
 	t.Parallel()
-	for _, missing := range []string{"none", "unrelated only", "looper-darwin-arm64", "looper-linux-amd64", "looperd-darwin-arm64", "looperd-linux-amd64"} {
+	cases := []string{"none", "unrelated only"}
+	for _, target := range publishedReleaseTargets {
+		cases = append(cases, "looper-"+target, "looperd-"+target)
+	}
+	for _, missing := range cases {
 		t.Run(missing, func(t *testing.T) {
 			t.Parallel()
 			body := withPublishedArtifacts(t, `{"manifestVersion":1,"channel":"stable","tag":"v1.2.3"}`)

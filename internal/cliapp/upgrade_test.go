@@ -56,6 +56,14 @@ func TestResolveLooperTarget(t *testing.T) {
 		t.Fatalf("resolveLooperTarget(linux, amd64) = %q, want %q", target, "linux-amd64")
 	}
 
+	target, err = resolveLooperTarget("linux", "arm64")
+	if err != nil {
+		t.Fatalf("resolveLooperTarget(linux, arm64) error = %v", err)
+	}
+	if target != "linux-arm64" {
+		t.Fatalf("resolveLooperTarget(linux, arm64) = %q, want %q", target, "linux-arm64")
+	}
+
 	for _, arch := range []string{"amd64", "x64"} {
 		_, err = resolveLooperTarget("darwin", arch)
 		if err == nil {

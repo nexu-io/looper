@@ -353,15 +353,26 @@ func (r *commandRuntime) arch() string {
 	return goruntime.GOARCH
 }
 
-func resolveLooperdTarget(platform string, arch string) (string, error) {
-	if platform == "darwin" && arch == "arm64" {
-		return "darwin-arm64", nil
-	}
-	if platform == "linux" && arch == "amd64" {
-		return "linux-amd64", nil
-	}
+// publishedReleaseTargets is the GitHub Release GOOS-GOARCH matrix for both
+// looper and looperd. Install, upgrade, and CDN completeness checks share it.
+var publishedReleaseTargets = []string{"darwin-arm64", "linux-amd64", "linux-arm64"}
 
-	return "", fmt.Errorf("Unsupported platform/arch for looperd install: %s-%s. Supported targets: darwin-arm64, linux-amd64", platform, arch)
+func resolvePublishedTarget(platform string, arch string) (string, bool) {
+	target := platform + "-" + arch
+	for _, supported := range publishedReleaseTargets {
+		if supported == target {
+			return target, true
+		}
+	}
+	return "", false
+}
+
+func resolveLooperdTarget(platform string, arch string) (string, error) {
+	target, ok := resolvePublishedTarget(platform, arch)
+	if !ok {
+		return "", fmt.Errorf("Unsupported platform/arch for looperd install: %s-%s. Supported targets: %s", platform, arch, strings.Join(publishedReleaseTargets, ", "))
+	}
+	return target, nil
 }
 
 func releaseMetadataURLs(tag string) []string {
@@ -411,10 +422,10 @@ func decodeReleaseMetadata(body []byte, sourceURL string) (githubReleasePayload,
 			return githubReleasePayload{}, fmt.Errorf("stable release metadata must declare channel stable and a non-prerelease tag")
 		}
 		payload := githubReleaseFromManifest(manifest)
-		// A release publishes both binaries for both supported targets. Validate
+		// A release publishes both binaries for every supported target. Validate
 		// that contract here so checks and installs reject the same partial CDN
 		// object; raw binaries remain valid for older release manifests.
-		for _, target := range []string{"darwin-arm64", "linux-amd64"} {
+		for _, target := range publishedReleaseTargets {
 			for _, binary := range []string{"looper", "looperd"} {
 				if _, err := findReleaseAssetSet(payload, binary+"-"+target); err != nil {
 					return githubReleasePayload{}, fmt.Errorf("incomplete release manifest: %w", err)

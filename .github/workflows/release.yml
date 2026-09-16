@@ -317,6 +317,11 @@ jobs:
             goos: linux
             goarch: amd64
             artifact-name: looper-linux-amd64
+          - target: linux-arm64
+            runner: ubuntu-24.04-arm
+            goos: linux
+            goarch: arm64
+            artifact-name: looper-linux-arm64
     runs-on: ${{ matrix.runner }}
 
     steps:
@@ -397,6 +402,11 @@ jobs:
             goos: linux
             goarch: amd64
             artifact-name: looperd-linux-amd64
+          - target: linux-arm64
+            runner: ubuntu-24.04-arm
+            goos: linux
+            goarch: arm64
+            artifact-name: looperd-linux-arm64
     runs-on: ${{ matrix.runner }}
 
     steps:
@@ -578,6 +588,10 @@ jobs:
           test -f release-assets/looperd-darwin-arm64.tar.gz.sha256
           test -f release-assets/looperd-linux-amd64.tar.gz
           test -f release-assets/looperd-linux-amd64.tar.gz.sha256
+          test -f release-assets/looper-linux-arm64.tar.gz
+          test -f release-assets/looper-linux-arm64.tar.gz.sha256
+          test -f release-assets/looperd-linux-arm64.tar.gz
+          test -f release-assets/looperd-linux-arm64.tar.gz.sha256
 
       - name: Generate release manifest
         run: |
@@ -590,7 +604,7 @@ jobs:
             -min-cli-for-daemon "$LOOPER_BUILD_MIN_CLI_FOR_DAEMON" \
             -min-daemon-for-cli "$LOOPER_BUILD_MIN_DAEMON_FOR_CLI" \
             -assets-dir release-assets \
-            -required-assets "looper-darwin-arm64.tar.gz,looper-linux-amd64.tar.gz,looperd-darwin-arm64.tar.gz,looperd-linux-amd64.tar.gz" \
+            -required-assets "looper-darwin-arm64.tar.gz,looper-linux-amd64.tar.gz,looper-linux-arm64.tar.gz,looperd-darwin-arm64.tar.gz,looperd-linux-amd64.tar.gz,looperd-linux-arm64.tar.gz" \
             -output release-assets/manifest.json
 
       - name: Validate release manifest fields
@@ -619,8 +633,10 @@ jobs:
           required = {
               "looper-darwin-arm64.tar.gz",
               "looper-linux-amd64.tar.gz",
+              "looper-linux-arm64.tar.gz",
               "looperd-darwin-arm64.tar.gz",
               "looperd-linux-amd64.tar.gz",
+              "looperd-linux-arm64.tar.gz",
           }
           assert required.issubset(set(m["artifacts"].keys())), "manifest missing artifacts"
           for name in required:
@@ -643,10 +659,14 @@ jobs:
               "looper-darwin-arm64.sha256",
               "looper-linux-amd64",
               "looper-linux-amd64.sha256",
+              "looper-linux-arm64",
+              "looper-linux-arm64.sha256",
               "looperd-darwin-arm64",
               "looperd-darwin-arm64.sha256",
               "looperd-linux-amd64",
               "looperd-linux-amd64.sha256",
+              "looperd-linux-arm64",
+              "looperd-linux-arm64.sha256",
           ]
           release = json.loads(
               subprocess.run(
@@ -674,6 +694,10 @@ jobs:
             release-assets/looperd-darwin-arm64.tar.gz.sha256 \
             release-assets/looperd-linux-amd64.tar.gz \
             release-assets/looperd-linux-amd64.tar.gz.sha256 \
+            release-assets/looper-linux-arm64.tar.gz \
+            release-assets/looper-linux-arm64.tar.gz.sha256 \
+            release-assets/looperd-linux-arm64.tar.gz \
+            release-assets/looperd-linux-arm64.tar.gz.sha256 \
             release-assets/manifest.json \
             --clobber
 

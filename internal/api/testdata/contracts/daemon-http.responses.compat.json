@@ -75,7 +75,8 @@
               "artifactName": "<artifact-name>",
               "supportedTargets": [
                 "darwin-arm64",
-                "linux-amd64"
+                "linux-amd64",
+                "linux-arm64"
               ]
             }
           },

@@ -33,7 +33,8 @@ detect_target() {
     Linux)
       case "$arch" in
         x86_64|amd64) printf 'linux-amd64\n' ;;
-        *) fail "unsupported architecture for Linux: $arch (supported: x86_64)" ;;
+        arm64|aarch64) printf 'linux-arm64\n' ;;
+        *) fail "unsupported architecture for Linux: $arch (supported: x86_64, arm64)" ;;
       esac
       ;;
     *) fail "unsupported platform: $os (supported: macOS, Linux)" ;;
