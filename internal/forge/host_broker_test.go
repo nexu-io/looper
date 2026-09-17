@@ -250,6 +250,13 @@ func TestHostBrokerPaginationResponseLimitsAndErrors(t *testing.T) {
 					io.WriteString(w, "host-test-token-one")
 				}
 			})
+			if mode == "oversized" {
+				f.options.Config.Providers = []config.ProviderConfig{{
+					ID:               "forge",
+					Kind:             config.ProviderKindForgejo,
+					MaxResponseBytes: maxHostResponseBytes,
+				}}
+			}
 			f.start(t)
 			_, err := ProxyHost(context.Background(), HostRequest{Op: "api.read", Path: "issues/1/comments", Paginate: true})
 			if err == nil {

@@ -159,9 +159,9 @@ func (gateway forgejoReviewSubmitGateway) GetCurrentUserLogin(ctx context.Contex
 func (gateway forgejoReviewSubmitGateway) GetPullRequestDiff(ctx context.Context, input githubinfra.GetPullRequestDiffInput) (string, error) {
 	diff, err := gateway.client.PullRequestDiff(ctx, input.PRNumber)
 	if err != nil {
-		// Forgejo client caps response bodies at 1 MiB with a generic
-		// "response exceeds" error. Map that to ErrDiffTooLarge so top-level
-		// reviews without inline comments can use the existing no-anchor path.
+		// A configured Forgejo body cap surfaces as a generic "response exceeds"
+		// error. Map that to ErrDiffTooLarge so top-level reviews without inline
+		// comments can use the existing no-anchor path.
 		if strings.Contains(err.Error(), "response exceeds") {
 			return "", githubinfra.ErrDiffTooLarge
 		}

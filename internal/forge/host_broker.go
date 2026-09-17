@@ -126,6 +126,23 @@ func StartHostBroker(ctx context.Context, options HostBrokerOptions) (string, fu
 	return startHostingSocket(ctx, b.handle)
 }
 
+func (b *hostBroker) maxResponseBytes() int {
+	if b == nil || b.session == nil || b.session.Target().Kind != config.ProviderKindForgejo {
+		return maxHostResponseBytes
+	}
+	id := strings.TrimSpace(b.session.Target().ProviderID)
+	for _, provider := range b.options.Config.Providers {
+		if provider.Kind != config.ProviderKindForgejo {
+			continue
+		}
+		if id != "" && provider.ID != id {
+			continue
+		}
+		return provider.MaxResponseBytes
+	}
+	return 0
+}
+
 func (b *hostBroker) handle(ctx context.Context, conn net.Conn) {
 	serveHostingRequest(ctx, conn, func(ctx context.Context, req HostRequest) {
 		if req.Op == "" || req.Op == "review.submit" {
@@ -151,7 +168,7 @@ func (b *hostBroker) handle(ctx context.Context, conn net.Conn) {
 			writeHostingError(conn, b.session.Redact(err.Error()))
 			return
 		}
-		if len(output) > maxHostResponseBytes {
+		if responseExceedsLimit(len(output), b.maxResponseBytes()) {
 			writeHostingError(conn, "hosting response exceeds size limit")
 			return
 		}
@@ -352,11 +369,12 @@ func (b *hostBroker) request(ctx context.Context, method, path string, payload [
 		}
 		return nil, nil, &hostingidentity.Error{Identity: b.session.Name(), Operation: "read hosting context", StatusCode: resp.StatusCode, Reason: "hosting server rejected the request"}
 	}
-	data, err := io.ReadAll(io.LimitReader(resp.Body, maxHostResponseBytes+1))
+	limit := b.maxResponseBytes()
+	data, err := readBoundedResponse(resp.Body, limit)
 	if err != nil {
 		return nil, nil, errors.New("cannot read hosting response")
 	}
-	if len(data) > maxHostResponseBytes {
+	if responseExceedsLimit(len(data), limit) {
 		return nil, nil, errors.New("hosting response exceeds size limit")
 	}
 	return data, resp.Header, nil

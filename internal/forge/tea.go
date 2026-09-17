@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
@@ -45,7 +46,6 @@ const (
 	TeaErrorLoginMissing      = "tea_login_missing"
 	TeaErrorLoginHostMismatch = "tea_login_host_mismatch"
 	TeaErrorAuthFailed        = "tea_auth_failed"
-	maxTeaCommandOutputBytes  = maxForgejoResponseBodyBytes + 64*1024
 	defaultTeaCommandTimeout  = defaultForgejoTimeout
 	teaLoginsListTimeout      = 5 * time.Second
 )
@@ -110,7 +110,7 @@ func (defaultTeaRunner) Run(ctx context.Context, teaPath string, args []string, 
 		Args:             args,
 		Stdin:            stdin,
 		Timeout:          timeout,
-		MaxCapturedBytes: maxTeaCommandOutputBytes,
+		MaxCapturedBytes: math.MaxInt,
 	})
 }
 
@@ -249,14 +249,15 @@ func MatchingTeaLogins(ctx context.Context, baseURL, teaPath string, runner TeaC
 }
 
 type teaTransport struct {
-	teaPath string
-	login   string
-	timeout time.Duration
-	runner  TeaCommandRunner
-	baseURL *url.URL
+	teaPath      string
+	login        string
+	timeout      time.Duration
+	runner       TeaCommandRunner
+	baseURL      *url.URL
+	maxBodyBytes int
 }
 
-func newTeaTransport(teaPath, login string, baseURL *url.URL, timeout time.Duration, runner TeaCommandRunner) *teaTransport {
+func newTeaTransport(teaPath, login string, baseURL *url.URL, timeout time.Duration, runner TeaCommandRunner, maxBodyBytes int) *teaTransport {
 	if runner == nil {
 		runner = defaultTeaRunner{}
 	}
@@ -264,11 +265,12 @@ func newTeaTransport(teaPath, login string, baseURL *url.URL, timeout time.Durat
 		timeout = defaultTeaCommandTimeout
 	}
 	return &teaTransport{
-		teaPath: teaPath,
-		login:   login,
-		timeout: timeout,
-		runner:  runner,
-		baseURL: baseURL,
+		teaPath:      teaPath,
+		login:        login,
+		timeout:      timeout,
+		runner:       runner,
+		baseURL:      baseURL,
+		maxBodyBytes: maxBodyBytes,
 	}
 }
 
@@ -302,7 +304,10 @@ func (t *teaTransport) doRaw(ctx context.Context, method string, path string, qu
 		}
 	}
 	if result.StdoutTruncated || result.StderrTruncated {
-		return rawResponse{}, fmt.Errorf("forgejo tea API %s %s response exceeds %d bytes", method, path, maxForgejoResponseBodyBytes)
+		if t.maxBodyBytes > 0 {
+			return rawResponse{}, fmt.Errorf("forgejo tea API %s %s response exceeds %d bytes", method, path, t.maxBodyBytes)
+		}
+		return rawResponse{}, fmt.Errorf("forgejo tea API %s %s response exceeds capture buffer", method, path)
 	}
 	if result.ExitCode != 0 {
 		return rawResponse{}, classifyTeaAPIFailure(method, path, result)
@@ -319,8 +324,8 @@ func (t *teaTransport) doRaw(ctx context.Context, method string, path string, qu
 		}
 	}
 	body := []byte(result.Stdout)
-	if len(body) > maxForgejoResponseBodyBytes {
-		return rawResponse{}, fmt.Errorf("forgejo tea API %s %s response exceeds %d bytes", method, path, maxForgejoResponseBodyBytes)
+	if responseExceedsLimit(len(body), t.maxBodyBytes) {
+		return rawResponse{}, fmt.Errorf("forgejo tea API %s %s response exceeds %d bytes", method, path, t.maxBodyBytes)
 	}
 	if statusCode < 200 || statusCode >= 300 {
 		sanitized := sanitizeForgejoErrorBody(body, "")
@@ -361,7 +366,7 @@ func parseTeaIncludeHeaders(stderr string) (int, http.Header, error) {
 		return 0, nil, errors.New("tea -i produced no status/headers on stderr")
 	}
 	scanner := bufio.NewScanner(strings.NewReader(trimmed))
-	scanner.Buffer(make([]byte, 0, 64*1024), maxTeaCommandOutputBytes)
+	scanner.Buffer(make([]byte, 0, 64*1024), maxForgejoResponseBodyBytes)
 	if !scanner.Scan() {
 		return 0, nil, errors.New("tea -i status line missing")
 	}

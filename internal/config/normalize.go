@@ -178,16 +178,17 @@ func normalizeLayerPartial(partial PartialConfig) PartialConfig {
 		partials := make([]PartialProviderConfig, len(providers))
 		for i, provider := range providers {
 			partials[i] = PartialProviderConfig{
-				ID:        provider.ID,
-				Kind:      &provider.Kind,
-				BaseURL:   &provider.BaseURL,
-				GHPath:    provider.GHPath,
-				Auth:      providerAuthModePtr(provider.Auth),
-				TokenEnv:  provider.TokenEnv,
-				TeaLogin:  provider.TeaLogin,
-				TeaPath:   provider.TeaPath,
-				Workspace: provider.Workspace,
-				ProjectID: provider.ProjectID,
+				ID:               provider.ID,
+				Kind:             &provider.Kind,
+				BaseURL:          &provider.BaseURL,
+				GHPath:           provider.GHPath,
+				Auth:             providerAuthModePtr(provider.Auth),
+				TokenEnv:         provider.TokenEnv,
+				TeaLogin:         provider.TeaLogin,
+				TeaPath:          provider.TeaPath,
+				Workspace:        provider.Workspace,
+				ProjectID:        provider.ProjectID,
+				MaxResponseBytes: intPtrIfNonZero(provider.MaxResponseBytes),
 			}
 		}
 		normalized.Providers = &partials
@@ -1755,6 +1756,7 @@ func clonePartialConfig(partial PartialConfig) PartialConfig {
 			providers[i].TeaPath = cloneStringPtr(providers[i].TeaPath)
 			providers[i].Workspace = cloneStringPtr(providers[i].Workspace)
 			providers[i].ProjectID = cloneStringPtr(providers[i].ProjectID)
+			providers[i].MaxResponseBytes = cloneIntPtr(providers[i].MaxResponseBytes)
 		}
 		cloned.Providers = &providers
 	}
@@ -1900,14 +1902,15 @@ func cloneProviderConfigs(providers []PartialProviderConfig) []ProviderConfig {
 			kind = *provider.Kind
 		}
 		cloned[index] = ProviderConfig{
-			ID:        strings.TrimSpace(provider.ID),
-			Kind:      kind,
-			GHPath:    cloneStringPtr(provider.GHPath),
-			TokenEnv:  cloneStringPtr(provider.TokenEnv),
-			TeaLogin:  cloneStringPtr(provider.TeaLogin),
-			TeaPath:   cloneStringPtr(provider.TeaPath),
-			Workspace: cloneStringPtr(provider.Workspace),
-			ProjectID: cloneStringPtr(provider.ProjectID),
+			ID:               strings.TrimSpace(provider.ID),
+			Kind:             kind,
+			GHPath:           cloneStringPtr(provider.GHPath),
+			TokenEnv:         cloneStringPtr(provider.TokenEnv),
+			TeaLogin:         cloneStringPtr(provider.TeaLogin),
+			TeaPath:          cloneStringPtr(provider.TeaPath),
+			Workspace:        cloneStringPtr(provider.Workspace),
+			ProjectID:        cloneStringPtr(provider.ProjectID),
+			MaxResponseBytes: derefInt(provider.MaxResponseBytes),
 		}
 		if provider.Auth != nil {
 			cloned[index].Auth = *provider.Auth

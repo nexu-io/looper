@@ -67,7 +67,6 @@ func TestValidateExpectedBaseCommit(t *testing.T) {
 func TestForgejoReviewSubmitGatewayMapsOversizedDiffToDiffTooLarge(t *testing.T) {
 	t.Parallel()
 
-	// 1 MiB + 1 matches Forgejo client's response body cap.
 	oversized := strings.Repeat("d", (1<<20)+1)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet || r.URL.Path != "/api/v1/repos/acme/looper/pulls/42.diff" {
@@ -78,7 +77,7 @@ func TestForgejoReviewSubmitGatewayMapsOversizedDiffToDiffTooLarge(t *testing.T)
 	}))
 	defer server.Close()
 
-	client, err := forge.NewForgejoClient(forge.RepositoryRef{ProviderID: "forgejo", Kind: forge.ProviderKindForgejo, BaseURL: server.URL, Repo: "acme/looper"}, "token")
+	client, err := forge.NewForgejoClient(forge.RepositoryRef{ProviderID: "forgejo", Kind: forge.ProviderKindForgejo, BaseURL: server.URL, Repo: "acme/looper"}, "token", forge.WithMaxResponseBytes(1<<20))
 	if err != nil {
 		t.Fatalf("NewForgejoClient() error = %v", err)
 	}

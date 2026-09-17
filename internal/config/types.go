@@ -214,6 +214,9 @@ type ProviderConfig struct {
 	// its work-items from. Ignored for github/forgejo providers.
 	Workspace *string `json:"workspace,omitempty"`
 	ProjectID *string `json:"projectId,omitempty"`
+	// MaxResponseBytes caps Forgejo/tea API response bodies, including PR diffs.
+	// 0 (the default) is unlimited; a positive value is a hard byte cap.
+	MaxResponseBytes int `json:"maxResponseBytes,omitempty"`
 }
 
 // AgentBindingConfig is vendor+model only (profiles).
@@ -674,16 +677,17 @@ type PartialProjectWebhookConfig struct {
 }
 
 type PartialProviderConfig struct {
-	ID        string            `json:"id"`
-	Kind      *ProviderKind     `json:"kind,omitempty"`
-	BaseURL   *string           `json:"baseUrl,omitempty"`
-	GHPath    *string           `json:"ghPath,omitempty"`
-	Auth      *ProviderAuthMode `json:"auth,omitempty"`
-	TokenEnv  *string           `json:"tokenEnv,omitempty"`
-	TeaLogin  *string           `json:"teaLogin,omitempty"`
-	TeaPath   *string           `json:"teaPath,omitempty"`
-	Workspace *string           `json:"workspace,omitempty"`
-	ProjectID *string           `json:"projectId,omitempty"`
+	ID               string            `json:"id"`
+	Kind             *ProviderKind     `json:"kind,omitempty"`
+	BaseURL          *string           `json:"baseUrl,omitempty"`
+	GHPath           *string           `json:"ghPath,omitempty"`
+	Auth             *ProviderAuthMode `json:"auth,omitempty"`
+	TokenEnv         *string           `json:"tokenEnv,omitempty"`
+	TeaLogin         *string           `json:"teaLogin,omitempty"`
+	TeaPath          *string           `json:"teaPath,omitempty"`
+	Workspace        *string           `json:"workspace,omitempty"`
+	ProjectID        *string           `json:"projectId,omitempty"`
+	MaxResponseBytes *int              `json:"maxResponseBytes,omitempty"`
 }
 
 type Config struct {

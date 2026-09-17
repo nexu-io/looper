@@ -144,7 +144,7 @@ func (b *hostBroker) readAPI(ctx context.Context, req HostRequest) ([]byte, erro
 			return nil, err
 		}
 		totalBytes += len(data)
-		if totalBytes > maxHostResponseBytes {
+		if responseExceedsLimit(totalBytes, b.maxResponseBytes()) {
 			return nil, errors.New("paginated hosting response exceeds size limit")
 		}
 		if route.text {

@@ -538,7 +538,7 @@ func TestForgejoClientTimeoutOption(t *testing.T) {
 	}
 }
 
-func TestForgejoPullRequestDiffRejectsOversizedResponses(t *testing.T) {
+func TestForgejoPullRequestDiffAllowsResponsesOverOneMiBByDefault(t *testing.T) {
 	t.Parallel()
 
 	diffPayload := strings.Repeat("d", maxForgejoResponseBodyBytes+1)
@@ -552,6 +552,32 @@ func TestForgejoPullRequestDiffRejectsOversizedResponses(t *testing.T) {
 	defer server.Close()
 
 	client, err := NewForgejoClient(RepositoryRef{ProviderID: "fj", Kind: ProviderKindForgejo, BaseURL: server.URL, Repo: "acme/looper"}, "super-secret")
+	if err != nil {
+		t.Fatalf("NewForgejoClient() error = %v", err)
+	}
+	diff, err := client.PullRequestDiff(context.Background(), 9)
+	if err != nil {
+		t.Fatalf("PullRequestDiff() error = %v, want unlimited default to accept 1MiB+1", err)
+	}
+	if diff != diffPayload {
+		t.Fatalf("PullRequestDiff() length = %d, want %d", len(diff), len(diffPayload))
+	}
+}
+
+func TestForgejoPullRequestDiffRejectsOversizedResponses(t *testing.T) {
+	t.Parallel()
+
+	diffPayload := strings.Repeat("d", maxForgejoResponseBodyBytes+1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/api/v1/repos/acme/looper/pulls/9.diff" {
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(diffPayload))
+	}))
+	defer server.Close()
+
+	client, err := NewForgejoClient(RepositoryRef{ProviderID: "fj", Kind: ProviderKindForgejo, BaseURL: server.URL, Repo: "acme/looper"}, "super-secret", WithMaxResponseBytes(maxForgejoResponseBodyBytes))
 	if err != nil {
 		t.Fatalf("NewForgejoClient() error = %v", err)
 	}

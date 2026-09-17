@@ -304,6 +304,9 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 				issues = append(issues, ValidationIssue{Path: prefix + ".baseUrl", Message: "must be an absolute http(s) URL for forgejo providers"})
 			}
 			validateForgejoProviderAuth(config, provider, prefix, &issues)
+			if provider.MaxResponseBytes < 0 {
+				issues = append(issues, ValidationIssue{Path: prefix + ".maxResponseBytes", Message: "must be >= 0 (0 is unlimited)"})
+			}
 		}
 		if provider.Kind == ProviderKindPlane {
 			// baseUrl is optional (a default Plane host is used when omitted); if

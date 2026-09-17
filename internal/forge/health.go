@@ -275,7 +275,7 @@ func probeForgejoProviderTea(ctx context.Context, provider config.ProviderConfig
 		return health
 	}
 
-	openAPITransport := newTeaTransport(teaPath, strings.TrimSpace(*provider.TeaLogin), baseURL, defaultForgejoProbeTimeout, runner)
+	openAPITransport := newTeaTransport(teaPath, strings.TrimSpace(*provider.TeaLogin), baseURL, defaultForgejoProbeTimeout, runner, maxForgejoResponseBodyBytes)
 	// swagger.v1.json lives at the server root, not under /api/v1; pass absolute URL.
 	if openAPIResponse, openAPIErr := openAPITransport.doRaw(probeCtx, http.MethodGet, forgejoProbeURL(baseURL, "swagger.v1.json"), nil, nil); openAPIErr == nil {
 		health.Reachability = ReachabilityReachable
@@ -284,7 +284,7 @@ func probeForgejoProviderTea(ctx context.Context, provider config.ProviderConfig
 		}
 	}
 
-	userTransport := newTeaTransport(teaPath, strings.TrimSpace(*provider.TeaLogin), baseURL, defaultForgejoProbeTimeout, runner)
+	userTransport := newTeaTransport(teaPath, strings.TrimSpace(*provider.TeaLogin), baseURL, defaultForgejoProbeTimeout, runner, maxForgejoResponseBodyBytes)
 	userResponse, userErr := userTransport.doRaw(probeCtx, http.MethodGet, "user", nil, nil)
 	if userErr != nil {
 		health.Authentication = authenticationStateFromTeaError(userErr)

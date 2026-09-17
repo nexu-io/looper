@@ -71,3 +71,25 @@ func cloneStringPtr(value *string) *string {
 
 	return stringPtr(*value)
 }
+
+func cloneIntPtr(value *int) *int {
+	if value == nil {
+		return nil
+	}
+	cloned := *value
+	return &cloned
+}
+
+func derefInt(value *int) int {
+	if value == nil {
+		return 0
+	}
+	return *value
+}
+
+func intPtrIfNonZero(value int) *int {
+	if value == 0 {
+		return nil
+	}
+	return &value
+}
