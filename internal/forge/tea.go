@@ -102,15 +102,17 @@ type TeaCommandRunner interface {
 	Run(ctx context.Context, teaPath string, args []string, stdin string, timeout time.Duration) (shell.Result, error)
 }
 
-type defaultTeaRunner struct{}
+type defaultTeaRunner struct {
+	maxCapturedBytes int
+}
 
-func (defaultTeaRunner) Run(ctx context.Context, teaPath string, args []string, stdin string, timeout time.Duration) (shell.Result, error) {
+func (r defaultTeaRunner) Run(ctx context.Context, teaPath string, args []string, stdin string, timeout time.Duration) (shell.Result, error) {
 	return shell.Run(ctx, shell.Options{
 		Command:          teaPath,
 		Args:             args,
 		Stdin:            stdin,
 		Timeout:          timeout,
-		MaxCapturedBytes: math.MaxInt,
+		MaxCapturedBytes: r.maxCapturedBytes,
 	})
 }
 
@@ -137,7 +139,7 @@ func ResolveTeaPath(provider config.ProviderConfig, lookPath func(string) (strin
 // It never reads tea's config file or tokens.
 func ListTeaLogins(ctx context.Context, teaPath string, runner TeaCommandRunner) ([]TeaLogin, error) {
 	if runner == nil {
-		runner = defaultTeaRunner{}
+		runner = defaultTeaRunner{maxCapturedBytes: maxForgejoResponseBodyBytes}
 	}
 	result, err := runner.Run(ctx, teaPath, []string{"logins", "list", "-o", "json"}, "", teaLoginsListTimeout)
 	if err != nil {
@@ -258,9 +260,6 @@ type teaTransport struct {
 }
 
 func newTeaTransport(teaPath, login string, baseURL *url.URL, timeout time.Duration, runner TeaCommandRunner, maxBodyBytes int) *teaTransport {
-	if runner == nil {
-		runner = defaultTeaRunner{}
-	}
 	if timeout <= 0 {
 		timeout = defaultTeaCommandTimeout
 	}
@@ -286,7 +285,17 @@ func (t *teaTransport) doRaw(ctx context.Context, method string, path string, qu
 		stdin = string(encoded)
 		args = append(args, "-d", "@-")
 	}
-	result, err := t.runner.Run(ctx, t.teaPath, args, stdin, t.timeout)
+	runner := t.runner
+	if runner == nil {
+		// tea writes the body to stdout and -i headers to stderr. shell uses
+		// one limit per stream; allow small bodies a bounded header allowance.
+		captureLimit := math.MaxInt
+		if t.maxBodyBytes > 0 {
+			captureLimit = max(t.maxBodyBytes, 64*1024)
+		}
+		runner = defaultTeaRunner{maxCapturedBytes: captureLimit}
+	}
+	result, err := runner.Run(ctx, t.teaPath, args, stdin, t.timeout)
 	if err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return rawResponse{}, err

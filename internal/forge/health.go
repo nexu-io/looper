@@ -237,9 +237,6 @@ func probeForgejoProviderTea(ctx context.Context, provider config.ProviderConfig
 		}
 	}
 	runner := probeClient.teaRunner
-	if runner == nil {
-		runner = defaultTeaRunner{}
-	}
 
 	probeCtx, cancel := context.WithTimeout(ctx, defaultForgejoProbeTimeout)
 	defer cancel()

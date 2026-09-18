@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -98,7 +99,7 @@ func withProviderResponseLimit(provider config.ProviderConfig, options []Forgejo
 }
 
 func readBoundedResponse(r io.Reader, limit int) ([]byte, error) {
-	if limit <= 0 {
+	if limit <= 0 || int64(limit) == math.MaxInt64 {
 		return io.ReadAll(r)
 	}
 	return io.ReadAll(io.LimitReader(r, int64(limit)+1))
@@ -244,9 +245,6 @@ func newForgejoClientFromTea(provider config.ProviderConfig, repo string, option
 		}
 	}
 	runner := client.teaRunner
-	if runner == nil {
-		runner = defaultTeaRunner{}
-	}
 	ctx, cancel := context.WithTimeout(context.Background(), teaLoginsListTimeout)
 	defer cancel()
 	teaPath, login, err := ValidateTeaLoginForProvider(ctx, provider, runner, client.lookPath)
