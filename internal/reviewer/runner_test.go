@@ -2665,7 +2665,7 @@ func TestFinishHeldReviewerQueueItemPreservesBudgetHold(t *testing.T) {
 		t.Fatalf("Queue.Upsert() error = %v", err)
 	}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now})
-	result, err := runner.finishHeldReviewerQueueItem(context.Background(), loop, nil, queue, reviewerCheckpoint{}, "Reviewer stopped because review-fix budget is held")
+	result, err := runner.finishHeldReviewerQueueItem(context.Background(), storage.ProjectRecord{ID: projectID}, loop, nil, queue, reviewerCheckpoint{}, "Reviewer stopped because review-fix budget is held")
 	if err != nil {
 		t.Fatalf("finishHeldReviewerQueueItem() error = %v", err)
 	}
@@ -4800,8 +4800,13 @@ func TestProcessClaimedItemRemovesEyesWhenParkingNeedsHuman(t *testing.T) {
 	if got := reactionContents(github.addReactionCalls); len(got) != 1 || got[0] != "eyes" {
 		t.Fatalf("addReactionCalls = %#v, want in-progress eyes", github.addReactionCalls)
 	}
-	if got := reactionContents(github.removeReactionCalls); len(got) != 1 || got[0] != "eyes" {
+	if got := reactionContents(github.removeReactionCalls); len(got) == 0 {
 		t.Fatalf("removeReactionCalls = %#v, want eyes cleared after parking for human input", github.removeReactionCalls)
+	}
+	for _, content := range reactionContents(github.removeReactionCalls) {
+		if content != "eyes" {
+			t.Fatalf("removeReactionCalls = %#v, want only eyes", github.removeReactionCalls)
+		}
 	}
 }
 
@@ -5084,6 +5089,9 @@ func TestProcessClaimedItemSkipsCleanNoopWhenReviewRequestRemovedBeforePublish(t
 	}
 	if result.Status != "skipped" || !contains(result.Summary, "not requested for review") {
 		t.Fatalf("result = %#v, want skipped not requested", result)
+	}
+	if len(github.removeReactionCalls) != 1 || github.removeReactionCalls[0].Content != "eyes" {
+		t.Fatalf("removeReactionCalls = %#v, want eyes cleared on terminal skip", github.removeReactionCalls)
 	}
 	if got := excludingInProgressReactions(github.addReactionCalls); len(got) != 0 {
 		t.Fatalf("addReactionCalls = %d, want no clean signal reaction", len(got))
@@ -6334,6 +6342,9 @@ func TestApplyCleanNoopReviewSideEffectsPreservesCheckedHeadForSpecTransition(t 
 	}
 	if len(github.removeLabelCalls) != 0 || len(github.addLabelCalls) != 0 {
 		t.Fatalf("label calls = remove:%#v add:%#v, want none after head drift", github.removeLabelCalls, github.addLabelCalls)
+	}
+	if len(github.removeReactionCalls) != 0 {
+		t.Fatalf("removeReactionCalls = %#v, want eyes retained after failed spec transition", github.removeReactionCalls)
 	}
 }
 
@@ -13023,6 +13034,9 @@ func TestProcessClaimedItemCommentOnlySkipsWhenReviewRequestRemovedBeforePublish
 	}
 	if len(github.issueCommentCalls) != 0 {
 		t.Fatalf("issueCommentCalls = %#v, want no summary_comment publish after request removal", github.issueCommentCalls)
+	}
+	if len(github.removeReactionCalls) != 1 || github.removeReactionCalls[0].Content != "eyes" {
+		t.Fatalf("removeReactionCalls = %#v, want eyes cleared on terminal skip", github.removeReactionCalls)
 	}
 	updatedLoop, err := fixture.repos.Loops.GetByID(context.Background(), *claim.LoopID)
 	if err != nil || updatedLoop == nil || updatedLoop.MetadataJSON == nil {

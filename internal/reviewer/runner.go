@@ -2107,7 +2107,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 	if err := r.revalidateRoutedReviewerClaim(ctx, *project, queueItem); err != nil {
 		var holdErr *holdSkipError
 		if errors.As(err, &holdErr) {
-			return r.finishHeldReviewerQueueItem(ctx, *loop, nil, queueItem, reviewerCheckpoint{}, holdErr.summary)
+			return r.finishHeldReviewerQueueItem(ctx, *project, *loop, nil, queueItem, reviewerCheckpoint{}, holdErr.summary)
 		}
 		return ProcessResult{}, err
 	}
@@ -2242,7 +2242,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		if err != nil {
 			var holdErr *holdSkipError
 			if errors.As(err, &holdErr) {
-				return r.finishHeldReviewerQueueItem(ctx, *loop, &run, queueItem, checkpoint, holdErr.summary)
+				return r.finishHeldReviewerQueueItem(ctx, *project, *loop, &run, queueItem, checkpoint, holdErr.summary)
 			}
 			stepElapsedSeconds := durationSeconds(r.now().Sub(stepStartedAt))
 			failure := r.classifyFailureForProjectAndBoundary(project.ID, err, reviewerFailureBoundaryForStep(step))
@@ -2370,6 +2370,9 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 // pending/partial-batch continuation fail-closed (live read required; schedule errors surface).
 // After Complete, any downstream failure restores the row unless a continuation is already active.
 func (r *Runner) finalizeSuccessfulReviewerQueue(ctx context.Context, project storage.ProjectRecord, loop storage.LoopRecord, queueItem storage.QueueItemRecord, runID string, checkpoint reviewerCheckpoint, status, summary string) (ProcessResult, error) {
+	if status == "skipped" && checkpoint.SkipKind != "disposition_partial_batch" {
+		r.clearInProgressReactionForQueueItem(ctx, project, loop, queueItem, runID)
+	}
 	// Capture pending coalesced signal before completing the active item.
 	// Prefer the live row: mid-run may have stashed pending* and/or written
 	// partialBatchContinuation onto the running payload after claim.
@@ -5420,9 +5423,14 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 	return checkpoint, nil
 }
 
-func (r *Runner) finishHeldReviewerQueueItem(ctx context.Context, loop storage.LoopRecord, run *storage.RunRecord, queueItem storage.QueueItemRecord, checkpoint reviewerCheckpoint, summary string) (ProcessResult, error) {
+func (r *Runner) finishHeldReviewerQueueItem(ctx context.Context, project storage.ProjectRecord, loop storage.LoopRecord, run *storage.RunRecord, queueItem storage.QueueItemRecord, checkpoint reviewerCheckpoint, summary string) (ProcessResult, error) {
 	checkpoint.SkipReason = summary
 	checkpoint.ResumePolicy = loops.ResumePolicyAdvanceFromCheckpoint
+	runID := ""
+	if run != nil {
+		runID = run.ID
+	}
+	r.clearInProgressReactionForQueueItem(ctx, project, loop, queueItem, runID)
 	if run != nil {
 		if _, err := r.completeRun(ctx, *run, "success", summary, "", checkpoint); err != nil {
 			return ProcessResult{}, err
@@ -5837,10 +5845,13 @@ func (r *Runner) applyCleanNoopReviewSideEffects(ctx context.Context, input step
 	if err := r.github.AddPullRequestReaction(ctx, reaction); err != nil {
 		return &loopError{message: fmt.Sprintf("Failed to add clean-review reaction before marking publish success: %v", err), kind: FailureRetryableAfterResume}
 	}
-	_ = r.tryRemoveReaction(ctx, input, reviewerInProgressReaction)
 	policy := r.effectiveReviewEvents(input.Project.ID, input.Loop.MetadataJSON)
 	shouldTransitionSpecLabels := cleanSpecLabelTransitionAllowed(policy, cleanReviewEventForPolicy(policy), "clean")
-	return r.applyCleanSpecLabelTransition(ctx, input, checkpoint, detail, shouldTransitionSpecLabels)
+	if err := r.applyCleanSpecLabelTransition(ctx, input, checkpoint, detail, shouldTransitionSpecLabels); err != nil {
+		return err
+	}
+	_ = r.tryRemoveReaction(ctx, input, reviewerInProgressReaction)
+	return nil
 }
 
 const reviewerInProgressReaction = "eyes"
@@ -5859,6 +5870,13 @@ func (r *Runner) tryRemoveReaction(ctx context.Context, input stepInput, content
 		return err
 	}
 	return nil
+}
+
+func (r *Runner) clearInProgressReactionForQueueItem(ctx context.Context, project storage.ProjectRecord, loop storage.LoopRecord, queueItem storage.QueueItemRecord, runID string) {
+	if r.github == nil || queueItem.Repo == nil || queueItem.PRNumber == nil {
+		return
+	}
+	_ = r.tryRemoveReaction(ctx, stepInput{Project: project, Loop: loop, Run: storage.RunRecord{ID: runID}, Repo: *queueItem.Repo, PRNumber: *queueItem.PRNumber}, reviewerInProgressReaction)
 }
 
 func cleanSpecLabelTransitionAllowed(policy config.ReviewerReviewEventsConfig, event ReviewEvent, outcome string) bool {

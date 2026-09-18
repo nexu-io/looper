@@ -1,6 +1,7 @@
 package reviewer
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"os"
@@ -454,14 +455,7 @@ func TestReviewerBaseAdvanceBeforePublishWithFakeGH(t *testing.T) {
 	if git.diffReads != 0 {
 		t.Fatalf("criteria diff reads = %d, want none after base drift", git.diffReads)
 	}
-	for _, forbidden := range []string{`/pulls/42/reviews`, `"pr","merge"`, `"pr","review"`} {
-		if strings.Contains(string(logBytes), forbidden) {
-			t.Fatalf("unexpected publication after base drift: %s", logBytes)
-		}
-	}
-	if !strings.Contains(string(logBytes), `content=eyes`) {
-		t.Fatalf("expected in-progress eyes reaction before agent start, log:\n%s", logBytes)
-	}
+	assertNoMutatingPublicationBesidesEyes(t, logBytes)
 }
 
 type baseDriftGitGateway struct {
@@ -472,4 +466,64 @@ type baseDriftGitGateway struct {
 func (g *baseDriftGitGateway) ReadPullRequestDiff(ctx context.Context, cwd, base, head string) (string, error) {
 	g.diffReads++
 	return g.fakeGitGateway.ReadPullRequestDiff(ctx, cwd, base, head)
+}
+
+func assertNoMutatingPublicationBesidesEyes(t *testing.T, logBytes []byte) {
+	t.Helper()
+	sawEyes := false
+	for _, line := range bytes.Split(logBytes, []byte("\n")) {
+		line = bytes.TrimSpace(line)
+		if len(line) == 0 {
+			continue
+		}
+		var rec struct {
+			Argv []string `json:"argv"`
+		}
+		if err := json.Unmarshal(line, &rec); err != nil {
+			continue
+		}
+		if isEyesReactionArgv(rec.Argv) {
+			sawEyes = true
+			continue
+		}
+		if isMutatingGitHubArgv(rec.Argv) {
+			t.Fatalf("unexpected publication after base drift: %s", line)
+		}
+	}
+	if !sawEyes {
+		t.Fatalf("expected in-progress eyes reaction before agent start, log:\n%s", logBytes)
+	}
+}
+
+func isEyesReactionArgv(argv []string) bool {
+	joined := strings.Join(argv, " ")
+	if !strings.Contains(joined, "/reactions") || !strings.Contains(joined, "content=eyes") {
+		return false
+	}
+	return githubArgvHasMethod(argv, "POST")
+}
+
+func isMutatingGitHubArgv(argv []string) bool {
+	if githubArgvHasMethod(argv, "POST") || githubArgvHasMethod(argv, "PATCH") || githubArgvHasMethod(argv, "PUT") || githubArgvHasMethod(argv, "DELETE") {
+		return true
+	}
+	for i, arg := range argv {
+		if arg != "pr" || i+1 >= len(argv) {
+			continue
+		}
+		switch argv[i+1] {
+		case "merge", "review", "comment", "close", "ready", "edit":
+			return true
+		}
+	}
+	return false
+}
+
+func githubArgvHasMethod(argv []string, method string) bool {
+	for i, arg := range argv {
+		if arg == "--method" && i+1 < len(argv) && strings.EqualFold(argv[i+1], method) {
+			return true
+		}
+	}
+	return false
 }
