@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -22,24 +21,21 @@ import (
 
 const defaultForgejoTimeout = 30 * time.Second
 
-// maxForgejoResponseBodyBytes is the historical 1 MiB cap used by health probes
-// and by callers that set an explicit limit. The Forgejo client default is 0
-// (unlimited); providers[].maxResponseBytes overrides it.
+// maxForgejoResponseBodyBytes bounds health probes and login discovery only.
 const maxForgejoResponseBodyBytes = 1 << 20
 
 type ForgejoClient struct {
-	baseURL              *url.URL
-	token                string
-	session              *hostingidentity.Session
-	httpClient           *http.Client
-	repo                 RepositoryRef
-	capabilityMu         sync.Mutex
-	capabilityPaths      map[string]map[string]json.RawMessage
-	capabilityState      ProbeState
-	tea                  *teaTransport
-	teaRunner            TeaCommandRunner
-	lookPath             func(string) (string, error)
-	maxResponseBodyBytes int
+	baseURL         *url.URL
+	token           string
+	session         *hostingidentity.Session
+	httpClient      *http.Client
+	repo            RepositoryRef
+	capabilityMu    sync.Mutex
+	capabilityPaths map[string]map[string]json.RawMessage
+	capabilityState ProbeState
+	tea             *teaTransport
+	teaRunner       TeaCommandRunner
+	lookPath        func(string) (string, error)
 }
 
 type ForgejoOption func(*ForgejoClient)
@@ -84,22 +80,8 @@ func WithLookPath(lookPath func(string) (string, error)) ForgejoOption {
 	}
 }
 
-// WithMaxResponseBytes caps Forgejo/tea response bodies. 0 is unlimited.
-func WithMaxResponseBytes(n int) ForgejoOption {
-	return func(forgejo *ForgejoClient) {
-		forgejo.maxResponseBodyBytes = n
-		if forgejo.tea != nil {
-			forgejo.tea.maxBodyBytes = n
-		}
-	}
-}
-
-func withProviderResponseLimit(provider config.ProviderConfig, options []ForgejoOption) []ForgejoOption {
-	return append([]ForgejoOption{WithMaxResponseBytes(provider.MaxResponseBytes)}, options...)
-}
-
 func readBoundedResponse(r io.Reader, limit int) ([]byte, error) {
-	if limit <= 0 || int64(limit) == math.MaxInt64 {
+	if limit <= 0 {
 		return io.ReadAll(r)
 	}
 	return io.ReadAll(io.LimitReader(r, int64(limit)+1))
@@ -127,7 +109,7 @@ func NewForgejoClientForContext(ctx context.Context, provider config.ProviderCon
 	if err := session.CheckRepository(repo); err != nil {
 		return nil, err
 	}
-	return newForgejoClient(RepositoryRef{ProviderID: target.ProviderID, Kind: ProviderKindForgejo, BaseURL: target.BaseURL, Repo: target.Repo}, "", session, withProviderResponseLimit(provider, options)...)
+	return newForgejoClient(RepositoryRef{ProviderID: target.ProviderID, Kind: ProviderKindForgejo, BaseURL: target.BaseURL, Repo: target.Repo}, "", session, options...)
 }
 
 func newForgejoClient(ref RepositoryRef, token string, session *hostingidentity.Session, options ...ForgejoOption) (*ForgejoClient, error) {
@@ -202,7 +184,7 @@ func NewForgejoClientFromConfig(provider config.ProviderConfig, repo string, opt
 		if strings.TrimSpace(token) == "" {
 			return nil, fmt.Errorf("forgejo client: environment variable %s is required", tokenEnv)
 		}
-		return NewForgejoClient(RepositoryRef{ProviderID: provider.ID, Kind: ProviderKindForgejo, BaseURL: provider.BaseURL, Repo: repo}, token, withProviderResponseLimit(provider, options)...)
+		return NewForgejoClient(RepositoryRef{ProviderID: provider.ID, Kind: ProviderKindForgejo, BaseURL: provider.BaseURL, Repo: repo}, token, options...)
 	default:
 		if provider.TokenEnv != nil && strings.TrimSpace(*provider.TokenEnv) != "" {
 			// Backward-compatible path for callers that predate auth field.
@@ -211,7 +193,7 @@ func NewForgejoClientFromConfig(provider config.ProviderConfig, repo string, opt
 			if strings.TrimSpace(token) == "" {
 				return nil, fmt.Errorf("forgejo client: environment variable %s is required", tokenEnv)
 			}
-			return NewForgejoClient(RepositoryRef{ProviderID: provider.ID, Kind: ProviderKindForgejo, BaseURL: provider.BaseURL, Repo: repo}, token, withProviderResponseLimit(provider, options)...)
+			return NewForgejoClient(RepositoryRef{ProviderID: provider.ID, Kind: ProviderKindForgejo, BaseURL: provider.BaseURL, Repo: repo}, token, options...)
 		}
 		return nil, fmt.Errorf("forgejo client: provider %q requires auth=token-env with tokenEnv or auth=tea with teaLogin", provider.ID)
 	}
@@ -229,9 +211,8 @@ func newForgejoClientFromTea(provider config.ProviderConfig, repo string, option
 		return nil, fmt.Errorf("forgejo client: repo is required")
 	}
 	client := &ForgejoClient{
-		baseURL:              baseURL,
-		httpClient:           &http.Client{Timeout: defaultForgejoTimeout},
-		maxResponseBodyBytes: provider.MaxResponseBytes,
+		baseURL:    baseURL,
+		httpClient: &http.Client{Timeout: defaultForgejoTimeout},
 		repo: RepositoryRef{
 			ProviderID: strings.TrimSpace(provider.ID),
 			Kind:       ProviderKindForgejo,
@@ -255,7 +236,7 @@ func newForgejoClientFromTea(provider config.ProviderConfig, repo string, option
 	if client.httpClient != nil && client.httpClient.Timeout > 0 {
 		timeout = client.httpClient.Timeout
 	}
-	client.tea = newTeaTransport(teaPath, login.Name, baseURL, timeout, runner, client.maxResponseBodyBytes)
+	client.tea = newTeaTransport(teaPath, login.Name, baseURL, timeout, runner, 0)
 	return client, nil
 }
 
@@ -1078,19 +1059,12 @@ func (forgejo *ForgejoClient) doRaw(ctx context.Context, method string, path str
 		return rawResponse{}, fmt.Errorf("forgejo API %s %s failed: %w", method, path, err)
 	}
 	defer response.Body.Close()
-	limit := forgejo.maxResponseBodyBytes
-	responseBody, err := readBoundedResponse(response.Body, limit)
+	responseBody, err := io.ReadAll(response.Body)
 	if err != nil {
 		if forgejo.session != nil {
 			return rawResponse{}, &hostingidentity.Error{Identity: forgejo.session.Name(), Operation: "read Forgejo response", Reason: "cannot read hosting server response"}
 		}
 		return rawResponse{}, fmt.Errorf("forgejo API read response %s %s: %w", method, path, err)
-	}
-	if responseExceedsLimit(len(responseBody), limit) {
-		if forgejo.session != nil {
-			return rawResponse{}, &hostingidentity.Error{Identity: forgejo.session.Name(), Operation: "read Forgejo response", Reason: "hosting server response exceeds size limit"}
-		}
-		return rawResponse{}, fmt.Errorf("forgejo API %s %s response exceeds %d bytes", method, path, limit)
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		sanitized := sanitizeForgejoErrorBody(responseBody, token)

@@ -130,16 +130,6 @@ func (b *hostBroker) maxResponseBytes() int {
 	if b == nil || b.session == nil || b.session.Target().Kind != config.ProviderKindForgejo {
 		return maxHostResponseBytes
 	}
-	id := strings.TrimSpace(b.session.Target().ProviderID)
-	for _, provider := range b.options.Config.Providers {
-		if provider.Kind != config.ProviderKindForgejo {
-			continue
-		}
-		if id != "" && provider.ID != id {
-			continue
-		}
-		return provider.MaxResponseBytes
-	}
 	return 0
 }
 

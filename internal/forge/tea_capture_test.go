@@ -3,8 +3,6 @@ package forge
 import (
 	"context"
 	"encoding/json"
-	"github.com/nexu-io/looper/internal/config"
-	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -12,6 +10,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/nexu-io/looper/internal/config"
 )
 
 func teaOutputScript(t *testing.T, stdout, stderr string) string {
@@ -48,11 +48,10 @@ func TestTeaTransportCaptureContract(t *testing.T) {
 		wantError       bool
 	}{
 		{"unlimited large diff", 0, 2 << 20, "", false},
-		{"exact limit", 16, 16, "", false},
-		{"one byte over", 16, 17, "", true},
+		{"exact health limit", 1 << 20, 1 << 20, "", false},
+		{"over health limit", 1 << 20, (1 << 20) + 1, "", true},
 		{"health probe limit", 1 << 20, 2 << 20, "", true},
-		{"bounded headers", 16, 16, strings.Repeat("X-Padding: value\n", 8192), true},
-		{"maximum int does not overflow", math.MaxInt, 16, "", false},
+		{"bounded headers", 1 << 20, 16, strings.Repeat("X-Padding: value\n", 131072), true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			body := strings.Repeat("d", tc.bodySize)
@@ -67,13 +66,6 @@ func TestTeaTransportCaptureContract(t *testing.T) {
 				t.Fatalf("body length = %d, error = %v", len(response.body), err)
 			}
 		})
-	}
-}
-
-func TestReadBoundedResponseMaximumLimit(t *testing.T) {
-	body, err := readBoundedResponse(strings.NewReader("diff"), math.MaxInt)
-	if err != nil || string(body) != "diff" {
-		t.Fatalf("body = %q, error = %v", body, err)
 	}
 }
 
@@ -96,16 +88,15 @@ func TestTeaProviderAndHealthCaptureContract(t *testing.T) {
 	if err := os.WriteFile(path, []byte(script), 0700); err != nil {
 		t.Fatal(err)
 	}
-	provider := config.ProviderConfig{ID: "forgejo", Kind: config.ProviderKindForgejo, BaseURL: server.URL, Auth: config.ProviderAuthTea, TeaPath: &path, TeaLogin: stringPtr("test"), MaxResponseBytes: 64}
+	provider := config.ProviderConfig{ID: "forgejo", Kind: config.ProviderKindForgejo, BaseURL: server.URL, Auth: config.ProviderAuthTea, TeaPath: &path, TeaLogin: stringPtr("test")}
 	client, err := NewForgejoClientFromConfig(provider, "acme/repo")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := client.CurrentUser(context.Background()); err == nil || !strings.Contains(err.Error(), "response exceeds") {
-		t.Fatalf("configured provider must reject truncated headers: %v", err)
+	if _, err := client.CurrentUser(context.Background()); err != nil {
+		t.Fatalf("ordinary API read must accept large headers: %v", err)
 	}
-	// A provider's unlimited default must not override the health probe's 1 MiB cap.
-	provider.MaxResponseBytes = 0
+	// Ordinary reads must not override the health probe's fixed 1 MiB cap.
 	health := ProbeForgejoProvider(context.Background(), provider, nil)
 	if health.Authentication != AuthenticationUnknown || health.Identity != nil {
 		t.Fatalf("health probe accepted oversized capture: %+v", health)

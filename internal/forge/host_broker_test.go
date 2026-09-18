@@ -233,7 +233,11 @@ func TestHostBrokerRejectsEscapesAndEveryWrite(t *testing.T) {
 func TestHostBrokerPaginationResponseLimitsAndErrors(t *testing.T) {
 	for _, mode := range []string{"foreign-page", "scope-page", "oversized", "malformed", "denied"} {
 		t.Run(mode, func(t *testing.T) {
-			f := newHostFixture(t, config.HostingIdentityForgejoToken, func(w http.ResponseWriter, r *http.Request) {
+			kind := config.HostingIdentityForgejoToken
+			if mode == "oversized" {
+				kind = config.HostingIdentityGitHubApp
+			}
+			f := newHostFixture(t, kind, func(w http.ResponseWriter, r *http.Request) {
 				switch mode {
 				case "foreign-page":
 					w.Header().Set("Link", `<https://other.invalid/api/v1/repos/acme/looper/issues/1/comments?page=2&limit=50>; rel="next"`)
@@ -250,13 +254,7 @@ func TestHostBrokerPaginationResponseLimitsAndErrors(t *testing.T) {
 					io.WriteString(w, "host-test-token-one")
 				}
 			})
-			if mode == "oversized" {
-				f.options.Config.Providers = []config.ProviderConfig{{
-					ID:               "forge",
-					Kind:             config.ProviderKindForgejo,
-					MaxResponseBytes: maxHostResponseBytes,
-				}}
-			}
+
 			f.start(t)
 			_, err := ProxyHost(context.Background(), HostRequest{Op: "api.read", Path: "issues/1/comments", Paginate: true})
 			if err == nil {
@@ -396,15 +394,11 @@ func TestHostBrokerRedirectedJobLogResponseLimit(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
 		kind      config.HostingIdentityKind
-		limit     int
 		size      int
 		wantError bool
 	}{
-		{"unlimited", config.HostingIdentityForgejoToken, 0, 2 * maxHostResponseBytes, false},
-		{"large-configured", config.HostingIdentityForgejoToken, 3 * maxHostResponseBytes, 2 * maxHostResponseBytes, false},
-		{"exact-limit", config.HostingIdentityForgejoToken, 128, 128, false},
-		{"over-limit", config.HostingIdentityForgejoToken, 128, 129, true},
-		{"github-default", config.HostingIdentityGitHubApp, 0, maxHostResponseBytes + 1, true},
+		{"unlimited", config.HostingIdentityForgejoToken, 2 * maxHostResponseBytes, false},
+		{"github-default", config.HostingIdentityGitHubApp, maxHostResponseBytes + 1, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			body := strings.Repeat("x", tc.size)
@@ -419,7 +413,6 @@ func TestHostBrokerRedirectedJobLogResponseLimit(t *testing.T) {
 				w.Header().Set("Location", logs.URL+"/job?signature=fixture-signed-location")
 				w.WriteHeader(http.StatusFound)
 			})
-			f.options.Config.Providers = []config.ProviderConfig{{ID: "forge", Kind: config.ProviderKindForgejo, MaxResponseBytes: tc.limit}}
 			f.options.HTTPClient = logs.Client()
 			f.start(t)
 			output, err := ProxyHost(context.Background(), HostRequest{Op: "api.read", Path: "actions/jobs/9/logs"})

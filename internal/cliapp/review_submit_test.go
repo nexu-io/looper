@@ -1746,7 +1746,7 @@ func TestForgejoReviewSubmitUsesLocalDiffWithoutRemotePatch(t *testing.T) {
 		}
 	}))
 	defer server.Close()
-	client, err := forge.NewForgejoClient(forge.RepositoryRef{ProviderID: "forgejo", Kind: forge.ProviderKindForgejo, BaseURL: server.URL, Repo: "acme/looper"}, "token", forge.WithMaxResponseBytes(1024))
+	client, err := forge.NewForgejoClient(forge.RepositoryRef{ProviderID: "forgejo", Kind: forge.ProviderKindForgejo, BaseURL: server.URL, Repo: "acme/looper"}, "token")
 	if err != nil {
 		t.Fatal(err)
 	}

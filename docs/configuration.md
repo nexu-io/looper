@@ -715,6 +715,8 @@ repo = "acme/example"
 
 Forgejo rules:
 
+Ordinary Forgejo HTTP and tea API responses have no response-size cap. Review content comes from local Git. Health probes and login discovery retain fixed internal bounds.
+
 - `providers[].id` must be unique.
 - `providers[].kind` must be `github`, `forgejo`, or `plane`; `gitea` is not a supported provider kind yet.
 - Forgejo providers require an absolute `http(s)` `baseUrl` and an authentication strategy:
@@ -722,7 +724,6 @@ Forgejo rules:
   - `auth = "tea"` with an explicit `teaLogin` whose tea login URL matches `baseUrl` (never inferred from tea's default login when multiple identities exist)
 - When `auth` is omitted, a lone `tokenEnv` implies `token-env` and a lone `teaLogin` implies `tea`. Setting both without `auth` is a validation error.
 - Tea-backed API calls use `tea api --login <teaLogin>`; Looper never parses tea credential storage or copies the token into config, logs, argv, event payloads, or environment variables.
-- `providers[].maxResponseBytes` optionally caps Forgejo/tea API response bodies, including PR diffs. `0` (the default) is unlimited; a positive value is a hard byte cap. Reviewer discovery and snapshots do not request remote patches; review content and inline anchors come from local Git, so this setting is not a PR diff-size limit. For a positive limit, tea capture is bounded before decoding: each output stream retains at most `max(maxResponseBytes, 64 KiB)` bytes, with the small floor allowing HTTP headers. The response body is still checked against the exact configured limit. Health probes keep their independent 1 MiB bound.
 - Actionable tea auth failures surface as `tea_missing`, `tea_login_missing`, `tea_login_host_mismatch`, or `tea_auth_failed` (and never fall through to GitHub).
 - Forgejo projects require a `provider` and repo (`owner/name`). They can be written in config, persisted by `looper project add --provider <id>`, or created with `--forgejo-url` plus either `--forgejo-token-env` or `--auth tea --tea-login`. The repo may be detected only from an origin matching that provider. CLI/API-added provider bindings become active immediately through the atomic Project Catalog; already-started work retains its previous snapshot.
 - Duplicate repository identities are rejected case-insensitively. The same `owner/repo` may be used on different Forgejo instances or on GitHub and Forgejo.

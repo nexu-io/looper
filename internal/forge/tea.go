@@ -291,7 +291,7 @@ func (t *teaTransport) doRaw(ctx context.Context, method string, path string, qu
 		// one limit per stream; allow small bodies a bounded header allowance.
 		captureLimit := math.MaxInt
 		if t.maxBodyBytes > 0 {
-			captureLimit = max(t.maxBodyBytes, 64*1024)
+			captureLimit = t.maxBodyBytes
 		}
 		runner = defaultTeaRunner{maxCapturedBytes: captureLimit}
 	}
