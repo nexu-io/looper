@@ -4848,6 +4848,39 @@ func TestProcessClaimedQueueItemRemovesEyesWhenPublishPersistFailsTerminally(t *
 	}
 }
 
+func TestFinalizeClaimSetupFailureRemovesEyesWhenProjectLookupFails(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{}
+	repos := *fixture.repos
+	repos.Projects = nil
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: &repos, GitHub: github, Logger: fixture.logger, Now: fixture.now, RetryMaxAttempts: 1})
+	ctx := context.Background()
+	nowISO := fixture.nowISO()
+	repo := "acme/looper"
+	prNumber := int64(42)
+	target := "pr:acme/looper:42"
+	loop := storage.LoopRecord{ID: "loop_eyes_missing_project", Seq: 1, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", TargetID: &target, Repo: &repo, PRNumber: &prNumber, Status: "queued", CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(ctx, loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	projectID := "project_1"
+	queue := storage.QueueItemRecord{ID: "queue_eyes_missing_project", ProjectID: &projectID, LoopID: &loop.ID, Type: "reviewer", TargetType: "pull_request", TargetID: target, Repo: &repo, PRNumber: &prNumber, DedupeKey: "reviewer:missing-project", Priority: storage.QueuePriorityReviewer, Status: "running", AvailableAt: nowISO, MaxAttempts: 1, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Queue.Upsert(ctx, queue); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+	if err := runner.finalizeClaimSetupFailure(ctx, queue, fmt.Errorf("project not found: %s", projectID)); err != nil {
+		t.Fatalf("finalizeClaimSetupFailure() error = %v", err)
+	}
+	failedQueue, err := fixture.repos.Queue.GetByID(ctx, queue.ID)
+	if err != nil || failedQueue == nil || failedQueue.Status == "queued" {
+		t.Fatalf("queue after setup failure = (%#v, %v), want not queued", failedQueue, err)
+	}
+	if got := reactionContents(github.removeReactionCalls); len(got) != 1 || got[0] != "eyes" {
+		t.Fatalf("removeReactionCalls = %#v, want eyes cleared without project lookup", github.removeReactionCalls)
+	}
+}
+
 func TestProcessClaimedItemRemovesEyesWhenParkingNeedsHuman(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)

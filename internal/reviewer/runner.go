@@ -2034,11 +2034,13 @@ func (r *Runner) finalizeClaimSetupFailure(ctx context.Context, queueItem storag
 	if loop == nil {
 		return nil
 	}
+	project := storage.ProjectRecord{ID: loop.ProjectID}
 	if r.repos.Projects != nil {
-		if project, projErr := r.repos.Projects.GetByID(ctx, loop.ProjectID); projErr == nil && project != nil {
-			r.clearInProgressReactionIfQueueStopped(ctx, *project, *loop, queueItem, "", failedQueue)
+		if loaded, projErr := r.repos.Projects.GetByID(ctx, loop.ProjectID); projErr == nil && loaded != nil {
+			project = *loaded
 		}
 	}
+	r.clearInProgressReactionIfQueueStopped(ctx, project, *loop, queueItem, "", failedQueue)
 	_, err = r.updateLoop(ctx, *loop, func(updated *storage.LoopRecord) {
 		updated.LastRunAt = stringPtr(r.nowISO())
 		// Budget/scope pair holds must keep awaiting_human/paused presentation.
