@@ -2289,6 +2289,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			if queueErr != nil {
 				return ProcessResult{}, queueErr
 			}
+			r.clearInProgressReactionIfQueueStopped(ctx, *project, *loop, queueItem, run.ID, failedQueue)
 			terminalFailure := false
 			_, loopErr := r.updateLoop(ctx, *loop, func(updated *storage.LoopRecord) {
 				updated.LastRunAt = stringPtr(r.nowISO())
@@ -2330,9 +2331,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 					return ProcessResult{}, err
 				}
 				failedQueue.Status = "failed"
-			}
-			if failedQueue == nil || failedQueue.Status != "queued" {
-				r.clearInProgressReactionForQueueItem(ctx, *project, *loop, queueItem, run.ID)
+				r.clearInProgressReactionIfQueueStopped(ctx, *project, *loop, queueItem, run.ID, failedQueue)
 			}
 			if queueResultIsTerminalForCleanup(failedQueue) {
 				r.cleanupReviewerWorktreeIfTerminal(context.WithoutCancel(ctx), *project, &latest)
@@ -2373,7 +2372,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 // pending/partial-batch continuation fail-closed (live read required; schedule errors surface).
 // After Complete, any downstream failure restores the row unless a continuation is already active.
 func (r *Runner) finalizeSuccessfulReviewerQueue(ctx context.Context, project storage.ProjectRecord, loop storage.LoopRecord, queueItem storage.QueueItemRecord, runID string, checkpoint reviewerCheckpoint, status, summary string) (ProcessResult, error) {
-	if status == "skipped" && checkpoint.SkipKind != "disposition_partial_batch" {
+	if status == "success" || (status == "skipped" && checkpoint.SkipKind != "disposition_partial_batch") {
 		r.clearInProgressReactionForQueueItem(ctx, project, loop, queueItem, runID)
 	}
 	// Capture pending coalesced signal before completing the active item.
@@ -5056,7 +5055,6 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 				if err := r.parkOrDeferReviewerScopeHuman(ctx, input.Loop, completion); err != nil {
 					return checkpoint, err
 				}
-				_ = r.tryRemoveReaction(ctx, input, reviewerInProgressReaction)
 				return checkpoint, reviewerScopeOrBudgetHoldSkip(ctx, r, input.Loop)
 			}
 			// Mixed must_fix + needs_human: publish must_fix first (publish step),
@@ -5602,7 +5600,6 @@ func (r *Runner) finishNativeNeedsHumanCompletion(ctx context.Context, input ste
 	if err := r.parkOrDeferReviewerScopeHuman(ctx, input.Loop, nativeCompletion); err != nil {
 		return checkpoint, err
 	}
-	_ = r.tryRemoveReaction(ctx, input, reviewerInProgressReaction)
 	return checkpoint, reviewerScopeOrBudgetHoldSkip(ctx, r, input.Loop)
 }
 
@@ -5832,7 +5829,6 @@ func (r *Runner) applyVerifiedReviewSideEffects(ctx context.Context, input stepI
 	default:
 		return &loopError{message: "Verified review marker is missing outcome=clean|non_blocking|blocking|actionable; cannot validate review side effects", kind: FailureRetryableAfterResume}
 	}
-	_ = r.tryRemoveReaction(ctx, input, reviewerInProgressReaction)
 	return nil
 }
 
@@ -5853,7 +5849,6 @@ func (r *Runner) applyCleanNoopReviewSideEffects(ctx context.Context, input step
 	if err := r.applyCleanSpecLabelTransition(ctx, input, checkpoint, detail, shouldTransitionSpecLabels); err != nil {
 		return err
 	}
-	_ = r.tryRemoveReaction(ctx, input, reviewerInProgressReaction)
 	return nil
 }
 
@@ -5880,6 +5875,13 @@ func (r *Runner) clearInProgressReactionForQueueItem(ctx context.Context, projec
 		return
 	}
 	_ = r.tryRemoveReaction(ctx, stepInput{Project: project, Loop: loop, Run: storage.RunRecord{ID: runID}, Repo: *queueItem.Repo, PRNumber: *queueItem.PRNumber}, reviewerInProgressReaction)
+}
+
+func (r *Runner) clearInProgressReactionIfQueueStopped(ctx context.Context, project storage.ProjectRecord, loop storage.LoopRecord, queueItem storage.QueueItemRecord, runID string, failedQueue *storage.QueueItemRecord) {
+	if failedQueue != nil && failedQueue.Status == "queued" {
+		return
+	}
+	r.clearInProgressReactionForQueueItem(ctx, project, loop, queueItem, runID)
 }
 
 func cleanSpecLabelTransitionAllowed(policy config.ReviewerReviewEventsConfig, event ReviewEvent, outcome string) bool {
@@ -6077,7 +6079,6 @@ func (r *Runner) publishCriteriaFailureReview(ctx context.Context, input stepInp
 	if err := r.github.RemovePullRequestReaction(ctx, PullRequestReactionInput{Repo: input.Repo, PRNumber: input.PRNumber, Content: "+1", CWD: input.Project.RepoPath}); err != nil {
 		return nil, &loopError{message: fmt.Sprintf("Failed to remove stale clean-review reaction before marking publish success: %v", err), kind: FailureRetryableAfterResume}
 	}
-	_ = r.tryRemoveReaction(ctx, input, reviewerInProgressReaction)
 	return &criteriaPublishResult{reviewEvent: ReviewEventComment, marker: marker}, nil
 }
 
@@ -6221,7 +6222,6 @@ func (r *Runner) publishCommentOnlyReview(ctx context.Context, input stepInput, 
 		if err := r.parkOrDeferReviewerScopeHuman(ctx, input.Loop, completion); err != nil {
 			return err
 		}
-		_ = r.tryRemoveReaction(ctx, input, reviewerInProgressReaction)
 		return reviewerScopeOrBudgetHoldSkip(ctx, r, input.Loop)
 	}
 	comments, err := r.github.ListIssueComments(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.Project.RepoPath})
@@ -6253,7 +6253,6 @@ func (r *Runner) publishCommentOnlyReview(ctx context.Context, input stepInput, 
 		if err := r.github.UpdateIssueComment(ctx, UpdateIssueCommentInput{Repo: input.Repo, CommentID: existingComment.ID, Body: body, CWD: input.Project.RepoPath, DisclosureAgent: disclosureAgent, DisclosureModel: disclosureModel}); err != nil {
 			return &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 		}
-		_ = r.tryRemoveReaction(ctx, input, reviewerInProgressReaction)
 		return nil
 	}
 	if _, err := r.reviewerPublishFreshDetailForMutation(ctx, input, "creating comment-only review"); err != nil {
@@ -6262,7 +6261,6 @@ func (r *Runner) publishCommentOnlyReview(ctx context.Context, input stepInput, 
 	if _, err := r.github.CreateIssueComment(ctx, IssueCommentInput{Repo: input.Repo, IssueNumber: input.PRNumber, Body: body, CWD: input.Project.RepoPath, DisclosureAgent: disclosureAgent, DisclosureModel: disclosureModel}); err != nil {
 		return &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 	}
-	_ = r.tryRemoveReaction(ctx, input, reviewerInProgressReaction)
 	return nil
 }
 
@@ -9202,7 +9200,6 @@ func (r *Runner) afterCommentOnlyPublishMaybeParkScope(ctx context.Context, inpu
 	if err := r.parkOrDeferReviewerScopeHuman(ctx, input.Loop, completion); err != nil {
 		return checkpoint, err
 	}
-	_ = r.tryRemoveReaction(ctx, input, reviewerInProgressReaction)
 	return checkpoint, reviewerScopeOrBudgetHoldSkip(ctx, r, input.Loop)
 }
 
