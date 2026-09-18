@@ -2331,6 +2331,9 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 				}
 				failedQueue.Status = "failed"
 			}
+			if failedQueue == nil || failedQueue.Status != "queued" {
+				r.clearInProgressReactionForQueueItem(ctx, *project, *loop, queueItem, run.ID)
+			}
 			if queueResultIsTerminalForCleanup(failedQueue) {
 				r.cleanupReviewerWorktreeIfTerminal(context.WithoutCancel(ctx), *project, &latest)
 			}

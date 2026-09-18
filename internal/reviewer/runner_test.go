@@ -4761,6 +4761,48 @@ func TestProcessClaimedItemKeepsEyesWhenReviewAgentWaitFails(t *testing.T) {
 	}
 }
 
+func TestProcessClaimedItemRemovesEyesWhenTerminalAgentFailure(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{reviewRequests: []string{"octocat"}}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed"}}, waitErr: fmt.Errorf("agent wait failed")}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, LoopConfig: testReviewerLoopConfig(), RetryMaxAttempts: 1})
+	ctx := context.Background()
+	nowISO := fixture.nowISO()
+	repo := "acme/looper"
+	prNumber := int64(42)
+	metadata := `{"followUpdates":true,"loop":{"enabled":true}}`
+	loop := storage.LoopRecord{ID: "loop_eyes_terminal_fail", Seq: 1, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "queued", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(ctx, loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	queue, err := runner.enqueue(ctx, enqueueInput{ProjectID: "project_1", LoopID: loop.ID, Repo: repo, PRNumber: prNumber})
+	if err != nil {
+		t.Fatalf("enqueue() error = %v", err)
+	}
+	claimed, err := fixture.repos.Queue.ClaimNextOfType(ctx, fixture.nowISO(), "reviewer-worker-1", "reviewer")
+	if err != nil || claimed == nil || claimed.ID != queue.ID {
+		t.Fatalf("ClaimNextOfType() = (%#v, %v), want queued item %s", claimed, err, queue.ID)
+	}
+	result, err := runner.ProcessClaimedItem(ctx, *claimed)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "failed" {
+		t.Fatalf("result = %#v, want failed wait", result)
+	}
+	failedQueue, err := fixture.repos.Queue.GetByID(ctx, queue.ID)
+	if err != nil || failedQueue == nil || failedQueue.Status == "queued" {
+		t.Fatalf("queue after terminal fail = (%#v, %v), want not queued", failedQueue, err)
+	}
+	if got := reactionContents(github.addReactionCalls); len(got) != 1 || got[0] != "eyes" {
+		t.Fatalf("addReactionCalls = %#v, want in-progress eyes", github.addReactionCalls)
+	}
+	if got := reactionContents(github.removeReactionCalls); len(got) != 1 || got[0] != "eyes" {
+		t.Fatalf("removeReactionCalls = %#v, want eyes cleared after terminal agent failure", github.removeReactionCalls)
+	}
+}
+
 func TestProcessClaimedItemRemovesEyesWhenParkingNeedsHuman(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
