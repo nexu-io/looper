@@ -848,9 +848,18 @@ func TestGatewayPrepareWorktreeSupportsExplicitRef(t *testing.T) {
 		t.Fatalf("CreateWorktree() error = %v", err)
 	}
 
-	prepared, err := gateway.PrepareWorktree(ctx, PrepareWorktreeInput{WorktreePath: worktree.WorktreePath, Branch: "reviewer/pr-42", Ref: "refs/heads/feature/fixer"})
+	// The base exists only remotely and is not an ancestor of the feature head.
+	fixture.createUnfetchedRemoteBranch(t, "advanced-base")
+	baseSHA := stringsTrimSpace(runGit(t, fixture.remotePath, "rev-parse", "refs/heads/advanced-base"))
+	prepared, err := gateway.PrepareWorktree(ctx, PrepareWorktreeInput{WorktreePath: worktree.WorktreePath, Branch: "reviewer/pr-42", Ref: "refs/heads/feature/fixer", BaseSHA: baseSHA})
 	if err != nil {
 		t.Fatalf("PrepareWorktree() error = %v", err)
+	}
+	if got := stringsTrimSpace(runGit(t, worktree.WorktreePath, "rev-parse", baseSHA+"^{commit}")); got != baseSHA {
+		t.Fatalf("local base = %s, want %s", got, baseSHA)
+	}
+	if got := stringsTrimSpace(runGit(t, worktree.WorktreePath, "rev-parse", "FETCH_HEAD")); got != prepared.HeadSHA {
+		t.Fatalf("base fetch displaced PR head: %s != %s", got, prepared.HeadSHA)
 	}
 	if !prepared.Clean {
 		t.Fatal("PrepareWorktree().Clean = false, want true")

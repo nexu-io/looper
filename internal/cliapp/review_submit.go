@@ -87,12 +87,13 @@ type reviewSubmitPullRequestViewer interface {
 type reviewSubmitGateway interface {
 	reviewSubmitPullRequestViewer
 	GetCurrentUserLogin(context.Context, string) (string, error)
-	GetPullRequestDiff(context.Context, githubinfra.GetPullRequestDiffInput) (string, error)
+	BuildReviewAnchorIndex(context.Context, githubinfra.BuildReviewAnchorIndexInput) (*diffanchor.Index, string, error)
 	SubmitReview(context.Context, githubinfra.SubmitReviewInput) error
 }
 
 type forgejoReviewSubmitGateway struct {
 	client               *forge.ForgejoClient
+	localGit             *githubinfra.Gateway
 	stamper              disclosure.Stamper
 	requireReviewRequest bool
 	labels               []string
@@ -156,18 +157,8 @@ func (gateway forgejoReviewSubmitGateway) GetCurrentUserLogin(ctx context.Contex
 	return identity.Login, err
 }
 
-func (gateway forgejoReviewSubmitGateway) GetPullRequestDiff(ctx context.Context, input githubinfra.GetPullRequestDiffInput) (string, error) {
-	diff, err := gateway.client.PullRequestDiff(ctx, input.PRNumber)
-	if err != nil {
-		// A configured Forgejo body cap surfaces as a generic "response exceeds"
-		// error. Map that to ErrDiffTooLarge so top-level reviews without inline
-		// comments can use the existing no-anchor path.
-		if strings.Contains(err.Error(), "response exceeds") {
-			return "", githubinfra.ErrDiffTooLarge
-		}
-		return "", err
-	}
-	return diff, nil
+func (gateway forgejoReviewSubmitGateway) BuildReviewAnchorIndex(ctx context.Context, input githubinfra.BuildReviewAnchorIndexInput) (*diffanchor.Index, string, error) {
+	return gateway.localGit.BuildReviewAnchorIndex(ctx, input)
 }
 
 func (gateway forgejoReviewSubmitGateway) SubmitReview(ctx context.Context, input githubinfra.SubmitReviewInput) error {
@@ -234,6 +225,10 @@ func reviewSubmitGatewayForConfig(cfg config.Config, repo, cwd string, diagnosti
 }
 
 func reviewSubmitGatewayForContext(ctx context.Context, cfg config.Config, repo, cwd string, diagnostic func(string, map[string]any)) (reviewSubmitGateway, error) {
+	gitPath := "git"
+	if cfg.Tools.GitPath != nil && strings.TrimSpace(*cfg.Tools.GitPath) != "" {
+		gitPath = strings.TrimSpace(*cfg.Tools.GitPath)
+	}
 	matched, err := reviewSubmitProjectForRepo(cfg, repo, cwd)
 	if err != nil {
 		return nil, err
@@ -257,14 +252,10 @@ func reviewSubmitGatewayForContext(ctx context.Context, cfg config.Config, repo,
 		// project-specific roles instead of falling back to global defaults.
 		roleCfg := reviewSubmitConfigWithMatchedProject(cfg, matched)
 		roles := config.ProjectRoleConfigs(roleCfg, matched.ID)
-		return forgejoReviewSubmitGateway{client: client, stamper: disclosure.FromConfig(cfg), requireReviewRequest: roles.Reviewer.Discovery.Triggers.RequireReviewRequest, labels: append([]string(nil), roles.Reviewer.Discovery.Triggers.Labels...), labelMode: roles.Reviewer.Discovery.Triggers.LabelMode}, nil
+		return forgejoReviewSubmitGateway{client: client, localGit: githubinfra.New(githubinfra.Options{GitPath: gitPath, CWD: cwd}), stamper: disclosure.FromConfig(cfg), requireReviewRequest: roles.Reviewer.Discovery.Triggers.RequireReviewRequest, labels: append([]string(nil), roles.Reviewer.Discovery.Triggers.Labels...), labelMode: roles.Reviewer.Discovery.Triggers.LabelMode}, nil
 	}
 	if cfg.Tools.GHPath == nil || strings.TrimSpace(*cfg.Tools.GHPath) == "" {
 		return nil, fmt.Errorf("GitHub CLI (gh) not found; install gh or set --gh-path <path>")
-	}
-	gitPath := "git"
-	if cfg.Tools.GitPath != nil && strings.TrimSpace(*cfg.Tools.GitPath) != "" {
-		gitPath = strings.TrimSpace(*cfg.Tools.GitPath)
 	}
 	return githubinfra.New(githubinfra.Options{
 		GHPath:                 *cfg.Tools.GHPath,
@@ -551,18 +542,6 @@ func (r *commandRuntime) reviewSubmit(cmd *cobra.Command, args []string) error {
 	// prefix of `gh pr diff` and not the agent-provided line alone.
 	anchors, err := resolveReviewSubmitAnchors(cmd.Context(), gateway, repo, prNumber, cwd, detail, payload.Comments)
 	if err != nil {
-		if canSubmitWithoutAnchorValidation(err, payload.Comments) {
-			// Body-only oversized/truncated fallback still must fail closed on base/head
-			// drift: hold-only refresh is not enough when commit_id was captured earlier.
-			freshLabels, err := r.validateLatestReviewerReviewSubmitPublication(cmd, gateway, loaded.Config, repo, prNumber, commitID, detail.BaseSHA, getBoolFlag(cmd, "reviewer-manual"), getStringFlag(cmd, "reviewer-run-id"), cwd)
-			if err != nil {
-				return err
-			}
-			if err := validateForgejoReviewSubmitRequest(cmd.Context(), gateway, prNumber, freshLabels, requestBypass); err != nil {
-				return err
-			}
-			return submitReviewWithoutAnchorValidation(cmd, r, loaded.Config, gateway, repo, prNumber, submissionEvent, payload, commitID, cwd, loaded.Config.Disclosure)
-		}
 		// Never reach SubmitReview's content guard on this path: redact paths and
 		// never return path-bearing git/remote errors (path may be secret-shaped).
 		writeReviewSubmitDiagnostic(cmd.ErrOrStderr(), "github_review_submit_validation_failed", reviewSubmitDiagnosticFields{
@@ -574,11 +553,6 @@ func (r *commandRuntime) reviewSubmit(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("resolve PR diff anchor authority for review submit: %w", githubinfra.ErrAnchorValidationUnavailable)
 	}
 
-	comments := make([]githubinfra.ReviewComment, 0, len(payload.Comments))
-	for _, comment := range payload.Comments {
-		// Strip Looper-only disposition/scope fields before the provider Adapter.
-		comments = append(comments, githubinfra.ReviewComment{Body: comment.Body, Path: comment.Path, Line: comment.Line, Side: comment.Side, StartLine: comment.StartLine, StartSide: comment.StartSide})
-	}
 	// Fail closed on base/head drift between anchor resolution and mutation.
 	freshLabels, err := r.validateLatestReviewerReviewSubmitPublication(cmd, gateway, loaded.Config, repo, prNumber, commitID, detail.BaseSHA, getBoolFlag(cmd, "reviewer-manual"), getStringFlag(cmd, "reviewer-run-id"), cwd)
 	if err != nil {
@@ -587,16 +561,7 @@ func (r *commandRuntime) reviewSubmit(cmd *cobra.Command, args []string) error {
 	if err := validateForgejoReviewSubmitRequest(cmd.Context(), gateway, prNumber, freshLabels, requestBypass); err != nil {
 		return err
 	}
-	// Budget admission before mutation: agent-native reviews must not publish when
-	// a participating reviewer loop is already at/over live maxPublishesPerPR or
-	// on a review-fix budget hold. Daemon owns park; CLI only refuses.
-	if err := r.refuseReviewSubmitIfBudgetExhausted(cmd, loaded.Config, repo, prNumber); err != nil {
-		return err
-	}
-	if err := gateway.SubmitReview(cmd.Context(), githubinfra.SubmitReviewInput{Repo: repo, PRNumber: prNumber, Event: submissionEvent, Body: payload.Body, CommitID: commitID, Comments: comments, Anchors: anchors, Disclosure: loaded.Config.Disclosure, CWD: cwd}); err != nil {
-		return wrapReviewSubmitError(cmd, repo, prNumber, submissionEvent, commitID, payload, "submit validated PR review", err)
-	}
-	return writeJSON(cmd.OutOrStdout(), map[string]any{"submitted": true})
+	return submitReviewWithAnchors(cmd, r, loaded.Config, gateway, repo, prNumber, submissionEvent, payload, commitID, cwd, loaded.Config.Disclosure, anchors)
 }
 
 func validateForgejoReviewSubmitRequest(ctx context.Context, gateway reviewSubmitGateway, prNumber int64, labels []string, bypass bool) error {
@@ -670,50 +635,18 @@ func (r *commandRuntime) trustedReviewRequestSubmitBypass(cmd *cobra.Command, cf
 	return trustedCurrentFollowUpNewHeadReviewerBypass(cmd.Context(), repos, repo, prNumber, resolve)
 }
 
-// resolveReviewSubmitAnchors establishes complete base/head anchor authority.
-// For actionable inline comments it prefers path-targeted local diffs (GitHub
-// gateway) and never treats a truncated remote capture as authoritative.
-// Body-only reviews may still proceed when only GitHub oversized / local
-// capture limits block a full remote diff. Forgejo uses the remote PR diff as
-// complete authority.
+// Body-only reviews need no diff. Both providers use the same local Git index
+// for inline comments at the refreshed PR base/head SHAs.
 func resolveReviewSubmitAnchors(ctx context.Context, gateway reviewSubmitGateway, repo string, prNumber int64, cwd string, detail githubinfra.PullRequestDetail, comments []reviewSubmitComment) (*diffanchor.Index, error) {
 	if len(comments) == 0 {
-		diff, err := gateway.GetPullRequestDiff(ctx, githubinfra.GetPullRequestDiffInput{Repo: repo, PRNumber: prNumber, CWD: cwd})
-		if err != nil {
-			return nil, err
-		}
-		parsed := diffanchor.Parse(diff)
-		return &parsed, nil
+		return nil, nil
 	}
-
-	// Prefer complete local base/head authority when the gateway supports it.
-	if gh, ok := gateway.(*githubinfra.Gateway); ok {
-		paths := make([]string, 0, len(comments))
-		for _, comment := range comments {
-			paths = append(paths, comment.Path)
-		}
-		anchors, _, err := gh.BuildReviewAnchorIndex(ctx, githubinfra.BuildReviewAnchorIndexInput{
-			CWD:     cwd,
-			BaseSHA: detail.BaseSHA,
-			HeadSHA: detail.HeadSHA,
-			Paths:   paths,
-			RemoteDiff: func(ctx context.Context) (string, error) {
-				return gh.GetPullRequestDiff(ctx, githubinfra.GetPullRequestDiffInput{Repo: repo, PRNumber: prNumber, CWD: cwd})
-			},
-		})
-		if err != nil {
-			return nil, err
-		}
-		return anchors, nil
+	paths := make([]string, 0, len(comments))
+	for _, comment := range comments {
+		paths = append(paths, comment.Path)
 	}
-
-	// Forgejo and other gateways: remote PR diff is the complete authority.
-	diff, err := gateway.GetPullRequestDiff(ctx, githubinfra.GetPullRequestDiffInput{Repo: repo, PRNumber: prNumber, CWD: cwd})
-	if err != nil {
-		return nil, err
-	}
-	parsed := diffanchor.Parse(diff)
-	return &parsed, nil
+	anchors, _, err := gateway.BuildReviewAnchorIndex(ctx, githubinfra.BuildReviewAnchorIndexInput{CWD: cwd, BaseSHA: detail.BaseSHA, HeadSHA: detail.HeadSHA, Paths: paths})
+	return anchors, err
 }
 
 // wrapReviewSubmitError keeps content-safety rejections actionable for agents
@@ -1254,21 +1187,17 @@ func parseReviewSubmitJSONObject(value *string) map[string]any {
 	return parsed
 }
 
-func canSubmitWithoutAnchorValidation(err error, comments []reviewSubmitComment) bool {
-	if len(comments) != 0 {
-		// Actionable inline comments must not silently become body-only when
-		// anchor authority is unavailable; fail closed for retry instead.
-		return false
+func submitReviewWithAnchors(cmd *cobra.Command, r *commandRuntime, cfg config.Config, gh reviewSubmitGateway, repo string, prNumber int64, event string, payload reviewSubmitPayload, commitID string, cwd string, disclosureCfg config.DisclosureConfig, anchors *diffanchor.Index) error {
+	comments := make([]githubinfra.ReviewComment, 0, len(payload.Comments))
+	for _, comment := range payload.Comments {
+		// Strip Looper-only disposition/scope fields before the provider Adapter.
+		comments = append(comments, githubinfra.ReviewComment{Body: comment.Body, Path: comment.Path, Line: comment.Line, Side: comment.Side, StartLine: comment.StartLine, StartSide: comment.StartSide})
 	}
-	return errors.Is(err, githubinfra.ErrDiffTooLarge) || errors.Is(err, githubinfra.ErrLocalCaptureTruncated)
-}
-
-func submitReviewWithoutAnchorValidation(cmd *cobra.Command, r *commandRuntime, cfg config.Config, gh reviewSubmitGateway, repo string, prNumber int64, event string, payload reviewSubmitPayload, commitID string, cwd string, disclosureCfg config.DisclosureConfig) error {
 	if err := r.refuseReviewSubmitIfBudgetExhausted(cmd, cfg, repo, prNumber); err != nil {
 		return err
 	}
-	if err := gh.SubmitReview(cmd.Context(), githubinfra.SubmitReviewInput{Repo: repo, PRNumber: prNumber, Event: event, Body: payload.Body, CommitID: commitID, Disclosure: disclosureCfg, CWD: cwd}); err != nil {
-		return wrapReviewSubmitError(cmd, repo, prNumber, event, commitID, payload, "submit PR review without anchor validation", err)
+	if err := gh.SubmitReview(cmd.Context(), githubinfra.SubmitReviewInput{Repo: repo, PRNumber: prNumber, Event: event, Body: payload.Body, CommitID: commitID, Comments: comments, Anchors: anchors, Disclosure: disclosureCfg, CWD: cwd}); err != nil {
+		return wrapReviewSubmitError(cmd, repo, prNumber, event, commitID, payload, "submit validated PR review", err)
 	}
 	return writeJSON(cmd.OutOrStdout(), map[string]any{"submitted": true})
 }

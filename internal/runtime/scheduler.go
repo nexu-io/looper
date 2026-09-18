@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
@@ -1343,10 +1344,6 @@ func (a reviewerGitHubAdapter) ViewPullRequest(ctx context.Context, input review
 		if err != nil {
 			return reviewer.PullRequestDetail{}, err
 		}
-		diff, err := client.PullRequestDiff(ctx, input.PRNumber)
-		if err != nil {
-			return reviewer.PullRequestDetail{}, err
-		}
 		comments, err := client.ListIssueComments(ctx, input.PRNumber)
 		if err != nil {
 			return reviewer.PullRequestDetail{}, err
@@ -1363,7 +1360,7 @@ func (a reviewerGitHubAdapter) ViewPullRequest(ctx context.Context, input review
 		if err != nil {
 			return reviewer.PullRequestDetail{}, err
 		}
-		return reviewer.PullRequestDetail{Number: pr.Number, URL: pr.HTMLURL, Title: pr.Title, Body: pr.Body, State: pr.State, IsDraft: pr.IsDraft, ReviewDecision: decision, Labels: forgeLabelNames(pr.Labels), HeadSHA: pr.Head.SHA, BaseSHA: pr.Base.SHA, HeadRefName: pr.Head.Name, BaseRefName: pr.Base.Name, Author: pr.User.Login, ReviewRequests: requests, ReviewRequestUsers: requestUsers, HasConflicts: conflicted, ChecksSummary: summarizeCheckStates(forgeChecksToObjects(checks)), Comments: forgeReviewContextComments(reviews), Diff: diff, IssueComments: forgeCommentsToObjects(comments), Reviews: reviews}, nil
+		return reviewer.PullRequestDetail{Number: pr.Number, URL: pr.HTMLURL, Title: pr.Title, Body: pr.Body, State: pr.State, IsDraft: pr.IsDraft, ReviewDecision: decision, Labels: forgeLabelNames(pr.Labels), HeadSHA: pr.Head.SHA, BaseSHA: pr.Base.SHA, HeadRefName: pr.Head.Name, BaseRefName: pr.Base.Name, Author: pr.User.Login, ReviewRequests: requests, ReviewRequestUsers: requestUsers, HasConflicts: conflicted, ChecksSummary: summarizeCheckStates(forgeChecksToObjects(checks)), Comments: forgeReviewContextComments(reviews), IssueComments: forgeCommentsToObjects(comments), Reviews: reviews}, nil
 	}
 	if a.gateway == nil {
 		return reviewer.PullRequestDetail{}, fmt.Errorf("github gateway is not configured")
@@ -1451,11 +1448,7 @@ func (a reviewerGitHubAdapter) CapturePullRequestSnapshot(ctx context.Context, i
 		if err != nil {
 			return storage.PullRequestSnapshotRecord{}, err
 		}
-		diff, err := client.PullRequestDiff(ctx, input.PRNumber)
-		if err != nil {
-			return storage.PullRequestSnapshotRecord{}, err
-		}
-		payloadJSON, err := json.Marshal(map[string]any{"diff": diff})
+		payload, err := json.Marshal(map[string]any{"detail": map[string]any{"state": pr.State, "isDraft": pr.IsDraft}})
 		if err != nil {
 			return storage.PullRequestSnapshotRecord{}, err
 		}
@@ -1465,12 +1458,12 @@ func (a reviewerGitHubAdapter) CapturePullRequestSnapshot(ctx context.Context, i
 			ProjectID:   input.ProjectID,
 			Repo:        input.Repo,
 			PRNumber:    input.PRNumber,
+			PayloadJSON: stringPtr(string(payload)),
 			HeadSHA:     pr.Head.SHA,
 			BaseSHA:     stringPtr(baseSHA),
 			Title:       stringPtr(pr.Title),
 			Body:        stringPtr(pr.Body),
 			Author:      stringPtr(pr.User.Login),
-			PayloadJSON: stringPtr(string(payloadJSON)),
 			CapturedAt:  input.CapturedAt,
 			CreatedAt:   input.CapturedAt,
 		}, nil
@@ -1973,7 +1966,20 @@ func (a *reviewerAgentExecutionAdapter) closeProxy() {
 	})
 }
 
-type reviewerGitAdapter struct{ gateway *gitinfra.Gateway }
+type reviewerGitAdapter struct {
+	gateway   *gitinfra.Gateway
+	localDiff *githubinfra.Gateway
+}
+
+func (a reviewerGitAdapter) ReadPullRequestDiff(ctx context.Context, cwd, baseSHA, headSHA string) (string, error) {
+	var diff string
+	err := a.localDiff.ReadLocalPullRequestDiff(ctx, cwd, baseSHA, headSHA, nil, func(reader io.Reader) error {
+		data, err := io.ReadAll(reader)
+		diff = string(data)
+		return err
+	})
+	return diff, err
+}
 
 func (a reviewerGitAdapter) CreateWorktree(ctx context.Context, input reviewer.CreateWorktreeInput) (reviewer.CreateWorktreeResult, error) {
 	worktree, err := a.gateway.CreateWorktree(ctx, gitinfra.CreateWorktreeInput{ProjectID: input.ProjectID, RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot, Branch: input.Branch, BaseBranch: input.BaseBranch, PRNumber: input.PRNumber, ProtectedBranches: input.ProtectedBranches, CheckoutMode: gitinfra.CheckoutMode(input.CheckoutMode)})
@@ -1984,7 +1990,7 @@ func (a reviewerGitAdapter) CreateWorktree(ctx context.Context, input reviewer.C
 }
 
 func (a reviewerGitAdapter) PrepareWorktree(ctx context.Context, input reviewer.PrepareWorktreeInput) (reviewer.PrepareWorktreeResult, error) {
-	result, err := a.gateway.PrepareWorktree(ctx, gitinfra.PrepareWorktreeInput{RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot, WorktreePath: input.WorktreePath, Branch: input.Branch, Ref: input.Ref, ExpectedHeadSHA: input.ExpectedHeadSHA, Remote: input.Remote})
+	result, err := a.gateway.PrepareWorktree(ctx, gitinfra.PrepareWorktreeInput{RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot, WorktreePath: input.WorktreePath, Branch: input.Branch, Ref: input.Ref, ExpectedHeadSHA: input.ExpectedHeadSHA, BaseSHA: input.BaseSHA, Remote: input.Remote})
 	if err != nil {
 		return reviewer.PrepareWorktreeResult{}, err
 	}
@@ -3689,7 +3695,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			DB:     coordinator.DB(),
 			Repos:  repos,
 			GitHub: reviewerGitHubAdapter{gateway: githubGateway, stamper: reviewerStamper, config: &cfg},
-			Git:    reviewerGitAdapter{gateway: gitGateway},
+			Git:    reviewerGitAdapter{gateway: gitGateway, localDiff: githubinfra.New(githubinfra.Options{GitPath: derefString(cfg.Tools.GitPath)})},
 			AgentExecutor: reviewerAgentExecutorAdapter{
 				executor:    reviewerExecutor,
 				realLooper:  looperCLIPath,

@@ -106,3 +106,7 @@ func (f *restoreFailAfterClearGit) CleanupWorktree(_ context.Context, _ CleanupW
 func (f *restoreFailAfterClearGit) ScrubReservedReviewerScratch(_ context.Context, _ string) error {
 	return nil
 }
+
+func (f *restoreFailAfterClearGit) ReadPullRequestDiff(context.Context, string, string, string) (string, error) {
+	return "", nil
+}

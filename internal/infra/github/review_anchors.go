@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -17,11 +19,9 @@ import (
 // exact SHAs under review — not a bounded shell prefix of `gh pr diff`, and not
 // the agent's requested line numbers by themselves.
 const (
-	reviewPathDiffMaxCapturedBytes = 32 * 1024 * 1024
-	reviewPathDiffCommandTimeout   = 180 * time.Second
+	reviewPathDiffCommandTimeout = 180 * time.Second
 
 	ReviewAnchorAuthorityLocalPathDiff = "local_path_diff"
-	ReviewAnchorAuthorityRemotePRDiff  = "remote_pr_diff"
 )
 
 // BuildReviewAnchorIndexInput selects the complete base/head authority used to
@@ -31,17 +31,10 @@ type BuildReviewAnchorIndexInput struct {
 	BaseSHA string
 	HeadSHA string
 	Paths   []string
-	// RemoteDiff is an optional fallback that must return a complete, untruncated
-	// PR diff. Local capture truncation and true GitHub oversized responses must
-	// surface as ErrLocalCaptureTruncated / ErrDiffTooLarge so they are not
-	// parsed as complete authority.
-	RemoteDiff func(context.Context) (string, error)
 }
 
-// BuildReviewAnchorIndex builds an authoritative diffanchor.Index for the
-// comment paths. It prefers a path-targeted local base...head git diff after
-// verifying local objects match the refreshed PR SHAs, and only falls back to a
-// complete remote PR diff when that remote payload is fully available.
+// BuildReviewAnchorIndex validates only the comment paths using local PR commits.
+// Remote diff APIs are intentionally not part of review publication.
 func (g *Gateway) BuildReviewAnchorIndex(ctx context.Context, input BuildReviewAnchorIndexInput) (*diffanchor.Index, string, error) {
 	paths := uniqueReviewAnchorPaths(input.Paths)
 	if len(paths) == 0 {
@@ -59,28 +52,11 @@ func (g *Gateway) BuildReviewAnchorIndex(ctx context.Context, input BuildReviewA
 		return nil, "", fmt.Errorf("%w: missing base or head SHA", ErrAnchorValidationUnavailable)
 	}
 
-	localIndex, localErr := g.buildLocalPathAnchorIndex(ctx, input.CWD, baseSHA, headSHA, paths)
-	if localErr == nil {
-		return localIndex, ReviewAnchorAuthorityLocalPathDiff, nil
+	index, err := g.buildLocalPathAnchorIndex(ctx, input.CWD, baseSHA, headSHA, paths)
+	if err != nil {
+		return nil, "", fmt.Errorf("%w: %s", ErrAnchorValidationUnavailable, sanitizeReviewAnchorLocalError(err))
 	}
-
-	// Never embed raw localErr: runGitForReviewAnchors can include full pathspecs after
-	// `git diff --`, and comments[].path may be secret-shaped (e.g. SERVICE_TOKEN=...).
-	localReason := sanitizeReviewAnchorLocalError(localErr)
-	if input.RemoteDiff == nil {
-		return nil, "", fmt.Errorf("%w: %s", ErrAnchorValidationUnavailable, localReason)
-	}
-	remoteDiff, remoteErr := input.RemoteDiff(ctx)
-	if remoteErr == nil {
-		// Only complete remote payloads may be parsed into an authoritative index.
-		parsed := diffanchor.Parse(remoteDiff)
-		return &parsed, ReviewAnchorAuthorityRemotePRDiff, nil
-	}
-	if errors.Is(remoteErr, ErrLocalCaptureTruncated) || errors.Is(remoteErr, ErrDiffTooLarge) {
-		return nil, "", fmt.Errorf("%w: remote PR diff unavailable (%s); local path authority failed: %s", ErrAnchorValidationUnavailable, remoteDiffAuthorityReason(remoteErr), localReason)
-	}
-	// Remote transport/message is also path-free: do not concatenate remoteErr text.
-	return nil, "", fmt.Errorf("%w: remote PR diff failed; local path authority failed: %s", ErrAnchorValidationUnavailable, localReason)
+	return index, ReviewAnchorAuthorityLocalPathDiff, nil
 }
 
 // sanitizeReviewAnchorLocalError maps local path-authority failures to path-free
@@ -92,8 +68,6 @@ func sanitizeReviewAnchorLocalError(err error) string {
 	switch {
 	case errors.Is(err, ErrLocalCaptureTruncated):
 		return DiffTruncationReasonLocalCapture
-	case errors.Is(err, ErrDiffTooLarge):
-		return DiffTruncationReasonGitHubTooLarge
 	case errors.Is(err, ErrReviewBaseHeadMismatch):
 		return "local_base_head_mismatch"
 	default:
@@ -101,49 +75,57 @@ func sanitizeReviewAnchorLocalError(err error) string {
 	}
 }
 
-func remoteDiffAuthorityReason(err error) string {
-	switch {
-	case errors.Is(err, ErrLocalCaptureTruncated):
-		return DiffTruncationReasonLocalCapture
-	case errors.Is(err, ErrDiffTooLarge):
-		return DiffTruncationReasonGitHubTooLarge
-	default:
-		return AnchorValidationUnavailableReason
+func (g *Gateway) buildLocalPathAnchorIndex(ctx context.Context, cwd, baseSHA, headSHA string, paths []string) (*diffanchor.Index, error) {
+	var parsed diffanchor.Index
+	err := g.ReadLocalPullRequestDiff(ctx, cwd, baseSHA, headSHA, paths, func(reader io.Reader) error {
+		var parseErr error
+		parsed, parseErr = diffanchor.ParseReader(reader)
+		return parseErr
+	})
+	if err != nil {
+		return nil, err
 	}
+	return &parsed, nil
 }
 
-func (g *Gateway) buildLocalPathAnchorIndex(ctx context.Context, cwd, baseSHA, headSHA string, paths []string) (*diffanchor.Index, error) {
+// ReadLocalPullRequestDiff reads immutable PR commits using merge-base semantics.
+// Git writes to a disposable file, bypassing shell output capture limits. The
+// file is removed on every return; snapshots never persist the patch.
+func (g *Gateway) ReadLocalPullRequestDiff(ctx context.Context, cwd, baseSHA, headSHA string, paths []string, read func(io.Reader) error) error {
 	if err := g.verifyLocalCommitObject(ctx, cwd, baseSHA); err != nil {
-		return nil, err
+		return err
 	}
 	if err := g.verifyLocalCommitObject(ctx, cwd, headSHA); err != nil {
-		return nil, err
+		return err
 	}
-
-	// Path-only diffs for the post-rename path emit a pure new-file patch unless the
-	// pre-rename path is also selected. Expand rename/copy partners so the local
-	// authority matches a complete PR rename diff (LEFT ranges + real RIGHT hunks).
-	paths, err := g.expandReviewAnchorPathsForRenames(ctx, cwd, baseSHA, headSHA, paths)
-	if err != nil {
-		return nil, err
+	// Include both rename paths so a new-path-only query preserves LEFT ranges.
+	if len(paths) > 0 {
+		expanded, err := g.expandReviewAnchorPathsForRenames(ctx, cwd, baseSHA, headSHA, paths)
+		if err != nil {
+			return err
+		}
+		paths = expanded
 	}
-
-	// Three-dot range matches GitHub PR diff semantics (merge-base(base, head)...head).
-	// Use --literal-pathspecs so comments[].path values that look like Git pathspec
-	// magic (e.g. ":(foo).txt") are treated as literal filenames, not magic.
-	args := make([]string, 0, 7+len(paths))
-	args = append(args, "--literal-pathspecs", "diff", "--no-ext-diff", "--no-color", baseSHA+"..."+headSHA, "--")
+	args := []string{"--literal-pathspecs", "diff", "--no-ext-diff", "--no-textconv", "--no-color", "-M", "--unified=3", baseSHA + "..." + headSHA, "--"}
 	args = append(args, paths...)
-	result, err := g.runGitForReviewAnchors(ctx, cwd, args...)
-	if result.StdoutTruncated {
-		// Incomplete path-targeted output is never authoritative.
-		return nil, ErrLocalCaptureTruncated
-	}
+	return g.readGitDiffOutput(ctx, cwd, args, read)
+}
+
+func (g *Gateway) readGitDiffOutput(ctx context.Context, cwd string, args []string, read func(io.Reader) error) error {
+	file, err := os.CreateTemp("", "looper-local-diff-*")
 	if err != nil {
-		return nil, err
+		return err
 	}
-	parsed := diffanchor.Parse(result.Stdout)
-	return &parsed, nil
+	defer os.Remove(file.Name())
+	defer file.Close()
+	// Insert before -- so the output option cannot become a pathspec.
+	outputArgs := append([]string(nil), args[:2]...)
+	outputArgs = append(outputArgs, "--output="+file.Name())
+	outputArgs = append(outputArgs, args[2:]...)
+	if _, err := g.runGitForReviewAnchors(ctx, cwd, outputArgs...); err != nil {
+		return err
+	}
+	return read(file)
 }
 
 // expandReviewAnchorPathsForRenames adds rename/copy partner paths for any comment
@@ -157,17 +139,16 @@ func (g *Gateway) expandReviewAnchorPathsForRenames(ctx context.Context, cwd, ba
 	// Whole-tree name-status is one line per path (not file content). Rename
 	// detection must not be path-limited: `git diff --name-status -M -- new/path`
 	// reports A for renames when the old path is omitted from the pathspec.
-	result, err := g.runGitForReviewAnchors(ctx, cwd,
-		"--literal-pathspecs", "diff", "--name-status", "-M", "--no-ext-diff", "--no-color", baseSHA+"..."+headSHA,
-	)
-	if result.StdoutTruncated {
-		return nil, ErrLocalCaptureTruncated
-	}
-	if err != nil {
-		return nil, err
-	}
-	expanded := expandPathsWithRenamePartners(paths, result.Stdout)
-	return expanded, nil
+	var expanded []string
+	err := g.readGitDiffOutput(ctx, cwd, []string{"--literal-pathspecs", "diff", "--name-status", "-M", "--no-ext-diff", "--no-textconv", "--no-color", baseSHA + "..." + headSHA}, func(reader io.Reader) error {
+		data, err := io.ReadAll(reader)
+		if err != nil {
+			return err
+		}
+		expanded = expandPathsWithRenamePartners(paths, string(data))
+		return nil
+	})
+	return expanded, err
 }
 
 // expandPathsWithRenamePartners returns unique sorted paths including both sides of
@@ -292,11 +273,10 @@ func (g *Gateway) runGitForReviewAnchors(ctx context.Context, cwd string, args .
 		gitPath = "git"
 	}
 	result, err := gitRun(ctx, shell.Options{
-		Command:          gitPath,
-		Args:             args,
-		CWD:              valueOr(strings.TrimSpace(cwd), g.cwd),
-		Timeout:          reviewPathDiffCommandTimeout,
-		MaxCapturedBytes: reviewPathDiffMaxCapturedBytes,
+		Command: gitPath,
+		Args:    args,
+		CWD:     valueOr(strings.TrimSpace(cwd), g.cwd),
+		Timeout: reviewPathDiffCommandTimeout,
 	})
 	if err == nil {
 		return result, nil

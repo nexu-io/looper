@@ -9,7 +9,7 @@ import (
 
 func TestHostingIdentityReviewerPromptUsesBrokerForEveryRead(t *testing.T) {
 	prompt, _ := buildReviewPromptWithInstructions("project", config.Config{}, "acme/looper", 42, reviewerCheckpoint{Snapshot: &checkpointSnapshot{HeadSHA: "abc123"}}, "run", "reviewer:head", config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventComment, Blocking: config.ReviewerReviewEventComment}, false, true, "", config.ReviewerScopeFullPR, config.DefaultDisclosureConfig(), "opencode", "", "/opt/looper/bin/looper", false, false, "", config.HostingIdentityGitHubApp)
-	for _, want := range []string{`"$LOOPER_HOST_CLI" host api pulls/42`, `host api pulls/42/reviews --paginate`, `host api pulls/42 --diff`, `host threads 42`, `review submit`, `findings`, `scopeEvidence`} {
+	for _, want := range []string{`"$LOOPER_HOST_CLI" host api pulls/42`, `host api pulls/42/reviews --paginate`, `git diff --name-status <base_sha>...<head_sha>`, `host threads 42`, `review submit`, `findings`, `scopeEvidence`} {
 		if !strings.Contains(prompt, want) {
 			t.Errorf("bot reviewer prompt lost %q", want)
 		}
@@ -39,10 +39,10 @@ func TestHostingIdentityReviewerPromptRetainsSeedDriftChecks(t *testing.T) {
 				"Minimal PR seed (authoritative handoff fields",
 				`"head_sha": "abc123"`, `"base_ref": "main"`, `"head_ref": "looper/feature"`,
 				`"expected_state": "OPEN"`, `"expected_draft": false`,
-				"host api pulls/42.", "host api pulls/42 --diff",
+				"host api pulls/42.", "git diff --name-status <base_sha>...<head_sha>",
 				"Before reviewing and again before conclusions or publication, read live PR metadata",
 				"verify seeded head/base/state/draft and stop on drift or access failures",
-				"Fetch the diff and read all PR conversation and reviews before reviewing",
+				"Read all PR conversation and reviews before reviewing",
 				"review submit", "__LOOPER_RESULT__",
 			} {
 				if !strings.Contains(prompt, want) {
