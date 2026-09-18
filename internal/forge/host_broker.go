@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -242,14 +241,7 @@ func ProxyHost(ctx context.Context, request HostRequest) (string, error) {
 		return "", err
 	}
 	var response trustedReviewProxyResponse
-	raw, err := io.ReadAll(io.LimitReader(conn, maxTrustedReviewProxyResponseBytes+1))
-	if err != nil {
-		return "", fmt.Errorf("read hosting response: %w", err)
-	}
-	if len(raw) > maxTrustedReviewProxyResponseBytes {
-		return "", errors.New("hosting response exceeds size limit")
-	}
-	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder := json.NewDecoder(conn)
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&response); err != nil {
 		return "", fmt.Errorf("decode hosting response: %w", err)

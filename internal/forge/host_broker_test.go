@@ -395,13 +395,15 @@ func TestHostBrokerRedirectedJobLogResponseLimit(t *testing.T) {
 		name      string
 		kind      config.HostingIdentityKind
 		size      int
+		character string
 		wantError bool
 	}{
-		{"unlimited", config.HostingIdentityForgejoToken, 2 * maxHostResponseBytes, false},
-		{"github-default", config.HostingIdentityGitHubApp, maxHostResponseBytes + 1, true},
+		{"large", config.HostingIdentityForgejoToken, maxTrustedReviewProxyResponseBytes + 1, "x", false},
+		{"escaped", config.HostingIdentityForgejoToken, maxHostResponseBytes, "\x01", false},
+		{"github-default", config.HostingIdentityGitHubApp, maxHostResponseBytes + 1, "x", true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			body := strings.Repeat("x", tc.size)
+			body := strings.Repeat(tc.character, tc.size)
 			logs := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if r.Header.Get("Authorization") != "" || r.Header.Get("Cookie") != "" {
 					t.Error("job log download forwarded API credentials")
