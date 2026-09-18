@@ -391,3 +391,48 @@ printf '%s\n' "$@"
 		t.Fatal("review was retargeted")
 	}
 }
+
+func TestHostBrokerRedirectedJobLogResponseLimit(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		kind      config.HostingIdentityKind
+		limit     int
+		size      int
+		wantError bool
+	}{
+		{"unlimited", config.HostingIdentityForgejoToken, 0, 2 * maxHostResponseBytes, false},
+		{"large-configured", config.HostingIdentityForgejoToken, 3 * maxHostResponseBytes, 2 * maxHostResponseBytes, false},
+		{"exact-limit", config.HostingIdentityForgejoToken, 128, 128, false},
+		{"over-limit", config.HostingIdentityForgejoToken, 128, 129, true},
+		{"github-default", config.HostingIdentityGitHubApp, 0, maxHostResponseBytes + 1, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := strings.Repeat("x", tc.size)
+			logs := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Header.Get("Authorization") != "" || r.Header.Get("Cookie") != "" {
+					t.Error("job log download forwarded API credentials")
+				}
+				io.WriteString(w, body)
+			}))
+			defer logs.Close()
+			f := newHostFixture(t, tc.kind, func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Location", logs.URL+"/job?signature=fixture-signed-location")
+				w.WriteHeader(http.StatusFound)
+			})
+			f.options.Config.Providers = []config.ProviderConfig{{ID: "forge", Kind: config.ProviderKindForgejo, MaxResponseBytes: tc.limit}}
+			f.options.HTTPClient = logs.Client()
+			f.start(t)
+			output, err := ProxyHost(context.Background(), HostRequest{Op: "api.read", Path: "actions/jobs/9/logs"})
+			if tc.wantError {
+				if err == nil || !strings.Contains(err.Error(), "response limit") {
+					t.Fatalf("expected response limit error, got %v", err)
+				}
+			} else if err != nil || output != body {
+				t.Fatalf("download: bytes=%d, want %d; error=%v", len(output), len(body), err)
+			}
+			if strings.Contains(fmt.Sprint(err), "signature=") || strings.Contains(output, "signature=") {
+				t.Fatal("signed URL exposed to agent")
+			}
+		})
+	}
+}

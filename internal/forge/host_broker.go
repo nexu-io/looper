@@ -397,8 +397,9 @@ func (b *hostBroker) downloadJobLog(ctx context.Context, location string) ([]byt
 	if resp.StatusCode != http.StatusOK {
 		return nil, nil, errors.New("hosting job log download was rejected")
 	}
-	data, err := io.ReadAll(io.LimitReader(resp.Body, maxHostResponseBytes+1))
-	if err != nil || len(data) > maxHostResponseBytes {
+	limit := b.maxResponseBytes()
+	data, err := readBoundedResponse(resp.Body, limit)
+	if err != nil || responseExceedsLimit(len(data), limit) {
 		return nil, nil, errors.New("hosting job log exceeds response limit or could not be read")
 	}
 	return data, resp.Header, nil
