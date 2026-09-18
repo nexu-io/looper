@@ -454,10 +454,13 @@ func TestReviewerBaseAdvanceBeforePublishWithFakeGH(t *testing.T) {
 	if git.diffReads != 0 {
 		t.Fatalf("criteria diff reads = %d, want none after base drift", git.diffReads)
 	}
-	for _, forbidden := range []string{`"--method","POST"`, `"pr","merge"`} {
+	for _, forbidden := range []string{`/pulls/42/reviews`, `"pr","merge"`, `"pr","review"`} {
 		if strings.Contains(string(logBytes), forbidden) {
 			t.Fatalf("unexpected publication after base drift: %s", logBytes)
 		}
+	}
+	if !strings.Contains(string(logBytes), `content=eyes`) {
+		t.Fatalf("expected in-progress eyes reaction before agent start, log:\n%s", logBytes)
 	}
 }
 

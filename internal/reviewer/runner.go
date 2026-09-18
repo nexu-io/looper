@@ -4942,6 +4942,7 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 		}
 	}
 	useSnap, snapVendor, snapModel := agentRunSnapshotFields(agentVendor, agentModel, useSnapshot)
+	_ = r.tryAddReaction(ctx, input, reviewerInProgressReaction)
 	execution, err := r.agentExecutor.Start(ctx, AgentRunInput{
 		ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID,
 		Prompt: prompt, NativeResumePrompt: nativeResumePrompt, WorkingDirectory: worktree.Path,
@@ -4949,6 +4950,7 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 		UseSnapshot: useSnap, SnapshotVendor: snapVendor, SnapshotModel: snapModel,
 	})
 	if err != nil {
+		_ = r.tryRemoveReaction(ctx, input, reviewerInProgressReaction)
 		return checkpoint, err
 	}
 	r.appendReviewerAgentEvent(ctx, input, "reviewer.agent.started", "review", executionID, map[string]any{"promptBytes": len(prompt), "timeoutSeconds": durationSeconds(r.agentTimeout), "idleTimeoutSeconds": durationSeconds(r.agentIdleTimeout), "scope": string(r.scope), "headSha": checkpoint.Snapshot.HeadSHA})
@@ -4962,7 +4964,6 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 		}
 	}
 	headMonitor := r.startReviewerHeadChangeMonitor(ctx, input, checkpoint, execution, executionID)
-	_ = r.tryAddReaction(ctx, input, reviewerInProgressReaction)
 	result, err := execution.Wait(ctx)
 	headChange := headMonitor.stop()
 	if headChange.Reason != "" {
