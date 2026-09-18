@@ -4803,6 +4803,51 @@ func TestProcessClaimedItemRemovesEyesWhenTerminalAgentFailure(t *testing.T) {
 	}
 }
 
+func TestProcessClaimedQueueItemRemovesEyesWhenPublishPersistFailsTerminally(t *testing.T) {
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{reviewRequests: []string{"octocat"}, reviewMarkerMissing: true}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "No actionable findings; added clean signal", Stdout: `__LOOPER_RESULT__={"summary":"No actionable findings; added clean signal"}`, ParseStatus: "parsed"}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, LoopConfig: testReviewerLoopConfig(), RetryMaxAttempts: 1})
+	oldHook := persistStepCompletedHook
+	t.Cleanup(func() { persistStepCompletedHook = oldHook })
+	persistStepCompletedHook = func(step ReviewerStep) error {
+		if step == stepPublish {
+			return fmt.Errorf("persist publish checkpoint failed")
+		}
+		return nil
+	}
+	ctx := context.Background()
+	nowISO := fixture.nowISO()
+	repo := "acme/looper"
+	prNumber := int64(42)
+	metadata := `{"followUpdates":true,"loop":{"enabled":true}}`
+	loop := storage.LoopRecord{ID: "loop_eyes_persist_fail", Seq: 1, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "queued", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(ctx, loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	queue, err := runner.enqueue(ctx, enqueueInput{ProjectID: "project_1", LoopID: loop.ID, Repo: repo, PRNumber: prNumber})
+	if err != nil {
+		t.Fatalf("enqueue() error = %v", err)
+	}
+	claimed, err := fixture.repos.Queue.ClaimNextOfType(ctx, fixture.nowISO(), "reviewer-worker-1", "reviewer")
+	if err != nil || claimed == nil || claimed.ID != queue.ID {
+		t.Fatalf("ClaimNextOfType() = (%#v, %v), want queued item %s", claimed, err, queue.ID)
+	}
+	if _, err := runner.ProcessClaimedQueueItem(ctx, *claimed); err == nil || !contains(err.Error(), "persist publish checkpoint failed") {
+		t.Fatalf("ProcessClaimedQueueItem() error = %v, want persist failure", err)
+	}
+	failedQueue, err := fixture.repos.Queue.GetByID(ctx, queue.ID)
+	if err != nil || failedQueue == nil || failedQueue.Status == "queued" {
+		t.Fatalf("queue after persist fail = (%#v, %v), want not queued", failedQueue, err)
+	}
+	if got := reactionContents(github.addReactionCalls); len(got) == 0 || got[0] != "eyes" {
+		t.Fatalf("addReactionCalls = %#v, want in-progress eyes", github.addReactionCalls)
+	}
+	if got := reactionContents(github.removeReactionCalls); len(got) != 1 || got[0] != "eyes" {
+		t.Fatalf("removeReactionCalls = %#v, want eyes cleared after terminal persist failure", github.removeReactionCalls)
+	}
+}
+
 func TestProcessClaimedItemRemovesEyesWhenParkingNeedsHuman(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)

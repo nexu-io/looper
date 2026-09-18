@@ -2034,6 +2034,11 @@ func (r *Runner) finalizeClaimSetupFailure(ctx context.Context, queueItem storag
 	if loop == nil {
 		return nil
 	}
+	if r.repos.Projects != nil {
+		if project, projErr := r.repos.Projects.GetByID(ctx, loop.ProjectID); projErr == nil && project != nil {
+			r.clearInProgressReactionIfQueueStopped(ctx, *project, *loop, queueItem, "", failedQueue)
+		}
+	}
 	_, err = r.updateLoop(ctx, *loop, func(updated *storage.LoopRecord) {
 		updated.LastRunAt = stringPtr(r.nowISO())
 		// Budget/scope pair holds must keep awaiting_human/paused presentation.
@@ -7300,6 +7305,11 @@ func (r *Runner) persistStepStarted(ctx context.Context, run storage.RunRecord, 
 }
 
 func (r *Runner) persistStepCompleted(ctx context.Context, run storage.RunRecord, step ReviewerStep, checkpoint reviewerCheckpoint) (storage.RunRecord, error) {
+	if persistStepCompletedHook != nil {
+		if err := persistStepCompletedHook(step); err != nil {
+			return storage.RunRecord{}, err
+		}
+	}
 	updated := run
 	nowISO := r.nowISO()
 	next := nextReviewerStep(step)
@@ -7955,6 +7965,10 @@ func cappedRetryDelayAttempt(attempts, maxAttempts int64) int64 {
 // updateLoopBeforeWriteHook, when set (tests only), runs after a live GetByID
 // and before mutate+CAS so Continue can interleave.
 var updateLoopBeforeWriteHook func(loop storage.LoopRecord) error
+
+// persistStepCompletedHook, when set (tests only), fails persistStepCompleted
+// after the named step so claim-setup recovery can be exercised.
+var persistStepCompletedHook func(step ReviewerStep) error
 
 func (r *Runner) updateLoop(ctx context.Context, loop storage.LoopRecord, mutate func(*storage.LoopRecord)) (storage.LoopRecord, error) {
 	if r.repos == nil || r.repos.Loops == nil || strings.TrimSpace(loop.ID) == "" {
