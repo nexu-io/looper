@@ -4705,8 +4705,11 @@ func TestProcessClaimedItemRecordsCleanNoopWithoutReviewMarkerForCommentPolicy(t
 	if github.reviewMarkerCalls != 0 {
 		t.Fatalf("reviewMarkerCalls = %d, want no review marker lookup for clean no-op", github.reviewMarkerCalls)
 	}
-	if len(github.addReactionCalls) != 1 {
-		t.Fatalf("addReactionCalls = %d, want one clean signal reaction", len(github.addReactionCalls))
+	if got := reactionContents(github.addReactionCalls); len(got) != 2 || got[0] != "eyes" || got[1] != "+1" {
+		t.Fatalf("addReactionCalls = %#v, want eyes then +1", github.addReactionCalls)
+	}
+	if got := reactionContents(github.removeReactionCalls); len(got) != 1 || got[0] != "eyes" {
+		t.Fatalf("removeReactionCalls = %#v, want eyes removed after clean publish", github.removeReactionCalls)
 	}
 	updatedLoop, err := fixture.repos.Loops.GetByID(ctx, loop.ID)
 	if err != nil || updatedLoop == nil || updatedLoop.MetadataJSON == nil {
@@ -4718,6 +4721,63 @@ func TestProcessClaimedItemRecordsCleanNoopWithoutReviewMarkerForCommentPolicy(t
 	if contains(*updatedLoop.MetadataJSON, `"lastOutputFingerprint"`) {
 		t.Fatalf("loop metadata = %s, want clean no-op excluded from output fingerprinting", *updatedLoop.MetadataJSON)
 	}
+}
+
+func TestProcessClaimedItemKeepsEyesWhenReviewAgentWaitFails(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{reviewRequests: []string{"octocat"}}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed"}}, waitErr: fmt.Errorf("agent wait failed")}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, LoopConfig: testReviewerLoopConfig()})
+	ctx := context.Background()
+	nowISO := fixture.nowISO()
+	repo := "acme/looper"
+	prNumber := int64(42)
+	metadata := `{"followUpdates":true,"loop":{"enabled":true}}`
+	loop := storage.LoopRecord{ID: "loop_eyes_wait_fail", Seq: 1, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "queued", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(ctx, loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	queue, err := runner.enqueue(ctx, enqueueInput{ProjectID: "project_1", LoopID: loop.ID, Repo: repo, PRNumber: prNumber})
+	if err != nil {
+		t.Fatalf("enqueue() error = %v", err)
+	}
+	claimed, err := fixture.repos.Queue.ClaimNextOfType(ctx, fixture.nowISO(), "reviewer-worker-1", "reviewer")
+	if err != nil || claimed == nil || claimed.ID != queue.ID {
+		t.Fatalf("ClaimNextOfType() = (%#v, %v), want queued item %s", claimed, err, queue.ID)
+	}
+	result, err := runner.ProcessClaimedItem(ctx, *claimed)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "failed" {
+		t.Fatalf("result = %#v, want failed wait", result)
+	}
+	if got := reactionContents(github.addReactionCalls); len(got) != 1 || got[0] != "eyes" {
+		t.Fatalf("addReactionCalls = %#v, want in-progress eyes", github.addReactionCalls)
+	}
+	if len(github.removeReactionCalls) != 0 {
+		t.Fatalf("removeReactionCalls = %#v, want eyes kept after agent failure", github.removeReactionCalls)
+	}
+}
+
+func reactionContents(calls []PullRequestReactionInput) []string {
+	out := make([]string, 0, len(calls))
+	for _, call := range calls {
+		out = append(out, call.Content)
+	}
+	return out
+}
+
+func excludingInProgressReactions(calls []PullRequestReactionInput) []PullRequestReactionInput {
+	out := make([]PullRequestReactionInput, 0, len(calls))
+	for _, call := range calls {
+		if call.Content == reviewerInProgressReaction {
+			continue
+		}
+		out = append(out, call)
+	}
+	return out
 }
 
 func TestProcessClaimedItemRejectsCleanNoopWithoutApprovedMarkerForApprovePolicy(t *testing.T) {
@@ -4744,8 +4804,8 @@ func TestProcessClaimedItemRejectsCleanNoopWithoutApprovedMarkerForApprovePolicy
 	if github.reviewMarkerCalls == 0 {
 		t.Fatalf("reviewMarkerCalls = %d, want marker lookup before rejecting clean APPROVE summary", github.reviewMarkerCalls)
 	}
-	if len(github.addReactionCalls) != 0 {
-		t.Fatalf("addReactionCalls = %#v, want no reaction for rejected clean no-op", github.addReactionCalls)
+	if got := excludingInProgressReactions(github.addReactionCalls); len(got) != 0 {
+		t.Fatalf("addReactionCalls = %#v, want no reaction for rejected clean no-op", got)
 	}
 }
 
@@ -4777,7 +4837,7 @@ func TestProcessClaimedItemAcceptsCleanNoopWithApprovedMarkerForApprovePolicy(t 
 	if github.reviewMarkerCalls < 2 {
 		t.Fatalf("reviewMarkerCalls = %d, want review-step and publish marker verification", github.reviewMarkerCalls)
 	}
-	if len(github.addReactionCalls) != 1 {
+	if got := excludingInProgressReactions(github.addReactionCalls); len(got) != 1 {
 		t.Fatalf("addReactionCalls = %#v, want clean signal reaction", github.addReactionCalls)
 	}
 	if claim.LoopID == nil {
@@ -4850,8 +4910,8 @@ func TestProcessClaimedItemRejectsCleanNoopWithInvalidApprovedMarkerBodyForAppro
 	if github.reviewMarkerCalls == 0 {
 		t.Fatalf("reviewMarkerCalls = %d, want marker lookup before rejecting invalid clean APPROVE body", github.reviewMarkerCalls)
 	}
-	if len(github.addReactionCalls) != 0 {
-		t.Fatalf("addReactionCalls = %#v, want no reaction for rejected clean no-op", github.addReactionCalls)
+	if got := excludingInProgressReactions(github.addReactionCalls); len(got) != 0 {
+		t.Fatalf("addReactionCalls = %#v, want no reaction for rejected clean no-op", got)
 	}
 }
 
@@ -4898,8 +4958,8 @@ func TestProcessClaimedItemRejectsCleanNoopResumeWithInvalidApprovedMarkerBodyFo
 	if len(agent.starts) != 0 {
 		t.Fatalf("len(agent.starts) = %d, want no review rerun in failed publish attempt", len(agent.starts))
 	}
-	if len(github.addReactionCalls) != 0 {
-		t.Fatalf("addReactionCalls = %#v, want no reaction for rejected clean no-op resume", github.addReactionCalls)
+	if got := excludingInProgressReactions(github.addReactionCalls); len(got) != 0 {
+		t.Fatalf("addReactionCalls = %#v, want no reaction for rejected clean no-op resume", got)
 	}
 }
 
@@ -4981,8 +5041,8 @@ func TestProcessClaimedItemSkipsCleanNoopWhenReviewRequestRemovedBeforePublish(t
 	if result.Status != "skipped" || !contains(result.Summary, "not requested for review") {
 		t.Fatalf("result = %#v, want skipped not requested", result)
 	}
-	if len(github.addReactionCalls) != 0 {
-		t.Fatalf("addReactionCalls = %d, want no clean signal reaction", len(github.addReactionCalls))
+	if got := excludingInProgressReactions(github.addReactionCalls); len(got) != 0 {
+		t.Fatalf("addReactionCalls = %d, want no clean signal reaction", len(got))
 	}
 	updatedLoop, err := fixture.repos.Loops.GetByID(ctx, loop.ID)
 	if err != nil || updatedLoop == nil || updatedLoop.MetadataJSON == nil {
@@ -5379,7 +5439,7 @@ func TestProcessClaimedItemDoesNotTransitionSpecLabelsForCleanNoopCommentPolicy(
 	if result.Status != "success" {
 		t.Fatalf("result = %#v, want success", result)
 	}
-	if len(github.addReactionCalls) != 1 || github.addReactionCalls[0].Content != "+1" {
+	if got := excludingInProgressReactions(github.addReactionCalls); len(got) != 1 || got[0].Content != "+1" {
 		t.Fatalf("addReactionCalls = %#v, want one +1 reaction", github.addReactionCalls)
 	}
 	if len(github.removeLabelCalls) != 0 {
@@ -5729,8 +5789,8 @@ func TestProcessClaimedItemDoesNotTreatActionableSummaryMentioningPriorCleanRevi
 	if github.reviewMarkerCalls == 0 {
 		t.Fatalf("reviewMarkerCalls = %d, want marker lookup for actionable summary", github.reviewMarkerCalls)
 	}
-	if len(github.addReactionCalls) != 0 {
-		t.Fatalf("addReactionCalls = %#v, want no clean noop reaction", github.addReactionCalls)
+	if got := excludingInProgressReactions(github.addReactionCalls); len(got) != 0 {
+		t.Fatalf("addReactionCalls = %#v, want no clean noop reaction", got)
 	}
 }
 
@@ -6095,7 +6155,7 @@ func TestProcessClaimedItemAppliesCleanSpecSideEffectsBeforePublishSuccess(t *te
 	if result.Status != "success" {
 		t.Fatalf("result = %#v, want success", result)
 	}
-	if len(github.addReactionCalls) != 1 || github.addReactionCalls[0].Content != "+1" {
+	if got := excludingInProgressReactions(github.addReactionCalls); len(got) != 1 || got[0].Content != "+1" {
 		t.Fatalf("addReactionCalls = %#v, want one +1 reaction", github.addReactionCalls)
 	}
 	if len(github.removeLabelCalls) != 1 || github.removeLabelCalls[0].Labels[0] != specpr.ReviewingLabel {
@@ -6261,7 +6321,7 @@ func TestProcessClaimedItemDoesNotTransitionSpecLabelsForCleanCommentReview(t *t
 	if result.Status != "success" {
 		t.Fatalf("result = %#v, want success", result)
 	}
-	if len(github.addReactionCalls) != 1 || github.addReactionCalls[0].Content != "+1" {
+	if got := excludingInProgressReactions(github.addReactionCalls); len(got) != 1 || got[0].Content != "+1" {
 		t.Fatalf("addReactionCalls = %#v, want one +1 reaction", github.addReactionCalls)
 	}
 	if len(github.removeLabelCalls) != 0 {
@@ -6305,7 +6365,7 @@ func TestProcessClaimedItemDoesNotTransitionSpecLabelsWhenPRReviewStateIsNotClea
 			if result.Status != "success" {
 				t.Fatalf("result = %#v, want success", result)
 			}
-			if len(github.addReactionCalls) != 1 || github.addReactionCalls[0].Content != "+1" {
+			if got := excludingInProgressReactions(github.addReactionCalls); len(got) != 1 || got[0].Content != "+1" {
 				t.Fatalf("addReactionCalls = %#v, want one +1 reaction", github.addReactionCalls)
 			}
 			if len(github.removeLabelCalls) != 0 {
@@ -10154,8 +10214,8 @@ func TestProcessClaimedItemCommentOnlyPublishesCleanNoopWithoutReactionOrLabelRe
 	if len(parsedSummary.Items) != 0 {
 		t.Fatalf("parsed summary items = %#v, want none", parsedSummary.Items)
 	}
-	if len(github.addReactionCalls) != 0 {
-		t.Fatalf("addReactionCalls = %#v, want no GitHub reaction for comment-only clean noop", github.addReactionCalls)
+	if got := excludingInProgressReactions(github.addReactionCalls); len(got) != 0 {
+		t.Fatalf("addReactionCalls = %#v, want no GitHub reaction for comment-only clean noop", got)
 	}
 	if len(github.removeLabelCalls) != 0 {
 		t.Fatalf("removeLabelCalls = %#v, want no spec-reviewing label removal", github.removeLabelCalls)
@@ -12972,8 +13032,8 @@ func TestProcessClaimedItemCommentOnlyDoesNotMarkActionableNoActionSummaryAsClea
 	if len(parsedSummary.Items) != 1 || parsedSummary.Items[0].Status != forge.ReviewItemStatusOpen {
 		t.Fatalf("parsed summary = %#v, want one open item", parsedSummary)
 	}
-	if len(github.addReactionCalls) != 0 {
-		t.Fatalf("addReactionCalls = %#v, want no clean reaction side effects", github.addReactionCalls)
+	if got := excludingInProgressReactions(github.addReactionCalls); len(got) != 0 {
+		t.Fatalf("addReactionCalls = %#v, want no clean reaction side effects", got)
 	}
 	if len(github.removeLabelCalls) != 0 {
 		t.Fatalf("removeLabelCalls = %#v, want no clean noop label removal", github.removeLabelCalls)

@@ -4964,6 +4964,7 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 			r.logger.Warn("reviewer agent start notification failed", map[string]any{"loopId": input.Loop.ID, "runId": input.Run.ID, "error": err.Error()})
 		}
 	}
+	_ = r.tryAddReaction(ctx, input, reviewerInProgressReaction)
 	headMonitor := r.startReviewerHeadChangeMonitor(ctx, input, checkpoint, execution, executionID)
 	result, err := execution.Wait(ctx)
 	headChange := headMonitor.stop()
@@ -5810,6 +5811,7 @@ func (r *Runner) applyVerifiedReviewSideEffects(ctx context.Context, input stepI
 	default:
 		return &loopError{message: "Verified review marker is missing outcome=clean|non_blocking|blocking|actionable; cannot validate review side effects", kind: FailureRetryableAfterResume}
 	}
+	_ = r.tryRemoveReaction(ctx, input, reviewerInProgressReaction)
 	return nil
 }
 
@@ -5825,9 +5827,28 @@ func (r *Runner) applyCleanNoopReviewSideEffects(ctx context.Context, input step
 	if err := r.github.AddPullRequestReaction(ctx, reaction); err != nil {
 		return &loopError{message: fmt.Sprintf("Failed to add clean-review reaction before marking publish success: %v", err), kind: FailureRetryableAfterResume}
 	}
+	_ = r.tryRemoveReaction(ctx, input, reviewerInProgressReaction)
 	policy := r.effectiveReviewEvents(input.Project.ID, input.Loop.MetadataJSON)
 	shouldTransitionSpecLabels := cleanSpecLabelTransitionAllowed(policy, cleanReviewEventForPolicy(policy), "clean")
 	return r.applyCleanSpecLabelTransition(ctx, input, checkpoint, detail, shouldTransitionSpecLabels)
+}
+
+const reviewerInProgressReaction = "eyes"
+
+func (r *Runner) tryAddReaction(ctx context.Context, input stepInput, content string) error {
+	if err := r.github.AddPullRequestReaction(ctx, PullRequestReactionInput{Repo: input.Repo, PRNumber: input.PRNumber, Content: content, CWD: input.Project.RepoPath}); err != nil {
+		r.logWarn("reviewer reaction add failed", map[string]any{"projectId": input.Project.ID, "loopId": input.Loop.ID, "runId": input.Run.ID, "repo": input.Repo, "prNumber": input.PRNumber, "content": content, "error": err.Error()})
+		return err
+	}
+	return nil
+}
+
+func (r *Runner) tryRemoveReaction(ctx context.Context, input stepInput, content string) error {
+	if err := r.github.RemovePullRequestReaction(ctx, PullRequestReactionInput{Repo: input.Repo, PRNumber: input.PRNumber, Content: content, CWD: input.Project.RepoPath}); err != nil {
+		r.logWarn("reviewer reaction removal failed", map[string]any{"projectId": input.Project.ID, "loopId": input.Loop.ID, "runId": input.Run.ID, "repo": input.Repo, "prNumber": input.PRNumber, "content": content, "error": err.Error()})
+		return err
+	}
+	return nil
 }
 
 func cleanSpecLabelTransitionAllowed(policy config.ReviewerReviewEventsConfig, event ReviewEvent, outcome string) bool {
@@ -6017,6 +6038,7 @@ func (r *Runner) publishCriteriaFailureReview(ctx context.Context, input stepInp
 	if err := r.github.RemovePullRequestReaction(ctx, PullRequestReactionInput{Repo: input.Repo, PRNumber: input.PRNumber, Content: "+1", CWD: input.Project.RepoPath}); err != nil {
 		return nil, &loopError{message: fmt.Sprintf("Failed to remove stale clean-review reaction before marking publish success: %v", err), kind: FailureRetryableAfterResume}
 	}
+	_ = r.tryRemoveReaction(ctx, input, reviewerInProgressReaction)
 	return &criteriaPublishResult{reviewEvent: ReviewEventComment, marker: marker}, nil
 }
 
@@ -6191,6 +6213,7 @@ func (r *Runner) publishCommentOnlyReview(ctx context.Context, input stepInput, 
 		if err := r.github.UpdateIssueComment(ctx, UpdateIssueCommentInput{Repo: input.Repo, CommentID: existingComment.ID, Body: body, CWD: input.Project.RepoPath, DisclosureAgent: disclosureAgent, DisclosureModel: disclosureModel}); err != nil {
 			return &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 		}
+		_ = r.tryRemoveReaction(ctx, input, reviewerInProgressReaction)
 		return nil
 	}
 	if _, err := r.reviewerPublishFreshDetailForMutation(ctx, input, "creating comment-only review"); err != nil {
@@ -6199,6 +6222,7 @@ func (r *Runner) publishCommentOnlyReview(ctx context.Context, input stepInput, 
 	if _, err := r.github.CreateIssueComment(ctx, IssueCommentInput{Repo: input.Repo, IssueNumber: input.PRNumber, Body: body, CWD: input.Project.RepoPath, DisclosureAgent: disclosureAgent, DisclosureModel: disclosureModel}); err != nil {
 		return &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 	}
+	_ = r.tryRemoveReaction(ctx, input, reviewerInProgressReaction)
 	return nil
 }
 
