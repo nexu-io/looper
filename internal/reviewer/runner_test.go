@@ -8926,7 +8926,7 @@ func TestBuildReviewPromptIncludesActionableQualityContract(t *testing.T) {
 		"Agent-side GitHub fetch contract",
 		"Local checkout contract: the current working directory is Looper's prepared reviewer worktree for this PR and is the canonical local checkout for verification",
 		"Do not run `gh repo clone`, `git clone`, or create any additional checkout for this PR's base or head repository unless the provided worktree is missing or unusable.",
-		"gh pr view <pr-url> -R <repo> --json number,title,body,state,isDraft,baseRefName,headRefName,headRefOid,url,labels",
+		"gh pr view <pr-url> -R <repo> --json number,title,body,state,isDraft,baseRefName,baseRefOid,headRefName,headRefOid,url,labels",
 		"git diff --name-status <base_sha>...<head_sha>",
 		"git diff <base_sha>...<head_sha> -- <path>",
 		"gh pr checks <pr-url> -R <repo>",

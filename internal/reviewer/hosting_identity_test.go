@@ -52,3 +52,23 @@ func TestHostingIdentityReviewerPromptRetainsSeedDriftChecks(t *testing.T) {
 		})
 	}
 }
+
+func TestReviewerGitHubFetchRequestsDriftFields(t *testing.T) {
+	contract := reviewerAgentSideGitHubFetchContract()
+	for _, part := range strings.Split(contract, "`") {
+		if !strings.HasPrefix(part, "gh pr view ") {
+			continue
+		}
+		_, fields, ok := strings.Cut(part, "--json ")
+		if !ok {
+			t.Fatal("PR view command has no JSON fields")
+		}
+		for _, field := range []string{"baseRefOid", "headRefOid", "baseRefName", "state", "isDraft"} {
+			if !strings.Contains(","+fields+",", ","+field+",") {
+				t.Errorf("PR view command cannot validate %s: %s", field, part)
+			}
+		}
+		return
+	}
+	t.Fatal("missing PR view command")
+}

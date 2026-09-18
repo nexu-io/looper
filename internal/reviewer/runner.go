@@ -5660,6 +5660,16 @@ func reviewerPublishDriftReason(input stepInput, checkpoint reviewerCheckpoint, 
 		}
 		return fmt.Sprintf("PR drift detected before publish: expected PR state OPEN, observed %s for %s#%d", observed, input.Repo, input.PRNumber)
 	}
+	seededBase := ""
+	if checkpoint.Snapshot != nil {
+		seededBase = checkpoint.Snapshot.BaseSHA
+	}
+	if seededBase == "" && checkpoint.Detail != nil {
+		seededBase = checkpoint.Detail.BaseSHA
+	}
+	if seededBase != "" && seededBase != detail.BaseSHA {
+		return fmt.Sprintf("PR base changed before publish: expected %s, got %s", seededBase, detail.BaseSHA)
+	}
 	if checkpoint.Detail != nil {
 		if checkpoint.Detail.IsDraft != detail.IsDraft {
 			return fmt.Sprintf("PR drift detected before publish: draft status changed from %t to %t for %s#%d", checkpoint.Detail.IsDraft, detail.IsDraft, input.Repo, input.PRNumber)
@@ -9679,7 +9689,7 @@ func reviewerAgentSideGitHubFetchContract() string {
 	return strings.Join([]string{
 		"Agent-side GitHub fetch contract: use the minimal PR seed above as the stable handoff. Do not assume PR title, body, full diff, full comment dumps, reviews, or checks from this prompt are complete or fresh.",
 		"Local checkout contract: the current working directory is Looper's prepared reviewer worktree for this PR and is the canonical local checkout for verification. Reuse this worktree for git fetch, git checkout, diff inspection, and any local validation. Do not run `gh repo clone`, `git clone`, or create any additional checkout for this PR's base or head repository unless the provided worktree is missing or unusable.",
-		"Before acting and again before final conclusions or publishing, run `gh pr view <pr-url> -R <repo> --json number,title,body,state,isDraft,baseRefName,headRefName,headRefOid,url,labels` using the seeded PR URL or number plus repository, and validate `headRefOid` equals the seeded `head_sha`, `baseRefOid` equals the seeded `base_sha` and `baseRefName` equals the seeded `base_ref` when present, and state/draft status match the seed. Fail fast on drift.",
+		"Before acting and again before final conclusions or publishing, run `gh pr view <pr-url> -R <repo> --json number,title,body,state,isDraft,baseRefName,baseRefOid,headRefName,headRefOid,url,labels` using the seeded PR URL or number plus repository, and validate `headRefOid` equals the seeded `head_sha`, `baseRefOid` equals the seeded `base_sha` and `baseRefName` equals the seeded `base_ref` when present, and state/draft status match the seed. Fail fast on drift.",
 		"Inspect changes with local Git using the fixed `base_sha` and `head_sha` from the seed. Start with `git diff --name-status <base_sha>...<head_sha>`, then use `git diff <base_sha>...<head_sha> -- <path>` and read files as needed. Fetch missing commits/history before inspecting; never treat missing objects or truncated output as an empty diff. Page large file diffs and continue reviewing all changed files. A remote PR diff is not required. Run `gh pr checks <pr-url> -R <repo>` only when CI status matters.",
 		"When review feedback context matters, do not rely only on `gh pr view --comments`; collect all review feedback with pagination: `gh api repos/{owner}/{repo}/pulls/{number}/comments --paginate`, `gh api repos/{owner}/{repo}/pulls/{number}/reviews --paginate`, and `gh api repos/{owner}/{repo}/issues/{number}/comments --paginate`.",
 		"If `gh` fails for authentication, network, rate-limit, or PR drift reasons, stop and return a structured error with `type` set to one of `auth`, `network`, `rate_limit`, or `pr_drift`, plus a short `message` and any observed PR metadata. Do not proceed on stale PR data.",
