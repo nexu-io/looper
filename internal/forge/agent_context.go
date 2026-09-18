@@ -73,7 +73,7 @@ func ForgejoAgentContext(cfg config.Config, projectID, repo string, prNumber int
 		"Forgejo repository context: " + prURL + ". API base: " + apiBase + ".",
 		auth,
 		"Use the prepared local worktree for Git inspection and validation. Use Forgejo API reads for mutable PR context; gh commands target the wrong provider. Follow the role-specific publishing instructions for all writes.",
-		fmt.Sprintf("PR metadata: GET %s/pulls/%d (head.sha, base.sha, head.ref, base.ref, state, draft, requested_reviewers). Patch: GET %s/pulls/%d.diff. Conversation: GET %s/issues/%d/comments.", apiRepo, prNumber, apiRepo, prNumber, apiRepo, prNumber),
+		fmt.Sprintf("PR metadata: GET %s/pulls/%d (head.sha, base.sha, head.ref, base.ref, state, draft, requested_reviewers). Conversation: GET %s/issues/%d/comments.", apiRepo, prNumber, apiRepo, prNumber),
 		fmt.Sprintf("Native reviews: GET %s/pulls/%d/reviews, then GET %s/pulls/%d/reviews/<review_id>/comments for inline findings. These are not GitHub GraphQL threads; Forgejo currently has no supported resolve endpoint.", apiRepo, prNumber, apiRepo, prNumber),
 		"Paginate list reads with page=1&limit=50, following Link rel=next / X-Total-Pages; retain all relevant pages. A failed read is not an empty list or clean result.",
 		fmt.Sprintf("CI: GET %s/statuses/<head_sha>?sort=highestindex and retain the newest status per context. Actions: GET %s/actions/runs?head_sha=<head_sha> (do not combine event with head_sha); response.workflow_runs is an array. Use run.id for API paths, not index_in_repo or the UI run number. For each relevant newest workflow run, GET %s/actions/runs/<run_id>/jobs returns a bare array. Failed-job plaintext logs: GET %s/actions/jobs/<job_id>/logs (optional ?attempt=<attempt>). Fetch logs only for diagnostics needed in this run.", apiRepo, apiRepo, apiRepo, apiRepo),
@@ -98,9 +98,12 @@ func HostingAgentContext(kind config.HostingIdentityKind, role, repo string, tar
 		parts = append(parts, fmt.Sprintf(`Issue context: "$LOOPER_HOST_CLI" host api issues/%d. Conversation: "$LOOPER_HOST_CLI" host api issues/%d/comments --paginate. Read these when current issue context is needed.`, targetNumber, targetNumber))
 	} else if hasPR {
 		parts = append(parts,
-			fmt.Sprintf(`PR metadata: "$LOOPER_HOST_CLI" host api pulls/%d. Patch: "$LOOPER_HOST_CLI" host api pulls/%d --diff. Read these when current PR context is needed, and inspect only relevant files.`, targetNumber, targetNumber),
+			fmt.Sprintf(`PR metadata: "$LOOPER_HOST_CLI" host api pulls/%d. Read these when current PR context is needed, and inspect only relevant files.`, targetNumber),
 			fmt.Sprintf(`Conversation: "$LOOPER_HOST_CLI" host api issues/%d/comments --paginate. Reviews: "$LOOPER_HOST_CLI" host api pulls/%d/reviews --paginate.`, targetNumber, targetNumber),
 		)
+		if role != "reviewer" {
+			parts = append(parts, fmt.Sprintf(`Optional remote patch: "$LOOPER_HOST_CLI" host api pulls/%d --diff. Use the local checkout for large changes.`, targetNumber))
+		}
 	}
 	parts = append(parts,
 		`Use the prepared local checkout for local Git inspection, edits, add and commits. If refs are missing, use "$LOOPER_HOST_CLI" host git fetch <ref>, then inspect FETCH_HEAD locally. Do not clone another checkout, push, create/edit a PR, change labels/reviewers, or make remote review-state changes. After validation, Looper publishes local commits and applies the run's PR metadata. Native reviewer review publication, when explicitly authorized later, uses only the existing trusted review submit command.`,

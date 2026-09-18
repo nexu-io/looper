@@ -181,7 +181,6 @@ type PullRequestDetail struct {
 	ReviewRequestUsers []networkpolicy.GitHubUser
 	HasConflicts       bool
 	ChecksSummary      string
-	Diff               string
 	Comments           []map[string]any
 	IssueComments      []map[string]any
 	Reviews            []map[string]any
@@ -211,6 +210,7 @@ type PrepareWorktreeInput struct {
 	Branch          string
 	Ref             string
 	ExpectedHeadSHA string
+	BaseSHA         string
 	Remote          string
 }
 
@@ -405,6 +405,7 @@ type GitHubGateway interface {
 }
 
 type GitGateway interface {
+	ReadPullRequestDiff(context.Context, string, string, string) (string, error)
 	CreateWorktree(context.Context, CreateWorktreeInput) (CreateWorktreeResult, error)
 	PrepareWorktree(context.Context, PrepareWorktreeInput) (PrepareWorktreeResult, error)
 	CleanupWorktree(context.Context, CleanupWorktreeInput) error
@@ -642,13 +643,13 @@ type checkpointWorktree struct {
 type checkpointSnapshot struct {
 	ID                    string `json:"id,omitempty"`
 	HeadSHA               string `json:"headSha,omitempty"`
+	BaseSHA               string `json:"baseSha,omitempty"`
 	CapturedAt            string `json:"capturedAt,omitempty"`
 	Title                 string `json:"title,omitempty"`
 	Body                  string `json:"body,omitempty"`
 	Author                string `json:"author,omitempty"`
 	ChecksSummary         string `json:"checksSummary,omitempty"`
 	UnresolvedThreadCount *int64 `json:"unresolvedThreadCount,omitempty"`
-	PayloadJSON           string `json:"payloadJson,omitempty"`
 }
 
 type pendingReviewCheckpoint struct {
@@ -3305,7 +3306,7 @@ func (r *Runner) runSnapshotStep(ctx context.Context, input stepInput) (reviewer
 		return input.Checkpoint, err
 	}
 	checkpoint := input.Checkpoint
-	checkpoint.Snapshot = &checkpointSnapshot{ID: snapshot.ID, HeadSHA: snapshot.HeadSHA, CapturedAt: snapshot.CapturedAt, Title: derefString(snapshot.Title), Body: derefString(snapshot.Body), Author: derefString(snapshot.Author), ChecksSummary: derefString(snapshot.ChecksSummary), UnresolvedThreadCount: snapshot.UnresolvedThreadCount, PayloadJSON: derefString(snapshot.PayloadJSON)}
+	checkpoint.Snapshot = &checkpointSnapshot{ID: snapshot.ID, HeadSHA: snapshot.HeadSHA, BaseSHA: derefString(snapshot.BaseSHA), CapturedAt: snapshot.CapturedAt, Title: derefString(snapshot.Title), Body: derefString(snapshot.Body), Author: derefString(snapshot.Author), ChecksSummary: derefString(snapshot.ChecksSummary), UnresolvedThreadCount: snapshot.UnresolvedThreadCount}
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
 	return checkpoint, nil
 }
@@ -3403,7 +3404,7 @@ func (r *Runner) runPrepareWorktreeStep(ctx context.Context, input stepInput) (r
 		}
 		return checkpoint, err
 	}
-	prepared, err := r.git.PrepareWorktree(ctx, PrepareWorktreeInput{RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: created.WorktreePath, Branch: branch, Ref: prRef, ExpectedHeadSHA: checkpoint.Snapshot.HeadSHA})
+	prepared, err := r.git.PrepareWorktree(ctx, PrepareWorktreeInput{RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: created.WorktreePath, Branch: branch, Ref: prRef, ExpectedHeadSHA: checkpoint.Snapshot.HeadSHA, BaseSHA: firstNonEmpty(checkpoint.Snapshot.BaseSHA, checkpoint.Detail.BaseSHA)})
 	if err != nil {
 		if restoreErr := restoreFixerOwnerToken(created.WorktreePath, priorFixerToken); restoreErr != nil {
 			// Do not continue with cleared-but-unrestored ownership: a later fixer
@@ -4575,14 +4576,10 @@ func buildThreadResolutionPrompt(repo string, prNumber int64, headSHA string, th
 		payload["prTitle"] = checkpoint.Snapshot.Title
 		payload["prBody"] = checkpoint.Snapshot.Body
 	}
-	if checkpoint.Snapshot != nil && checkpoint.Snapshot.PayloadJSON != "" {
-		// Linked-intent / instructions already captured on the snapshot when present.
-		payload["snapshotContext"] = checkpoint.Snapshot.PayloadJSON
-	}
 	encoded, _ := json.MarshalIndent(payload, "", "  ")
 	return strings.TrimSpace(`You are running Looper's reviewer thread reconciliation phase.
 
-Inspect the current worktree and the unresolved pull request review threads in the JSON payload below. Classify each thread. Use PR title/body and any snapshotContext (repository instructions / linked intent) as scope authority.
+Inspect the current worktree and the unresolved pull request review threads in the JSON payload below. Classify each thread. Use PR title/body, repository instructions, and linked intent as scope authority.
 
 Decisions:
 - objectively_fixed: requested behavior is verifiably present at the current head
@@ -5663,6 +5660,16 @@ func reviewerPublishDriftReason(input stepInput, checkpoint reviewerCheckpoint, 
 		}
 		return fmt.Sprintf("PR drift detected before publish: expected PR state OPEN, observed %s for %s#%d", observed, input.Repo, input.PRNumber)
 	}
+	seededBase := ""
+	if checkpoint.Snapshot != nil {
+		seededBase = checkpoint.Snapshot.BaseSHA
+	}
+	if seededBase == "" && checkpoint.Detail != nil {
+		seededBase = checkpoint.Detail.BaseSHA
+	}
+	if seededBase != "" && seededBase != detail.BaseSHA {
+		return fmt.Sprintf("PR base changed before publish: expected %s, got %s", seededBase, detail.BaseSHA)
+	}
 	if checkpoint.Detail != nil {
 		if checkpoint.Detail.IsDraft != detail.IsDraft {
 			return fmt.Sprintf("PR drift detected before publish: draft status changed from %t to %t for %s#%d", checkpoint.Detail.IsDraft, detail.IsDraft, input.Repo, input.PRNumber)
@@ -5931,7 +5938,15 @@ func (r *Runner) maybePublishCriteriaAnchoredCleanReview(ctx context.Context, in
 	if len(extracted) == 0 {
 		return r.publishCleanReviewWithoutCriteria(ctx, input, checkpoint, pending, detail)
 	}
-	verification, err := r.verifyAcceptanceCriteria(criteriaVerificationDiff(checkpoint, detail), extracted)
+	cwd := input.Project.RepoPath
+	if checkpoint.Worktree != nil {
+		cwd = checkpoint.Worktree.Path
+	}
+	rawDiff, err := r.git.ReadPullRequestDiff(ctx, cwd, detail.BaseSHA, detail.HeadSHA)
+	if err != nil {
+		return nil, &loopError{message: fmt.Sprintf("Read local PR diff for acceptance criteria: %v", err), kind: FailureRetryableAfterResume}
+	}
+	verification, err := r.verifyAcceptanceCriteria(rawDiff, extracted)
 	if err != nil {
 		return nil, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 	}
@@ -6217,43 +6232,25 @@ func stampedCommentAlreadyPosted(comments []map[string]any, marker string) bool 
 
 func parseCriteriaPRDiff(raw string) criteria.PRDiff {
 	files := []criteria.DiffFile{}
-	var current *criteria.DiffFile
+	var path string
+	var patch strings.Builder
+	flush := func() {
+		if path != "" {
+			files = append(files, criteria.DiffFile{Path: path, Patch: strings.TrimSuffix(patch.String(), "\n")})
+		}
+		patch.Reset()
+	}
 	for _, line := range strings.Split(raw, "\n") {
 		if strings.HasPrefix(line, "diff --git ") {
-			if current != nil {
-				files = append(files, *current)
-			}
-			path := parseDiffFilePath(line)
-			current = &criteria.DiffFile{Path: path}
-			continue
-		}
-		if current == nil {
-			continue
-		}
-		if current.Patch == "" {
-			current.Patch = line
-		} else {
-			current.Patch += "\n" + line
+			flush()
+			path = parseDiffFilePath(line)
+		} else if path != "" {
+			patch.WriteString(line)
+			patch.WriteByte('\n')
 		}
 	}
-	if current != nil {
-		files = append(files, *current)
-	}
+	flush()
 	return criteria.PRDiff{Files: files}
-}
-
-func criteriaVerificationDiff(checkpoint reviewerCheckpoint, detail PullRequestDetail) string {
-	if strings.TrimSpace(detail.Diff) != "" {
-		return detail.Diff
-	}
-	if checkpoint.Snapshot == nil || strings.TrimSpace(checkpoint.Snapshot.PayloadJSON) == "" {
-		return ""
-	}
-	payload := parseJSONObject(&checkpoint.Snapshot.PayloadJSON)
-	if diff, ok := payload["diff"].(string); ok {
-		return diff
-	}
-	return ""
 }
 
 func parseDiffFilePath(line string) string {
@@ -9638,12 +9635,16 @@ func buildReviewerMinimalPRSeed(repo string, prNumber int64, checkpoint reviewer
 			seed["url"] = checkpoint.Detail.URL
 		}
 		seed["base_ref"] = checkpoint.Detail.BaseRefName
+		seed["base_sha"] = checkpoint.Detail.BaseSHA
 		seed["head_ref"] = checkpoint.Detail.HeadRefName
 		seed["expected_state"] = firstNonEmpty(strings.ToUpper(strings.TrimSpace(checkpoint.Detail.State)), "OPEN")
 		seed["expected_draft"] = checkpoint.Detail.IsDraft
 	} else {
 		seed["base_ref"] = ""
 		seed["head_ref"] = ""
+	}
+	if checkpoint.Snapshot != nil && checkpoint.Snapshot.BaseSHA != "" {
+		seed["base_sha"] = checkpoint.Snapshot.BaseSHA
 	}
 	encoded, _ := json.MarshalIndent(seed, "", "  ")
 	return "Minimal PR seed (authoritative handoff fields; fetch all mutable PR details yourself):\n" + string(encoded)
@@ -9680,12 +9681,16 @@ func seededPullRequestRepoParts(repo string) (host string, path string) {
 	return defaultHost, strings.Trim(repo, "/")
 }
 
+func reviewerLocalDiffContract() string {
+	return "Local review source: the prepared worktree and fixed base_sha/head_sha commits are the source for code changes. No complete remote diff is supplied or required. Ensure both commits and their merge-base history are available locally (fetch missing refs/history using the authorized Git transport). Use git diff --name-status <base_sha>...<head_sha> to enumerate changes, then git diff <base_sha>...<head_sha> -- <path> and read files as needed. Page large outputs; a truncated tool response is not the complete diff and must not silently omit review coverage. Do not substitute a moving branch name or the working tree for the seeded commits."
+}
+
 func reviewerAgentSideGitHubFetchContract() string {
 	return strings.Join([]string{
 		"Agent-side GitHub fetch contract: use the minimal PR seed above as the stable handoff. Do not assume PR title, body, full diff, full comment dumps, reviews, or checks from this prompt are complete or fresh.",
 		"Local checkout contract: the current working directory is Looper's prepared reviewer worktree for this PR and is the canonical local checkout for verification. Reuse this worktree for git fetch, git checkout, diff inspection, and any local validation. Do not run `gh repo clone`, `git clone`, or create any additional checkout for this PR's base or head repository unless the provided worktree is missing or unusable.",
-		"Before acting and again before final conclusions or publishing, run `gh pr view <pr-url> -R <repo> --json number,title,body,state,isDraft,baseRefName,headRefName,headRefOid,url,labels` using the seeded PR URL or number plus repository, and validate `headRefOid` equals the seeded `head_sha`, `baseRefName` equals the seeded `base_ref` when present, and state/draft status match the seed. Fail fast on drift.",
-		"Fetch scoped data on demand with `gh pr diff <pr-url> -R <repo> --name-only` before selecting files. For relevant file diffs, use a supported workflow such as fetching the full patch with `gh pr diff <pr-url> -R <repo> --patch` and filtering locally, or fetching refs and running `git diff <base>...<head> -- <path>`. Run `gh pr checks <pr-url> -R <repo>` only when CI status matters.",
+		"Before acting and again before final conclusions or publishing, run `gh pr view <pr-url> -R <repo> --json number,title,body,state,isDraft,baseRefName,baseRefOid,headRefName,headRefOid,url,labels` using the seeded PR URL or number plus repository, and validate `headRefOid` equals the seeded `head_sha`, `baseRefOid` equals the seeded `base_sha` and `baseRefName` equals the seeded `base_ref` when present, and state/draft status match the seed. Fail fast on drift.",
+		"Inspect changes with local Git using the fixed `base_sha` and `head_sha` from the seed. Start with `git diff --name-status <base_sha>...<head_sha>`, then use `git diff <base_sha>...<head_sha> -- <path>` and read files as needed. Fetch missing commits/history before inspecting; never treat missing objects or truncated output as an empty diff. Page large file diffs and continue reviewing all changed files. A remote PR diff is not required. Run `gh pr checks <pr-url> -R <repo>` only when CI status matters.",
 		"When review feedback context matters, do not rely only on `gh pr view --comments`; collect all review feedback with pagination: `gh api repos/{owner}/{repo}/pulls/{number}/comments --paginate`, `gh api repos/{owner}/{repo}/pulls/{number}/reviews --paginate`, and `gh api repos/{owner}/{repo}/issues/{number}/comments --paginate`.",
 		"If `gh` fails for authentication, network, rate-limit, or PR drift reasons, stop and return a structured error with `type` set to one of `auth`, `network`, `rate_limit`, or `pr_drift`, plus a short `message` and any observed PR metadata. Do not proceed on stale PR data.",
 	}, "\n")
@@ -9734,22 +9739,22 @@ func buildReviewPromptWithInstructions(projectID string, instructionConfig confi
 	}
 	fetchContract := reviewerAgentSideGitHubFetchContract()
 	if forgejoNative {
-		fetchContract = "Provider-supplied Forgejo review context: Looper fetched the native PR metadata, review decision/history, requested reviewers, and diff before invoking you. Use the prepared local worktree plus this supplied context; Forgejo-only runs do not require `gh`. Publish only through the trusted Looper review-submit wrapper."
+		fetchContract = "Provider-supplied Forgejo review context: Looper fetched the native PR metadata, review decision/history, requested reviewers, before invoking you. Use the prepared local worktree plus this supplied context; Forgejo-only runs do not require `gh`. Publish only through the trusted Looper review-submit wrapper."
 	}
 	if commentOnlyPublish {
-		publishInstruction = "This provider is comment-only. Looper supplied the PR metadata and diff in this prompt/context and will publish exactly one top-level PR comment from your final completion summary after re-checking local idempotency. Do not publish anything yourself or attempt native review features."
+		publishInstruction = "This provider is comment-only. Looper supplied the PR metadata in this prompt/context and will publish exactly one top-level PR comment from your final completion summary after re-checking local idempotency. Do not publish anything yourself or attempt native review features."
 		outcomeInstruction = "Classify every candidate finding with disposition `must_fix` | `follow_up` | `needs_human`, plus `severity`, `scopeBasis`, and `scopeEvidence`. Include all candidates in `__LOOPER_RESULT__.findings`. Looper publishes only `must_fix` findings into the remote Reviewer Summary; `follow_up` stays in the structured result only; `needs_human` parks the pair and is never posted as a change request. If there are must_fix findings, finish successfully with a concise markdown summary and set `summary`, `outcome` (`non_blocking` or `blocking`), and `findings`. Each finding object MUST contain `title`, `body`, `disposition`, `severity`, `scopeBasis`, `scopeEvidence`, and optional `files`; include `review_item_id` when the issue matches an existing Reviewer Summary item unchanged, and include `supersedes` with prior `review_item_id` values only when this finding materially replaces older items. If there are no must_fix findings and no needs_human, set `outcome` to `clean` (follow_up-only findings may remain in `findings`), and start `summary` with `No actionable findings` when there are no must_fix items. Do not include terminal logs, extra JSON payloads, or publishing commands."
 		cleanResultCompletionInstruction = "Group findings only when they share the same root cause; keep unrelated concerns separate. Accumulate every independent in-scope must_fix before finalizing. If there is no concrete must_fix feedback, start the final summary with `No actionable findings`. Do not invent feedback."
-		fetchContract = "Provider-supplied Forgejo review context: Looper fetched PR metadata and diff before invoking you. Use the prepared local worktree plus the supplied metadata/diff as the review context; do not use GitHub CLI/API commands or native review/thread features."
+		fetchContract = "Provider-supplied Forgejo review context: Looper fetched PR metadata before invoking you. Use the prepared local worktree plus the supplied metadata as the review context; do not use GitHub CLI/API commands or native review/thread features."
 	}
 	if hostingKind != "" {
-		fetchContract = forge.HostingAgentContext(hostingKind, "reviewer", repo, prNumber) + "\nBefore reviewing and again before conclusions or publication, read live PR metadata; verify seeded head/base/state/draft and stop on drift or access failures. Fetch the diff and read all PR conversation and reviews before reviewing."
+		fetchContract = forge.HostingAgentContext(hostingKind, "reviewer", repo, prNumber) + "\nBefore reviewing and again before conclusions or publication, read live PR metadata; verify seeded head/base/state/draft and stop on drift or access failures. Read all PR conversation and reviews before reviewing; inspect the diff locally at the seeded base/head SHAs."
 	}
 	scopeInstruction := reviewerScopeInstruction(scope)
 	if hostingKind != "" {
 		scopeInstruction = strings.ReplaceAll(scopeInstruction, "fetched through `gh` according to the agent-side GitHub fetch contract", "fetched through the trusted Looper host commands")
 	}
-	parts := []string{fmt.Sprintf("Review pull request %s#%d.", repo, prNumber), buildReviewerMinimalPRSeed(repo, prNumber, checkpoint, scope, forge.ConfiguredPullRequestURL(instructionConfig, projectID, repo, prNumber)), fetchContract, "Phase: " + phase, phaseInstruction, scopeInstruction, publishInstruction, fmt.Sprintf("Review idempotency marker prefix: <!-- looper:review id=%s head=%s outcome=clean|non_blocking|blocking -->", idempotencyKey, currentHeadSHA), outcomeInstruction, "Run ID for logging only, not for idempotency: " + runID}
+	parts := []string{reviewerLocalDiffContract(), fmt.Sprintf("Review pull request %s#%d.", repo, prNumber), buildReviewerMinimalPRSeed(repo, prNumber, checkpoint, scope, forge.ConfiguredPullRequestURL(instructionConfig, projectID, repo, prNumber)), fetchContract, "Phase: " + phase, phaseInstruction, scopeInstruction, publishInstruction, fmt.Sprintf("Review idempotency marker prefix: <!-- looper:review id=%s head=%s outcome=clean|non_blocking|blocking -->", idempotencyKey, currentHeadSHA), outcomeInstruction, "Run ID for logging only, not for idempotency: " + runID}
 	if providerContext := forge.ForgejoAgentContext(instructionConfig, projectID, repo, prNumber); hostingKind == "" && providerContext != "" {
 		parts = append(parts, providerContext)
 	}
@@ -9764,6 +9769,9 @@ func buildReviewPromptWithInstructions(projectID string, instructionConfig confi
 		parts = append(parts, "Current labels: "+strings.Join(checkpoint.Detail.Labels, ", "))
 	}
 	if checkpoint.Snapshot != nil {
+		if isForgejo {
+			parts = append(parts, "PR title: "+checkpoint.Snapshot.Title, "PR body: "+checkpoint.Snapshot.Body)
+		}
 		parts = append(parts, "Head SHA: "+checkpoint.Snapshot.HeadSHA)
 		if checkpoint.Detail != nil && checkpoint.Detail.Author != "" {
 			parts = append(parts, "Author: "+checkpoint.Detail.Author)
@@ -9836,7 +9844,7 @@ func buildReviewPromptWithInstructions(projectID string, instructionConfig confi
 		reviewRequestInstruction = "This reviewer configuration does not require a current-user review request before posting."
 	}
 	if commentOnlyPublish {
-		reviewPassContract := "Review pass contract: complete one full review pass before finalizing. Use the supplied PR metadata, supplied diff, and local worktree to inspect every changed file/range in scope. Do not stop after the first issue. If an in-scope must_fix issue is visible in the current PR head and review context, include it in this review rather than deferring it to a later pass."
+		reviewPassContract := "Review pass contract: complete one full review pass before finalizing. Use the supplied PR metadata and local Git diff to inspect every changed file/range in scope. Do not stop after the first issue. If an in-scope must_fix issue is visible in the current PR head and review context, include it in this review rather than deferring it to a later pass."
 		if laterPass {
 			reviewPassContract = "Review pass contract (later pass / repair frontier): complete the repair-frontier inspection before finalizing. Do not perform a full first-pass rescan of untouched original diff. Focus on unresolved prior must_fix threads, the last-reviewed-head→current-head delta, directly affected contracts/tests/lifecycle invariants, and Fixer evidence. Do not stop after the first issue within that frontier."
 		}
@@ -9857,13 +9865,13 @@ func buildReviewPromptWithInstructions(projectID string, instructionConfig confi
 	submitPayloadInstruction := fmt.Sprintf("When submitting through `%s review submit`, pass stdin JSON with `body` and optional `comments` entries. Each actionable comment MUST include GitHub fields `path`, `line`, `side` (`RIGHT` for new diff lines, `LEFT` for old diff lines), optional `start_line` and `start_side` for multiline ranges, `body`, plus Looper-only fields `disposition` (must be `must_fix`), `scopeBasis`, and `scopeEvidence` (and preferably `severity`). The trusted wrapper rejects missing disposition/scope fields and rejects `follow_up`/`needs_human` in actionable comments or the visible review body; those dispositions stay out of the submit payload. Looper strips Looper-only fields before calling GitHub/Forgejo.", looperCLICommand)
 	idempotencyInstruction := "Idempotency requirement: before posting anything, use `gh api` to list existing PR reviews for this PR. Only treat an existing marker as satisfying this run when the review body contains the exact idempotency id and expected head SHA, and the review state matches the required outcome-specific policy for this run. If such a matching review already exists, do not post another review. Instead, rely on Looper to validate that marker after the agent exits and to reconcile clean-signal reactions/spec label transitions as needed. If the marker exists but the outcome/review-state combination does not satisfy this run, ignore it and publish the correct review for this run instead."
 	freshnessInstruction := "Before posting, use `gh` to confirm the PR is still open and the head SHA still matches the expected head SHA. If it changed, do not post a review and exit non-zero with the exact message `PR head changed before publish`."
-	anchorInstruction := "Before posting, validate every inline review comment's `path`, `line`, `side`, `start_line`, and `start_side` against the live PR diff fetched with `gh pr diff`. Preserve exact anchors that fit the live diff. If a must_fix location is outside the live diff's exact line, attach it to the nearest anchorable changed-file location instead of submitting an invalid inline anchor. Do not move must_fix findings into the top-level review body; the trusted wrapper rejects actionable body-only reviews, and body-only markers are not published must_fix."
+	anchorInstruction := "Before posting, validate every inline review comment's `path`, `line`, `side`, `start_line`, and `start_side` against the local PR diff for the exact base/head SHAs. Preserve exact anchors that fit the live diff. If a must_fix location is outside the live diff's exact line, attach it to the nearest anchorable changed-file location instead of submitting an invalid inline anchor. Do not move must_fix findings into the top-level review body; the trusted wrapper rejects actionable body-only reviews, and body-only markers are not published must_fix."
 	if forgejoNative {
 		githubOperationContract = fmt.Sprintf("Forgejo operation contract: submit exactly one native PR review for this run through the trusted Looper CLI at %s, with review JSON on stdin. The wrapper validates the expected head, current review request, content safety, provider capability, and idempotency marker before it calls Forgejo. Do not call the Forgejo review API directly.", actionableReviewSubmitCommand)
 		submitPayloadInstruction = fmt.Sprintf("When submitting through `%s review submit`, pass stdin JSON with `body` and optional `comments` entries using `path`, `line`, `side` (`RIGHT` for new lines, `LEFT` for old lines), `body`, plus Looper-only `disposition=must_fix`, `scopeBasis`, and `scopeEvidence`; the wrapper validates those fields, rejects `follow_up`/`needs_human` in comments or the visible review body, then maps anchors to Forgejo and strips Looper-only fields before the provider call.", looperCLICommand)
 		idempotencyInstruction = "Idempotency requirement: submit only through the trusted Looper wrapper. The wrapper lists existing native Forgejo reviews and reuses an exact id/head/outcome/state marker match; after the agent exits, the runner verifies the same marker before recording publication. Never call the Forgejo review endpoint directly."
 		freshnessInstruction = "Before posting, rely on the trusted Looper wrapper to confirm the Forgejo PR is still open and the head SHA still matches. If it reports drift, exit non-zero with the exact message `PR head changed before publish`."
-		anchorInstruction = "Before posting, validate every inline review comment against the supplied Forgejo diff and local worktree. Preserve exact changed-file anchors. If a must_fix location is not exactly on the supplied diff, attach it to the nearest anchorable changed-file location. Do not downgrade must_fix findings to a top-level review-body item; every must_fix must remain an inline comment."
+		anchorInstruction = "Before posting, validate every inline review comment against the local Git diff at the fixed PR base/head SHAs. Preserve exact changed-file anchors. If a must_fix location is not exactly on the local diff, attach it to the nearest anchorable changed-file location. Do not downgrade must_fix findings to a top-level review-body item; every must_fix must remain an inline comment."
 	}
 	if hostingKind != "" {
 		idempotencyInstruction = strings.ReplaceAll(idempotencyInstruction, "use `gh api` to list existing PR reviews for this PR", fmt.Sprintf("use `\"$LOOPER_HOST_CLI\" host api pulls/%d/reviews --paginate` to list existing PR reviews", prNumber))
@@ -9965,7 +9973,7 @@ func shellQuote(value string) string {
 func reviewerScopeInstruction(scope config.ReviewerScope) string {
 	switch scope {
 	case config.ReviewerScopeFullPR:
-		return "Review scope: full_pr. Use the full PR context, including title, body, checks, discussion metadata, and the complete diff fetched through `gh` according to the agent-side GitHub fetch contract. You may report actionable issues anywhere in the PR diff when they are supported by the fetched context."
+		return "Review scope: full_pr. Use the full PR context, including title, body, checks, discussion metadata, and the complete set of changes inspected through local Git at the seeded base/head SHAs. You may report actionable issues anywhere in the PR diff when they are supported by the fetched context."
 	case config.ReviewerScopeChangedFiles:
 		return "Review scope: changed_files. Limit actionable findings to files changed by this PR. Use unchanged hunks only as context for changed files, and do not request changes in unrelated files unless the changed-file behavior cannot be fixed locally."
 	case config.ReviewerScopeChangedRanges:

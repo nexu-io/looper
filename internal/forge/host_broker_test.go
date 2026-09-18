@@ -233,7 +233,11 @@ func TestHostBrokerRejectsEscapesAndEveryWrite(t *testing.T) {
 func TestHostBrokerPaginationResponseLimitsAndErrors(t *testing.T) {
 	for _, mode := range []string{"foreign-page", "scope-page", "oversized", "malformed", "denied"} {
 		t.Run(mode, func(t *testing.T) {
-			f := newHostFixture(t, config.HostingIdentityForgejoToken, func(w http.ResponseWriter, r *http.Request) {
+			kind := config.HostingIdentityForgejoToken
+			if mode == "oversized" {
+				kind = config.HostingIdentityGitHubApp
+			}
+			f := newHostFixture(t, kind, func(w http.ResponseWriter, r *http.Request) {
 				switch mode {
 				case "foreign-page":
 					w.Header().Set("Link", `<https://other.invalid/api/v1/repos/acme/looper/issues/1/comments?page=2&limit=50>; rel="next"`)
@@ -250,6 +254,7 @@ func TestHostBrokerPaginationResponseLimitsAndErrors(t *testing.T) {
 					io.WriteString(w, "host-test-token-one")
 				}
 			})
+
 			f.start(t)
 			_, err := ProxyHost(context.Background(), HostRequest{Op: "api.read", Path: "issues/1/comments", Paginate: true})
 			if err == nil {
@@ -382,5 +387,47 @@ printf '%s\n' "$@"
 	}
 	if _, err := ProxyHost(context.Background(), HostRequest{Op: "review.submit", Argv: []string{"review", "submit", "acme/other#42"}}); err == nil {
 		t.Fatal("review was retargeted")
+	}
+}
+
+func TestHostBrokerRedirectedJobLogResponseLimit(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		kind      config.HostingIdentityKind
+		size      int
+		character string
+		wantError bool
+	}{
+		{"large", config.HostingIdentityForgejoToken, maxTrustedReviewProxyResponseBytes + 1, "x", false},
+		{"escaped", config.HostingIdentityForgejoToken, maxHostResponseBytes, "\x01", false},
+		{"github-default", config.HostingIdentityGitHubApp, maxHostResponseBytes + 1, "x", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := strings.Repeat(tc.character, tc.size)
+			logs := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Header.Get("Authorization") != "" || r.Header.Get("Cookie") != "" {
+					t.Error("job log download forwarded API credentials")
+				}
+				io.WriteString(w, body)
+			}))
+			defer logs.Close()
+			f := newHostFixture(t, tc.kind, func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Location", logs.URL+"/job?signature=fixture-signed-location")
+				w.WriteHeader(http.StatusFound)
+			})
+			f.options.HTTPClient = logs.Client()
+			f.start(t)
+			output, err := ProxyHost(context.Background(), HostRequest{Op: "api.read", Path: "actions/jobs/9/logs"})
+			if tc.wantError {
+				if err == nil || !strings.Contains(err.Error(), "response limit") {
+					t.Fatalf("expected response limit error, got %v", err)
+				}
+			} else if err != nil || output != body {
+				t.Fatalf("download: bytes=%d, want %d; error=%v", len(output), len(body), err)
+			}
+			if strings.Contains(fmt.Sprint(err), "signature=") || strings.Contains(output, "signature=") {
+				t.Fatal("signed URL exposed to agent")
+			}
+		})
 	}
 }

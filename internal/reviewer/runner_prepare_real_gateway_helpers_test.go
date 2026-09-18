@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -11,6 +12,7 @@ import (
 	"testing"
 
 	gitinfra "github.com/nexu-io/looper/internal/infra/git"
+	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 )
 
 // setupRealRepoWithPRHead creates a bare remote + clone with main, a feature branch,
@@ -96,7 +98,7 @@ func (g *countingRealGitGateway) PrepareWorktree(ctx context.Context, input Prep
 	g.prepareCalls++
 	res, err := g.inner.PrepareWorktree(ctx, gitinfra.PrepareWorktreeInput{
 		RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot, WorktreePath: input.WorktreePath,
-		Branch: input.Branch, Ref: input.Ref, ExpectedHeadSHA: input.ExpectedHeadSHA, Remote: input.Remote,
+		Branch: input.Branch, Ref: input.Ref, ExpectedHeadSHA: input.ExpectedHeadSHA, BaseSHA: input.BaseSHA, Remote: input.Remote,
 	})
 	if err != nil {
 		return PrepareWorktreeResult{}, err
@@ -114,4 +116,14 @@ func (g *countingRealGitGateway) CleanupWorktree(ctx context.Context, input Clea
 
 func (g *countingRealGitGateway) ScrubReservedReviewerScratch(ctx context.Context, worktreePath string) error {
 	return g.inner.ScrubReservedReviewerScratch(ctx, worktreePath)
+}
+
+func (g *countingRealGitGateway) ReadPullRequestDiff(ctx context.Context, cwd, base, head string) (string, error) {
+	var diff string
+	err := githubinfra.New(githubinfra.Options{GitPath: "git"}).ReadLocalPullRequestDiff(ctx, cwd, base, head, nil, func(reader io.Reader) error {
+		data, err := io.ReadAll(reader)
+		diff = string(data)
+		return err
+	})
+	return diff, err
 }

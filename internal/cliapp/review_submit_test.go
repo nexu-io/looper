@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -28,29 +27,6 @@ import (
 var commentOnlyReviewPolicy = config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventComment, Blocking: config.ReviewerReviewEventComment}
 var decisionReviewPolicy = config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventApprove, Blocking: config.ReviewerReviewEventRequestChanges}
 
-func TestCanSubmitWithoutAnchorValidationOnlyAllowsLargeDiffTopLevelReviews(t *testing.T) {
-	t.Parallel()
-
-	if !canSubmitWithoutAnchorValidation(githubinfra.ErrDiffTooLarge, nil) {
-		t.Fatalf("canSubmitWithoutAnchorValidation() = false, want true for large diff top-level review")
-	}
-	if !canSubmitWithoutAnchorValidation(githubinfra.ErrLocalCaptureTruncated, nil) {
-		t.Fatalf("canSubmitWithoutAnchorValidation() = false, want true for local capture truncation top-level review")
-	}
-	if canSubmitWithoutAnchorValidation(githubinfra.ErrDiffTooLarge, []reviewSubmitComment{{Body: "inline", Path: "app.go", Line: 10, Side: "RIGHT"}}) {
-		t.Fatalf("canSubmitWithoutAnchorValidation() = true, want false when inline comments need validation")
-	}
-	if canSubmitWithoutAnchorValidation(githubinfra.ErrLocalCaptureTruncated, []reviewSubmitComment{{Body: "inline", Path: "app.go", Line: 10, Side: "RIGHT"}}) {
-		t.Fatalf("canSubmitWithoutAnchorValidation(local truncation with comments) = true, want false")
-	}
-	if canSubmitWithoutAnchorValidation(githubinfra.ErrAnchorValidationUnavailable, []reviewSubmitComment{{Body: "inline", Path: "app.go", Line: 10, Side: "RIGHT"}}) {
-		t.Fatalf("canSubmitWithoutAnchorValidation(unavailable with comments) = true, want false fail-closed")
-	}
-	if canSubmitWithoutAnchorValidation(errors.New("network failed"), nil) {
-		t.Fatalf("canSubmitWithoutAnchorValidation() = true, want false for generic diff errors")
-	}
-}
-
 func TestValidateExpectedBaseCommit(t *testing.T) {
 	t.Parallel()
 	if err := validateExpectedBaseCommit("abc123", "ABC123"); err != nil {
@@ -61,37 +37,6 @@ func TestValidateExpectedBaseCommit(t *testing.T) {
 	}
 	if err := validateExpectedBaseCommit("abc123", "def456"); err == nil || !strings.Contains(err.Error(), "expected base commit") {
 		t.Fatalf("validateExpectedBaseCommit(mismatch) error = %v, want base drift failure", err)
-	}
-}
-
-func TestForgejoReviewSubmitGatewayMapsOversizedDiffToDiffTooLarge(t *testing.T) {
-	t.Parallel()
-
-	// 1 MiB + 1 matches Forgejo client's response body cap.
-	oversized := strings.Repeat("d", (1<<20)+1)
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet || r.URL.Path != "/api/v1/repos/acme/looper/pulls/42.diff" {
-			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
-		}
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(oversized))
-	}))
-	defer server.Close()
-
-	client, err := forge.NewForgejoClient(forge.RepositoryRef{ProviderID: "forgejo", Kind: forge.ProviderKindForgejo, BaseURL: server.URL, Repo: "acme/looper"}, "token")
-	if err != nil {
-		t.Fatalf("NewForgejoClient() error = %v", err)
-	}
-	gateway := forgejoReviewSubmitGateway{client: client, stamper: disclosure.FromConfig(config.Config{})}
-	_, err = gateway.GetPullRequestDiff(context.Background(), githubinfra.GetPullRequestDiffInput{Repo: "acme/looper", PRNumber: 42})
-	if !errors.Is(err, githubinfra.ErrDiffTooLarge) {
-		t.Fatalf("GetPullRequestDiff() error = %v, want ErrDiffTooLarge", err)
-	}
-	if !canSubmitWithoutAnchorValidation(err, nil) {
-		t.Fatalf("canSubmitWithoutAnchorValidation() = false for Forgejo oversized top-level review")
-	}
-	if canSubmitWithoutAnchorValidation(err, []reviewSubmitComment{{Body: "inline", Path: "app.go", Line: 10, Side: "RIGHT"}}) {
-		t.Fatalf("canSubmitWithoutAnchorValidation() = true, want false when inline comments need anchors")
 	}
 }
 
@@ -709,7 +654,7 @@ func TestRefuseReviewSubmitBudgetFailsClosedOnMultipleRunningRuns(t *testing.T) 
 	}
 }
 
-func TestSubmitReviewWithoutAnchorValidationRefusesBudgetBeforeSubmit(t *testing.T) {
+func TestSubmitReviewWithAnchorsRefusesBudgetBeforeSubmit(t *testing.T) {
 	t.Parallel()
 
 	root := t.TempDir()
@@ -756,9 +701,9 @@ func TestSubmitReviewWithoutAnchorValidationRefusesBudgetBeforeSubmit(t *testing
 	}
 	runtime := &commandRuntime{}
 	payload := reviewSubmitPayload{Body: "ok\n<!-- looper:review id=a head=head outcome=clean -->"}
-	err = submitReviewWithoutAnchorValidation(cmd, runtime, cfg, gateway, repo, prNumber, "COMMENT", payload, "head", root, cfg.Disclosure)
+	err = submitReviewWithAnchors(cmd, runtime, cfg, gateway, repo, prNumber, "COMMENT", payload, "head", root, cfg.Disclosure, nil)
 	if err == nil || !strings.Contains(err.Error(), "publish budget exhausted") {
-		t.Fatalf("submitReviewWithoutAnchorValidation() error = %v, want budget exhausted", err)
+		t.Fatalf("submitReviewWithAnchors() error = %v, want budget exhausted", err)
 	}
 	if submitCalls != 0 {
 		t.Fatalf("SubmitReview calls = %d, want 0 (refused before mutation)", submitCalls)
@@ -769,7 +714,7 @@ func TestSubmitReviewWithoutAnchorValidationRefusesBudgetBeforeSubmit(t *testing
 	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_budget", Seq: 7, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "running", MetadataJSON: &underMeta, CreatedAt: now, UpdatedAt: now}); err != nil {
 		t.Fatalf("Loops.Upsert(under) error = %v", err)
 	}
-	err = submitReviewWithoutAnchorValidation(cmd, runtime, cfg, gateway, repo, prNumber, "COMMENT", payload, "head", root, cfg.Disclosure)
+	err = submitReviewWithAnchors(cmd, runtime, cfg, gateway, repo, prNumber, "COMMENT", payload, "head", root, cfg.Disclosure, nil)
 	if err != nil {
 		t.Fatalf("under-cap submit error = %v", err)
 	}
@@ -788,8 +733,8 @@ func (g *budgetGateSubmitGateway) ViewPullRequest(context.Context, githubinfra.V
 func (g *budgetGateSubmitGateway) GetCurrentUserLogin(context.Context, string) (string, error) {
 	return "reviewer", nil
 }
-func (g *budgetGateSubmitGateway) GetPullRequestDiff(context.Context, githubinfra.GetPullRequestDiffInput) (string, error) {
-	return "", nil
+func (g *budgetGateSubmitGateway) BuildReviewAnchorIndex(context.Context, githubinfra.BuildReviewAnchorIndexInput) (*diffanchor.Index, string, error) {
+	return nil, "", nil
 }
 func (g *budgetGateSubmitGateway) SubmitReview(context.Context, githubinfra.SubmitReviewInput) error {
 	if g.onSubmit != nil {
@@ -1778,5 +1723,53 @@ func TestReviewSubmitStripsLooperOnlyFieldsAndRejectsBeforeSubmit(t *testing.T) 
 	}
 	if submitCalls != 0 {
 		t.Fatalf("SubmitReview calls = %d, want 0", submitCalls)
+	}
+}
+
+func TestForgejoReviewSubmitUsesLocalDiffWithoutRemotePatch(t *testing.T) {
+	t.Parallel()
+	repo := t.TempDir()
+	base, head, line := seedReviewSubmitLargeRepo(t, repo)
+	var published map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/swagger.v1.json":
+			_, _ = w.Write([]byte(`{"paths":{"/repos/{owner}/{repo}/pulls/{index}/reviews":{"get":{},"post":{}},"/repos/{owner}/{repo}/pulls/{index}/reviews/{id}/comments":{"get":{}}}}`))
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/reviews"):
+			if err := json.NewDecoder(r.Body).Decode(&published); err != nil {
+				t.Error(err)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": 9, "state": "COMMENT", "commit_id": head})
+		default:
+			t.Errorf("unexpected remote dependency: %s %s", r.Method, r.URL.Path)
+			http.Error(w, "unavailable", http.StatusRequestEntityTooLarge)
+		}
+	}))
+	defer server.Close()
+	client, err := forge.NewForgejoClient(forge.RepositoryRef{ProviderID: "forgejo", Kind: forge.ProviderKindForgejo, BaseURL: server.URL, Repo: "acme/looper"}, "token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	gateway := forgejoReviewSubmitGateway{client: client, localGit: githubinfra.New(githubinfra.Options{GitPath: "git"}), stamper: disclosure.FromConfig(config.Config{})}
+	anchors, err := resolveReviewSubmitAnchors(context.Background(), gateway, "acme/looper", 42, repo, githubinfra.PullRequestDetail{BaseSHA: base, HeadSHA: head}, []reviewSubmitComment{{Path: "target/late.go", Line: line, Side: "RIGHT"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = gateway.SubmitReview(context.Background(), githubinfra.SubmitReviewInput{PRNumber: 42, Event: "COMMENT", Body: "Local review", CommitID: head, Comments: []githubinfra.ReviewComment{{Body: "Fix this change", Path: "target/late.go", Line: line, Side: "RIGHT"}}, Anchors: anchors})
+	if err != nil {
+		t.Fatal(err)
+	}
+	comments, _ := published["comments"].([]any)
+	if len(comments) != 1 {
+		t.Fatalf("missing native inline comment: %#v", published)
+	}
+	comment := comments[0].(map[string]any)
+	if comment["path"] != "target/late.go" || comment["new_position"] != float64(line) {
+		t.Fatalf("wrong native anchor: %#v", comment)
+	}
+	// A body-only review works even without local Git or any diff endpoint.
+	anchors, err = resolveReviewSubmitAnchors(context.Background(), forgejoReviewSubmitGateway{}, "acme/looper", 42, repo, githubinfra.PullRequestDetail{}, nil)
+	if err != nil || anchors != nil {
+		t.Fatalf("body-only anchor lookup = %v, %v", anchors, err)
 	}
 }

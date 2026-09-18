@@ -152,6 +152,9 @@ func TestGitHubSandboxAppIdentity(t *testing.T) {
 		t.Fatalf("App daemon readiness: %v", err)
 	}
 	client := newAPIClient(proc.BaseURL())
+	// Real App JWT + first scheduler tick (planner discovery) can occupy SQLite
+	// and GitHub longer than the default 2s API client timeout.
+	client.client.Timeout = 10 * time.Second
 	var created struct {
 		ID string `json:"id"`
 	}

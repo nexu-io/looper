@@ -715,6 +715,8 @@ repo = "acme/example"
 
 Forgejo rules:
 
+Ordinary Forgejo HTTP and tea API responses have no response-size cap. Review content comes from local Git. Health probes and login discovery retain fixed internal bounds.
+
 - `providers[].id` must be unique.
 - `providers[].kind` must be `github`, `forgejo`, or `plane`; `gitea` is not a supported provider kind yet.
 - Forgejo providers require an absolute `http(s)` `baseUrl` and an authentication strategy:

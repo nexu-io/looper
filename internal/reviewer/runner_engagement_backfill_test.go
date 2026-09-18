@@ -419,7 +419,7 @@ func TestQueuedAndResumedReviewerRecoverEngagementWithoutDiscovery(t *testing.T)
 			if mode == "review" || mode == "publish" || mode == "legacy-thread-only" {
 				checkpoint := reviewerCheckpoint{
 					ResumePolicy: "advance_from_checkpoint",
-					Detail:       &checkpointDetail{Title: "Review", State: "OPEN", HeadSHA: "new-head", BaseSHA: "base", HeadRefName: "feature/review-me", BaseRefName: "main", Author: "alice", CurrentLogin: "bob", Reviews: reviews},
+					Detail:       &checkpointDetail{Title: "Review", State: "OPEN", HeadSHA: "new-head", BaseSHA: "base123", HeadRefName: "feature/review-me", BaseRefName: "main", Author: "alice", CurrentLogin: "bob", Reviews: reviews},
 					Snapshot:     &checkpointSnapshot{HeadSHA: "new-head"},
 					Worktree:     &checkpointWorktree{Path: t.TempDir(), Branch: "pr-42", BaseBranch: "main", PreparedAt: now},
 					// Pending review lets a resumed review/publish retain its checkpoint even

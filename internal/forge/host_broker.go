@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -126,6 +125,13 @@ func StartHostBroker(ctx context.Context, options HostBrokerOptions) (string, fu
 	return startHostingSocket(ctx, b.handle)
 }
 
+func (b *hostBroker) maxResponseBytes() int {
+	if b == nil || b.session == nil || b.session.Target().Kind != config.ProviderKindForgejo {
+		return maxHostResponseBytes
+	}
+	return 0
+}
+
 func (b *hostBroker) handle(ctx context.Context, conn net.Conn) {
 	serveHostingRequest(ctx, conn, func(ctx context.Context, req HostRequest) {
 		if req.Op == "" || req.Op == "review.submit" {
@@ -151,7 +157,7 @@ func (b *hostBroker) handle(ctx context.Context, conn net.Conn) {
 			writeHostingError(conn, b.session.Redact(err.Error()))
 			return
 		}
-		if len(output) > maxHostResponseBytes {
+		if responseExceedsLimit(len(output), b.maxResponseBytes()) {
 			writeHostingError(conn, "hosting response exceeds size limit")
 			return
 		}
@@ -235,14 +241,7 @@ func ProxyHost(ctx context.Context, request HostRequest) (string, error) {
 		return "", err
 	}
 	var response trustedReviewProxyResponse
-	raw, err := io.ReadAll(io.LimitReader(conn, maxTrustedReviewProxyResponseBytes+1))
-	if err != nil {
-		return "", fmt.Errorf("read hosting response: %w", err)
-	}
-	if len(raw) > maxTrustedReviewProxyResponseBytes {
-		return "", errors.New("hosting response exceeds size limit")
-	}
-	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder := json.NewDecoder(conn)
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&response); err != nil {
 		return "", fmt.Errorf("decode hosting response: %w", err)
@@ -352,11 +351,12 @@ func (b *hostBroker) request(ctx context.Context, method, path string, payload [
 		}
 		return nil, nil, &hostingidentity.Error{Identity: b.session.Name(), Operation: "read hosting context", StatusCode: resp.StatusCode, Reason: "hosting server rejected the request"}
 	}
-	data, err := io.ReadAll(io.LimitReader(resp.Body, maxHostResponseBytes+1))
+	limit := b.maxResponseBytes()
+	data, err := readBoundedResponse(resp.Body, limit)
 	if err != nil {
 		return nil, nil, errors.New("cannot read hosting response")
 	}
-	if len(data) > maxHostResponseBytes {
+	if responseExceedsLimit(len(data), limit) {
 		return nil, nil, errors.New("hosting response exceeds size limit")
 	}
 	return data, resp.Header, nil
@@ -379,8 +379,9 @@ func (b *hostBroker) downloadJobLog(ctx context.Context, location string) ([]byt
 	if resp.StatusCode != http.StatusOK {
 		return nil, nil, errors.New("hosting job log download was rejected")
 	}
-	data, err := io.ReadAll(io.LimitReader(resp.Body, maxHostResponseBytes+1))
-	if err != nil || len(data) > maxHostResponseBytes {
+	limit := b.maxResponseBytes()
+	data, err := readBoundedResponse(resp.Body, limit)
+	if err != nil || responseExceedsLimit(len(data), limit) {
 		return nil, nil, errors.New("hosting job log exceeds response limit or could not be read")
 	}
 	return data, resp.Header, nil

@@ -412,7 +412,8 @@ func TestReviewerGitHubAdapterForgejoCommentOnlyFlow(t *testing.T) {
 				"labels": []map[string]any{{"id": 1, "name": "looper:review"}},
 			})
 		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/repos/acme/looper/pulls/42.diff":
-			_, _ = w.Write([]byte("diff --git a/a.go b/a.go\n@@ -1 +1 @@\n-old\n+new\n"))
+			t.Error("reviewer must not request remote diff")
+			http.Error(w, "diff unavailable", http.StatusRequestEntityTooLarge)
 		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/repos/acme/looper/issues/42/comments":
 			_ = json.NewEncoder(w).Encode([]map[string]any{{
 				"id":         77,
@@ -457,9 +458,6 @@ func TestReviewerGitHubAdapterForgejoCommentOnlyFlow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ViewPullRequest() error = %v", err)
 	}
-	if !strings.Contains(detail.Diff, "diff --git") {
-		t.Fatalf("detail.Diff = %q, want fetched Forgejo diff", detail.Diff)
-	}
 	if !detail.IsDraft {
 		t.Fatalf("detail = %#v, want draft preserved", detail)
 	}
@@ -473,8 +471,8 @@ func TestReviewerGitHubAdapterForgejoCommentOnlyFlow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CapturePullRequestSnapshot() error = %v", err)
 	}
-	if snapshot.HeadSHA != "abc123" || snapshot.PayloadJSON == nil || !strings.Contains(*snapshot.PayloadJSON, "diff --git") {
-		t.Fatalf("snapshot = %#v, want captured Forgejo diff payload", snapshot)
+	if snapshot.HeadSHA != "abc123" || snapshot.PayloadJSON == nil || strings.Contains(*snapshot.PayloadJSON, "diff") {
+		t.Fatalf("snapshot = %#v, want metadata-only Forgejo snapshot", snapshot)
 	}
 	comment, err := adapter.CreateIssueComment(context.Background(), reviewer.IssueCommentInput{Repo: "acme/looper", IssueNumber: 42, Body: "Needs a test", CWD: repoPath})
 	if err != nil {

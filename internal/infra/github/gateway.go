@@ -3059,25 +3059,11 @@ func (g *Gateway) CapturePullRequestSnapshot(ctx context.Context, input CaptureP
 	if err != nil {
 		return storage.PullRequestSnapshotRecord{}, err
 	}
-	diff, err := g.GetPullRequestDiff(ctx, GetPullRequestDiffInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD})
-	if err != nil {
-		if !errors.Is(err, ErrDiffTooLarge) && !errors.Is(err, ErrLocalCaptureTruncated) {
-			return storage.PullRequestSnapshotRecord{}, err
-		}
-	}
 	capturedAt := strings.TrimSpace(input.CapturedAt)
 	if capturedAt == "" {
 		capturedAt = g.now().UTC().Format(javaScriptISOStringLayout)
 	}
-	payloadMap := map[string]any{"detail": detail, "diff": diff}
-	if errors.Is(err, ErrDiffTooLarge) {
-		payloadMap["diffTruncated"] = true
-		payloadMap["diffTruncationReason"] = DiffTruncationReasonGitHubTooLarge
-	}
-	if errors.Is(err, ErrLocalCaptureTruncated) {
-		payloadMap["diffTruncated"] = true
-		payloadMap["diffTruncationReason"] = DiffTruncationReasonLocalCapture
-	}
+	payloadMap := map[string]any{"detail": map[string]any{"state": detail.State, "isDraft": detail.IsDraft, "hasConflicts": detail.HasConflicts}}
 	payload, err := json.Marshal(payloadMap)
 	if err != nil {
 		return storage.PullRequestSnapshotRecord{}, fmt.Errorf("marshal pull request snapshot payload: %w", err)
@@ -3093,7 +3079,6 @@ func (g *Gateway) CapturePullRequestSnapshot(ctx context.Context, input CaptureP
 		Title:                 stringPtrIfNotEmpty(detail.Title),
 		Body:                  stringPtrIfNotEmpty(detail.Body),
 		Author:                stringPtrIfNotEmpty(detail.Author),
-		DiffRef:               stringPtr(fmt.Sprintf("gh:pr-diff:%s:%d", input.Repo, input.PRNumber)),
 		ChecksSummary:         stringPtrIfNotEmpty(summarizeChecks(detail.Checks)),
 		UnresolvedThreadCount: &unresolvedCount,
 		ReviewState:           stringPtrIfNotEmpty(detail.ReviewDecision),
