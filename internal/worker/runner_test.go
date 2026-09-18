@@ -2909,6 +2909,131 @@ func TestProcessClaimedItemAutoDiscoveredIssueSkipsSelfAssignWhenAssigneePolicyD
 	}
 }
 
+func TestEnsureLoopForDiscoveredIssueInheritsPlannerSpecPullRequest(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{}, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+	ctx := context.Background()
+	project, err := fixture.repos.Projects.GetByID(ctx, "project_1")
+	if err != nil || project == nil {
+		t.Fatalf("Projects.GetByID() = (%#v, %v), want project", project, err)
+	}
+	nowISO := fixture.nowISO()
+	plannerTargetID := "issue:acme/looper:52"
+	plannerMeta := `{"specPath":"specs/52.md","prNumber":42}`
+	prNumber := int64(42)
+	if err := fixture.repos.Loops.Upsert(ctx, storage.LoopRecord{ID: "loop_planner_1", Seq: 2, ProjectID: "project_1", Type: "planner", TargetType: "issue", TargetID: &plannerTargetID, Repo: stringPtr("acme/looper"), PRNumber: &prNumber, Status: "completed", MetadataJSON: &plannerMeta, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	snapshotPayload := `{"detail":{"state":"open"}}`
+	if err := fixture.repos.PullRequestSnapshots.Upsert(ctx, storage.PullRequestSnapshotRecord{ID: "snapshot_1", ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42, PayloadJSON: &snapshotPayload, CapturedAt: nowISO, CreatedAt: nowISO}); err != nil {
+		t.Fatalf("PullRequestSnapshots.Upsert() error = %v", err)
+	}
+	issue := IssueSummary{Number: 52, Title: "Implement worker loop", URL: "https://example/issues/52", Labels: []string{"looper:worker-ready"}}
+	fingerprint := buildWorkerDiscoveryFingerprint("acme/looper", derefString(project.BaseBranch), issue)
+	loopResult, err := runner.ensureLoopForDiscoveredIssue(ctx, *project, "acme/looper", issue, fingerprint)
+	if err != nil {
+		t.Fatalf("ensureLoopForDiscoveredIssue() error = %v", err)
+	}
+	loop := loopResult.record
+	if !loopResult.created || loop.TargetType != "pull_request" || derefString(loop.TargetID) != "pr:acme/looper:42" || derefInt64(loop.PRNumber) != 42 {
+		t.Fatalf("loop = %#v (created=%v), want new pull_request loop targeting pr:acme/looper:42", loop, loopResult.created)
+	}
+	queueItem, err := runner.enqueueDiscoveredIssue(ctx, *project, loop, "acme/looper", issue, fingerprint)
+	if err != nil {
+		t.Fatalf("enqueueDiscoveredIssue() error = %v", err)
+	}
+	if queueItem.TargetType != "pull_request" || queueItem.TargetID != "pr:acme/looper:42" || derefInt64(queueItem.PRNumber) != 42 {
+		t.Fatalf("queueItem target = %s %s pr=%v, want pull_request pr:acme/looper:42", queueItem.TargetType, queueItem.TargetID, queueItem.PRNumber)
+	}
+	if queueItem.DedupeKey != "worker:project_1:acme/looper:42" || derefString(queueItem.LockKey) != storage.PullRequestLockKey("project_1", "acme/looper", 42) {
+		t.Fatalf("queueItem dedupe/lock = %q/%q, want PR-scoped keys", queueItem.DedupeKey, derefString(queueItem.LockKey))
+	}
+	payload := parseJSONObject(queueItem.PayloadJSON)
+	if stringFromAnyDefault(payload["specPath"]) != "specs/52.md" || int64FromAny(payload["prNumber"]) != 42 || stringFromAnyDefault(payload["executionMode"]) != "push-existing" || int64FromAny(payload["issueNumber"]) != 52 {
+		t.Fatalf("payload = %s, want specPath/prNumber/push-existing inherited from planner", derefString(queueItem.PayloadJSON))
+	}
+}
+
+func TestEnsureLoopForDiscoveredIssueKeepsIssueTargetWhenPlannerPRClosed(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{}, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+	ctx := context.Background()
+	project, err := fixture.repos.Projects.GetByID(ctx, "project_1")
+	if err != nil || project == nil {
+		t.Fatalf("Projects.GetByID() = (%#v, %v), want project", project, err)
+	}
+	nowISO := fixture.nowISO()
+	plannerTargetID := "issue:acme/looper:52"
+	plannerMeta := `{"specPath":"specs/52.md","prNumber":42}`
+	prNumber := int64(42)
+	if err := fixture.repos.Loops.Upsert(ctx, storage.LoopRecord{ID: "loop_planner_1", Seq: 2, ProjectID: "project_1", Type: "planner", TargetType: "issue", TargetID: &plannerTargetID, Repo: stringPtr("acme/looper"), PRNumber: &prNumber, Status: "completed", MetadataJSON: &plannerMeta, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	snapshotPayload := `{"detail":{"state":"closed"}}`
+	if err := fixture.repos.PullRequestSnapshots.Upsert(ctx, storage.PullRequestSnapshotRecord{ID: "snapshot_1", ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42, PayloadJSON: &snapshotPayload, CapturedAt: nowISO, CreatedAt: nowISO}); err != nil {
+		t.Fatalf("PullRequestSnapshots.Upsert() error = %v", err)
+	}
+	issue := IssueSummary{Number: 52, Title: "Implement worker loop", URL: "https://example/issues/52", Labels: []string{"looper:worker-ready"}}
+	fingerprint := buildWorkerDiscoveryFingerprint("acme/looper", derefString(project.BaseBranch), issue)
+	loopResult, err := runner.ensureLoopForDiscoveredIssue(ctx, *project, "acme/looper", issue, fingerprint)
+	if err != nil {
+		t.Fatalf("ensureLoopForDiscoveredIssue() error = %v", err)
+	}
+	loop := loopResult.record
+	if !loopResult.created || loop.TargetType != "issue" || derefString(loop.TargetID) != "issue:acme/looper:52" || loop.PRNumber != nil {
+		t.Fatalf("loop = %#v (created=%v), want new issue loop without prNumber", loop, loopResult.created)
+	}
+	workerMeta, _ := parseJSONObject(loop.MetadataJSON)["worker"].(map[string]any)
+	if stringFromAnyDefault(workerMeta["specPath"]) != "specs/52.md" {
+		t.Fatalf("worker metadata = %s, want inherited specPath", derefString(loop.MetadataJSON))
+	}
+}
+
+func TestEnsureLoopForDiscoveredIssueMergesSpecPathIntoExistingIssueLoop(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{}, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+	ctx := context.Background()
+	project, err := fixture.repos.Projects.GetByID(ctx, "project_1")
+	if err != nil || project == nil {
+		t.Fatalf("Projects.GetByID() = (%#v, %v), want project", project, err)
+	}
+	nowISO := fixture.nowISO()
+	issueTargetID := "issue:acme/looper:52"
+	existingMeta := `{"worker":{"title":"Implement worker loop","repo":"acme/looper","issueNumber":52,"baseBranch":"main","executionMode":"create-pr"}}`
+	if err := fixture.repos.Loops.Upsert(ctx, storage.LoopRecord{ID: "loop_worker_52", Seq: 2, ProjectID: "project_1", Type: "worker", TargetType: "issue", TargetID: &issueTargetID, Repo: stringPtr("acme/looper"), Status: "queued", MetadataJSON: &existingMeta, NextRunAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	plannerMeta := `{"specPath":"specs/52.md","prNumber":42}`
+	prNumber := int64(42)
+	if err := fixture.repos.Loops.Upsert(ctx, storage.LoopRecord{ID: "loop_planner_1", Seq: 3, ProjectID: "project_1", Type: "planner", TargetType: "issue", TargetID: &issueTargetID, Repo: stringPtr("acme/looper"), PRNumber: &prNumber, Status: "completed", MetadataJSON: &plannerMeta, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	snapshotPayload := `{"detail":{"state":"open"}}`
+	if err := fixture.repos.PullRequestSnapshots.Upsert(ctx, storage.PullRequestSnapshotRecord{ID: "snapshot_1", ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42, PayloadJSON: &snapshotPayload, CapturedAt: nowISO, CreatedAt: nowISO}); err != nil {
+		t.Fatalf("PullRequestSnapshots.Upsert() error = %v", err)
+	}
+	issue := IssueSummary{Number: 52, Title: "Implement worker loop", URL: "https://example/issues/52", Labels: []string{"looper:worker-ready"}}
+	fingerprint := buildWorkerDiscoveryFingerprint("acme/looper", derefString(project.BaseBranch), issue)
+	loopResult, err := runner.ensureLoopForDiscoveredIssue(ctx, *project, "acme/looper", issue, fingerprint)
+	if err != nil {
+		t.Fatalf("ensureLoopForDiscoveredIssue() error = %v", err)
+	}
+	loop := loopResult.record
+	if loopResult.created || loop.TargetType != "issue" || loop.PRNumber != nil {
+		t.Fatalf("loop = %#v (created=%v), want existing issue loop kept on issue target", loop, loopResult.created)
+	}
+	workerMeta, _ := parseJSONObject(loop.MetadataJSON)["worker"].(map[string]any)
+	if stringFromAnyDefault(workerMeta["specPath"]) != "specs/52.md" {
+		t.Fatalf("worker metadata = %s, want merged specPath", derefString(loop.MetadataJSON))
+	}
+	if int64FromAny(workerMeta["prNumber"]) != 0 {
+		t.Fatalf("worker metadata = %s, want no prNumber on issue-targeted loop", derefString(loop.MetadataJSON))
+	}
+}
+
 func TestProcessClaimedItemForgejoPromptAvoidsGitHubCLIText(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)

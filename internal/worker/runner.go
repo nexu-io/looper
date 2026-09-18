@@ -2945,12 +2945,15 @@ func (r *Runner) ensureLoopForDiscoveredIssue(ctx context.Context, project stora
 	nowISO := r.nowISO()
 	targetID := buildIssueTargetID(repo, issue.Number)
 	baseBranch := firstNonEmpty(derefString(project.BaseBranch), "main")
-	work := workerInput{Title: firstNonEmpty(issue.Title, buildDefaultIssueWorkerTitle(repo, issue.Number)), Repo: repo, BaseBranch: baseBranch, ExecutionMode: "create-pr", IssueNumber: issue.Number, IssueURL: issue.URL, TriggerLogin: issue.Author, AutoDiscovered: true}
-	workerMeta := map[string]any{"worker": mergeWorkerMetadata(parseJSONObject(nil), work)}
 	existingLoops, err := r.repos.Loops.List(ctx)
 	if err != nil {
 		return loopUpsertResult{}, err
 	}
+	specPath, prNumber, err := r.plannerOutputForDiscoveredIssue(ctx, project.ID, repo, issue.Number, existingLoops)
+	if err != nil {
+		return loopUpsertResult{}, err
+	}
+	work := workerInput{Title: firstNonEmpty(issue.Title, buildDefaultIssueWorkerTitle(repo, issue.Number)), SpecPath: specPath, Repo: repo, BaseBranch: baseBranch, ExecutionMode: "create-pr", IssueNumber: issue.Number, IssueURL: issue.URL, TriggerLogin: issue.Author, AutoDiscovered: true}
 	for _, existing := range existingLoops {
 		if workerLoopTracksIssue(existing, project.ID, repo, issue.Number) {
 			pausedOrCompleted := existing.Status == "paused" || existing.Status == "human_takeover" || existing.Status == "completed" || existing.Status == "awaiting_human"
@@ -2976,20 +2979,77 @@ func (r *Runner) ensureLoopForDiscoveredIssue(ctx context.Context, project stora
 			return loopUpsertResult{record: updated}, nil
 		}
 	}
+
+	work.PRNumber = prNumber
 	seq, err := r.repos.Loops.AllocateSeq(ctx)
 	if err != nil {
 		return loopUpsertResult{}, err
 	}
-	metadataJSON := mustMarshalJSON(workerMeta)
-	loop := storage.LoopRecord{ID: eventlog.NewEventID("loop"), Seq: seq, ProjectID: project.ID, Type: "worker", TargetType: "issue", TargetID: &targetID, Repo: &repo, Status: "queued", MetadataJSON: &metadataJSON, NextRunAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}
+	loop := storage.LoopRecord{ID: eventlog.NewEventID("loop"), Seq: seq, ProjectID: project.ID, Type: "worker", TargetType: "issue", TargetID: &targetID, Repo: &repo, Status: "queued", NextRunAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if prNumber > 0 {
+		work.ExecutionMode = "push-existing"
+		prTargetID := fmt.Sprintf("pr:%s:%d", repo, prNumber)
+		loop.TargetType = "pull_request"
+		loop.TargetID = &prTargetID
+		loop.PRNumber = &prNumber
+	}
+	metadataJSON := mustMarshalJSON(map[string]any{"worker": mergeWorkerMetadata(parseJSONObject(nil), work)})
+	loop.MetadataJSON = &metadataJSON
 	if err := r.repos.Loops.Upsert(ctx, loop); err != nil {
 		return loopUpsertResult{}, err
 	}
 	return loopUpsertResult{record: loop, created: true}, nil
 }
 
+func (r *Runner) plannerOutputForDiscoveredIssue(ctx context.Context, projectID, repo string, issueNumber int64, loopsList []storage.LoopRecord) (string, int64, error) {
+	targetID := buildIssueTargetID(repo, issueNumber)
+	for _, loop := range loopsList {
+		if loop.ProjectID != projectID || loop.Type != "planner" || loop.TargetType != "issue" || derefString(loop.TargetID) != targetID {
+			continue
+		}
+		metadata := parseJSONObject(loop.MetadataJSON)
+		specPath := stringFromAnyDefault(metadata["specPath"])
+		prNumber := firstNonZero(derefInt64(loop.PRNumber), int64FromAny(metadata["prNumber"]))
+		if prNumber <= 0 {
+			return specPath, 0, nil
+		}
+		isOpen, known, err := r.plannerPullRequestOpenState(ctx, projectID, repo, prNumber)
+		if err != nil {
+			return "", 0, err
+		}
+		if known && !isOpen {
+			return specPath, 0, nil
+		}
+		return specPath, prNumber, nil
+	}
+	return "", 0, nil
+}
+
+func (r *Runner) plannerPullRequestOpenState(ctx context.Context, projectID, repo string, prNumber int64) (bool, bool, error) {
+	if r.repos == nil || r.repos.PullRequestSnapshots == nil || prNumber <= 0 {
+		return false, prNumber <= 0, nil
+	}
+	snapshot, err := r.repos.PullRequestSnapshots.GetLatestByProject(ctx, projectID, repo, prNumber)
+	if err != nil {
+		return false, false, err
+	}
+	if snapshot == nil {
+		return false, false, nil
+	}
+	payload := parseJSONObject(snapshot.PayloadJSON)
+	detail, _ := payload["detail"].(map[string]any)
+	state := firstNonEmpty(stringFromAnyDefault(detail["state"]), stringFromAnyDefault(detail["State"]))
+	if state == "" {
+		return false, false, nil
+	}
+	return strings.EqualFold(state, "open"), true, nil
+}
+
 func (r *Runner) enqueueDiscoveredIssue(ctx context.Context, project storage.ProjectRecord, loop storage.LoopRecord, repo string, issue IssueSummary, fingerprint string) (storage.QueueItemRecord, error) {
 	dedupeKey := buildWorkerIssueDedupeKey(project.ID, repo, issue.Number)
+	if loop.TargetType == "pull_request" && derefInt64(loop.PRNumber) > 0 {
+		dedupeKey = fmt.Sprintf("worker:%s:%s:%d", project.ID, repo, derefInt64(loop.PRNumber))
+	}
 	existing, err := r.repos.Queue.FindActiveByDedupe(ctx, dedupeKey)
 	if err != nil {
 		return storage.QueueItemRecord{}, err
@@ -2999,12 +3059,30 @@ func (r *Runner) enqueueDiscoveredIssue(ctx context.Context, project storage.Pro
 	}
 	nowISO := r.nowISO()
 	baseBranch := firstNonEmpty(derefString(project.BaseBranch), "main")
-	payload := mustMarshalJSON(map[string]any{"title": firstNonEmpty(issue.Title, buildDefaultIssueWorkerTitle(repo, issue.Number)), "repo": repo, "baseBranch": baseBranch, "executionMode": "create-pr", "issueNumber": issue.Number, "issueUrl": issue.URL, "triggerLogin": issue.Author, "autoDiscovered": true, "discoveryFingerprint": fingerprint})
+	workerMeta, _ := parseJSONObject(loop.MetadataJSON)["worker"].(map[string]any)
+	specPath := stringFromAnyDefault(workerMeta["specPath"])
+	payloadFields := map[string]any{"title": firstNonEmpty(issue.Title, buildDefaultIssueWorkerTitle(repo, issue.Number)), "repo": repo, "baseBranch": baseBranch, "issueNumber": issue.Number, "issueUrl": issue.URL, "triggerLogin": issue.Author, "autoDiscovered": true, "discoveryFingerprint": fingerprint}
+	targetType := "issue"
 	targetID := buildIssueTargetID(repo, issue.Number)
 	lockKey := storage.IssueLockKey(project.ID, repo, issue.Number)
+	var prNumber *int64
+	if loop.TargetType == "pull_request" && derefInt64(loop.PRNumber) > 0 {
+		targetType = "pull_request"
+		targetID = derefString(loop.TargetID)
+		prNumber = loop.PRNumber
+		lockKey = storage.PullRequestLockKey(project.ID, repo, *prNumber)
+		payloadFields["executionMode"] = "push-existing"
+		payloadFields["prNumber"] = *prNumber
+	} else {
+		payloadFields["executionMode"] = "create-pr"
+	}
+	if specPath != "" {
+		payloadFields["specPath"] = specPath
+	}
+	payload := mustMarshalJSON(payloadFields)
 	projectID := project.ID
 	loopID := loop.ID
-	queueItem := storage.QueueItemRecord{ID: eventlog.NewEventID("queue"), ProjectID: &projectID, LoopID: &loopID, Type: "worker", TargetType: "issue", TargetID: targetID, Repo: &repo, DedupeKey: dedupeKey, Priority: storage.QueuePriorityWorker, Status: "queued", AvailableAt: nowISO, Attempts: 0, MaxAttempts: r.retryMaxAttempts, LockKey: &lockKey, PayloadJSON: &payload, CreatedAt: nowISO, UpdatedAt: nowISO}
+	queueItem := storage.QueueItemRecord{ID: eventlog.NewEventID("queue"), ProjectID: &projectID, LoopID: &loopID, Type: "worker", TargetType: targetType, TargetID: targetID, Repo: &repo, PRNumber: prNumber, DedupeKey: dedupeKey, Priority: storage.QueuePriorityWorker, Status: "queued", AvailableAt: nowISO, Attempts: 0, MaxAttempts: r.retryMaxAttempts, LockKey: &lockKey, PayloadJSON: &payload, CreatedAt: nowISO, UpdatedAt: nowISO}
 	persisted, created, err := r.repos.Queue.CreateOrGetActiveByDedupe(ctx, queueItem)
 	if err != nil {
 		return storage.QueueItemRecord{}, err
