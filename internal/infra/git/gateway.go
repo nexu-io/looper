@@ -74,6 +74,7 @@ type PrepareWorktreeInput struct {
 	Branch          string
 	Ref             string
 	ExpectedHeadSHA string
+	BaseSHA         string
 	Remote          string
 }
 
@@ -164,6 +165,7 @@ func (e *ProtectedBranchError) Error() string {
 type RemoteHeadChangedError struct {
 	Branch          string
 	ExpectedHeadSHA string
+	BaseSHA         string
 	ActualHeadSHA   string
 }
 
@@ -710,6 +712,12 @@ func (g *Gateway) PrepareWorktree(ctx context.Context, input PrepareWorktreeInpu
 	}
 	if targetSpec == "" {
 		return PrepareWorktreeResult{}, fmt.Errorf("branch or ref is required")
+	}
+	// Fetch the immutable base before the PR head: the head fetch owns FETCH_HEAD.
+	if input.BaseSHA != "" {
+		if err := g.runGit(ctx, input.WorktreePath, nil, "fetch", remote, input.BaseSHA); err != nil {
+			return PrepareWorktreeResult{}, err
+		}
 	}
 	if err := g.runGit(ctx, input.WorktreePath, nil, "fetch", remote, targetSpec); err != nil {
 		return PrepareWorktreeResult{}, err

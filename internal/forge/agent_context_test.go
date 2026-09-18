@@ -72,7 +72,10 @@ func TestHostingAgentContextUsesAvailableRoleTarget(t *testing.T) {
 						}
 					}
 					if tc.wantPR {
-						for _, required := range []string{"host api pulls/42.", "host api pulls/42 --diff", "host api issues/42/comments --paginate", "host api pulls/42/reviews --paginate"} {
+						if tc.role == "reviewer" && strings.Contains(got, "--diff") {
+							t.Error("reviewer context must use local Git for patches")
+						}
+						for _, required := range []string{"host api pulls/42.", "host api issues/42/comments --paginate", "host api pulls/42/reviews --paginate"} {
 							if !strings.Contains(got, required) {
 								t.Errorf("PR context missing %q: %s", required, got)
 							}

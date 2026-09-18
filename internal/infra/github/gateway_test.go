@@ -2163,7 +2163,7 @@ func TestGatewayCapturePullRequestSnapshotPreservesFullDetails(t *testing.T) {
 	}
 }
 
-func TestGatewayCapturePullRequestSnapshotTruncatesTooLargeDiff(t *testing.T) {
+func TestGatewayCapturePullRequestSnapshotDoesNotRequireRemoteDiff(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {
 		name           string
@@ -2188,6 +2188,7 @@ func TestGatewayCapturePullRequestSnapshotTruncatesTooLargeDiff(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			runner := &fakeGHRunner{t: t}
+			snapshotting := false
 			runner.respond = func(options shell.Options) (shell.Result, error) {
 				args := strings.Join(options.Args, " ")
 				switch {
@@ -2198,6 +2199,9 @@ func TestGatewayCapturePullRequestSnapshotTruncatesTooLargeDiff(t *testing.T) {
 				case strings.HasPrefix(args, "api --paginate repos/acme/looper/issues/42/comments --jq "):
 					return shell.Result{}, nil
 				case strings.HasPrefix(args, "pr diff"):
+					if snapshotting {
+						t.Fatal("snapshot requested remote diff")
+					}
 					return tc.diffResult, tc.diffErr
 				case strings.HasPrefix(args, "api user"):
 					return shell.Result{Stdout: "looper-bot\n"}, nil
@@ -2213,12 +2217,13 @@ func TestGatewayCapturePullRequestSnapshotTruncatesTooLargeDiff(t *testing.T) {
 				t.Fatalf("GetPullRequestDiff() error = %v, want %v", getErr, tc.wantGetDiffErr)
 			}
 
+			snapshotting = true
 			snapshot, err := gateway.CapturePullRequestSnapshot(context.Background(), CapturePullRequestSnapshotInput{ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42})
 			if err != nil {
 				t.Fatalf("CapturePullRequestSnapshot() error = %v", err)
 			}
-			if snapshot.PayloadJSON == nil || !strings.Contains(*snapshot.PayloadJSON, `"diffTruncated":true`) || !strings.Contains(*snapshot.PayloadJSON, `"diffTruncationReason":"`+tc.wantReason+`"`) {
-				t.Fatalf("PayloadJSON = %v, want truncated marker with reason %q", snapshot.PayloadJSON, tc.wantReason)
+			if snapshot.PayloadJSON == nil || strings.Contains(*snapshot.PayloadJSON, `"diff`) || snapshot.DiffRef != nil {
+				t.Fatalf("snapshot must contain metadata only: %+v", snapshot)
 			}
 		})
 	}

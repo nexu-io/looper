@@ -250,12 +250,11 @@ func (a reviewerIntegrationGatewayAdapter) ViewPullRequest(ctx context.Context, 
 	if err != nil {
 		return PullRequestDetail{}, err
 	}
-	diff, _ := a.Gateway.GetPullRequestDiff(ctx, githubinfra.GetPullRequestDiffInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD})
 	issueComments := make([]map[string]any, 0, len(detail.IssueComments))
 	for _, comment := range detail.IssueComments {
 		issueComments = append(issueComments, map[string]any{"body": comment.Body})
 	}
-	return PullRequestDetail{Number: detail.Number, Title: detail.Title, Body: detail.Body, State: detail.State, IsDraft: detail.IsDraft, ReviewDecision: detail.ReviewDecision, Labels: append([]string(nil), detail.Labels...), HeadSHA: detail.HeadSHA, BaseSHA: detail.BaseSHA, HeadRefName: detail.HeadRefName, BaseRefName: detail.BaseRefName, Author: detail.Author, ReviewRequests: append([]string(nil), detail.ReviewRequests...), HasConflicts: detail.HasConflicts, Diff: diff, Comments: detail.Comments, IssueComments: issueComments, Reviews: detail.Reviews}, nil
+	return PullRequestDetail{Number: detail.Number, Title: detail.Title, Body: detail.Body, State: detail.State, IsDraft: detail.IsDraft, ReviewDecision: detail.ReviewDecision, Labels: append([]string(nil), detail.Labels...), HeadSHA: detail.HeadSHA, BaseSHA: detail.BaseSHA, HeadRefName: detail.HeadRefName, BaseRefName: detail.BaseRefName, Author: detail.Author, ReviewRequests: append([]string(nil), detail.ReviewRequests...), HasConflicts: detail.HasConflicts, Comments: detail.Comments, IssueComments: issueComments, Reviews: detail.Reviews}, nil
 }
 
 func (a reviewerIntegrationGatewayAdapter) LoadPullRequestReviews(ctx context.Context, input ViewPullRequestInput) ([]map[string]any, error) {
@@ -376,4 +375,98 @@ func reviewEventsToStringsLocal(events []ReviewEvent) []string {
 		result = append(result, string(event))
 	}
 	return result
+}
+
+func TestReviewerBaseAdvanceBeforePublishWithFakeGH(t *testing.T) {
+	bins := harness.MustBinaries(t)
+	fakeGH := harness.NewFakeGH(t, bins, harness.GHSchema{JSONFieldAllowlist: map[string][]string{"pr view": {"number", "title", "body", "url", "state", "createdAt", "updatedAt", "closedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "authorAssociation", "reviewRequests", "comments", "reviews", "statusCheckRollup", "mergeStateStatus"}}})
+	for key, value := range fakeGH.EnvMap() {
+		t.Setenv(key, value)
+	}
+	fakeGH.WriteState(t, harness.GHState{
+		Commands: map[string]any{"pr diff": map[string]any{"stdout": json.RawMessage(`"diff --git a/app.go b/app.go\n@@ -1,1 +1,2 @@\n-old\n+new\n+more\n"`)}},
+		Routes: map[string]any{
+			"repos/acme/looper/issues/358":               json.RawMessage(`{"number":358,"title":"Auto merge","body":"## Acceptance criteria\n- ship app change\n- add more\n","html_url":"https://example.test/issues/358","state":"open","created_at":"2026-05-14T12:00:00Z","updated_at":"2026-05-14T12:00:00Z","user":{"login":"octo"},"labels":[{"name":"triaged"},{"name":"dispatch/plan"}]}`),
+			"repos/acme/looper":                          json.RawMessage(`{"allow_squash_merge":true,"allow_merge_commit":true,"allow_rebase_merge":true,"allow_auto_merge":true}`),
+			"repos/acme/looper/branches/main/protection": json.RawMessage(`{"required_status_checks":{"contexts":["ci"]}}`),
+		},
+		CurrentUserLogin: "reviewer",
+		PullRequests: map[string]harness.GHPullRequest{
+			"acme/looper#42": {Number: 42, Repo: "acme/looper", Title: "Review me", Body: "Implements feature.\n\nCloses #358", State: "OPEN", Labels: []string{"looper:worker-ready"}, HeadRefName: "feature/review-me", BaseRefName: "main", HeadSHA: "abc123", BaseSHA: "base123", Author: "octocat", ReviewRequests: []string{"reviewer"}},
+		},
+	})
+
+	fixture := newRunnerFixture(t)
+	ctx := context.Background()
+	repoPath := t.TempDir()
+	baseBranch := "main"
+	if err := fixture.repos.Projects.Upsert(ctx, storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: repoPath, BaseBranch: &baseBranch, CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	github := reviewerIntegrationGatewayAdapter{Gateway: githubinfra.New(githubinfra.Options{GHPath: fakeGH.Path, CWD: repoPath, Now: fixture.now})}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "No actionable findings", Stdout: `__LOOPER_RESULT__={"summary":"No actionable findings"}`, ParseStatus: "parsed"}}}
+	git := &baseDriftGitGateway{}
+	agent.onStart = func(AgentRunInput) {
+		state := readFakeGHState(t, fakeGH.StatePath)
+		pr := state.PullRequests["acme/looper#42"]
+		pr.BaseSHA = "advanced-base"
+		state.PullRequests["acme/looper#42"] = pr
+		fakeGH.WriteState(t, state)
+	}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, ReviewEvents: config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventApprove}, LoopConfig: testReviewerLoopConfig(), CustomInstructions: reviewerAutoMergeTestConfig(t), CriteriaVerifier: stubCriteriaVerifier{responses: map[criteria.AcceptanceCriterion]criteria.CriterionAssessment{
+		"ship app change": {Verdict: criteria.VerdictPass, Justification: "present in diff", Evidence: []criteria.Evidence{{FilePath: "app.go", StartLine: 1, EndLine: 2}}},
+		"add more":        {Verdict: criteria.VerdictPass, Justification: "present in diff", Evidence: []criteria.Evidence{{FilePath: "app.go", StartLine: 2, EndLine: 2}}},
+	}}})
+	repo := "acme/looper"
+	prNumber := int64(42)
+	metadata := `{"followUpdates":true,"loop":{"enabled":true}}`
+	loop := storage.LoopRecord{ID: "loop_fakegh_auto_merge_pass", Seq: 1, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "queued", MetadataJSON: &metadata, CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	if err := fixture.repos.Loops.Upsert(ctx, loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	queue, err := runner.enqueue(ctx, enqueueInput{ProjectID: "project_1", LoopID: loop.ID, Repo: repo, PRNumber: prNumber})
+	if err != nil {
+		t.Fatalf("enqueue() error = %v", err)
+	}
+	claimed, err := fixture.repos.Queue.ClaimNextOfType(ctx, fixture.nowISO(), "reviewer-worker-1", "reviewer")
+	if err != nil || claimed == nil || claimed.ID != queue.ID {
+		t.Fatalf("ClaimNextOfType() = (%#v, %v), want queue item %s", claimed, err, queue.ID)
+	}
+	result, err := runner.ProcessClaimedItem(ctx, *claimed)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	logBytes, err := os.ReadFile(fakeGH.InvocationLog)
+	if err != nil {
+		t.Fatalf("ReadFile(invocation log) error = %v", err)
+	}
+	if result.Status != "skipped" {
+		t.Fatalf("result = %#v\ninvocations:\n%s", result, string(logBytes))
+	}
+	run, err := fixture.repos.Runs.GetByID(ctx, result.RunID)
+	if err != nil || run == nil {
+		t.Fatalf("load run: %v, %v", run, err)
+	}
+	checkpoint := parseCheckpoint(run.CheckpointJSON)
+	if checkpoint.SkipKind != "stale" || checkpoint.PendingReview != nil || !strings.Contains(checkpoint.SkipReason, "PR base changed before publish") {
+		t.Fatalf("expected stale review with no pending publication, got %#v", checkpoint)
+	}
+	if git.diffReads != 0 {
+		t.Fatalf("criteria diff reads = %d, want none after base drift", git.diffReads)
+	}
+	for _, forbidden := range []string{`"--method","POST"`, `"pr","merge"`} {
+		if strings.Contains(string(logBytes), forbidden) {
+			t.Fatalf("unexpected publication after base drift: %s", logBytes)
+		}
+	}
+}
+
+type baseDriftGitGateway struct {
+	fakeGitGateway
+	diffReads int
+}
+
+func (g *baseDriftGitGateway) ReadPullRequestDiff(ctx context.Context, cwd, base, head string) (string, error) {
+	g.diffReads++
+	return g.fakeGitGateway.ReadPullRequestDiff(ctx, cwd, base, head)
 }

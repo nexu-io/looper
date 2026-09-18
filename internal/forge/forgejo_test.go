@@ -538,7 +538,7 @@ func TestForgejoClientTimeoutOption(t *testing.T) {
 	}
 }
 
-func TestForgejoPullRequestDiffRejectsOversizedResponses(t *testing.T) {
+func TestForgejoPullRequestDiffAllowsResponsesOverOneMiBByDefault(t *testing.T) {
 	t.Parallel()
 
 	diffPayload := strings.Repeat("d", maxForgejoResponseBodyBytes+1)
@@ -555,10 +555,12 @@ func TestForgejoPullRequestDiffRejectsOversizedResponses(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewForgejoClient() error = %v", err)
 	}
-
-	_, err = client.PullRequestDiff(context.Background(), 9)
-	if err == nil || !strings.Contains(err.Error(), "response exceeds") {
-		t.Fatalf("PullRequestDiff() error = %v, want oversized response failure", err)
+	diff, err := client.PullRequestDiff(context.Background(), 9)
+	if err != nil {
+		t.Fatalf("PullRequestDiff() error = %v, want unlimited default to accept 1MiB+1", err)
+	}
+	if diff != diffPayload {
+		t.Fatalf("PullRequestDiff() length = %d, want %d", len(diff), len(diffPayload))
 	}
 }
 

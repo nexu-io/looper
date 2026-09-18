@@ -20,6 +20,8 @@ import (
 )
 
 const defaultForgejoTimeout = 30 * time.Second
+
+// maxForgejoResponseBodyBytes bounds health probes and login discovery only.
 const maxForgejoResponseBodyBytes = 1 << 20
 
 type ForgejoClient struct {
@@ -76,6 +78,17 @@ func WithLookPath(lookPath func(string) (string, error)) ForgejoOption {
 	return func(forgejo *ForgejoClient) {
 		forgejo.lookPath = lookPath
 	}
+}
+
+func readBoundedResponse(r io.Reader, limit int) ([]byte, error) {
+	if limit <= 0 {
+		return io.ReadAll(r)
+	}
+	return io.ReadAll(io.LimitReader(r, int64(limit)+1))
+}
+
+func responseExceedsLimit(n, limit int) bool {
+	return limit > 0 && n > limit
 }
 
 func NewForgejoClient(ref RepositoryRef, token string, options ...ForgejoOption) (*ForgejoClient, error) {
@@ -213,9 +226,6 @@ func newForgejoClientFromTea(provider config.ProviderConfig, repo string, option
 		}
 	}
 	runner := client.teaRunner
-	if runner == nil {
-		runner = defaultTeaRunner{}
-	}
 	ctx, cancel := context.WithTimeout(context.Background(), teaLoginsListTimeout)
 	defer cancel()
 	teaPath, login, err := ValidateTeaLoginForProvider(ctx, provider, runner, client.lookPath)
@@ -226,7 +236,7 @@ func newForgejoClientFromTea(provider config.ProviderConfig, repo string, option
 	if client.httpClient != nil && client.httpClient.Timeout > 0 {
 		timeout = client.httpClient.Timeout
 	}
-	client.tea = newTeaTransport(teaPath, login.Name, baseURL, timeout, runner)
+	client.tea = newTeaTransport(teaPath, login.Name, baseURL, timeout, runner, 0)
 	return client, nil
 }
 
@@ -1049,18 +1059,12 @@ func (forgejo *ForgejoClient) doRaw(ctx context.Context, method string, path str
 		return rawResponse{}, fmt.Errorf("forgejo API %s %s failed: %w", method, path, err)
 	}
 	defer response.Body.Close()
-	responseBody, err := io.ReadAll(io.LimitReader(response.Body, maxForgejoResponseBodyBytes+1))
+	responseBody, err := io.ReadAll(response.Body)
 	if err != nil {
 		if forgejo.session != nil {
 			return rawResponse{}, &hostingidentity.Error{Identity: forgejo.session.Name(), Operation: "read Forgejo response", Reason: "cannot read hosting server response"}
 		}
 		return rawResponse{}, fmt.Errorf("forgejo API read response %s %s: %w", method, path, err)
-	}
-	if len(responseBody) > maxForgejoResponseBodyBytes {
-		if forgejo.session != nil {
-			return rawResponse{}, &hostingidentity.Error{Identity: forgejo.session.Name(), Operation: "read Forgejo response", Reason: "hosting server response exceeds size limit"}
-		}
-		return rawResponse{}, fmt.Errorf("forgejo API %s %s response exceeds %d bytes", method, path, maxForgejoResponseBodyBytes)
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		sanitized := sanitizeForgejoErrorBody(responseBody, token)

@@ -61,7 +61,7 @@ func TestForgejoAutoMergePublishRetryRetainsApprovalAndRejectsHeadDrift(t *testi
 			fixture := newRunnerFixture(t)
 			gateway := &forgejoImmediateMergeGateway{fakeGitHubGateway: &fakeGitHubGateway{
 				author: "octocat", currentLogin: "reviewer", reviewMarkerMissing: true, reviewRequests: []string{"reviewer"},
-				labels: []string{"looper:worker-ready"}, viewBody: "Closes #358", viewDiff: "diff --git a/app.go b/app.go\n@@ -1 +1 @@\n-old\n+new\n",
+				labels: []string{"looper:worker-ready"}, viewBody: "Closes #358",
 				issueDetail: githubinfra.IssueDetail{Number: 358, Body: "## Acceptance criteria\n- ship app change\n", Labels: []string{"triaged"}},
 			}}
 			cfg := reviewerAutoMergeTestConfig(t)
@@ -71,7 +71,7 @@ func TestForgejoAutoMergePublishRetryRetainsApprovalAndRejectsHeadDrift(t *testi
 			cfg.Roles.Reviewer.Discovery.Triggers.Labels = nil
 			cfg.Roles.Reviewer.Behavior.Loop = testReviewerLoopConfig()
 			agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "No actionable findings", Stdout: `__LOOPER_RESULT__={"summary":"No actionable findings"}`, ParseStatus: "parsed"}}}
-			runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: gateway, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, CustomInstructions: cfg, CriteriaVerifier: stubCriteriaVerifier{responses: map[criteria.AcceptanceCriterion]criteria.CriterionAssessment{"ship app change": {Verdict: criteria.VerdictPass, Justification: "present in diff", Evidence: []criteria.Evidence{{FilePath: "app.go", StartLine: 1, EndLine: 1}}}}}})
+			runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: gateway, Git: &fakeGitGateway{localDiff: "diff --git a/app.go b/app.go\n@@ -1 +1 @@\n-old\n+new\n"}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, CustomInstructions: cfg, CriteriaVerifier: stubCriteriaVerifier{responses: map[criteria.AcceptanceCriterion]criteria.CriterionAssessment{"ship app change": {Verdict: criteria.VerdictPass, Justification: "present in diff", Evidence: []criteria.Evidence{{FilePath: "app.go", StartLine: 1, EndLine: 1}}}}}})
 			ctx := context.Background()
 			repo, number, metadata := "acme/looper", int64(42), `{"followUpdates":true,"loop":{"enabled":true}}`
 			loop := storage.LoopRecord{ID: "loop_forgejo_ci", Seq: 1, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &number, Status: "queued", MetadataJSON: &metadata, CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
