@@ -4964,8 +4964,8 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 			r.logger.Warn("reviewer agent start notification failed", map[string]any{"loopId": input.Loop.ID, "runId": input.Run.ID, "error": err.Error()})
 		}
 	}
-	_ = r.tryAddReaction(ctx, input, reviewerInProgressReaction)
 	headMonitor := r.startReviewerHeadChangeMonitor(ctx, input, checkpoint, execution, executionID)
+	_ = r.tryAddReaction(ctx, input, reviewerInProgressReaction)
 	result, err := execution.Wait(ctx)
 	headChange := headMonitor.stop()
 	if headChange.Reason != "" {
@@ -5052,6 +5052,7 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 				if err := r.parkOrDeferReviewerScopeHuman(ctx, input.Loop, completion); err != nil {
 					return checkpoint, err
 				}
+				_ = r.tryRemoveReaction(ctx, input, reviewerInProgressReaction)
 				return checkpoint, reviewerScopeOrBudgetHoldSkip(ctx, r, input.Loop)
 			}
 			// Mixed must_fix + needs_human: publish must_fix first (publish step),
@@ -5592,6 +5593,7 @@ func (r *Runner) finishNativeNeedsHumanCompletion(ctx context.Context, input ste
 	if err := r.parkOrDeferReviewerScopeHuman(ctx, input.Loop, nativeCompletion); err != nil {
 		return checkpoint, err
 	}
+	_ = r.tryRemoveReaction(ctx, input, reviewerInProgressReaction)
 	return checkpoint, reviewerScopeOrBudgetHoldSkip(ctx, r, input.Loop)
 }
 
@@ -6182,6 +6184,7 @@ func (r *Runner) publishCommentOnlyReview(ctx context.Context, input stepInput, 
 		if err := r.parkOrDeferReviewerScopeHuman(ctx, input.Loop, completion); err != nil {
 			return err
 		}
+		_ = r.tryRemoveReaction(ctx, input, reviewerInProgressReaction)
 		return reviewerScopeOrBudgetHoldSkip(ctx, r, input.Loop)
 	}
 	comments, err := r.github.ListIssueComments(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.Project.RepoPath})
@@ -9180,6 +9183,7 @@ func (r *Runner) afterCommentOnlyPublishMaybeParkScope(ctx context.Context, inpu
 	if err := r.parkOrDeferReviewerScopeHuman(ctx, input.Loop, completion); err != nil {
 		return checkpoint, err
 	}
+	_ = r.tryRemoveReaction(ctx, input, reviewerInProgressReaction)
 	return checkpoint, reviewerScopeOrBudgetHoldSkip(ctx, r, input.Loop)
 }
 

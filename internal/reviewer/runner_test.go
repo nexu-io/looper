@@ -4761,6 +4761,50 @@ func TestProcessClaimedItemKeepsEyesWhenReviewAgentWaitFails(t *testing.T) {
 	}
 }
 
+func TestProcessClaimedItemRemovesEyesWhenParkingNeedsHuman(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{reviewRequests: []string{"octocat"}, reviewMarkerMissing: true}
+	stdout := `__LOOPER_RESULT__={"summary":"Need human","outcome":"blocking","findings":[{"title":"Ambiguous","body":"Unclear","disposition":"needs_human","severity":"blocking","scopeBasis":"ambiguous_intent","scopeEvidence":"AGENTS.md rule X","path":"a.go","line":1}]}`
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "Need human", Stdout: stdout, ParseStatus: "parsed"}}}
+	cfg, err := config.DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig: %v", err)
+	}
+	cfg.HITL.Enabled = false
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, CustomInstructions: &cfg, LoopConfig: testReviewerLoopConfig()})
+	ctx := context.Background()
+	nowISO := fixture.nowISO()
+	repo := "acme/looper"
+	prNumber := int64(42)
+	metadata := `{"followUpdates":true,"loop":{"enabled":true}}`
+	loop := storage.LoopRecord{ID: "loop_eyes_needs_human", Seq: 1, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "queued", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(ctx, loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	queue, err := runner.enqueue(ctx, enqueueInput{ProjectID: "project_1", LoopID: loop.ID, Repo: repo, PRNumber: prNumber})
+	if err != nil {
+		t.Fatalf("enqueue() error = %v", err)
+	}
+	claimed, err := fixture.repos.Queue.ClaimNextOfType(ctx, fixture.nowISO(), "reviewer-worker-1", "reviewer")
+	if err != nil || claimed == nil || claimed.ID != queue.ID {
+		t.Fatalf("ClaimNextOfType() = (%#v, %v), want queued item %s", claimed, err, queue.ID)
+	}
+	result, err := runner.ProcessClaimedItem(ctx, *claimed)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "skipped" {
+		t.Fatalf("result = %#v, want skipped after needs_human park", result)
+	}
+	if got := reactionContents(github.addReactionCalls); len(got) != 1 || got[0] != "eyes" {
+		t.Fatalf("addReactionCalls = %#v, want in-progress eyes", github.addReactionCalls)
+	}
+	if got := reactionContents(github.removeReactionCalls); len(got) != 1 || got[0] != "eyes" {
+		t.Fatalf("removeReactionCalls = %#v, want eyes cleared after parking for human input", github.removeReactionCalls)
+	}
+}
+
 func reactionContents(calls []PullRequestReactionInput) []string {
 	out := make([]string, 0, len(calls))
 	for _, call := range calls {
