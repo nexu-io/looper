@@ -90,6 +90,8 @@ var hotEditablePaths = map[string]struct{}{
 	"roles.reviewer.behavior.detectDuplicateFindings":                      {},
 	"roles.reviewer.behavior.nativeResume.onHeadChange":                    {},
 	"roles.reviewer.behavior.nativeResume.reReviewPromptOnHeadChange":      {},
+	"roles.reviewer.behavior.relatedFileGroups.enabled":                    {},
+	"roles.reviewer.behavior.relatedFileGroups.minChangedFiles":            {},
 	"roles.reviewer.behavior.threadResolution.enabled":                     {},
 	"roles.reviewer.behavior.threadResolution.mode":                        {},
 	"roles.reviewer.behavior.threadResolution.scope":                       {},

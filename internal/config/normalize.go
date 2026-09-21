@@ -1195,6 +1195,14 @@ func mergeReviewerConfig(config *ReviewerConfig, partial PartialReviewerConfig) 
 	if partial.ThreadResolution != nil {
 		mergeReviewerThreadResolutionConfig(&config.ThreadResolution, *partial.ThreadResolution)
 	}
+	if partial.RelatedFileGroups != nil {
+		if partial.RelatedFileGroups.Enabled != nil {
+			config.RelatedFileGroups.Enabled = *partial.RelatedFileGroups.Enabled
+		}
+		if partial.RelatedFileGroups.MinChangedFiles != nil {
+			config.RelatedFileGroups.MinChangedFiles = *partial.RelatedFileGroups.MinChangedFiles
+		}
+	}
 }
 
 func mergeReviewerRetryConfig(config *ReviewerRetryConfig, partial PartialReviewerRetryConfig) {
