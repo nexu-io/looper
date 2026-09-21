@@ -201,7 +201,10 @@ func TestBuiltinSkillFilesContainMigratedMethodText(t *testing.T) {
 		"Unverified is not wrong",
 		"Drop a candidate only when evidence proves it factually wrong",
 		"internal related-file plan",
-		"only if CSS or style files are in the changed set",
+		"CSS parsing or linting logic",
+		"A type documented as not concurrent does not disprove a race",
+		"the preexisting `v` is reused",
+		"On Go 1.23+, the garbage collector can recover unreferenced, unstopped timers",
 		"Stay one reviewer",
 	} {
 		if !strings.Contains(joined, want) {

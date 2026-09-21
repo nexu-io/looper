@@ -29,4 +29,4 @@ Always read:
 
 Read on demand:
 
-- [CSS linting](references/css-lint.md) — only if CSS or style files are in the changed set
+- [CSS linting](references/css-lint.md) — when the change set includes CSS parsing or linting logic, including Go, TypeScript, or other non-style implementations. Do not require a CSS or style file in the changed set. Ordinary CSS-only edits do not need this fixture-matrix guidance.
