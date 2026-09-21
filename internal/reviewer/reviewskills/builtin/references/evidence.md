@@ -8,7 +8,7 @@ Comment shape for every finding: trigger condition → actual path → wrong con
 
 Establish a real concurrent call path, the shared state, and the synchronization that is supposed to protect it. Do not infer a race from a mutex, channel, or `go` keyword alone.
 
-Positive: two goroutines have conflicting concurrent accesses to the same struct field / map / slice header, with at least one access a write and no lock, atomic, or channel handoff on that path.
+Positive: two goroutines have conflicting concurrent accesses to the same shared memory location (for example a struct field, map, slice header, ordinary variable, pointer target, array or slice element, interface value, or an object's internal storage), with at least one access a write and no lock, atomic, or channel handoff on that path.
 
 Negative: a per-call local variable, a value copied into a closure, or a field only mutated on a single-owner goroutine.
 
@@ -26,9 +26,11 @@ Negative: ownership is returned to the caller (`io.ReadCloser`, constructor that
 
 Name the untrusted input, a reachable path from that input, and the actual trust boundary.
 
-Positive: attacker-controlled bytes reach a sink (exec, query, path, template, authz check) that interprets them unsafely—missing parameterization, contextual escaping, or path confinement—without validation or a trust-boundary change.
+Positive (unsafe interpretation): attacker-controlled bytes reach a sink (exec, query, path, template) that interprets them unsafely—missing parameterization, contextual escaping, or path confinement—without validation or a trust-boundary change.
 
-Negative: the specific value has already been constrained for the destination sink, comes from a trusted config/operator surface, or never reaches the sink on the claimed path. Authentication or authorization to invoke an operation does not make user-supplied repository names, query strings, or template values trusted.
+Positive (authorization): a reachable path lets a principal perform an action on a resource that the policy forbids, because an ownership, tenant, or other authorization check is missing or applied to the wrong principal/resource. A valid, sink-constrained identifier (for example a UUID in a parameterized query) is not a drop reason for this case.
+
+Negative: the specific value has already been constrained for the destination sink, comes from a trusted config/operator surface, or never reaches the sink on the claimed path. Authentication or authorization to invoke an operation does not make user-supplied repository names, query strings, or template values trusted. Sink-constrained bytes do not disprove a missing or misapplied authorization check.
 
 ## Go loop variable / timer
 
@@ -62,7 +64,9 @@ Never write only "add tests". Name the failing behavior, the test file or packag
 
 ## Counterexample pass
 
-Run this pass in the same review context before finalizing. It is a conservative self-check, not a second model stage.
+Run this pass in the same review context before finalizing. It is a conservative self-check, not a second model stage. The authority for a drop is that same context (diff, callers, tests, contracts), not the first structured candidate list.
+
+This pass prevents publishing a finding the same context already disproves. Cost: one extra same-context pass and retained unverified findings (unverified is not a drop). It adds no persisted state, no second model, and no new evidence schema. Requiring stronger structured evidence fields is insufficient: extra fields would not catch a claimed path the existing context already falsifies, and this skill forbids inventing evidence records.
 
 Drop a candidate only when evidence proves it factually wrong, or when it is the same root cause as another finding (keep one representative).
 

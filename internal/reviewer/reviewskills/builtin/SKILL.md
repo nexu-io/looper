@@ -16,7 +16,7 @@ Do not treat skill selection as a scope reduction: if no specialty skill matches
 3. Read the surrounding context needed to judge each change (callers, tests, contracts, lifecycle).
 4. For large PRs (roughly ≥15 changed files, or changes that cross packages), write an internal related-file plan grouping interface/impl/callers, db/readers, and prod/tests. Stay one reviewer; do not spawn sub-agents or subtasks.
 5. Accumulate independent in-scope findings. Group only the same root cause; keep unrelated concerns separate.
-6. Run a counterexample pass in the same context before finalizing. Drop a candidate only when evidence proves it factually wrong or a same-root-cause duplicate. Unverified is not wrong.
+6. Run a counterexample pass in the same context before finalizing. The authority for dropping a candidate is that same review context (diff, callers, tests, contracts), not the agent's first structured finding list. Drop a candidate only when evidence proves it factually wrong or a same-root-cause duplicate. Unverified is not wrong.
 7. Deliver the existing disposition schema from the Looper prompt (`must_fix` | `follow_up` | `needs_human`, severity, scopeBasis, scopeEvidence). Write comments that meet the quality bar in the reference files.
 
 ## References
