@@ -272,6 +272,11 @@ func DefaultConfig(cwd string) (Config, error) {
 					TransientRetries:        3,
 					Scope:                   ReviewerAutoMergeScopeLooperOnly,
 				},
+				Skills: ReviewerSkillsConfig{
+					Mode:     ReviewerSkillsModeExtend,
+					Required: []string{},
+					Optional: []string{},
+				},
 			},
 			Fixer: FixerRoleConfig{
 				AutoDiscovery: true,

@@ -4935,26 +4935,48 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 		return checkpoint, fmt.Errorf("materialize reviewer skills: %w", err)
 	}
 	defer skillBundle.Close()
-	skillIndex := reviewskills.FormatIndex(skillBundle.Entries)
+	skillsCfg := config.ReviewerSkillsConfig{Mode: config.ReviewerSkillsModeExtend}
+	if r.projectRoleConfig != nil {
+		skillsCfg = config.ProjectRoleConfigs(*r.projectRoleConfig, input.Project.ID).Reviewer.Skills
+	}
+	userHome, homeErr := os.UserHomeDir()
+	if homeErr != nil {
+		return checkpoint, fmt.Errorf("resolve reviewer skills: %w", homeErr)
+	}
+	resolvedSkills, err := reviewskills.Resolve(reviewskills.ResolveInput{
+		Mode:       skillsCfg.Mode,
+		Required:   skillsCfg.Required,
+		Optional:   skillsCfg.Optional,
+		Worktree:   worktree.Path,
+		UserHome:   userHome,
+		BuiltinDir: skillBundle.Dir,
+	})
+	if err != nil {
+		return checkpoint, fmt.Errorf("resolve reviewer skills: %w", err)
+	}
+	skillIndex := reviewskills.FormatIndex(resolvedSkills.Entries)
 	prompt, instructionBlock := buildReviewPromptWithInstructions(input.Project.ID, r.customInstructions, input.Repo, input.PRNumber, checkpoint, input.Run.ID, idempotencyKey, reviewEvents, isManualReviewerLoop(input.Loop), requireReviewRequest, reviewRequestBypassReason, r.scope, r.disclosure, agentVendor, derefString(agentModel), r.looperCLIPath, r.reviewerAutoMergeConfigForProject(input.Project.ID).Enabled, commentOnlyCompletion, lastPublishedHeadSHA, skillIndex, hostingKindForContext(ctx))
 	nativeResumePrompt := r.nativeResumePromptForReview(ctx, input, checkpoint.Snapshot.HeadSHA, idempotencyKey, lastPublishedHeadSHA)
 	if nativeResumePrompt != "" {
-		if reminder := reviewskills.ResumeReminder(skillBundle.Entries); reminder != "" {
+		if reminder := reviewskills.ResumeReminder(resolvedSkills.Entries); reminder != "" {
 			nativeResumePrompt = nativeResumePrompt + "\n\n" + reminder
 		}
 	}
 	metadata := map[string]any{
-		"loopType":               "reviewer",
-		"phase":                  "review",
-		"repo":                   input.Repo,
-		"prNumber":               input.PRNumber,
-		"cleanReviewEvent":       string(reviewEvents.Clean),
-		"blockingReviewEvent":    string(reviewEvents.Blocking),
-		"expectedCommitID":       checkpoint.Snapshot.HeadSHA,
-		"reviewerManual":         isManualReviewerLoop(input.Loop),
-		"reviewerRunID":          input.Run.ID,
-		"reviewSkillsConfigured": reviewSkillMetadata(skillBundle.Entries),
-		"reviewSkillsRequired":   reviewSkillMetadata(requiredReviewSkills(skillBundle.Entries)),
+		"loopType":                "reviewer",
+		"phase":                   "review",
+		"repo":                    input.Repo,
+		"prNumber":                input.PRNumber,
+		"cleanReviewEvent":        string(reviewEvents.Clean),
+		"blockingReviewEvent":     string(reviewEvents.Blocking),
+		"expectedCommitID":        checkpoint.Snapshot.HeadSHA,
+		"reviewerManual":          isManualReviewerLoop(input.Loop),
+		"reviewerRunID":           input.Run.ID,
+		"reviewSkillsMode":        reviewerSkillsModeValue(skillsCfg.Mode),
+		"reviewSkillsConfigured":  reviewerSkillsConfiguredMetadata(skillsCfg),
+		"reviewSkillsRequired":    reviewSkillMetadata(requiredReviewSkills(resolvedSkills.Entries)),
+		"reviewSkillsOptional":    reviewSkillMetadata(optionalReviewSkills(resolvedSkills.Entries)),
+		"reviewSkillsUnavailable": append([]string(nil), resolvedSkills.Unavailable...),
 	}
 	for key, value := range config.CustomInstructionMetadata(instructionBlock, prompt) {
 		metadata[key] = value
@@ -10028,6 +10050,30 @@ func requiredReviewSkills(entries []reviewskills.Entry) []reviewskills.Entry {
 		}
 	}
 	return out
+}
+
+func optionalReviewSkills(entries []reviewskills.Entry) []reviewskills.Entry {
+	out := make([]reviewskills.Entry, 0, len(entries))
+	for _, entry := range entries {
+		if !entry.Required {
+			out = append(out, entry)
+		}
+	}
+	return out
+}
+
+func reviewerSkillsModeValue(mode config.ReviewerSkillsMode) string {
+	if mode == "" {
+		return string(config.ReviewerSkillsModeExtend)
+	}
+	return string(mode)
+}
+
+func reviewerSkillsConfiguredMetadata(cfg config.ReviewerSkillsConfig) map[string]any {
+	return map[string]any{
+		"required": append([]string(nil), cfg.Required...),
+		"optional": append([]string(nil), cfg.Optional...),
+	}
 }
 
 func cleanReviewAuthorTarget(checkpoint reviewerCheckpoint) string {

@@ -150,7 +150,7 @@ The hot-safe surface is an explicit allowlist (see [ADR-0014](adr/0014-config-fi
 - the current `disclosure.*` fields
 - `defaults.allowAutoCommit`, `defaults.allowAutoPush`, `defaults.allowRiskyFixes`, `defaults.openPrStrategy`, and `defaults.addSnapshotMode`; `defaults.baseBranch` is restart-bound because configured project records materialize it
 - `instructions.enabled` only
-- the current Planner discovery/trigger/instruction fields except `roles.planner.triggers.planeAssigneeId`; all current Worker and Fixer discovery/trigger/instruction fields; Reviewer discovery, most behavior, and instructions; and Coordinator polling, triage, dispatch, and merge-watch policy except `mergeWatch.transientRetries`
+- the current Planner discovery/trigger/instruction fields except `roles.planner.triggers.planeAssigneeId`; all current Worker and Fixer discovery/trigger/instruction fields; Reviewer discovery, most behavior, instructions, and skills; and Coordinator polling, triage, dispatch, and merge-watch policy except `mergeWatch.transientRetries`
 - `tools.looperPath` and `tools.osascriptPath`
 
 Profile and role agent vendor/model fields are hot-safe curated identity fields: a claim made after publication resolves against the new config; an already active run keeps the frozen agent snapshot it started with (resume/retry lineages copy that predecessor snapshot rather than re-resolving live config).
@@ -954,6 +954,53 @@ reReviewPromptOnHeadChange = false
 ```
 
 The reviewer defaults above are intentionally aggressive: clean reviews publish `APPROVE`, blocking reviews publish `REQUEST_CHANGES`, and `enableSelfReview` still defaults to `false`.
+
+### Reviewer skills
+
+Reviewer skills live at `roles.reviewer.skills` (and `projects[].roles.reviewer.skills`). They select extra `SKILL.md` files the reviewer agent must read before reviewing. An old config without `skills` stays valid and keeps the builtin `looper-review` method only.
+
+`roles.reviewer.instructions` still **replace** inherited instruction text (they do not append) and remain supplemental to skills. Skills do not grant publish permission.
+
+| Path | Purpose | Default |
+| --- | --- | --- |
+| `roles.reviewer.skills.mode` | `extend` keeps builtin `looper-review` and adds configured skills; `replace` drops builtin unless you list it | `"extend"` (empty is treated as extend) |
+| `roles.reviewer.skills.required` | Skill names or paths that must resolve or the review step fails | `[]` |
+| `roles.reviewer.skills.optional` | Skill names or paths that are skipped when missing | `[]` |
+
+`replace` requires at least one entry in `required`. Arrays replace as a whole; an explicit empty array clears the inherited list.
+
+Name lookup (first match wins): `{worktree}/.agents/skills/`, then `~/.agents/skills/`, then Looper's materialized builtin bundle. Matching uses the `SKILL.md` YAML `name:` field, not the directory name alone. Unconfigured user/project skills are never auto-enabled.
+
+In `extend` mode, builtin `looper-review` is injected from the builtin bundle directly. A project or user file named `looper-review` cannot shadow it; use `replace` to drop builtin.
+
+Two different real files at the same lookup layer with the same `name:` is a configuration error. Symlink aliases of one real path are deduped. A high-priority file that exists but is unreadable or has invalid frontmatter fails the review; Looper does not fall back to a lower layer. Missing required skills fail the review; missing optional skills are recorded as `reviewSkillsUnavailable` and the run continues.
+
+Refs that start with `./`, `../`, `/`, or `~/` are paths. `~/` expands to the daemon user's home directory. Relative paths are resolved against the prepared reviewer worktree. Absolute paths are user-managed.
+
+Extend (JSON):
+
+```json
+{
+  "roles": {
+    "reviewer": {
+      "skills": {
+        "mode": "extend",
+        "required": ["security-review"],
+        "optional": ["perf-review"]
+      }
+    }
+  }
+}
+```
+
+Replace (TOML):
+
+```toml
+[roles.reviewer.skills]
+mode = "replace"
+required = ["security-review", "./review-skills/team-bar.md"]
+optional = ["perf-review"]
+```
 
 ### Review-fix budget
 

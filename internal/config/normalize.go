@@ -1491,6 +1491,9 @@ func mergeReviewerRoleConfig(config *ReviewerRoleConfig, partial PartialReviewer
 	if partial.Instructions != nil {
 		config.Instructions = *partial.Instructions
 	}
+	if partial.Skills != nil {
+		mergeReviewerSkillsConfig(&config.Skills, *partial.Skills)
+	}
 	if partial.Agent != nil {
 		mergeRoleAgentConfig(&config.Agent, partial.Agent)
 	}
@@ -1511,6 +1514,18 @@ func mergeReviewerAutoMergeConfig(config *ReviewerAutoMergeConfig, partial Parti
 	}
 	if partial.Scope != nil {
 		config.Scope = *partial.Scope
+	}
+}
+
+func mergeReviewerSkillsConfig(config *ReviewerSkillsConfig, partial PartialReviewerSkillsConfig) {
+	if partial.Mode != nil {
+		config.Mode = *partial.Mode
+	}
+	if partial.Required != nil {
+		config.Required = cloneStrings(*partial.Required)
+	}
+	if partial.Optional != nil {
+		config.Optional = cloneStrings(*partial.Optional)
 	}
 }
 
@@ -2142,6 +2157,18 @@ func clonePartialRoleConfigs(configs *PartialRoleConfigs) *PartialRoleConfigs {
 				behavior.ThreadResolution = &threadResolution
 			}
 			reviewer.Behavior = &behavior
+		}
+		if configs.Reviewer.Skills != nil {
+			skills := *configs.Reviewer.Skills
+			if skills.Required != nil {
+				required := cloneStrings(*skills.Required)
+				skills.Required = &required
+			}
+			if skills.Optional != nil {
+				optional := cloneStrings(*skills.Optional)
+				skills.Optional = &optional
+			}
+			reviewer.Skills = &skills
 		}
 		reviewer.Agent = cloneRoleAgentConfig(configs.Reviewer.Agent)
 		cloned.Reviewer = &reviewer

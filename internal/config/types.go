@@ -481,6 +481,25 @@ type ReviewerAutoMergeConfig struct {
 	Scope                   ReviewerAutoMergeScope    `json:"scope"`
 }
 
+type ReviewerSkillsMode string
+
+const (
+	ReviewerSkillsModeExtend  ReviewerSkillsMode = "extend"
+	ReviewerSkillsModeReplace ReviewerSkillsMode = "replace"
+)
+
+type ReviewerSkillsConfig struct {
+	Mode     ReviewerSkillsMode `json:"mode"`
+	Required []string           `json:"required"`
+	Optional []string           `json:"optional"`
+}
+
+type PartialReviewerSkillsConfig struct {
+	Mode     *ReviewerSkillsMode `json:"mode,omitempty"`
+	Required *[]string           `json:"required,omitempty"`
+	Optional *[]string           `json:"optional,omitempty"`
+}
+
 type IssueRoleTriggersConfig struct {
 	Labels                     []string  `json:"labels"`
 	LabelMode                  LabelMode `json:"labelMode"`
@@ -547,6 +566,7 @@ type ReviewerRoleConfig struct {
 	Behavior     ReviewerConfig              `json:"behavior"`
 	AutoMerge    ReviewerAutoMergeConfig     `json:"autoMerge"`
 	Instructions string                      `json:"instructions,omitempty"`
+	Skills       ReviewerSkillsConfig        `json:"skills"`
 	Agent        *RoleAgentConfig            `json:"agent,omitempty"`
 }
 
@@ -1068,6 +1088,7 @@ type PartialReviewerRoleConfig struct {
 	Behavior     *PartialReviewerConfig              `json:"behavior,omitempty"`
 	AutoMerge    *PartialReviewerAutoMergeConfig     `json:"autoMerge,omitempty"`
 	Instructions *string                             `json:"instructions,omitempty"`
+	Skills       *PartialReviewerSkillsConfig        `json:"skills,omitempty"`
 	Agent        *RoleAgentConfig                    `json:"agent,omitempty"`
 
 	AutoDiscovery *bool                              `json:"autoDiscovery,omitempty"`
