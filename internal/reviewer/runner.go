@@ -5142,7 +5142,7 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 		return r.finishNativeNeedsHumanCompletion(ctx, input, checkpoint, result, nativeCompletion, idempotencyKey)
 	}
 	nativeFindingsJSON := ""
-	if len(nativeCompletion.Findings) > 0 {
+	if len(nativeCompletion.Findings) > 0 || nativeCompletion.Coverage != nil {
 		payload, marshalErr := json.Marshal(nativeCompletion)
 		if marshalErr != nil {
 			return checkpoint, &loopError{message: fmt.Sprintf("marshal reviewer native completion: %v", marshalErr), kind: FailureRetryableAfterResume}
@@ -6709,15 +6709,12 @@ func sanitizeReviewerCoverage(coverage *reviewerCoverageReport) *reviewerCoverag
 	}
 	coverage.PassKind = strings.TrimSpace(coverage.PassKind)
 	coverage.ScopeBasis = strings.TrimSpace(coverage.ScopeBasis)
-	if coverage.PassKind != "" && coverage.PassKind != "first_pass" && coverage.PassKind != "repair_frontier" {
+	if coverage.PassKind != "first_pass" && coverage.PassKind != "repair_frontier" {
 		return nil
 	}
 	coverage.Reviewed = trimCoverageList(coverage.Reviewed)
 	coverage.Incomplete = trimCoverageList(coverage.Incomplete)
 	coverage.IncompleteReasons = trimCoverageList(coverage.IncompleteReasons)
-	if coverage.PassKind == "" && coverage.ScopeBasis == "" && len(coverage.Reviewed) == 0 && len(coverage.Incomplete) == 0 && len(coverage.IncompleteReasons) == 0 {
-		return nil
-	}
 	return coverage
 }
 
