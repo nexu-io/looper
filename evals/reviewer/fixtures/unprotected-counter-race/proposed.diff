@@ -1,0 +1,24 @@
+--- a/counter.go
++++ b/counter.go
+@@ -1,18 +1,15 @@
+ package racefix
+
+-import "sync"
+-
+ type Counter struct {
+ 	n int
+-	mu sync.Mutex
+ }
+
+ func (c *Counter) Add(delta int) {
+-	c.mu.Lock()
+-	c.n += delta
+-	c.mu.Unlock()
++	c.n += delta
+ }
+
+ func (c *Counter) Value() int {
+-	c.mu.Lock()
+-	defer c.mu.Unlock()
+ 	return c.n
+ }

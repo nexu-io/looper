@@ -19,3 +19,5 @@ deploy/**/*.env
 # Built onboarding bundles may contain the shared secrets — never commit.
 looper-hitl-onboarding*.zip
 .slim/deepwork/
+# Reviewer eval replay artifacts (model outputs, traces).
+evals/reviewer/runs/

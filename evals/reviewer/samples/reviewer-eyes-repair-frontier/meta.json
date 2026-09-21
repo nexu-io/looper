@@ -1,0 +1,25 @@
+{
+  "id": "reviewer-eyes-repair-frontier",
+  "sourceRepo": "nexu-io/looper",
+  "prNumber": 665,
+  "baseSHA": "b44bf5cb8f4fe95b90f0af83e2a39b0fd0d4681d",
+  "headSHA": "a14f17aa008b7dd38fcf8b609134a20d2592e0f7",
+  "mergeBase": "b44bf5cb8f4fe95b90f0af83e2a39b0fd0d4681d",
+  "passKind": "repair_frontier",
+  "scope": "changed_ranges",
+  "reviewKind": "implementation",
+  "categories": ["repair_frontier", "p0_p1_regression"],
+  "fixturePath": "",
+  "lastPublishedHeadSha": "b44bf5cb8f4fe95b90f0af83e2a39b0fd0d4681d",
+  "requiredHistory": {
+    "notes": "Later pass after #664 (b44bf5cb) published start-of-review eyes. Current head #665 (a14f17aa) must be inspected as lastPublishedHead→current delta plus the unresolved stale-eyes thread, not as a full first-pass rescan of #664.",
+    "unresolvedMustFixThreads": [
+      {
+        "id": "PRRT_eval_eyes_stuck_on_terminal_queue",
+        "path": "internal/reviewer/runner.go",
+        "body": "In-progress eyes remain on the PR after the reviewer queue stops retrying (paused or last-attempt failure), so the PR still looks like an active review. Keep the #664 add-at-start contract; clear the marker on ProcessClaimedItem terminal exits and when claim-setup recovery exhausts the queue."
+      }
+    ],
+    "fixerNotes": "No Fixer session is attached. This pair is reviewer-owned lifecycle: #664 added eyes at start; #665 owns clearing them when the queue is no longer queued."
+  }
+}

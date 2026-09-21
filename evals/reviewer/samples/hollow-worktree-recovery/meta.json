@@ -1,0 +1,19 @@
+{
+  "id": "hollow-worktree-recovery",
+  "sourceRepo": "nexu-io/looper",
+  "prNumber": 622,
+  "baseSHA": "bba7b145151eb6aae9313079cfc4ea04e800d445",
+  "headSHA": "8959f738b22f29e35932349537b00fba15ffbdb1",
+  "mergeBase": "bba7b145151eb6aae9313079cfc4ea04e800d445",
+  "passKind": "first_pass",
+  "scope": "changed_ranges",
+  "reviewKind": "implementation",
+  "categories": ["cross_module_contract", "concurrency_resource"],
+  "fixturePath": "",
+  "lastPublishedHeadSha": "",
+  "requiredHistory": {
+    "notes": "",
+    "unresolvedMustFixThreads": [],
+    "fixerNotes": ""
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "id": "local-diff-large-refactor",
+  "sourceRepo": "nexu-io/looper",
+  "prNumber": 663,
+  "baseSHA": "13969086e44cab447d619841b62140584334d703",
+  "headSHA": "ad51f777fb647ff812c005f879b3e70a7b32ad84",
+  "mergeBase": "13969086e44cab447d619841b62140584334d703",
+  "passKind": "first_pass",
+  "scope": "changed_ranges",
+  "reviewKind": "implementation",
+  "categories": ["large_diff", "implementation_review"],
+  "fixturePath": "",
+  "lastPublishedHeadSha": "",
+  "requiredHistory": {
+    "notes": "",
+    "unresolvedMustFixThreads": [],
+    "fixerNotes": ""
+  }
+}

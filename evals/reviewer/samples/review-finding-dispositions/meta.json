@@ -1,0 +1,19 @@
+{
+  "id": "review-finding-dispositions",
+  "sourceRepo": "nexu-io/looper",
+  "prNumber": 644,
+  "baseSHA": "550cdc84dbdbe892fcfe6d7aac533dd0e4705446",
+  "headSHA": "6b6df842d776caf240afd76fa23bd36f42d03ee1",
+  "mergeBase": "550cdc84dbdbe892fcfe6d7aac533dd0e4705446",
+  "passKind": "first_pass",
+  "scope": "changed_ranges",
+  "reviewKind": "implementation",
+  "categories": ["large_diff", "implementation_review"],
+  "fixturePath": "",
+  "lastPublishedHeadSha": "",
+  "requiredHistory": {
+    "notes": "",
+    "unresolvedMustFixThreads": [],
+    "fixerNotes": ""
+  }
+}

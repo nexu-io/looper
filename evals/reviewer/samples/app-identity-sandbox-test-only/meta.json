@@ -1,0 +1,19 @@
+{
+  "id": "app-identity-sandbox-test-only",
+  "sourceRepo": "nexu-io/looper",
+  "prNumber": 660,
+  "baseSHA": "89b99e894970a1bf4934833bc3c638a6ccab03f1",
+  "headSHA": "ef14149f3b3f68ff643bce98f02398c531fae866",
+  "mergeBase": "89b99e894970a1bf4934833bc3c638a6ccab03f1",
+  "passKind": "first_pass",
+  "scope": "changed_ranges",
+  "reviewKind": "implementation",
+  "categories": ["test_only"],
+  "fixturePath": "",
+  "lastPublishedHeadSha": "",
+  "requiredHistory": {
+    "notes": "",
+    "unresolvedMustFixThreads": [],
+    "fixerNotes": ""
+  }
+}
