@@ -155,12 +155,15 @@ func TestPromptPreviewReviewerUsesReviewSubmitContract(t *testing.T) {
 		"trusted `looper review submit` wrapper",
 		"GitHub operation contract: submit exactly one PR review",
 		"looper:review id=... head=... outcome=clean|actionable",
+		"Review method skills:",
+		"looper-review",
+		"<run-local builtin skill path>",
 	} {
 		if !strings.Contains(stdout, want) {
 			t.Fatalf("prompt preview = %q, want to contain %q", stdout, want)
 		}
 	}
-	for _, notWant := range []string{"gh pr diff -- <path>", "git_pr_lifecycle", "commit only relevant non-secret changes", "create or adopt an open pull request"} {
+	for _, notWant := range []string{"gh pr diff -- <path>", "git_pr_lifecycle", "commit only relevant non-secret changes", "create or adopt an open pull request", "looper-review-skills-", "/tmp/looper-review-skills"} {
 		if strings.Contains(stdout, notWant) {
 			t.Fatalf("reviewer prompt preview included generic git/PR lifecycle text %q:\n%s", notWant, stdout)
 		}
@@ -180,6 +183,8 @@ func TestPromptPreviewReviewerReflectsMissingTrustedWrapper(t *testing.T) {
 	for _, want := range []string{
 		"trusted Looper CLI path was not detected",
 		"trusted looper review submit wrapper unavailable",
+		"Review method skills:",
+		"<run-local builtin skill path>",
 	} {
 		if !strings.Contains(stdout, want) {
 			t.Fatalf("prompt preview = %q, want to contain %q", stdout, want)
@@ -188,6 +193,8 @@ func TestPromptPreviewReviewerReflectsMissingTrustedWrapper(t *testing.T) {
 	for _, notWant := range []string{
 		"Use Looper's trusted `looper review submit` wrapper",
 		"submit exactly one PR review for the run through the trusted Looper CLI review-submit wrapper",
+		"looper-review-skills-",
+		"/tmp/looper-review-skills",
 	} {
 		if strings.Contains(stdout, notWant) {
 			t.Fatalf("reviewer prompt preview advertised available submit wrapper %q despite missing looper path:\n%s", notWant, stdout)

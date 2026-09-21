@@ -37,6 +37,7 @@ import (
 	"github.com/nexu-io/looper/internal/reviewengagement"
 	"github.com/nexu-io/looper/internal/reviewer/automerge"
 	"github.com/nexu-io/looper/internal/reviewer/criteria"
+	"github.com/nexu-io/looper/internal/reviewer/reviewskills"
 	"github.com/nexu-io/looper/internal/storage"
 	"github.com/nexu-io/looper/internal/version"
 	"github.com/nexu-io/looper/internal/worktreesafety"
@@ -4929,18 +4930,31 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 		return checkpoint, fmt.Errorf("resolve run agent identity: %w", err)
 	}
 	lastPublishedHeadSHA, _ := stringFromAny(parseJSONObject(input.Loop.MetadataJSON)["lastPublishedHeadSha"])
-	prompt, instructionBlock := buildReviewPromptWithInstructions(input.Project.ID, r.customInstructions, input.Repo, input.PRNumber, checkpoint, input.Run.ID, idempotencyKey, reviewEvents, isManualReviewerLoop(input.Loop), requireReviewRequest, reviewRequestBypassReason, r.scope, r.disclosure, agentVendor, derefString(agentModel), r.looperCLIPath, r.reviewerAutoMergeConfigForProject(input.Project.ID).Enabled, commentOnlyCompletion, lastPublishedHeadSHA, hostingKindForContext(ctx))
+	skillBundle, err := reviewskills.MaterializeBuiltin()
+	if err != nil {
+		return checkpoint, fmt.Errorf("materialize reviewer skills: %w", err)
+	}
+	defer skillBundle.Close()
+	skillIndex := reviewskills.FormatIndex(skillBundle.Entries)
+	prompt, instructionBlock := buildReviewPromptWithInstructions(input.Project.ID, r.customInstructions, input.Repo, input.PRNumber, checkpoint, input.Run.ID, idempotencyKey, reviewEvents, isManualReviewerLoop(input.Loop), requireReviewRequest, reviewRequestBypassReason, r.scope, r.disclosure, agentVendor, derefString(agentModel), r.looperCLIPath, r.reviewerAutoMergeConfigForProject(input.Project.ID).Enabled, commentOnlyCompletion, lastPublishedHeadSHA, skillIndex, hostingKindForContext(ctx))
 	nativeResumePrompt := r.nativeResumePromptForReview(ctx, input, checkpoint.Snapshot.HeadSHA, idempotencyKey, lastPublishedHeadSHA)
+	if nativeResumePrompt != "" {
+		if reminder := reviewskills.ResumeReminder(skillBundle.Entries); reminder != "" {
+			nativeResumePrompt = nativeResumePrompt + "\n\n" + reminder
+		}
+	}
 	metadata := map[string]any{
-		"loopType":            "reviewer",
-		"phase":               "review",
-		"repo":                input.Repo,
-		"prNumber":            input.PRNumber,
-		"cleanReviewEvent":    string(reviewEvents.Clean),
-		"blockingReviewEvent": string(reviewEvents.Blocking),
-		"expectedCommitID":    checkpoint.Snapshot.HeadSHA,
-		"reviewerManual":      isManualReviewerLoop(input.Loop),
-		"reviewerRunID":       input.Run.ID,
+		"loopType":               "reviewer",
+		"phase":                  "review",
+		"repo":                   input.Repo,
+		"prNumber":               input.PRNumber,
+		"cleanReviewEvent":       string(reviewEvents.Clean),
+		"blockingReviewEvent":    string(reviewEvents.Blocking),
+		"expectedCommitID":       checkpoint.Snapshot.HeadSHA,
+		"reviewerManual":         isManualReviewerLoop(input.Loop),
+		"reviewerRunID":          input.Run.ID,
+		"reviewSkillsConfigured": reviewSkillMetadata(skillBundle.Entries),
+		"reviewSkillsRequired":   reviewSkillMetadata(requiredReviewSkills(skillBundle.Entries)),
 	}
 	for key, value := range config.CustomInstructionMetadata(instructionBlock, prompt) {
 		metadata[key] = value
@@ -9645,7 +9659,7 @@ func buildPullRequestLockKey(item storage.QueueItemRecord) string {
 func buildReviewPrompt(repo string, prNumber int64, checkpoint reviewerCheckpoint, runID string, idempotencyKey string, reviewEvents config.ReviewerReviewEventsConfig, manual bool, scope config.ReviewerScope, disclosureCfg config.DisclosureConfig, agentRuntime string, agentModel string, looperCLIPath string) string {
 	cfg, _ := config.Normalize("")
 	cfg.Instructions.Enabled = false
-	prompt, _ := buildReviewPromptWithInstructions("", cfg, repo, prNumber, checkpoint, runID, idempotencyKey, reviewEvents, manual, true, "", scope, disclosureCfg, agentRuntime, agentModel, looperCLIPath, false, false, "")
+	prompt, _ := buildReviewPromptWithInstructions("", cfg, repo, prNumber, checkpoint, runID, idempotencyKey, reviewEvents, manual, true, "", scope, disclosureCfg, agentRuntime, agentModel, looperCLIPath, false, false, "", reviewskills.PreviewIndexPlaceholder())
 	return prompt
 }
 
@@ -9769,7 +9783,7 @@ func reviewerProjectProviderKind(cfg config.Config, projectID string) config.Pro
 	return config.ProviderKindGitHub
 }
 
-func buildReviewPromptWithInstructions(projectID string, instructionConfig config.Config, repo string, prNumber int64, checkpoint reviewerCheckpoint, runID string, idempotencyKey string, reviewEvents config.ReviewerReviewEventsConfig, manual bool, requireReviewRequest bool, reviewRequestBypassReason string, scope config.ReviewerScope, disclosureCfg config.DisclosureConfig, agentRuntime string, agentModel string, looperCLIPath string, autoMergeEnabled bool, commentOnlyPublish bool, lastPublishedHeadSHA string, hostingKinds ...config.HostingIdentityKind) (string, config.CustomInstructionBlock) {
+func buildReviewPromptWithInstructions(projectID string, instructionConfig config.Config, repo string, prNumber int64, checkpoint reviewerCheckpoint, runID string, idempotencyKey string, reviewEvents config.ReviewerReviewEventsConfig, manual bool, requireReviewRequest bool, reviewRequestBypassReason string, scope config.ReviewerScope, disclosureCfg config.DisclosureConfig, agentRuntime string, agentModel string, looperCLIPath string, autoMergeEnabled bool, commentOnlyPublish bool, lastPublishedHeadSHA string, skillIndex string, hostingKinds ...config.HostingIdentityKind) (string, config.CustomInstructionBlock) {
 	hostingKind := config.HostingIdentityKind("")
 	if len(hostingKinds) > 0 {
 		hostingKind = hostingKinds[0]
@@ -9855,6 +9869,9 @@ func buildReviewPromptWithInstructions(projectID string, instructionConfig confi
 	if instructionBlock.Text != "" {
 		parts = append(parts, instructionBlock.Text)
 	}
+	if strings.TrimSpace(skillIndex) != "" {
+		parts = append(parts, skillIndex)
+	}
 	cleanReviewAuthorMention := cleanReviewAuthorTarget(checkpoint)
 	cleanNoopInstruction := "For no-actionable-finding results when the clean review policy is COMMENT, do not submit a clean COMMENT or APPROVE review; finish successfully with the `No actionable findings` summary only. After Looper validates that no clean review marker was required for this run, the runner will reconcile the clean-signal +1 reaction."
 	cleanInstruction := cleanNoopInstruction
@@ -9915,12 +9932,8 @@ func buildReviewPromptWithInstructions(projectID string, instructionConfig confi
 			"Comment-only publish contract: Looper will post your final completion summary as one top-level PR comment after it verifies the PR is still open, the head SHA still matches, and this head has not already been published locally. Do not publish anything yourself. Only must_fix findings become remote Reviewer Summary items; follow_up and needs_human remain in structured completion only.",
 			reviewPassContract,
 			"Finding disposition contract: every candidate uses disposition must_fix|follow_up|needs_human, severity blocking|non_blocking|nit, scopeBasis (stated_intent|introduced_regression|required_invariant|independent_improvement|ambiguous_intent), scopeEvidence (specific repository rule, PR goal/non-goal, linked spec section, or regression evidence), plus title/body/location. must_fix becomes remote feedback; follow_up is retained only in structured completion; needs_human must not be published as a change request and parks the pair for human judgment.",
-			"Finding accumulator contract: accumulate candidate findings internally before finalizing. For each candidate, track disposition, severity, scopeBasis, scopeEvidence, location, problem, why it matters, and a suggested fix. Deduplicate only the same root cause or a genuinely repeated pattern; keep unrelated concerns separate. Grouping is valid only for a shared root cause with representative locations.",
-			"Severity rubric: mark a finding as BLOCKING only when it can realistically cause incorrect behavior, data loss/corruption, security exposure, broken public API/protocol/config/migration/backward compatibility, failing existing or necessary tests, race/deadlock/resource leak, transaction/lifecycle inconsistency, clear production risk, or failure to satisfy the PR's stated goal. Mark actionable but merge-safe improvements as NON_BLOCKING. Mark tiny style, naming, wording, formatting, or subjective preferences as NIT; NITs must not block merge.",
 			"Finalization gate before completion: verify that the scoped changed files/ranges were reviewed, all observed in-scope must_fix findings are included, repeated patterns are consolidated only when they share a root cause, non-blocking/nit feedback is not escalated, every finding has disposition/scope evidence and a suggested fix, and the summary outcome matches the highest must_fix severity.",
 			cleanResultCompletionInstruction,
-			"Every finding MUST include: (1) disposition/severity/scopeBasis/scopeEvidence, (2) an exact file/section/symbol reference, (3) the concrete problem, (4) why it matters, (5) evidence from the changed lines or spec section, and (6) a specific suggested change.",
-			"Implementation review rubric: check correctness, error handling, tests, concurrency, config compatibility, security, resource lifecycle, observability, migrations, and backward compatibility. Only report issues that are concrete and actionable.",
 		)
 		return agent.AppendCompletionInstruction(strings.Join(parts, "\n\n")), instructionBlock
 	}
@@ -9955,8 +9968,6 @@ func buildReviewPromptWithInstructions(projectID string, instructionConfig confi
 		githubOperationContract,
 		reviewPassContract,
 		"Finding disposition contract: every candidate uses disposition must_fix|follow_up|needs_human, severity blocking|non_blocking|nit, scopeBasis (stated_intent|introduced_regression|required_invariant|independent_improvement|ambiguous_intent), scopeEvidence (specific repository rule, PR goal/non-goal, linked spec section, or regression evidence), path/line, problem, why, and suggestedChange. Emit the full candidate list in `__LOOPER_RESULT__.findings` — Looper parses this JSON. Only must_fix may be submitted through `looper review submit` as remote actionable feedback. Retain follow_up in structured completion only — do not submit follow_up as review comments. For needs_human, do not submit change-request comments; include them in `__LOOPER_RESULT__.findings` so Looper can park the pair for human judgment. Actionable/blocking reviews must carry must_fix as inline comments, not body-only prose.",
-		"Finding accumulator contract: accumulate candidate findings internally before publishing. For each candidate, track disposition, severity, scopeBasis, scopeEvidence, location, problem, why it matters, and a suggested fix. Before submitting, deduplicate only the same root cause or a genuinely repeated pattern; group repeated patterns into systemic comments with representative examples only when they share a root cause. Keep unrelated concerns as separate comments. The publication budget limits review publications, not findings per publication.",
-		"Severity rubric: mark a finding as BLOCKING only when it can realistically cause incorrect behavior, data loss/corruption, security exposure, broken public API/protocol/config/migration/backward compatibility, failing existing or necessary tests, race/deadlock/resource leak, transaction/lifecycle inconsistency, clear production risk, or failure to satisfy the PR's stated goal. Mark actionable but merge-safe improvements as NON_BLOCKING. Mark tiny style, naming, wording, formatting, or subjective preferences as NIT; NITs must not block merge.",
 		"Finalization gate before submit: verify that the scoped changed files/ranges were reviewed, all observed in-scope must_fix findings are included in this publication, repeated patterns are consolidated only for a shared root cause, non-blocking/nit feedback is not escalated, every published comment has disposition=must_fix with scopeBasis/scopeEvidence plus concrete evidence and a suggested fix, and the review outcome matches the highest published severity.",
 		freshnessInstruction,
 		reviewRequestInstruction,
@@ -9973,22 +9984,13 @@ func buildReviewPromptWithInstructions(projectID string, instructionConfig confi
 		blockingInstruction,
 		cleanResultCompletionInstruction,
 		"When follow-up findings target the same subsystem or topic as an existing unresolved thread, reply to that thread where possible instead of opening a separate top-level review round.",
-		"For complex linting/parsing logic, prefer recommending fixture-matrix tests over isolated one-regression tests. For CSS linting specifically, consider coverage for multiple style blocks, inline styles, comments, at-rules, cascade order, custom properties, var() fallbacks, theme scopes, and px/em/rem unit handling.",
-		"Every comment MUST include: (1) a location via inline anchor or exact file/section/symbol reference, (2) the concrete problem, (3) why it matters, (4) evidence from the changed lines or spec section, and (5) a specific suggested change.",
 		"Prefer inline comments for specific code-level feedback when you can anchor them confidently to the diff using the changed file path and file line numbers shown in the PR diff.",
 		"Cross-cutting or otherwise unanchorable must_fix findings still require an inline comment on a representative changed-file location; do not submit them as body-only top-level feedback.",
 		"Flag vague unlocated must_fix feedback as a follow-up quality-gating failure; every must_fix must be an inline comment with an exact file, section, symbol, or behavior reference.",
-		"Do not repeat the overall body/summary as a comment; comments must add distinct actionable feedback.",
 		inlineRequirement,
 		threadSemantics,
 		"For non-blocking or blocking must_fix reviews, the review body should be a short overview plus markers/disclosure; every must_fix finding must live in inline `comments` so maintainers can address them individually.",
 		"For multiline inline comments, `start_line`/`start_side` must identify the first line and `line`/`side` the last line; omit `start_line`/`start_side` for single-line comments.",
-		"Write substantially more detail than a brief summary; every comment should explain the problem, why it matters, and the concrete change to make.",
-		"A comment is invalid if it only names a category (for example, 'gaps around X', 'issues with Y', or 'concerns about Z'), says only 'add tests' without naming the behavior and where the test belongs, lacks a concrete location or section reference, asks a question without proposing a resolution path, or compresses multiple unrelated concerns into one vague summary.",
-		"Bad comment example: 'Spec review found actionable gaps around role-specific trigger schema, auto-discovery gating boundaries, and exact env/config-source behavior.' This is bad because it has no file, line, section, concrete missing requirement, evidence, or suggested wording.",
-		"Good spec/docs comment example: {\"severity\":\"major\",\"category\":\"spec\",\"body\":\"Define the role trigger schema before implementation starts\",\"problem\":\"The spec introduces role-specific triggers but does not define the schema fields or validation rules.\",\"why\":\"Implementers cannot know which fields are required, how defaults behave, or how invalid trigger definitions should fail.\",\"evidence\":\"The Role triggers section describes behavior but does not list fields, defaults, or invalid examples.\",\"suggestedChange\":\"Add a schema table defining role, event, enabled, conditions, defaults, and validation errors, plus one valid and one invalid example.\",\"path\":\"docs/reviewer.md\",\"line\":42,\"side\":\"RIGHT\"}",
-		"Implementation review rubric: check correctness, error handling, tests, concurrency, config compatibility, security, resource lifecycle, observability, migrations, and backward compatibility. Only report issues that are concrete and actionable.",
-		"Spec/docs review rubric: check whether every requirement is testable, schemas are typed/defaulted/validated, config precedence is explicit, failure modes are defined, rollout/backward compatibility is covered, acceptance criteria are present, and ambiguous terms are resolved. For missing spec details, suggest exact wording, section, table, or example content.",
 		"If the review is clean, do not write or publish a bare LGTM review body. For clean COMMENT policy, avoid adding PR conversation noise for no-actionable-finding outcomes. For clean APPROVE policy, the APPROVE review must include the required author mention, concise summary, and friendly acknowledgement.",
 	)
 	if submitPayloadInstruction != "" {
@@ -10004,6 +10006,28 @@ func customInstructionConfig(value *config.Config) config.Config {
 		return cfg
 	}
 	return *value
+}
+
+func reviewSkillMetadata(entries []reviewskills.Entry) []map[string]any {
+	out := make([]map[string]any, 0, len(entries))
+	for _, entry := range entries {
+		out = append(out, map[string]any{
+			"name":   entry.Name,
+			"source": entry.Source,
+			"path":   entry.Path,
+		})
+	}
+	return out
+}
+
+func requiredReviewSkills(entries []reviewskills.Entry) []reviewskills.Entry {
+	out := make([]reviewskills.Entry, 0, len(entries))
+	for _, entry := range entries {
+		if entry.Required {
+			out = append(out, entry)
+		}
+	}
+	return out
 }
 
 func cleanReviewAuthorTarget(checkpoint reviewerCheckpoint) string {
