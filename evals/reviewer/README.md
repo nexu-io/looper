@@ -12,6 +12,14 @@ Offline, re-runnable samples so later reviewer skill or config changes can be co
 - `baseline/` — recorded baseline or explicit gaps. No fabricated metrics.
 - `runs/` — local replay artifacts. Gitignored.
 
+## Design trade-off
+
+`index.json`, `meta.json`, and `labels.json` are a frozen eval record, not a looperd runtime store.
+
+- **Failure prevented.** Later reviewer skill or config changes need a stable, machine-readable labeled set. Identity (SHAs, pass kind, history) must stay separate from labels so prompt-construction replay can assert first-pass vs repair-frontier contracts without leaking expected findings into the agent prompt. Public history also has no remaining in-diff concurrency defect, so that category needs a committed fixture patch.
+- **Cost.** Index, meta, labels, notes, and optional fixtures must stay in sync. `TestEvalSampleIndexValid` can disagree with those files. Human labels drift as public PRs evolve. Fixture diffs can rot relative to their after-images (a corrupt patch silently drops recall for the only positive concurrency sample).
+- **Why not simpler.** A markdown list of PR numbers cannot replay prompts, cannot keep labels out of the agent, and cannot freeze a synthetic concurrency diff. Treating live GitHub review comments as ground truth is insufficient: those comments are material to verify, not labels.
+
 ## Counting rules (when a model is later run)
 
 - Precision and recall are grouped by `rootCauseKey`. Duplicate comments for the same key collapse to one predicted finding.

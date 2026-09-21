@@ -3,6 +3,7 @@ package reviewer
 import (
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -167,6 +168,9 @@ func TestEvalSampleIndexValid(t *testing.T) {
 				t.Fatalf("repair sample %s needs non-empty requiredHistory.notes", entry.ID)
 			}
 		}
+		if fp := strings.TrimSpace(meta.FixturePath); fp != "" {
+			assertEvalFixtureProposedDiff(t, root, entry.ID, fp)
+		}
 	}
 
 	required := []string{
@@ -187,6 +191,48 @@ func TestEvalSampleIndexValid(t *testing.T) {
 	}
 	if repairCount < 1 {
 		t.Fatal("index needs at least one repair_frontier sample")
+	}
+}
+
+func assertEvalFixtureProposedDiff(t *testing.T, root, id, fixturePath string) {
+	t.Helper()
+	dir := filepath.Join(root, fixturePath)
+	diffPath := filepath.Join(dir, "proposed.diff")
+	absDiff, err := filepath.Abs(diffPath)
+	if err != nil {
+		t.Fatalf("sample %s proposed.diff abs: %v", id, err)
+	}
+	numstat := exec.Command("git", "apply", "--numstat", absDiff)
+	if out, err := numstat.CombinedOutput(); err != nil {
+		t.Fatalf("sample %s proposed.diff is not a valid unified diff: %v\n%s", id, err, out)
+	}
+
+	tmp := t.TempDir()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("sample %s fixture dir: %v", id, err)
+	}
+	copied := 0
+	for _, entry := range entries {
+		if entry.IsDir() || entry.Name() == "proposed.diff" {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(dir, entry.Name()))
+		if err != nil {
+			t.Fatalf("sample %s read %s: %v", id, entry.Name(), err)
+		}
+		if err := os.WriteFile(filepath.Join(tmp, entry.Name()), data, 0o644); err != nil {
+			t.Fatalf("sample %s copy %s: %v", id, entry.Name(), err)
+		}
+		copied++
+	}
+	if copied == 0 {
+		t.Fatalf("sample %s fixture has no after-image files to apply against", id)
+	}
+	reverse := exec.Command("git", "apply", "--reverse", absDiff)
+	reverse.Dir = tmp
+	if out, err := reverse.CombinedOutput(); err != nil {
+		t.Fatalf("sample %s proposed.diff after-image does not match fixture files: %v\n%s", id, err, out)
 	}
 }
 
