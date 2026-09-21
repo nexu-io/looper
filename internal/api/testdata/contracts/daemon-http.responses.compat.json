@@ -477,8 +477,8 @@
               },
               "skills": {
                 "mode": "extend",
-                "optional": [],
-                "required": []
+                "required": [],
+                "optional": []
               }
             },
             "fixer": {

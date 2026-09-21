@@ -672,6 +672,23 @@ type reviewerCommentOnlyCompletion struct {
 	Coverage *reviewerCoverageReport            `json:"coverage,omitempty"`
 }
 
+func (c *reviewerCommentOnlyCompletion) UnmarshalJSON(data []byte) error {
+	var envelope struct {
+		Summary  string                             `json:"summary"`
+		Outcome  string                             `json:"outcome"`
+		Findings []reviewerCommentOnlyFindingResult `json:"findings"`
+		Coverage json.RawMessage                    `json:"coverage,omitempty"`
+	}
+	if err := json.Unmarshal(data, &envelope); err != nil {
+		return err
+	}
+	c.Summary = envelope.Summary
+	c.Outcome = envelope.Outcome
+	c.Findings = envelope.Findings
+	c.Coverage = decodeOptionalReviewerCoverage(envelope.Coverage)
+	return nil
+}
+
 type reviewerCoverageReport struct {
 	PassKind          string   `json:"passKind,omitempty"`
 	ScopeBasis        string   `json:"scopeBasis,omitempty"`
@@ -5146,7 +5163,7 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 		return r.finishNativeNeedsHumanCompletion(ctx, input, checkpoint, result, nativeCompletion, idempotencyKey)
 	}
 	nativeFindingsJSON := ""
-	if len(nativeCompletion.Findings) > 0 {
+	if len(nativeCompletion.Findings) > 0 || nativeCompletion.Coverage != nil {
 		payload, marshalErr := json.Marshal(nativeCompletion)
 		if marshalErr != nil {
 			return checkpoint, &loopError{message: fmt.Sprintf("marshal reviewer native completion: %v", marshalErr), kind: FailureRetryableAfterResume}
@@ -6707,21 +6724,30 @@ func validateReviewerCommentOnlyCompletion(completion reviewerCommentOnlyComplet
 	return completion, nil
 }
 
+func decodeOptionalReviewerCoverage(raw json.RawMessage) *reviewerCoverageReport {
+	trimmed := strings.TrimSpace(string(raw))
+	if trimmed == "" || trimmed == "null" {
+		return nil
+	}
+	var coverage reviewerCoverageReport
+	if err := json.Unmarshal([]byte(trimmed), &coverage); err != nil {
+		return nil
+	}
+	return &coverage
+}
+
 func sanitizeReviewerCoverage(coverage *reviewerCoverageReport) *reviewerCoverageReport {
 	if coverage == nil {
 		return nil
 	}
 	coverage.PassKind = strings.TrimSpace(coverage.PassKind)
 	coverage.ScopeBasis = strings.TrimSpace(coverage.ScopeBasis)
-	if coverage.PassKind != "" && coverage.PassKind != "first_pass" && coverage.PassKind != "repair_frontier" {
+	if coverage.PassKind != "first_pass" && coverage.PassKind != "repair_frontier" {
 		return nil
 	}
 	coverage.Reviewed = trimCoverageList(coverage.Reviewed)
 	coverage.Incomplete = trimCoverageList(coverage.Incomplete)
 	coverage.IncompleteReasons = trimCoverageList(coverage.IncompleteReasons)
-	if coverage.PassKind == "" && coverage.ScopeBasis == "" && len(coverage.Reviewed) == 0 && len(coverage.Incomplete) == 0 && len(coverage.IncompleteReasons) == 0 {
-		return nil
-	}
 	return coverage
 }
 
