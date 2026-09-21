@@ -155,6 +155,23 @@ func TestValidateReviewerSkillsInvalidModeAndReplaceWithoutRequired(t *testing.T
 	assertValidationIssue(t, replaceErr, "roles.reviewer.skills.required", "must contain at least one skill when mode is replace")
 }
 
+func TestValidateReviewerSkillsRejectsBlankRequiredReference(t *testing.T) {
+	t.Parallel()
+
+	cfg, err := DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Roles.Reviewer.Skills.Mode = ReviewerSkillsModeReplace
+	cfg.Roles.Reviewer.Skills.Required = []string{" "}
+	err = ValidateWithOptions(cfg, ValidateOptions{DefaultWorktreeRoot: t.TempDir()})
+	var validationErr *ConfigValidationError
+	if !errors.As(err, &validationErr) {
+		t.Fatalf("Validate(blank required) error = %v, want ConfigValidationError", err)
+	}
+	assertValidationIssue(t, validationErr, "roles.reviewer.skills.required[0]", "must be a non-empty string")
+}
+
 func TestValidateProjectOverlayReviewerSkillsReplaceWithoutRequired(t *testing.T) {
 	t.Parallel()
 

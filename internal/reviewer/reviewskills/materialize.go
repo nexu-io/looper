@@ -6,6 +6,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"gopkg.in/yaml.v3"
 )
 
 // Entry is one skill the reviewer agent must be able to read.
@@ -106,6 +108,11 @@ func readSkillFrontmatter(skillPath string) (name, description string, err error
 	return parseFrontmatter(string(data))
 }
 
+type skillFrontmatter struct {
+	Name        string `yaml:"name"`
+	Description string `yaml:"description"`
+}
+
 func parseFrontmatter(content string) (name, description string, err error) {
 	content = strings.ReplaceAll(content, "\r\n", "\n")
 	if !strings.HasPrefix(content, "---\n") {
@@ -116,21 +123,12 @@ func parseFrontmatter(content string) (name, description string, err error) {
 	if end < 0 {
 		return "", "", fmt.Errorf("skill frontmatter not terminated")
 	}
-	for _, line := range strings.Split(rest[:end], "\n") {
-		line = strings.TrimSpace(line)
-		key, value, ok := strings.Cut(line, ":")
-		if !ok {
-			continue
-		}
-		key = strings.TrimSpace(key)
-		value = strings.TrimSpace(value)
-		switch key {
-		case "name":
-			name = value
-		case "description":
-			description = value
-		}
+	var meta skillFrontmatter
+	if err := yaml.Unmarshal([]byte(rest[:end]), &meta); err != nil {
+		return "", "", fmt.Errorf("skill frontmatter is invalid YAML: %w", err)
 	}
+	name = strings.TrimSpace(meta.Name)
+	description = strings.TrimSpace(meta.Description)
 	if name == "" {
 		return "", "", fmt.Errorf("skill frontmatter missing name")
 	}
