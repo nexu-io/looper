@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/nexu-io/looper/internal/config"
+	"github.com/nexu-io/looper/internal/infra/specpr"
 )
 
 // Prompt-construction replay for the reviewer eval kit. This is not model-quality
@@ -39,15 +40,22 @@ type evalSampleMeta struct {
 	MergeBase            string              `json:"mergeBase"`
 	PassKind             string              `json:"passKind"`
 	Scope                string              `json:"scope"`
+	ReviewKind           string              `json:"reviewKind"`
 	LastPublishedHeadSha string              `json:"lastPublishedHeadSha"`
 	FixturePath          string              `json:"fixturePath"`
 	RequiredHistory      evalRequiredHistory `json:"requiredHistory"`
 }
 
 type evalRequiredHistory struct {
-	Notes                    string `json:"notes"`
-	UnresolvedMustFixThreads []any  `json:"unresolvedMustFixThreads"`
-	FixerNotes               string `json:"fixerNotes"`
+	Notes                    string             `json:"notes"`
+	UnresolvedMustFixThreads []evalFrozenThread `json:"unresolvedMustFixThreads"`
+	FixerNotes               string             `json:"fixerNotes"`
+}
+
+type evalFrozenThread struct {
+	ID   string `json:"id"`
+	Path string `json:"path"`
+	Body string `json:"body"`
 }
 
 type evalLabelsFile struct {
@@ -152,6 +160,9 @@ func TestEvalSampleIndexValid(t *testing.T) {
 		}
 		if meta.PassKind != "first_pass" && meta.PassKind != "repair_frontier" {
 			t.Fatalf("sample %s passKind %q", entry.ID, meta.PassKind)
+		}
+		if meta.ReviewKind != "implementation" && meta.ReviewKind != "spec" {
+			t.Fatalf("sample %s reviewKind %q", entry.ID, meta.ReviewKind)
 		}
 		if meta.Scope == "" {
 			meta.Scope = "changed_ranges"
@@ -285,6 +296,15 @@ func TestEvalReplayPromptConstruction(t *testing.T) {
 		}
 		assertLabelsStayOutOfPrompt(t, prompt, labels, labelRaw)
 	})
+
+	t.Run("frozen_sample_context", func(t *testing.T) {
+		for _, entry := range index.Samples {
+			meta, labels, labelRaw := loadEvalSample(t, root, entry.ID)
+			prompt := replayEvalPrompt(t, meta)
+			assertEvalFrozenSampleContext(t, meta, prompt)
+			assertLabelsStayOutOfPrompt(t, prompt, labels, labelRaw)
+		}
+	})
 }
 
 func replayEvalPrompt(t *testing.T, meta evalSampleMeta) string {
@@ -304,12 +324,23 @@ func replayEvalPrompt(t *testing.T, meta evalSampleMeta) string {
 	case "changed_files":
 		scope = config.ReviewerScopeChangedFiles
 	}
+	detail := &checkpointDetail{
+		HeadSHA: meta.HeadSHA,
+		BaseSHA: meta.BaseSHA,
+		State:   "OPEN",
+	}
+	if meta.ReviewKind == "spec" {
+		detail.Labels = []string{specpr.ReviewingLabel}
+	}
 	prompt, _ := buildReviewPromptWithInstructions(
 		"eval-project",
 		config.Config{},
 		repo,
 		prNumber,
-		reviewerCheckpoint{Snapshot: &checkpointSnapshot{HeadSHA: meta.HeadSHA}},
+		reviewerCheckpoint{
+			Detail:   detail,
+			Snapshot: &checkpointSnapshot{HeadSHA: meta.HeadSHA, BaseSHA: meta.BaseSHA},
+		},
 		"eval-run",
 		"reviewer:eval:"+meta.HeadSHA,
 		config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventComment, Blocking: config.ReviewerReviewEventComment},
@@ -325,7 +356,91 @@ func replayEvalPrompt(t *testing.T, meta evalSampleMeta) string {
 		false,
 		meta.LastPublishedHeadSha,
 	)
-	return prompt
+	return insertBeforeCompletionInstruction(prompt, evalFrozenHistoryPrompt(meta.RequiredHistory))
+}
+
+func assertEvalFrozenSampleContext(t *testing.T, meta evalSampleMeta, prompt string) {
+	t.Helper()
+	if base := strings.TrimSpace(meta.BaseSHA); base != "" && !strings.Contains(prompt, base) {
+		t.Fatalf("sample %s prompt missing frozen baseSHA %s", meta.ID, base)
+	}
+	switch meta.ReviewKind {
+	case "spec":
+		if !strings.Contains(prompt, "This is a spec review") {
+			t.Fatalf("sample %s prompt missing spec review phase:\n%s", meta.ID, prompt)
+		}
+		if strings.Contains(prompt, "This is an implementation review") {
+			t.Fatalf("sample %s prompt used implementation review phase:\n%s", meta.ID, prompt)
+		}
+	case "implementation":
+		if !strings.Contains(prompt, "This is an implementation review") {
+			t.Fatalf("sample %s prompt missing implementation review phase:\n%s", meta.ID, prompt)
+		}
+		if strings.Contains(prompt, "This is a spec review") {
+			t.Fatalf("sample %s prompt used spec review phase:\n%s", meta.ID, prompt)
+		}
+	}
+	history := meta.RequiredHistory
+	if notes := strings.TrimSpace(history.Notes); notes != "" && !strings.Contains(prompt, notes) {
+		t.Fatalf("sample %s prompt missing requiredHistory.notes", meta.ID)
+	}
+	if fixer := strings.TrimSpace(history.FixerNotes); fixer != "" && !strings.Contains(prompt, fixer) {
+		t.Fatalf("sample %s prompt missing requiredHistory.fixerNotes", meta.ID)
+	}
+	for _, thread := range history.UnresolvedMustFixThreads {
+		if id := strings.TrimSpace(thread.ID); id != "" && !strings.Contains(prompt, id) {
+			t.Fatalf("sample %s prompt missing frozen thread %s", meta.ID, id)
+		}
+		if body := strings.TrimSpace(thread.Body); body != "" && !strings.Contains(prompt, body) {
+			t.Fatalf("sample %s prompt missing frozen thread body for %s", meta.ID, thread.ID)
+		}
+	}
+}
+
+func evalFrozenHistoryPrompt(history evalRequiredHistory) string {
+	notes := strings.TrimSpace(history.Notes)
+	fixer := strings.TrimSpace(history.FixerNotes)
+	if notes == "" && fixer == "" && len(history.UnresolvedMustFixThreads) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("Frozen sample review history. Do not fetch live review threads; use this recorded evidence instead.")
+	if notes != "" {
+		b.WriteString("\n\n")
+		b.WriteString(notes)
+	}
+	if len(history.UnresolvedMustFixThreads) > 0 {
+		b.WriteString("\n\nUnresolved must_fix threads:")
+		for _, thread := range history.UnresolvedMustFixThreads {
+			b.WriteString("\n- id=")
+			b.WriteString(thread.ID)
+			if path := strings.TrimSpace(thread.Path); path != "" {
+				b.WriteString(" path=")
+				b.WriteString(path)
+			}
+			if body := strings.TrimSpace(thread.Body); body != "" {
+				b.WriteString("\n  ")
+				b.WriteString(body)
+			}
+		}
+	}
+	if fixer != "" {
+		b.WriteString("\n\nFixer notes:\n")
+		b.WriteString(fixer)
+	}
+	return b.String()
+}
+
+func insertBeforeCompletionInstruction(prompt, extra string) string {
+	extra = strings.TrimSpace(extra)
+	if extra == "" {
+		return prompt
+	}
+	const marker = "When finished, print exactly one final line to stdout in this format:"
+	if idx := strings.LastIndex(prompt, marker); idx >= 0 {
+		return strings.TrimRight(prompt[:idx], "\n") + "\n\n" + extra + "\n\n" + prompt[idx:]
+	}
+	return prompt + "\n\n" + extra
 }
 
 func assertLabelsStayOutOfPrompt(t *testing.T, prompt string, labels evalLabelsFile, labelRaw []byte) {
