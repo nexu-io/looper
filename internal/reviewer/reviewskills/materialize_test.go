@@ -55,6 +55,8 @@ func TestMaterializeBuiltinReadableFromUnrelatedCwd(t *testing.T) {
 	}
 	for _, rel := range []string{
 		"references/comment-quality.md",
+		"references/css-lint.md",
+		"references/evidence.md",
 		"references/implementation-rubric.md",
 		"references/spec-rubric.md",
 	} {
@@ -196,6 +198,11 @@ func TestBuiltinSkillFilesContainMigratedMethodText(t *testing.T) {
 		"Spec/docs review rubric",
 		"mark a finding as BLOCKING only when",
 		"group repeated patterns into systemic comments with representative examples only when they share a root cause",
+		"Unverified is not wrong",
+		"Drop a candidate only when evidence proves it factually wrong",
+		"internal related-file plan",
+		"only if CSS or style files are in the changed set",
+		"Stay one reviewer",
 	} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("materialized skills missing %q", want)

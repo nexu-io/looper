@@ -27,12 +27,15 @@ Equivalent METHOD migration from `buildReviewPromptWithInstructions`. Execution 
 | Bad comment example / Good spec/docs comment example | `builtin/references/comment-quality.md` |
 | "Write substantially more detail" | `builtin/references/comment-quality.md` |
 | "Do not repeat the overall body/summary as a comment" | `builtin/references/comment-quality.md` |
-| fixture-matrix + CSS linting paragraph | `builtin/references/comment-quality.md` |
+| fixture-matrix paragraph | `builtin/references/comment-quality.md` |
+| CSS linting (on-demand; CSS/style files only) | `builtin/references/css-lint.md` |
+| Evidence rules (race/leak/security/loop-var/contract/test suggestions) | `builtin/references/evidence.md` |
+| Counterexample pass (drop only if factually wrong or same root cause) | `builtin/references/evidence.md` |
 | Implementation review rubric | `builtin/references/implementation-rubric.md` |
 | Long severity rubric ("mark a finding as BLOCKING only when…") | `builtin/references/implementation-rubric.md` |
 | Long finding-accumulator essay | `builtin/references/implementation-rubric.md` |
 | Spec/docs review rubric | `builtin/references/spec-rubric.md` |
-| Short procedure (understand intent → enumerate → read context → accumulate → apply prompt disposition schema) | `builtin/SKILL.md` |
+| Procedure (intent → enumerate without shrinking → large-PR related-file plan → accumulate → same-context counterexample pass → existing schema) | `builtin/SKILL.md` |
 
 ## DELETED-DUPLICATE
 
@@ -53,3 +56,5 @@ Measured from the migrated METHOD string bodies (UTF-8) plus the injected skill-
 | Embedded skill tree (`builtin/`) | 0 | 5674 | +5674 (not in the core prompt) |
 
 Approximate assembled native first-pass prompt with typical seed/disclosure: **~21.5 KiB before**, **~18.2 KiB after** (net about -3.3 KiB from METHOD extraction, plus a ~0.5 KiB index). Comment-only prompts lose the extra ~0.6 KiB duplicate METHOD copy. Runtime materialized indexes add an absolute temp path (~80–120 bytes) instead of the placeholder.
+
+PR4 added evidence, counterexample, on-demand CSS lint, and large-PR related-file plan text to the builtin skill tree. That is a method-text change only. A quality comparison versus the PR1 baseline is not claimed without a model run.
