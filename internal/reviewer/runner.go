@@ -672,6 +672,23 @@ type reviewerCommentOnlyCompletion struct {
 	Coverage *reviewerCoverageReport            `json:"coverage,omitempty"`
 }
 
+func (c *reviewerCommentOnlyCompletion) UnmarshalJSON(data []byte) error {
+	var envelope struct {
+		Summary  string                             `json:"summary"`
+		Outcome  string                             `json:"outcome"`
+		Findings []reviewerCommentOnlyFindingResult `json:"findings"`
+		Coverage json.RawMessage                    `json:"coverage,omitempty"`
+	}
+	if err := json.Unmarshal(data, &envelope); err != nil {
+		return err
+	}
+	c.Summary = envelope.Summary
+	c.Outcome = envelope.Outcome
+	c.Findings = envelope.Findings
+	c.Coverage = decodeOptionalReviewerCoverage(envelope.Coverage)
+	return nil
+}
+
 type reviewerCoverageReport struct {
 	PassKind          string   `json:"passKind,omitempty"`
 	ScopeBasis        string   `json:"scopeBasis,omitempty"`
@@ -6701,6 +6718,18 @@ func validateReviewerCommentOnlyCompletion(completion reviewerCommentOnlyComplet
 		}
 	}
 	return completion, nil
+}
+
+func decodeOptionalReviewerCoverage(raw json.RawMessage) *reviewerCoverageReport {
+	trimmed := strings.TrimSpace(string(raw))
+	if trimmed == "" || trimmed == "null" {
+		return nil
+	}
+	var coverage reviewerCoverageReport
+	if err := json.Unmarshal([]byte(trimmed), &coverage); err != nil {
+		return nil
+	}
+	return &coverage
 }
 
 func sanitizeReviewerCoverage(coverage *reviewerCoverageReport) *reviewerCoverageReport {

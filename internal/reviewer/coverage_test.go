@@ -141,6 +141,37 @@ func TestParseReviewerNativeCompletionKeepsCleanCoverage(t *testing.T) {
 	}
 }
 
+func TestParseReviewerCompletionDropsMalformedCoverage(t *testing.T) {
+	t.Parallel()
+
+	commentOnly, err := parseReviewerCommentOnlyCompletion(AgentResult{
+		Stdout: `__LOOPER_RESULT__={"summary":"Must fix one","outcome":"blocking","findings":[{"title":"Bug","body":"Nil deref","disposition":"must_fix","severity":"blocking","scopeBasis":"introduced_regression","scopeEvidence":"new path"}],"coverage":{"passKind":"first_pass","reviewed":"internal/reviewer/runner.go"}}`,
+	})
+	if err != nil {
+		t.Fatalf("malformed coverage must not reject comment-only completion: %v", err)
+	}
+	if len(commentOnly.Findings) != 1 {
+		t.Fatalf("comment-only findings = %#v, want kept", commentOnly.Findings)
+	}
+	if commentOnly.Coverage != nil {
+		t.Fatalf("comment-only coverage = %#v, want dropped", commentOnly.Coverage)
+	}
+
+	native, err := parseReviewerNativeCompletion(AgentResult{
+		Stdout:  `__LOOPER_RESULT__={"summary":"No actionable findings","outcome":"clean","findings":[],"coverage":{"passKind":"first_pass","reviewed":"a.go"}}`,
+		Summary: "No actionable findings",
+	})
+	if err != nil {
+		t.Fatalf("malformed coverage must not reject native completion: %v", err)
+	}
+	if native.Summary != "No actionable findings" {
+		t.Fatalf("native summary = %q", native.Summary)
+	}
+	if native.Coverage != nil {
+		t.Fatalf("native coverage = %#v, want dropped", native.Coverage)
+	}
+}
+
 func TestRunReviewStepPersistsCleanNativeCoverage(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
