@@ -4,12 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"github.com/nexu-io/looper/internal/config"
-	"github.com/nexu-io/looper/internal/eventlog"
 	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"github.com/nexu-io/looper/internal/config"
+	"github.com/nexu-io/looper/internal/eventlog"
 )
 
 type changedFile struct {
@@ -26,27 +27,23 @@ type fileGroup struct {
 func parseNameStatus(output string) []changedFile {
 	var files []changedFile
 	seen := make(map[string]struct{})
-	for _, line := range strings.Split(output, "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-		fields := strings.Split(line, "\t")
-		if len(fields) < 2 {
-			continue
-		}
-		status := fields[0]
+	fields := strings.Split(output, "\x00")
+	i := 0
+	for i < len(fields) {
+		status := fields[i]
+		i++
 		if status == "" {
 			continue
 		}
 		kind := status[:1]
 		switch kind {
 		case "R", "C":
-			if len(fields) < 3 {
-				continue
+			if i+1 >= len(fields) {
+				return files
 			}
-			oldPath := unquoteNameStatusPath(fields[1])
-			newPath := unquoteNameStatusPath(fields[2])
+			oldPath := fields[i]
+			newPath := fields[i+1]
+			i += 2
 			if newPath == "" {
 				continue
 			}
@@ -62,7 +59,11 @@ func parseNameStatus(output string) []changedFile {
 				}
 			}
 		default:
-			path := unquoteNameStatusPath(fields[1])
+			if i >= len(fields) {
+				return files
+			}
+			path := fields[i]
+			i++
 			if path == "" {
 				continue
 			}
@@ -74,14 +75,6 @@ func parseNameStatus(output string) []changedFile {
 		}
 	}
 	return files
-}
-
-func unquoteNameStatusPath(path string) string {
-	path = strings.TrimSpace(path)
-	if len(path) >= 2 && path[0] == '"' && path[len(path)-1] == '"' {
-		return strings.Trim(path, `"`)
-	}
-	return path
 }
 
 func groupChangedFiles(files []changedFile) []fileGroup {
@@ -109,11 +102,10 @@ func groupChangedFiles(files []changedFile) []fileGroup {
 	}
 	sort.Strings(keys)
 	groups := make([]fileGroup, 0, len(keys)+1)
-	for i, key := range keys {
+	for _, key := range keys {
 		paths := buckets[key]
 		sort.Strings(paths)
 		groups = append(groups, fileGroup{ID: key, Paths: paths})
-		_ = i
 	}
 	if len(other) > 0 {
 		sort.Strings(other)
@@ -142,19 +134,8 @@ func groupingPlanText(groups []fileGroup, all []changedFile) string {
 
 func mergeGroupedFindings(batches ...[]reviewerCommentOnlyFindingResult) []reviewerCommentOnlyFindingResult {
 	var out []reviewerCommentOnlyFindingResult
-	seen := map[string]struct{}{}
 	for _, batch := range batches {
-		for _, finding := range batch {
-			key := strings.ToLower(strings.TrimSpace(finding.Path) + "\n" + strings.TrimSpace(finding.Title))
-			if key == "\n" {
-				key = strings.ToLower(strings.TrimSpace(finding.Title) + "\n" + strings.TrimSpace(finding.Body))
-			}
-			if _, ok := seen[key]; ok {
-				continue
-			}
-			seen[key] = struct{}{}
-			out = append(out, finding)
-		}
+		out = append(out, batch...)
 	}
 	return out
 }
@@ -175,11 +156,23 @@ func otherPaths(group fileGroup, all []changedFile) []string {
 	return other
 }
 
-func listChangedPaths(ctx context.Context, worktree, base, head string) ([]changedFile, error) {
+func groupingGitPath(r *Runner) string {
+	if r != nil && r.projectRoleConfig != nil && r.projectRoleConfig.Tools.GitPath != nil {
+		if path := strings.TrimSpace(*r.projectRoleConfig.Tools.GitPath); path != "" {
+			return path
+		}
+	}
+	return "git"
+}
+
+func listChangedPaths(ctx context.Context, gitPath, worktree, base, head string) ([]changedFile, error) {
 	if strings.TrimSpace(worktree) == "" || strings.TrimSpace(base) == "" || strings.TrimSpace(head) == "" {
 		return nil, fmt.Errorf("worktree and base/head SHAs are required")
 	}
-	cmd := exec.CommandContext(ctx, "git", "-C", worktree, "diff", "--name-status", "-M", "--no-ext-diff", "--no-color", base+"..."+head)
+	if strings.TrimSpace(gitPath) == "" {
+		gitPath = "git"
+	}
+	cmd := exec.CommandContext(ctx, gitPath, "-C", worktree, "diff", "--name-status", "-z", "-M", "--no-ext-diff", "--no-color", base+"..."+head)
 	out, err := cmd.Output()
 	if err != nil {
 		return nil, err
@@ -191,9 +184,6 @@ func relatedFileGroupsConfig(r *Runner, projectID string) config.ReviewerRelated
 	cfg := config.ReviewerRelatedFileGroupsConfig{MinChangedFiles: 24}
 	if r != nil && r.projectRoleConfig != nil {
 		cfg = config.ProjectRoleConfigs(*r.projectRoleConfig, projectID).Reviewer.Behavior.RelatedFileGroups
-	}
-	if cfg.MinChangedFiles < 1 {
-		cfg.MinChangedFiles = 24
 	}
 	return cfg
 }
@@ -211,8 +201,11 @@ func (r *Runner) applyRelatedFileGroups(ctx context.Context, input stepInput, ch
 	if last, _ := stringFromAny(parseJSONObject(input.Loop.MetadataJSON)["lastPublishedHeadSha"]); last != "" && last != head {
 		base = last
 	}
-	files, err := listChangedPaths(ctx, worktreePath, base, head)
-	if err != nil || len(files) < cfg.MinChangedFiles {
+	files, err := listChangedPaths(ctx, groupingGitPath(r), worktreePath, base, head)
+	if err != nil {
+		return "", fmt.Errorf("related-file groups: enumerate changed paths: %w", err)
+	}
+	if len(files) < cfg.MinChangedFiles {
 		return skillIndex, nil
 	}
 	groups := groupChangedFiles(files)
@@ -239,13 +232,21 @@ func (r *Runner) runGroupedFindingAgents(ctx context.Context, input stepInput, w
 	if r == nil || r.agentExecutor == nil {
 		return nil, nil
 	}
+	agentVendor, agentModel, _, useSnapshot, err := r.identityFromRun(input.Run)
+	if err != nil {
+		return nil, fmt.Errorf("grouped review: resolve run agent identity: %w", err)
+	}
+	useSnap, snapVendor, snapModel := agentRunSnapshotFields(agentVendor, agentModel, useSnapshot)
 	var batches [][]reviewerCommentOnlyFindingResult
 	for _, group := range groups {
 		prompt := groupedFindingPrompt(group, all, base, head)
 		execution, err := r.agentExecutor.Start(ctx, AgentRunInput{
 			ExecutionID: eventlog.NewEventID("agent"), ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID,
 			Prompt: prompt, WorkingDirectory: worktreePath, Timeout: r.agentTimeout, HeartbeatTimeout: r.agentIdleTimeout,
-			Metadata: map[string]any{"loopType": "reviewer", "phase": "review-group", "groupId": group.ID, "repo": input.Repo, "prNumber": input.PRNumber},
+			Metadata:       map[string]any{"loopType": "reviewer", "phase": "review-group", "groupId": group.ID, "repo": input.Repo, "prNumber": input.PRNumber},
+			UseSnapshot:    useSnap,
+			SnapshotVendor: snapVendor,
+			SnapshotModel:  snapModel,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("grouped review %s: %w", group.ID, err)
@@ -254,10 +255,13 @@ func (r *Runner) runGroupedFindingAgents(ctx context.Context, input stepInput, w
 		if err != nil {
 			return nil, fmt.Errorf("grouped review %s: %w", group.ID, err)
 		}
-		completion, parseErr := parseReviewerCommentOnlyCompletion(result)
-		if parseErr != nil {
-			completion, parseErr = parseReviewerNativeCompletion(result)
+		if result.Status != "completed" {
+			return nil, fmt.Errorf("grouped review %s: agent %s", group.ID, result.Status)
 		}
+		if err := r.assertGroupedWorktreeUnchanged(ctx, worktreePath, head); err != nil {
+			return nil, fmt.Errorf("grouped review %s: %w", group.ID, err)
+		}
+		completion, parseErr := parseReviewerCommentOnlyCompletion(result)
 		if parseErr != nil {
 			return nil, fmt.Errorf("grouped review %s: %w", group.ID, parseErr)
 		}
@@ -266,9 +270,33 @@ func (r *Runner) runGroupedFindingAgents(ctx context.Context, input stepInput, w
 	return mergeGroupedFindings(batches...), nil
 }
 
+func (r *Runner) assertGroupedWorktreeUnchanged(ctx context.Context, worktree, head string) error {
+	gitPath := groupingGitPath(r)
+	rev := exec.CommandContext(ctx, gitPath, "-C", worktree, "rev-parse", "HEAD")
+	out, err := rev.Output()
+	if err != nil {
+		return fmt.Errorf("worktree HEAD: %w", err)
+	}
+	got := strings.TrimSpace(string(out))
+	want := strings.TrimSpace(head)
+	if !strings.EqualFold(got, want) {
+		return fmt.Errorf("worktree HEAD drifted to %s, want %s", got, want)
+	}
+	status := exec.CommandContext(ctx, gitPath, "-C", worktree, "status", "--porcelain")
+	st, err := status.Output()
+	if err != nil {
+		return fmt.Errorf("worktree status: %w", err)
+	}
+	if strings.TrimSpace(string(st)) != "" {
+		return fmt.Errorf("worktree is dirty")
+	}
+	return nil
+}
+
 func groupedFindingPrompt(group fileGroup, all []changedFile, base, head string) string {
 	return strings.Join([]string{
 		"You are a grouped reviewer subtask. Do not publish a review or call review submit.",
+		"Do not checkout another revision, edit files, format, generate output, or otherwise mutate the worktree. Inspect the fixed head only.",
 		"Fixed base_sha=" + base + " head_sha=" + head + ".",
 		"Review only these paths: " + strings.Join(group.Paths, ", "),
 		"Other changed files (context; still check cross-group contracts): " + strings.Join(otherPaths(group, all), ", "),

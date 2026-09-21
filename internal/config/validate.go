@@ -727,6 +727,11 @@ func validateProjectRoleOverrides(roles *PartialRoleConfigs, prefix string, maxI
 				validateReviewFixBudgetCap(*roles.Reviewer.Behavior.Loop.MaxPublishesPerPR, prefix+".reviewer.behavior.loop.maxPublishesPerPR", issues)
 			}
 		}
+		if roles.Reviewer.Behavior != nil && roles.Reviewer.Behavior.RelatedFileGroups != nil && roles.Reviewer.Behavior.RelatedFileGroups.MinChangedFiles != nil {
+			if *roles.Reviewer.Behavior.RelatedFileGroups.MinChangedFiles < 1 {
+				*issues = append(*issues, ValidationIssue{Path: prefix + ".reviewer.behavior.relatedFileGroups.minChangedFiles", Message: "must be a positive integer"})
+			}
+		}
 		if roles.Reviewer.AutoMerge != nil {
 			validatePartialReviewerAutoMerge(*roles.Reviewer.AutoMerge, prefix+".reviewer.autoMerge", issues)
 		}

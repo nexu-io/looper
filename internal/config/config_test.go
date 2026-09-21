@@ -4064,6 +4064,30 @@ func TestValidateCoordinatorDependenciesRequiresPositiveBoundsWhenEnabled(t *tes
 	assertValidationIssue(t, validationErr, "roles.coordinator.dependencies.apiRetryAttempts", "must be a positive integer when dependencies are enabled")
 }
 
+func TestValidateRejectsProjectRelatedFileGroupsMinChangedFiles(t *testing.T) {
+	t.Parallel()
+	cfg, err := DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	zero := 0
+	repo := t.TempDir()
+	cfg.Projects = []ProjectRefConfig{{
+		ID: "demo", Name: "Demo", RepoPath: repo,
+		Roles: &PartialRoleConfigs{Reviewer: &PartialReviewerRoleConfig{
+			Behavior: &PartialReviewerConfig{
+				RelatedFileGroups: &PartialReviewerRelatedFileGroupsConfig{MinChangedFiles: &zero},
+			},
+		}},
+	}}
+	err = ValidateWithOptions(cfg, ValidateOptions{DefaultWorktreeRoot: t.TempDir()})
+	var validationErr *ConfigValidationError
+	if !errors.As(err, &validationErr) {
+		t.Fatalf("Validate() error = %v, want ConfigValidationError", err)
+	}
+	assertValidationIssue(t, validationErr, "projects[0].roles.reviewer.behavior.relatedFileGroups.minChangedFiles", "must be a positive integer")
+}
+
 func mapEnvLookup(values map[string]string) EnvLookupFunc {
 	return func(key string) (string, bool) {
 		value, ok := values[key]

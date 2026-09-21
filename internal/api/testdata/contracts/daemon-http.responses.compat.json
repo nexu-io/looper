@@ -456,6 +456,10 @@
                   "requireCurrentReviewRequest": true,
                   "requireNewHeadSinceThread": true,
                   "scope": "looper_authored_only"
+                },
+                "relatedFileGroups": {
+                  "enabled": false,
+                  "minChangedFiles": 24
                 }
               },
               "discovery": {
@@ -470,6 +474,11 @@
                   "includeReviewingLabel": true,
                   "reviewingLabel": "looper:spec-reviewing"
                 }
+              },
+              "skills": {
+                "mode": "extend",
+                "optional": [],
+                "required": []
               }
             },
             "fixer": {
