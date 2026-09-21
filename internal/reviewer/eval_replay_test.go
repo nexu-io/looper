@@ -2,6 +2,7 @@ package reviewer
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -122,11 +123,41 @@ func loadEvalSample(t *testing.T, root, id string) (evalSampleMeta, evalLabelsFi
 	if err := json.Unmarshal(metaRaw, &meta); err != nil {
 		t.Fatalf("sample %s meta.json parse: %v", id, err)
 	}
-	var labels evalLabelsFile
-	if err := json.Unmarshal(labelRaw, &labels); err != nil {
-		t.Fatalf("sample %s labels.json parse: %v", id, err)
+	labels, err := parseEvalLabels(labelRaw)
+	if err != nil {
+		t.Fatalf("sample %s labels.json: %v", id, err)
 	}
 	return meta, labels, labelRaw
+}
+
+func parseEvalLabels(labelRaw []byte) (evalLabelsFile, error) {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(labelRaw, &raw); err != nil {
+		return evalLabelsFile{}, err
+	}
+	findingsRaw, ok := raw["expectedFindings"]
+	if !ok {
+		return evalLabelsFile{}, fmt.Errorf("missing expectedFindings")
+	}
+	if strings.TrimSpace(string(findingsRaw)) == "null" {
+		return evalLabelsFile{}, fmt.Errorf("expectedFindings is null; use [] for a clean label")
+	}
+	var labels evalLabelsFile
+	if err := json.Unmarshal(labelRaw, &labels); err != nil {
+		return evalLabelsFile{}, err
+	}
+	for i, finding := range labels.ExpectedFindings {
+		if strings.TrimSpace(finding.RootCauseKey) == "" {
+			return evalLabelsFile{}, fmt.Errorf("expectedFindings[%d] missing rootCauseKey", i)
+		}
+		if strings.TrimSpace(finding.Path) == "" {
+			return evalLabelsFile{}, fmt.Errorf("expectedFindings[%d] missing path", i)
+		}
+		if finding.Line <= 0 {
+			return evalLabelsFile{}, fmt.Errorf("expectedFindings[%d] missing line", i)
+		}
+	}
+	return labels, nil
 }
 
 func TestEvalSampleIndexValid(t *testing.T) {
@@ -202,6 +233,47 @@ func TestEvalSampleIndexValid(t *testing.T) {
 	}
 	if repairCount < 1 {
 		t.Fatal("index needs at least one repair_frontier sample")
+	}
+}
+
+func TestEvalLabelsRejectMalformed(t *testing.T) {
+	t.Parallel()
+	validFinding := `{
+		"id": "F1",
+		"path": "pkg/file.go",
+		"line": 12,
+		"title": "title",
+		"body": "body",
+		"rootCauseKey": "shared-root"
+	}`
+	tests := []struct {
+		name    string
+		raw     string
+		wantErr string
+	}{
+		{name: "clean_empty_array", raw: `{"expectedFindings":[]}`},
+		{name: "valid_finding", raw: `{"expectedFindings":[` + validFinding + `]}`},
+		{name: "missing_key", raw: `{}`, wantErr: "missing expectedFindings"},
+		{name: "misspelled_key", raw: `{"expected_findings":[]}`, wantErr: "missing expectedFindings"},
+		{name: "null_findings", raw: `{"expectedFindings":null}`, wantErr: "expectedFindings is null"},
+		{name: "missing_root_cause", raw: `{"expectedFindings":[{"id":"F1","path":"pkg/file.go","line":12,"rootCauseKey":""}]}`, wantErr: "missing rootCauseKey"},
+		{name: "missing_path", raw: `{"expectedFindings":[{"id":"F1","path":"","line":12,"rootCauseKey":"shared-root"}]}`, wantErr: "missing path"},
+		{name: "missing_line", raw: `{"expectedFindings":[{"id":"F1","path":"pkg/file.go","rootCauseKey":"shared-root"}]}`, wantErr: "missing line"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			_, err := parseEvalLabels([]byte(tc.raw))
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("parseEvalLabels() error = %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("parseEvalLabels() error = %v, want substring %q", err, tc.wantErr)
+			}
+		})
 	}
 }
 
@@ -356,7 +428,7 @@ func replayEvalPrompt(t *testing.T, meta evalSampleMeta) string {
 		false,
 		meta.LastPublishedHeadSha,
 	)
-	return insertBeforeCompletionInstruction(prompt, evalFrozenHistoryPrompt(meta.RequiredHistory))
+	return insertBeforeCompletionInstruction(applyEvalOfflinePromptContract(t, prompt), evalFrozenHistoryPrompt(meta.RequiredHistory))
 }
 
 func assertEvalFrozenSampleContext(t *testing.T, meta evalSampleMeta, prompt string) {
@@ -395,6 +467,7 @@ func assertEvalFrozenSampleContext(t *testing.T, meta evalSampleMeta, prompt str
 			t.Fatalf("sample %s prompt missing frozen thread body for %s", meta.ID, thread.ID)
 		}
 	}
+	assertEvalPromptOmitsLiveGitHub(t, meta, prompt)
 }
 
 func evalFrozenHistoryPrompt(history evalRequiredHistory) string {
@@ -429,6 +502,69 @@ func evalFrozenHistoryPrompt(history evalRequiredHistory) string {
 		b.WriteString(fixer)
 	}
 	return b.String()
+}
+
+func evalOfflineFetchContract() string {
+	return strings.Join([]string{
+		"Offline eval sample contract: this prompt is a frozen fixture replay. Use only the minimal PR seed, requiredHistory, local checkout, and committed fixture diff in this prompt.",
+		"Do not query live GitHub metadata, checks, review threads, or comments for this sample.",
+		"Do not validate live head/base SHAs, PR state, or draft status, and do not fail fast on PR drift. These samples include historical OPEN PRs, synthetic PR numbers, and nonexistent SHAs; live validation would introduce mutable evidence or terminate with pr_drift instead of reviewing the frozen sample.",
+		"Inspect changes with local Git using the fixed base_sha and head_sha from the seed, or the committed fixture patch when a fixturePath is provided. Never treat a missing local object as permission to fetch the live PR.",
+	}, "\n")
+}
+
+func applyEvalOfflinePromptContract(t *testing.T, prompt string) string {
+	t.Helper()
+	live := reviewerAgentSideGitHubFetchContract()
+	if !strings.Contains(prompt, live) {
+		t.Fatal("eval replay prompt missing production GitHub fetch contract to replace")
+	}
+	prompt = strings.Replace(prompt, live, evalOfflineFetchContract(), 1)
+	replacements := [][2]string{
+		{
+			"Idempotency requirement: before posting anything, use `gh api` to list existing PR reviews for this PR. Only treat an existing marker as satisfying this run when the review body contains the exact idempotency id and expected head SHA, and the review state matches the required outcome-specific policy for this run. If such a matching review already exists, do not post another review. Instead, rely on Looper to validate that marker after the agent exits and to reconcile clean-signal reactions/spec label transitions as needed. If the marker exists but the outcome/review-state combination does not satisfy this run, ignore it and publish the correct review for this run instead.",
+			"Idempotency requirement: do not list live PR reviews or inspect live review markers. Frozen eval samples are offline fixtures.",
+		},
+		{
+			"Before posting, use `gh` to confirm the PR is still open and the head SHA still matches the expected head SHA. If it changed, do not post a review and exit non-zero with the exact message `PR head changed before publish`.",
+			"Do not confirm live PR state or head SHA before posting. Frozen eval samples include historical OPEN PRs and synthetic SHAs; do not exit for PR drift.",
+		},
+		{
+			"Before posting, confirm the current GitHub user is still requested for review. If not requested, do not post a review; exit non-zero with the exact message `review request removed before publish`.",
+			"Do not confirm a live GitHub review request. Frozen eval samples are not live review assignments.",
+		},
+	}
+	for _, pair := range replacements {
+		if !strings.Contains(prompt, pair[0]) {
+			t.Fatalf("eval replay prompt missing live GitHub instruction to replace: %q", pair[0])
+		}
+		prompt = strings.Replace(prompt, pair[0], pair[1], 1)
+	}
+	return prompt
+}
+
+func assertEvalPromptOmitsLiveGitHub(t *testing.T, meta evalSampleMeta, prompt string) {
+	t.Helper()
+	if !strings.Contains(prompt, "Offline eval sample contract") {
+		t.Fatalf("sample %s prompt missing offline eval contract", meta.ID)
+	}
+	if strings.Contains(prompt, reviewerAgentSideGitHubFetchContract()) {
+		t.Fatalf("sample %s prompt retained production GitHub fetch contract", meta.ID)
+	}
+	for _, forbidden := range []string{
+		"gh pr view <pr-url>",
+		"gh pr checks <pr-url>",
+		"gh api repos/{owner}/{repo}/pulls/{number}/comments --paginate",
+		"Fail fast on drift",
+		"Do not proceed on stale PR data",
+		"use `gh api` to list existing PR reviews",
+		"use `gh` to confirm the PR is still open",
+		"review request removed before publish",
+	} {
+		if strings.Contains(prompt, forbidden) {
+			t.Fatalf("sample %s prompt still contains live GitHub instruction %q", meta.ID, forbidden)
+		}
+	}
 }
 
 func insertBeforeCompletionInstruction(prompt, extra string) string {
