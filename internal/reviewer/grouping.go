@@ -298,8 +298,21 @@ func groupedFindingPrompt(group fileGroup, all []changedFile, base, head string)
 		"You are a grouped reviewer subtask. Do not publish a review or call review submit.",
 		"Do not checkout another revision, edit files, format, generate output, or otherwise mutate the worktree. Inspect the fixed head only.",
 		"Fixed base_sha=" + base + " head_sha=" + head + ".",
-		"Review only these paths: " + strings.Join(group.Paths, ", "),
-		"Other changed files (context; still check cross-group contracts): " + strings.Join(otherPaths(group, all), ", "),
-		"Return __LOOPER_RESULT__ JSON with summary, outcome, and findings using disposition, severity, scopeBasis, scopeEvidence, title, body, optional path/line.",
+		"Review only these paths (JSON array): " + marshalPromptPaths(group.Paths),
+		"Other changed files (JSON array; context; still check cross-group contracts): " + marshalPromptPaths(otherPaths(group, all)),
+		"Return __LOOPER_RESULT__ JSON with summary, outcome (`clean` | `non_blocking` | `blocking`), and findings.",
+		"Each finding MUST include title, body, disposition `must_fix` | `follow_up` | `needs_human`, severity `blocking` | `non_blocking` | `nit`, scopeBasis `stated_intent` | `introduced_regression` | `required_invariant` | `independent_improvement` | `ambiguous_intent`, scopeEvidence, and optional path/line.",
+		"Use outcome=clean only when there are no must_fix findings. Clean summaries MUST start with `No actionable findings`.",
 	}, "\n")
+}
+
+func marshalPromptPaths(paths []string) string {
+	if paths == nil {
+		paths = []string{}
+	}
+	payload, err := json.Marshal(paths)
+	if err != nil {
+		return "[]"
+	}
+	return string(payload)
 }

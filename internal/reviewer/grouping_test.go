@@ -2,6 +2,7 @@ package reviewer
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -119,6 +120,50 @@ func TestGroupedFindingPromptForbidsWorktreeMutation(t *testing.T) {
 	}
 	if !strings.Contains(prompt, "must not publish") && !strings.Contains(prompt, "Do not publish") {
 		t.Fatalf("prompt missing publish prohibition: %s", prompt)
+	}
+}
+
+func TestGroupedFindingPromptEncodesPathsAsJSON(t *testing.T) {
+	t.Parallel()
+	group := fileGroup{ID: "other", Paths: []string{"foo\nbar.go", "a,b.go"}}
+	all := []changedFile{{Path: "foo\nbar.go"}, {Path: "a,b.go"}, {Path: "ok.go"}}
+	prompt := groupedFindingPrompt(group, all, "base", "head")
+	if strings.Contains(prompt, "foo\nbar.go") {
+		t.Fatalf("prompt inserted a literal newline path")
+	}
+	var reviewPaths, other []string
+	for _, line := range strings.Split(prompt, "\n") {
+		switch {
+		case strings.HasPrefix(line, "Review only these paths (JSON array): "):
+			if err := json.Unmarshal([]byte(strings.TrimPrefix(line, "Review only these paths (JSON array): ")), &reviewPaths); err != nil {
+				t.Fatalf("review paths JSON: %v (%q)", err, line)
+			}
+		case strings.HasPrefix(line, "Other changed files (JSON array; context; still check cross-group contracts): "):
+			if err := json.Unmarshal([]byte(strings.TrimPrefix(line, "Other changed files (JSON array; context; still check cross-group contracts): ")), &other); err != nil {
+				t.Fatalf("other paths JSON: %v (%q)", err, line)
+			}
+		}
+	}
+	if !reflect.DeepEqual(reviewPaths, group.Paths) {
+		t.Fatalf("review paths = %#v", reviewPaths)
+	}
+	if !reflect.DeepEqual(other, []string{"ok.go"}) {
+		t.Fatalf("other paths = %#v", other)
+	}
+}
+
+func TestGroupedFindingPromptSpecifiesCompletionVocabulary(t *testing.T) {
+	t.Parallel()
+	prompt := groupedFindingPrompt(fileGroup{ID: "go:pkg", Paths: []string{"a.go"}}, []changedFile{{Path: "a.go"}}, "base", "head")
+	for _, want := range []string{
+		"must_fix", "follow_up", "needs_human",
+		"blocking", "non_blocking", "nit",
+		"stated_intent", "introduced_regression", "required_invariant", "independent_improvement", "ambiguous_intent",
+		"No actionable findings",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("prompt missing %q: %s", want, prompt)
+		}
 	}
 }
 
