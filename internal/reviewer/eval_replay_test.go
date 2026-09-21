@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/nexu-io/looper/internal/config"
+	"github.com/nexu-io/looper/internal/reviewer/reviewskills"
 )
 
 // Prompt-construction replay for the reviewer eval kit. This is not model-quality
@@ -278,6 +279,7 @@ func replayEvalPrompt(t *testing.T, meta evalSampleMeta) string {
 		false,
 		false,
 		meta.LastPublishedHeadSha,
+		reviewskills.PreviewIndexPlaceholder(),
 	)
 	return prompt
 }
