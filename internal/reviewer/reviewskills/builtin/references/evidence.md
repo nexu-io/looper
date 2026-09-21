@@ -8,7 +8,7 @@ Comment shape for every finding: trigger condition → actual path → wrong con
 
 Establish a real concurrent call path, the shared state, and the synchronization that is supposed to protect it. Do not infer a race from a mutex, channel, or `go` keyword alone.
 
-Positive: two goroutines can write the same struct field / map / slice header with no lock, atomic, or channel handoff on that path.
+Positive: two goroutines have conflicting concurrent accesses to the same struct field / map / slice header, with at least one access a write and no lock, atomic, or channel handoff on that path.
 
 Negative: a per-call local variable, a value copied into a closure, or a field only mutated on a single-owner goroutine.
 
@@ -26,9 +26,9 @@ Negative: ownership is returned to the caller (`io.ReadCloser`, constructor that
 
 Name the untrusted input, a reachable path from that input, and the actual trust boundary.
 
-Positive: attacker-controlled bytes reach a sink (exec, query, path, template, authz check) without validation or a trust-boundary change.
+Positive: attacker-controlled bytes reach a sink (exec, query, path, template, authz check) that interprets them unsafely—missing parameterization, contextual escaping, or path confinement—without validation or a trust-boundary change.
 
-Negative: the value is already authenticated/authorized, comes from a trusted config/operator surface, or never reaches the sink on the claimed path.
+Negative: the specific value has already been constrained for the destination sink, comes from a trusted config/operator surface, or never reaches the sink on the claimed path. Authentication or authorization to invoke an operation does not make user-supplied repository names, query strings, or template values trusted.
 
 ## Go loop variable / timer
 

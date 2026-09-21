@@ -35,7 +35,7 @@ Equivalent METHOD migration from `buildReviewPromptWithInstructions`. Execution 
 | Long severity rubric ("mark a finding as BLOCKING only when…") | `builtin/references/implementation-rubric.md` |
 | Long finding-accumulator essay | `builtin/references/implementation-rubric.md` |
 | Spec/docs review rubric | `builtin/references/spec-rubric.md` |
-| Procedure (intent → enumerate without shrinking → large-PR related-file plan → accumulate → same-context counterexample pass → existing schema) | `builtin/SKILL.md` |
+| Procedure (intent → enumerate without shrinking → surrounding context → large-PR related-file plan → accumulate → same-context counterexample pass → existing schema) | `builtin/SKILL.md` |
 
 ## DELETED-DUPLICATE
 
