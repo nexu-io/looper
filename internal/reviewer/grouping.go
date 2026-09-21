@@ -125,9 +125,9 @@ func groupingPlanText(groups []fileGroup, all []changedFile) string {
 		allPaths = append(allPaths, file.Path)
 	}
 	sort.Strings(allPaths)
-	b.WriteString("All changed paths: " + strings.Join(allPaths, ", ") + "\n")
+	b.WriteString("All changed paths (JSON array): " + marshalPromptPaths(allPaths) + "\n")
 	for _, group := range groups {
-		b.WriteString("- " + group.ID + ": " + strings.Join(group.Paths, ", ") + "\n")
+		b.WriteString("- " + group.ID + ": " + marshalPromptPaths(group.Paths) + "\n")
 	}
 	return strings.TrimSpace(b.String())
 }
@@ -239,14 +239,18 @@ func (r *Runner) runGroupedFindingAgents(ctx context.Context, input stepInput, w
 	useSnap, snapVendor, snapModel := agentRunSnapshotFields(agentVendor, agentModel, useSnapshot)
 	var batches [][]reviewerCommentOnlyFindingResult
 	for _, group := range groups {
+		if err := r.rejectIfReviewerHeld(ctx, input); err != nil {
+			return nil, err
+		}
 		prompt := groupedFindingPrompt(group, all, base, head)
 		execution, err := r.agentExecutor.Start(ctx, AgentRunInput{
 			ExecutionID: eventlog.NewEventID("agent"), ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID,
 			Prompt: prompt, WorkingDirectory: worktreePath, Timeout: r.agentTimeout, HeartbeatTimeout: r.agentIdleTimeout,
-			Metadata:       map[string]any{"loopType": "reviewer", "phase": "review-group", "groupId": group.ID, "repo": input.Repo, "prNumber": input.PRNumber},
-			UseSnapshot:    useSnap,
-			SnapshotVendor: snapVendor,
-			SnapshotModel:  snapModel,
+			Metadata:            map[string]any{"loopType": "reviewer", "phase": "review-group", "groupId": group.ID, "repo": input.Repo, "prNumber": input.PRNumber},
+			UseSnapshot:         useSnap,
+			SnapshotVendor:      snapVendor,
+			SnapshotModel:       snapModel,
+			DisableNativeResume: true,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("grouped review %s: %w", group.ID, err)

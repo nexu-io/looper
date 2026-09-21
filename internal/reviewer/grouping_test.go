@@ -3,6 +3,7 @@ package reviewer
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -11,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/nexu-io/looper/internal/config"
+	"github.com/nexu-io/looper/internal/domain"
 	"github.com/nexu-io/looper/internal/storage"
 )
 
@@ -152,6 +154,35 @@ func TestGroupedFindingPromptEncodesPathsAsJSON(t *testing.T) {
 	}
 }
 
+func TestGroupingPlanTextEncodesPathsAsJSON(t *testing.T) {
+	t.Parallel()
+	groups := []fileGroup{{ID: "other", Paths: []string{"foo\nbar.go", "a,b.go"}}}
+	all := []changedFile{{Path: "foo\nbar.go"}, {Path: "a,b.go"}}
+	plan := groupingPlanText(groups, all)
+	if strings.Contains(plan, "foo\nbar.go") {
+		t.Fatalf("plan inserted a literal newline path")
+	}
+	var allPaths, groupPaths []string
+	for _, line := range strings.Split(plan, "\n") {
+		switch {
+		case strings.HasPrefix(line, "All changed paths (JSON array): "):
+			if err := json.Unmarshal([]byte(strings.TrimPrefix(line, "All changed paths (JSON array): ")), &allPaths); err != nil {
+				t.Fatalf("all paths JSON: %v (%q)", err, line)
+			}
+		case strings.HasPrefix(line, "- other: "):
+			if err := json.Unmarshal([]byte(strings.TrimPrefix(line, "- other: ")), &groupPaths); err != nil {
+				t.Fatalf("group paths JSON: %v (%q)", err, line)
+			}
+		}
+	}
+	if !reflect.DeepEqual(allPaths, []string{"a,b.go", "foo\nbar.go"}) {
+		t.Fatalf("all paths = %#v", allPaths)
+	}
+	if !reflect.DeepEqual(groupPaths, groups[0].Paths) {
+		t.Fatalf("group paths = %#v", groupPaths)
+	}
+}
+
 func TestGroupedFindingPromptSpecifiesCompletionVocabulary(t *testing.T) {
 	t.Parallel()
 	prompt := groupedFindingPrompt(fileGroup{ID: "go:pkg", Paths: []string{"a.go"}}, []changedFile{{Path: "a.go"}}, "base", "head")
@@ -250,6 +281,31 @@ func TestRunGroupedFindingAgentsPassesRunSnapshot(t *testing.T) {
 	}
 	if agent.starts[0].SnapshotModel == nil || *agent.starts[0].SnapshotModel != model {
 		t.Fatalf("snapshot model = %#v", agent.starts[0].SnapshotModel)
+	}
+	if !agent.starts[0].DisableNativeResume {
+		t.Fatalf("DisableNativeResume = false, want true")
+	}
+}
+
+func TestRunGroupedFindingAgentsStopsOnHoldBetweenGroups(t *testing.T) {
+	t.Parallel()
+	repo, _, head := groupingTestRepoWithRename(t)
+	github := &fakeGitHubGateway{}
+	completed := AgentResult{Status: "completed", Stdout: `__LOOPER_RESULT__={"summary":"No actionable findings","outcome":"clean","findings":[]}`}
+	agent := &fakeAgentExecutor{
+		results: []AgentResult{completed, completed},
+		onStart: func(AgentRunInput) {
+			github.labels = []string{domain.HoldLabelReviewer}
+		},
+	}
+	runner := &Runner{agentExecutor: agent, github: github, projectRoleConfig: &config.Config{}}
+	_, err := runner.runGroupedFindingAgents(context.Background(), stepInput{Repo: "acme/looper", PRNumber: 42}, repo, []fileGroup{{ID: "a", Paths: []string{"new name.go"}}, {ID: "b", Paths: []string{"other.go"}}}, []changedFile{{Path: "new name.go"}, {Path: "other.go"}}, "base", head)
+	var hold *holdSkipError
+	if !errors.As(err, &hold) {
+		t.Fatalf("runGroupedFindingAgents() error = %v, want hold skip", err)
+	}
+	if len(agent.starts) != 1 {
+		t.Fatalf("starts = %d, want 1", len(agent.starts))
 	}
 }
 

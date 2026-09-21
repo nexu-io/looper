@@ -164,6 +164,10 @@ type RunInput struct {
 	Env                map[string]string
 	TrustedReview      *forge.TrustedReviewAuthority
 	NativeSessionID    string
+	// DisableNativeResume skips LoopID auto-attach so a sibling start cannot
+	// consume a pending native session. Explicit NativeSessionID still wins.
+	DisableNativeResume bool
+
 	// UseSnapshot, when true with a non-empty SnapshotVendor, overrides the
 	// executor's configured vendor/model for this start only (spawn, native
 	// resume vendor checks, and persisted execution vendor). Env and
@@ -401,6 +405,9 @@ func (e *ConfiguredExecutor) resolveNativeResume(ctx context.Context, input RunI
 			return nativeResumeInfo{Enabled: true, SessionID: sessionID, Mode: "native_resume", Status: "started"}, nil
 		}
 		return nativeResumeInfo{Mode: "checkpoint_restart", Status: "unsupported"}, nil
+	}
+	if input.DisableNativeResume {
+		return nativeResumeInfo{Mode: "checkpoint_restart", Status: "unavailable"}, nil
 	}
 	if e.repos == nil || e.repos.AgentExecutions == nil || strings.TrimSpace(input.LoopID) == "" {
 		return nativeResumeInfo{Mode: "checkpoint_restart", Status: "unavailable"}, nil

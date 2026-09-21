@@ -416,17 +416,20 @@ type GitGateway interface {
 }
 
 type AgentRunInput struct {
-	ExecutionID        string
-	ProjectID          string
-	LoopID             string
-	RunID              string
-	Prompt             string
-	NativeResumePrompt string
-	WorkingDirectory   string
-	Timeout            time.Duration
-	HeartbeatTimeout   time.Duration
-	Metadata           map[string]any
-	IdempotencyKey     string
+	ExecutionID         string
+	ProjectID           string
+	LoopID              string
+	RunID               string
+	Prompt              string
+	NativeResumePrompt  string
+	NativeSessionID     string
+	DisableNativeResume bool
+
+	WorkingDirectory string
+	Timeout          time.Duration
+	HeartbeatTimeout time.Duration
+	Metadata         map[string]any
+	IdempotencyKey   string
 	// UseSnapshot + SnapshotVendor/Model override the executor config for this
 	// start when the run has a durable agent snapshot (execution authority).
 	UseSnapshot    bool
@@ -4981,17 +4984,24 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 		return checkpoint, fmt.Errorf("resolve reviewer skills: %w", err)
 	}
 	skillIndex := reviewskills.FormatIndex(resolvedSkills.Entries)
-	skillIndex, err = r.applyRelatedFileGroups(ctx, input, checkpoint, worktree.Path, skillIndex)
-	if err != nil {
-		return checkpoint, err
-	}
-	prompt, instructionBlock := buildReviewPromptWithInstructions(input.Project.ID, r.customInstructions, input.Repo, input.PRNumber, checkpoint, input.Run.ID, idempotencyKey, reviewEvents, isManualReviewerLoop(input.Loop), requireReviewRequest, reviewRequestBypassReason, r.scope, r.disclosure, agentVendor, derefString(agentModel), r.looperCLIPath, r.reviewerAutoMergeConfigForProject(input.Project.ID).Enabled, commentOnlyCompletion, lastPublishedHeadSHA, skillIndex, hostingKindForContext(ctx))
 	nativeResumePrompt := r.nativeResumePromptForReview(ctx, input, checkpoint.Snapshot.HeadSHA, idempotencyKey, lastPublishedHeadSHA)
 	if nativeResumePrompt != "" {
 		if reminder := reviewskills.ResumeReminder(resolvedSkills.Entries); reminder != "" {
 			nativeResumePrompt = nativeResumePrompt + "\n\n" + reminder
 		}
 	}
+	nativeSessionID := r.pendingNativeResumeSessionID(ctx, input.Loop.ID)
+	if relatedFileGroupsConfig(r, input.Project.ID).Enabled {
+		if err := r.rejectIfReviewerHeld(ctx, input); err != nil {
+			return checkpoint, err
+		}
+	}
+	skillIndex, err = r.applyRelatedFileGroups(ctx, input, checkpoint, worktree.Path, skillIndex)
+	if err != nil {
+		return checkpoint, err
+	}
+	prompt, instructionBlock := buildReviewPromptWithInstructions(input.Project.ID, r.customInstructions, input.Repo, input.PRNumber, checkpoint, input.Run.ID, idempotencyKey, reviewEvents, isManualReviewerLoop(input.Loop), requireReviewRequest, reviewRequestBypassReason, r.scope, r.disclosure, agentVendor, derefString(agentModel), r.looperCLIPath, r.reviewerAutoMergeConfigForProject(input.Project.ID).Enabled, commentOnlyCompletion, lastPublishedHeadSHA, skillIndex, hostingKindForContext(ctx))
+
 	metadata := map[string]any{
 		"loopType":                "reviewer",
 		"phase":                   "review",
@@ -5023,7 +5033,7 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 	_ = r.tryAddReaction(ctx, input, reviewerInProgressReaction)
 	execution, err := r.agentExecutor.Start(ctx, AgentRunInput{
 		ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID,
-		Prompt: prompt, NativeResumePrompt: nativeResumePrompt, WorkingDirectory: worktree.Path,
+		Prompt: prompt, NativeResumePrompt: nativeResumePrompt, NativeSessionID: nativeSessionID, WorkingDirectory: worktree.Path,
 		Timeout: r.agentTimeout, HeartbeatTimeout: r.agentIdleTimeout, Metadata: metadata, IdempotencyKey: idempotencyKey,
 		UseSnapshot: useSnap, SnapshotVendor: snapVendor, SnapshotModel: snapModel,
 	})
@@ -8324,6 +8334,28 @@ func (r *Runner) pendingNativeResume(ctx context.Context, loopID string) *storag
 		return nil
 	}
 	return latest
+}
+
+func (r *Runner) pendingNativeResumeSessionID(ctx context.Context, loopID string) string {
+	record := r.pendingNativeResume(ctx, loopID)
+	if record == nil || record.NativeSessionID == nil {
+		return ""
+	}
+	return strings.TrimSpace(*record.NativeSessionID)
+}
+
+func (r *Runner) rejectIfReviewerHeld(ctx context.Context, input stepInput) error {
+	if r == nil || r.github == nil {
+		return nil
+	}
+	freshDetail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.Project.RepoPath})
+	if err != nil {
+		return &loopError{message: fmt.Sprintf("Failed to refresh pull request before starting reviewer agent: %v", err), kind: FailureRetryableAfterResume}
+	}
+	if domain.IsAutomaticLoopHeld(domain.LoopTypeReviewer, isManualReviewerLoop(input.Loop), freshDetail.Labels) {
+		return &holdSkipError{summary: fmt.Sprintf("Reviewer stopped because %s#%d is currently held", input.Repo, input.PRNumber)}
+	}
+	return nil
 }
 
 func (r *Runner) hasPendingNativeResume(ctx context.Context, loopID string) bool {

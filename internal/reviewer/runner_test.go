@@ -7565,6 +7565,10 @@ func TestRunReviewStepKeepsFullPromptForPendingNativeResumeFallback(t *testing.T
 	if len(agent.starts) != 1 {
 		t.Fatalf("len(agent.starts) = %d, want 1", len(agent.starts))
 	}
+	if agent.starts[0].NativeSessionID != "session-123" {
+		t.Fatalf("NativeSessionID = %q, want captured pending session", agent.starts[0].NativeSessionID)
+	}
+
 	prompt := agent.starts[0].Prompt
 	if strings.Contains(prompt, "Continue the existing Looper reviewer review task") {
 		t.Fatalf("prompt = %q, want full review prompt for checkpoint fallback safety", prompt)
@@ -7802,6 +7806,40 @@ func TestRunReviewStepRechecksHoldBeforeAgentStart(t *testing.T) {
 		Project:  *project,
 		Loop:     storage.LoopRecord{ID: "loop_hold_before_agent", Type: "reviewer"},
 		Run:      storage.RunRecord{ID: "run_hold_before_agent"},
+		Repo:     "acme/looper",
+		PRNumber: 42,
+		Checkpoint: reviewerCheckpoint{
+			Detail:   &checkpointDetail{HeadRefName: "feature/review-me", BaseRefName: "main", Labels: []string{}},
+			Snapshot: &checkpointSnapshot{HeadSHA: "abc123"},
+			Worktree: &checkpointWorktree{Path: t.TempDir(), Branch: "feature/review-me", PreparedAt: fixture.nowISO()},
+		},
+	})
+	var holdErr *holdSkipError
+	if !errors.As(err, &holdErr) {
+		t.Fatalf("runReviewStep() error = %v, want hold skip", err)
+	}
+	if len(agent.starts) != 0 {
+		t.Fatalf("agent.starts = %#v, want none", agent.starts)
+	}
+}
+
+func TestRunReviewStepHoldPreventsGroupedStarts(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{labels: []string{domain.HoldLabelReviewer}}
+	agent := &fakeAgentExecutor{}
+	cfg := config.Config{}
+	cfg.Roles.Reviewer.Behavior.RelatedFileGroups = config.ReviewerRelatedFileGroupsConfig{Enabled: true, MinChangedFiles: 1}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, CustomInstructions: &cfg})
+
+	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	if err != nil || project == nil {
+		t.Fatalf("Projects.GetByID() = (%#v, %v), want project", project, err)
+	}
+	_, err = runner.runReviewStep(context.Background(), stepInput{
+		Project:  *project,
+		Loop:     storage.LoopRecord{ID: "loop_hold_before_groups", Type: "reviewer"},
+		Run:      storage.RunRecord{ID: "run_hold_before_groups"},
 		Repo:     "acme/looper",
 		PRNumber: 42,
 		Checkpoint: reviewerCheckpoint{
