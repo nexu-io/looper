@@ -10,7 +10,7 @@ Establish a real concurrent call path, the shared state, and the synchronization
 
 Positive: two goroutines have conflicting concurrent accesses to the same shared memory location (for example a struct field, map, slice header, ordinary variable, pointer target, array or slice element, interface value, or an object's internal storage), with at least one access a write and no lock, atomic, or channel handoff on that path.
 
-Negative: a per-call local variable, a value copied into a closure, or a field only mutated on a single-owner goroutine.
+Negative: a per-call local that is never shared with another goroutine, a copied value that does not reference shared mutable storage, or a field whose reads and writes are all confined to one owner goroutine. A local captured by multiple goroutines or a single writer with unsynchronized readers is not a negative example.
 
 Drop a race finding only when existing synchronization or single-owner access already excludes the claimed interleaving. A type documented as not concurrent does not disprove a race; report the caller's unsynchronized shared use (for example concurrent writes to a shared `bytes.Buffer`).
 
@@ -18,7 +18,7 @@ Drop a race finding only when existing synchronization or single-owner access al
 
 Name the owner, the lifecycle, and whether ownership transferred.
 
-Positive: a handle, file, connection, ticker, or context cancel is created on a success path that can return without close/stop, and no caller is documented to take ownership.
+Positive: a handle, file, connection, or context cancel is created on a success path that can return without release, and no caller is documented to take ownership. For timers and tickers, also establish the effective Go version semantics and reachability described below before claiming a leak.
 
 Negative: ownership is returned to the caller (`io.ReadCloser`, constructor that documents Close), or a `defer` on every return path already releases it.
 
@@ -46,7 +46,7 @@ Timer findings depend on the module's Go version and whether the timer stays rea
 
 Before Go 1.23, `time.After` keeps the timer alive until it fires. Flag it when a long-lived loop or a canceled request can accumulate or retain those timers. A short one-shot that remains referenced until fire is not automatically a leak, but a long-duration `time.After` after cancel can still retain the timer.
 
-On Go 1.23+, the garbage collector can recover unreferenced, unstopped timers, so `time.After` in a loop is not inherently a leak. Prefer `time.NewTimer` with `Stop`/`Reset` only when the code still holds the timer, needs cancel/reset, or the module targets a pre-1.23 toolchain.
+With Go 1.23+ timer semantics, the garbage collector can recover unreferenced, unstopped timers and tickers, so `time.After` in a loop or an unreachable `time.Ticker` without `Stop` is not inherently a leak. Check the module version and any runtime override of those semantics. Still report retained timers/tickers or ticking beyond the intended lifecycle when a concrete resource or behavior consequence is reachable. Prefer `time.NewTimer` with `Stop`/`Reset` only when the code still holds the timer, needs cancel/reset, or uses pre-1.23 timer semantics.
 
 ## Contract errors
 
