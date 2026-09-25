@@ -975,6 +975,8 @@ In `extend` mode, builtin `looper-review` is injected from the builtin bundle di
 
 Two different real files at the same lookup layer with the same `name:` is a configuration error. Symlink aliases of one real path are deduped. A high-priority file that exists but is unreadable or has invalid frontmatter fails the review; Looper does not fall back to a lower layer. Missing required skills fail the review; missing optional skills are recorded as `reviewSkillsUnavailable` and the run continues.
 
+Required references reject blank entries, surrounding whitespace and duplicates during config validation. Optional references are trimmed, empty entries are ignored, and references resolving to the same real file are deduplicated.
+
 Refs that start with `./`, `../`, `/`, or `~/` are paths. `~/` expands to the daemon user's home directory. Relative paths are resolved against the prepared reviewer worktree. Absolute paths are user-managed.
 
 Extend (JSON):

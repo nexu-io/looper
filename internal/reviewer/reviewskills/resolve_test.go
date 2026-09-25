@@ -62,6 +62,29 @@ func TestResolveSameLevelConflict(t *testing.T) {
 	}
 }
 
+func TestReplacementIndexOnlyNamesResolvedMethods(t *testing.T) {
+	t.Parallel()
+
+	worktree := t.TempDir()
+	writeNamedSkill(t, filepath.Join(worktree, ".agents", "skills", "team-review"), "team-review", "team method")
+	result, err := Resolve(ResolveInput{
+		Mode:     config.ReviewerSkillsModeReplace,
+		Required: []string{"team-review"},
+		Worktree: worktree,
+		UserHome: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("Resolve() error = %v", err)
+	}
+	index := FormatIndex(result.Entries)
+	if strings.Contains(index, "looper-review") {
+		t.Fatalf("replacement index instructs the agent to use an unavailable builtin:\n%s", index)
+	}
+	if !strings.Contains(index, result.Entries[0].Path) || !strings.Contains(index, "complete the full review") {
+		t.Fatalf("replacement index lost the custom method or full-review contract:\n%s", index)
+	}
+}
+
 func TestResolveSymlinkAliasDedupes(t *testing.T) {
 	t.Parallel()
 

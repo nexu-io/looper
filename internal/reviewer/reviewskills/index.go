@@ -15,7 +15,13 @@ func FormatIndex(entries []Entry) string {
 	b.WriteString("Review method skills:\n")
 	b.WriteString("Every listed skill MUST be read from the given absolute paths before reviewing.\n")
 	b.WriteString("required: true means the skill had to exist; required: false means it was optional and present. Do not skip a listed skill.\n")
-	b.WriteString("Skill selection does not shrink review scope; if no specialty skill matches, still complete the base review using looper-review.")
+	b.WriteString("Skill selection does not shrink review scope; complete the full review using the resolved methods listed below.")
+	for _, entry := range entries {
+		if entry.Name == "looper-review" {
+			b.WriteString(" If no specialty skill matches, still complete the base review using looper-review.")
+			break
+		}
+	}
 	for _, entry := range entries {
 		fmt.Fprintf(&b, "\n- name: %s\n  source: %s\n  required: %t\n  path: %s\n  description: %s", entry.Name, entry.Source, entry.Required, entry.Path, entry.Description)
 	}
