@@ -3,6 +3,8 @@ package reviewskills
 import (
 	"fmt"
 	"strings"
+
+	"github.com/nexu-io/looper/internal/config"
 )
 
 const previewSkillPath = "<run-local builtin skill path>"
@@ -28,15 +30,34 @@ func FormatIndex(entries []Entry) string {
 	return b.String()
 }
 
-// PreviewIndexPlaceholder describes the builtin skill without fabricating a filesystem path.
+// PreviewIndexPlaceholder describes the default selection without runtime paths.
 func PreviewIndexPlaceholder() string {
-	return FormatIndex([]Entry{{
-		Name:        "looper-review",
-		Description: builtinSkillDescription,
-		Path:        previewSkillPath,
-		Source:      "builtin",
-		Required:    true,
-	}})
+	return PreviewIndex(config.ReviewerSkillsConfig{})
+}
+
+// PreviewIndex describes configured references without claiming runtime availability.
+func PreviewIndex(cfg config.ReviewerSkillsConfig) string {
+	var b strings.Builder
+	b.WriteString("Review method skills:\nPreview only: configured references and absolute paths are resolved at review time in the prepared worktree. Required references must resolve; optional references are included only if present.\n")
+	seen := make(map[string]bool)
+	if cfg.Mode != config.ReviewerSkillsModeReplace {
+		fmt.Fprintf(&b, "- name: looper-review\n  source: builtin\n  required: true\n  path: %s\n  description: %s\n", previewSkillPath, builtinSkillDescription)
+		seen["looper-review"] = true
+	}
+	for _, selection := range []struct {
+		refs     []string
+		required bool
+	}{{cfg.Required, true}, {cfg.Optional, false}} {
+		for _, ref := range selection.refs {
+			ref = strings.TrimSpace(ref)
+			if ref == "" || seen[ref] {
+				continue
+			}
+			seen[ref] = true
+			fmt.Fprintf(&b, "- ref: %q\n  required: %t\n  path: <resolved at review time>\n", ref, selection.required)
+		}
+	}
+	return strings.TrimSpace(b.String())
 }
 
 // ResumeReminder restates current absolute skill paths for a native resume prompt.
