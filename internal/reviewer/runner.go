@@ -4994,7 +4994,10 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 			nativeResumePrompt = nativeResumePrompt + "\n\n" + reminder
 		}
 	}
-	groupedContext, err := r.applyRelatedFileGroups(ctx, input, checkpoint, worktree.Path, skillIndex)
+	groupedContext, closeGroupedContext, err := r.applyRelatedFileGroups(ctx, input, checkpoint, worktree.Path, skillIndex)
+	if closeGroupedContext != nil {
+		defer closeGroupedContext()
+	}
 	if err != nil {
 		var interrupted *loopError
 		if errors.As(err, &interrupted) && interrupted.interrupted {

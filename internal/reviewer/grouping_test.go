@@ -2,12 +2,10 @@ package reviewer
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"reflect"
 	"strings"
 	"testing"
 
@@ -94,15 +92,6 @@ func TestMergeGroupedFindingsPreservesDistinctFindings(t *testing.T) {
 	}
 }
 
-func TestOtherPathsListsRemainder(t *testing.T) {
-	t.Parallel()
-	all := []changedFile{{Path: "a.go"}, {Path: "b.go"}, {Path: "c.md"}}
-	got := otherPaths(fileGroup{Paths: []string{"a.go"}}, all)
-	if !reflect.DeepEqual(got, []string{"b.go", "c.md"}) {
-		t.Fatalf("other = %#v", got)
-	}
-}
-
 func TestGroupingGitPathUsesConfiguredExecutable(t *testing.T) {
 	t.Parallel()
 	path := "/opt/custom/git"
@@ -116,7 +105,7 @@ func TestGroupingGitPathUsesConfiguredExecutable(t *testing.T) {
 
 func TestGroupedFindingPromptForbidsWorktreeMutation(t *testing.T) {
 	t.Parallel()
-	prompt := groupedFindingPrompt(fileGroup{ID: "go:pkg", Paths: []string{"a.go"}}, []changedFile{{Path: "a.go"}, {Path: "b.md"}}, "base", "head")
+	prompt := groupedFindingPrompt("context.json", 0, "base", "head")
 	if !strings.Contains(prompt, "Do not checkout another revision") {
 		t.Fatalf("prompt missing read-only contract: %s", prompt)
 	}
@@ -125,67 +114,9 @@ func TestGroupedFindingPromptForbidsWorktreeMutation(t *testing.T) {
 	}
 }
 
-func TestGroupedFindingPromptEncodesPathsAsJSON(t *testing.T) {
-	t.Parallel()
-	group := fileGroup{ID: "other", Paths: []string{"foo\nbar.go", "a,b.go"}}
-	all := []changedFile{{Path: "foo\nbar.go"}, {Path: "a,b.go"}, {Path: "ok.go"}}
-	prompt := groupedFindingPrompt(group, all, "base", "head")
-	if strings.Contains(prompt, "foo\nbar.go") {
-		t.Fatalf("prompt inserted a literal newline path")
-	}
-	var reviewPaths, other []string
-	for _, line := range strings.Split(prompt, "\n") {
-		switch {
-		case strings.HasPrefix(line, "Review only these paths (JSON array): "):
-			if err := json.Unmarshal([]byte(strings.TrimPrefix(line, "Review only these paths (JSON array): ")), &reviewPaths); err != nil {
-				t.Fatalf("review paths JSON: %v (%q)", err, line)
-			}
-		case strings.HasPrefix(line, "Other changed files (JSON array; context; still check cross-group contracts): "):
-			if err := json.Unmarshal([]byte(strings.TrimPrefix(line, "Other changed files (JSON array; context; still check cross-group contracts): ")), &other); err != nil {
-				t.Fatalf("other paths JSON: %v (%q)", err, line)
-			}
-		}
-	}
-	if !reflect.DeepEqual(reviewPaths, group.Paths) {
-		t.Fatalf("review paths = %#v", reviewPaths)
-	}
-	if !reflect.DeepEqual(other, []string{"ok.go"}) {
-		t.Fatalf("other paths = %#v", other)
-	}
-}
-
-func TestGroupingPlanTextEncodesPathsAsJSON(t *testing.T) {
-	t.Parallel()
-	groups := []fileGroup{{ID: "other", Paths: []string{"foo\nbar.go", "a,b.go"}}}
-	all := []changedFile{{Path: "foo\nbar.go"}, {Path: "a,b.go"}}
-	plan := groupingPlanText(groups, all)
-	if strings.Contains(plan, "foo\nbar.go") {
-		t.Fatalf("plan inserted a literal newline path")
-	}
-	var allPaths, groupPaths []string
-	for _, line := range strings.Split(plan, "\n") {
-		switch {
-		case strings.HasPrefix(line, "All changed paths (JSON array): "):
-			if err := json.Unmarshal([]byte(strings.TrimPrefix(line, "All changed paths (JSON array): ")), &allPaths); err != nil {
-				t.Fatalf("all paths JSON: %v (%q)", err, line)
-			}
-		case strings.HasPrefix(line, "- \"other\": "):
-			if err := json.Unmarshal([]byte(strings.TrimPrefix(line, "- \"other\": ")), &groupPaths); err != nil {
-				t.Fatalf("group paths JSON: %v (%q)", err, line)
-			}
-		}
-	}
-	if !reflect.DeepEqual(allPaths, []string{"a,b.go", "foo\nbar.go"}) {
-		t.Fatalf("all paths = %#v", allPaths)
-	}
-	if !reflect.DeepEqual(groupPaths, groups[0].Paths) {
-		t.Fatalf("group paths = %#v", groupPaths)
-	}
-}
-
 func TestGroupedFindingPromptSpecifiesCompletionVocabulary(t *testing.T) {
 	t.Parallel()
-	prompt := groupedFindingPrompt(fileGroup{ID: "go:pkg", Paths: []string{"a.go"}}, []changedFile{{Path: "a.go"}}, "base", "head")
+	prompt := groupedFindingPrompt("context.json", 0, "base", "head")
 	for _, want := range []string{
 		"must_fix", "follow_up", "needs_human",
 		"blocking", "non_blocking", "nit",
@@ -198,21 +129,6 @@ func TestGroupedFindingPromptSpecifiesCompletionVocabulary(t *testing.T) {
 	}
 }
 
-func TestGroupingPlanTextEscapesDirectoryDerivedIdentifiers(t *testing.T) {
-	t.Parallel()
-	files := []changedFile{{Path: "pkg/line\nwith\x01control/file.go"}}
-	groups := groupChangedFiles(files)
-	plan := groupingPlanText(groups, files)
-	if strings.Contains(plan, groups[0].ID) || len(strings.Split(plan, "\n")) != 3 {
-		t.Fatalf("directory text escaped its data boundary: %q", plan)
-	}
-	line := strings.Split(plan, "\n")[2]
-	var identifier string
-	if err := json.NewDecoder(strings.NewReader(strings.TrimPrefix(line, "- "))).Decode(&identifier); err != nil || identifier != groups[0].ID {
-		t.Fatalf("group identifier failed JSON round trip: %q, %v", identifier, err)
-	}
-}
-
 func TestApplyRelatedFileGroupsFailsOnChangedPathEnumeration(t *testing.T) {
 	t.Parallel()
 	missing := filepath.Join(t.TempDir(), "missing-git")
@@ -220,7 +136,10 @@ func TestApplyRelatedFileGroupsFailsOnChangedPathEnumeration(t *testing.T) {
 	cfg.Roles.Reviewer.Behavior.RelatedFileGroups = config.ReviewerRelatedFileGroupsConfig{Enabled: true, MinChangedFiles: 1}
 	cfg.Tools.GitPath = &missing
 	runner := &Runner{projectRoleConfig: &cfg}
-	_, err := runner.applyRelatedFileGroups(context.Background(), stepInput{Project: storage.ProjectRecord{ID: "p"}}, reviewerCheckpoint{Snapshot: &checkpointSnapshot{BaseSHA: "aaa", HeadSHA: "bbb"}}, t.TempDir(), "skills")
+	_, cleanup, err := runner.applyRelatedFileGroups(context.Background(), stepInput{Project: storage.ProjectRecord{ID: "p"}}, reviewerCheckpoint{Snapshot: &checkpointSnapshot{BaseSHA: "aaa", HeadSHA: "bbb"}}, t.TempDir(), "skills")
+	if cleanup != nil {
+		defer cleanup()
+	}
 	if err == nil || !strings.Contains(err.Error(), "enumerate changed paths") {
 		t.Fatalf("applyRelatedFileGroups() error = %v", err)
 	}
@@ -232,7 +151,10 @@ func TestApplyRelatedFileGroupsLeavesSmallDiffUngrouped(t *testing.T) {
 	cfg := config.Config{}
 	cfg.Roles.Reviewer.Behavior.RelatedFileGroups = config.ReviewerRelatedFileGroupsConfig{Enabled: true, MinChangedFiles: 24}
 	runner := &Runner{projectRoleConfig: &cfg}
-	got, err := runner.applyRelatedFileGroups(context.Background(), stepInput{Project: storage.ProjectRecord{ID: "p"}}, reviewerCheckpoint{Snapshot: &checkpointSnapshot{BaseSHA: base, HeadSHA: head}}, repo, "skills")
+	got, cleanup, err := runner.applyRelatedFileGroups(context.Background(), stepInput{Project: storage.ProjectRecord{ID: "p"}}, reviewerCheckpoint{Snapshot: &checkpointSnapshot{BaseSHA: base, HeadSHA: head}}, repo, "skills")
+	if cleanup != nil {
+		defer cleanup()
+	}
 	if err != nil {
 		t.Fatalf("applyRelatedFileGroups() error = %v", err)
 	}
@@ -261,7 +183,7 @@ func TestRunGroupedFindingAgentsRequiresCompletedStatus(t *testing.T) {
 	t.Parallel()
 	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "failed", Stdout: `__LOOPER_RESULT__={"summary":"No actionable findings","outcome":"clean","findings":[]}`}}}
 	runner := &Runner{agentExecutor: agent}
-	_, err := runner.runGroupedFindingAgents(context.Background(), stepInput{}, t.TempDir(), []fileGroup{{ID: "go:pkg", Paths: []string{"a.go"}}}, []changedFile{{Path: "a.go"}}, "base", "head", "")
+	_, err := runner.runGroupedFindingAgents(context.Background(), stepInput{}, t.TempDir(), []fileGroup{{ID: "go:pkg", Paths: []string{"a.go"}}}, "base", "head", "", "")
 	if err == nil || !strings.Contains(err.Error(), "agent failed") {
 		t.Fatalf("runGroupedFindingAgents() error = %v", err)
 	}
@@ -272,7 +194,7 @@ func TestRunGroupedFindingAgentsRequiresCommentOnlyMarker(t *testing.T) {
 	repo, _, head := groupingTestRepoWithRename(t)
 	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Stdout: "reviewed without a marker"}}}
 	runner := &Runner{agentExecutor: agent, projectRoleConfig: &config.Config{}}
-	_, err := runner.runGroupedFindingAgents(context.Background(), stepInput{}, repo, []fileGroup{{ID: "go:pkg", Paths: []string{"new name.go"}}}, []changedFile{{Path: "new name.go"}}, "base", head, "")
+	_, err := runner.runGroupedFindingAgents(context.Background(), stepInput{}, repo, []fileGroup{{ID: "go:pkg", Paths: []string{"new name.go"}}}, "base", head, "", "")
 	if err == nil || !strings.Contains(err.Error(), "completion marker is required") {
 		t.Fatalf("runGroupedFindingAgents() error = %v", err)
 	}
@@ -288,7 +210,7 @@ func TestRunGroupedFindingAgentsPassesRunSnapshot(t *testing.T) {
 	}
 	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Stdout: `__LOOPER_RESULT__={"summary":"No actionable findings","outcome":"clean","findings":[]}`}}}
 	runner := &Runner{agentExecutor: agent, projectRoleConfig: &config.Config{}}
-	if _, err := runner.runGroupedFindingAgents(context.Background(), stepInput{Run: storage.RunRecord{AgentSnapshotJSON: &snapshot}}, repo, []fileGroup{{ID: "go:pkg", Paths: []string{"new name.go"}}}, []changedFile{{Path: "new name.go"}}, "base", head, ""); err != nil {
+	if _, err := runner.runGroupedFindingAgents(context.Background(), stepInput{Run: storage.RunRecord{AgentSnapshotJSON: &snapshot}}, repo, []fileGroup{{ID: "go:pkg", Paths: []string{"new name.go"}}}, "base", head, "", ""); err != nil {
 		t.Fatalf("runGroupedFindingAgents() error = %v", err)
 	}
 	if len(agent.starts) != 1 || !agent.starts[0].UseSnapshot || agent.starts[0].SnapshotVendor != "codex" {
@@ -314,7 +236,7 @@ func TestRunGroupedFindingAgentsStopsOnHoldBetweenGroups(t *testing.T) {
 		},
 	}
 	runner := &Runner{agentExecutor: agent, github: github, projectRoleConfig: &config.Config{}}
-	_, err := runner.runGroupedFindingAgents(context.Background(), stepInput{Repo: "acme/looper", PRNumber: 42}, repo, []fileGroup{{ID: "a", Paths: []string{"new name.go"}}, {ID: "b", Paths: []string{"other.go"}}}, []changedFile{{Path: "new name.go"}, {Path: "other.go"}}, "base", head, "")
+	_, err := runner.runGroupedFindingAgents(context.Background(), stepInput{Repo: "acme/looper", PRNumber: 42}, repo, []fileGroup{{ID: "a", Paths: []string{"new name.go"}}, {ID: "b", Paths: []string{"other.go"}}}, "base", head, "", "")
 	var hold *holdSkipError
 	if !errors.As(err, &hold) {
 		t.Fatalf("runGroupedFindingAgents() error = %v, want hold skip", err)

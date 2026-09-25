@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -124,11 +125,24 @@ func TestGroupedReviewHonorsParentCancellation(t *testing.T) {
 	runner, input, _, agent := groupedReviewLifecycleFixture(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	agent.onStart = func(AgentRunInput) { cancel() }
+	var contextPath string
+	agent.onStart = func(start AgentRunInput) {
+		var err error
+		contextPath, _, err = groupedContextPayload(start.Prompt)
+		if err != nil {
+			t.Error(err)
+		}
+		cancel()
+	}
 	agent.wait = func(ctx context.Context) error { return ctx.Err() }
 	_, err := runner.executeStep(ctx, stepReview, input)
 	if !errors.Is(err, context.Canceled) || len(agent.starts) != 1 {
 		t.Fatalf("canceled grouped pass: err=%v, starts=%d", err, len(agent.starts))
+	}
+	if contextPath != "" {
+		if _, err := os.Stat(filepath.Dir(contextPath)); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("group context directory remains after cancellation: %v", err)
+		}
 	}
 }
 
@@ -151,6 +165,20 @@ func TestGroupedReviewRetainsResumeContextAfterRetry(t *testing.T) {
 		}
 	}
 	agent.results[0] = AgentResult{Status: "completed", Summary: "Grouped contract finding", Stdout: `__LOOPER_RESULT__={"summary":"Grouped contract finding","outcome":"blocking","findings":[{"title":"Grouped contract finding","body":"Introduced broken contract","disposition":"must_fix","severity":"blocking","scopeBasis":"introduced_regression","scopeEvidence":"changed call site"}]}`}
+	var finalContexts [][]byte
+	agent.onStart = func(start AgentRunInput) {
+		if start.Metadata["phase"] != "review" {
+			return
+		}
+		for _, prompt := range []string{start.Prompt, start.NativeResumePrompt} {
+			_, payload, err := groupedContextPayload(prompt)
+			if err != nil {
+				t.Error(err)
+				continue
+			}
+			finalContexts = append(finalContexts, payload)
+		}
+	}
 	if _, err := runner.executeStep(ctx, stepReview, input); err != nil {
 		t.Fatal(err)
 	}
@@ -164,8 +192,16 @@ func TestGroupedReviewRetainsResumeContextAfterRetry(t *testing.T) {
 	}
 	final := agent.starts[2]
 	for _, prompt := range []string{final.Prompt, final.NativeResumePrompt} {
-		if !strings.Contains(prompt, "Related-file group plan") || !strings.Contains(prompt, "Grouped contract finding") {
+		if !strings.Contains(prompt, "Related-file group plan") {
 			t.Fatalf("final review lost grouped context: %s", prompt)
+		}
+	}
+	if len(finalContexts) != 2 {
+		t.Fatalf("readable final contexts = %d, want full and resumed", len(finalContexts))
+	}
+	for _, payload := range finalContexts {
+		if !strings.Contains(string(payload), "Grouped contract finding") {
+			t.Fatal("final review context lost group findings")
 		}
 	}
 	if !strings.Contains(final.NativeResumePrompt, "Continue the existing Looper reviewer review task") {
@@ -214,5 +250,103 @@ func TestGroupedReviewUsesConfiguredGuidance(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func groupedContextPayload(prompt string) (string, []byte, error) {
+	const prefix = "Related-file group context (JSON file): "
+	for _, line := range strings.Split(prompt, "\n") {
+		if strings.HasPrefix(line, prefix) {
+			var path string
+			if err := json.Unmarshal([]byte(strings.TrimPrefix(line, prefix)), &path); err != nil {
+				return "", nil, err
+			}
+			payload, err := os.ReadFile(path)
+			return path, payload, err
+		}
+	}
+	return "", nil, fmt.Errorf("group context file reference missing")
+}
+
+func TestGroupedReviewBoundsLargePathContext(t *testing.T) {
+	t.Parallel()
+	runner, input, github, agent := groupedReviewLifecycleFixture(t)
+	worktree := input.Checkpoint.Worktree.Path
+	for i := 0; i < 800; i++ {
+		path := filepath.Join(worktree, fmt.Sprintf("%04d_%s.go", i, strings.Repeat("p", 180)))
+		if err := os.WriteFile(path, []byte("package old\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	oddDir := filepath.Join(worktree, "nested\ncontrol\x01")
+	if err := os.Mkdir(oddDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(oddDir, "file.go"), []byte("package nested\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{{"add", "."}, {"commit", "-qm", "test: large path context"}, {"rev-parse", "HEAD"}} {
+		out, err := exec.Command("git", append([]string{"-C", worktree}, args...)...).CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, out)
+		}
+		input.Checkpoint.Snapshot.HeadSHA = strings.TrimSpace(string(out))
+	}
+	github.viewHeadSHA = input.Checkpoint.Snapshot.HeadSHA
+	expected, err := listChangedPaths(context.Background(), "git", worktree, input.Checkpoint.Snapshot.BaseSHA, github.viewHeadSHA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	agent.results = append(agent.results, agent.results[0])
+	var contextPath string
+	agent.onStart = func(start AgentRunInput) {
+		if len(start.Prompt) > 32*1024 {
+			t.Errorf("large path list expanded %s prompt to %d bytes", start.Metadata["phase"], len(start.Prompt))
+		}
+		path, payload, err := groupedContextPayload(start.Prompt)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		contextPath = path
+		var data struct {
+			Groups       []fileGroup   `json:"groups"`
+			ChangedFiles []changedFile `json:"changedFiles"`
+		}
+		if err := json.Unmarshal(payload, &data); err != nil {
+			t.Error(err)
+			return
+		}
+		if !reflect.DeepEqual(data.ChangedFiles, expected) {
+			t.Error("context file lost or changed source paths")
+		}
+		assigned := map[string]bool{}
+		for _, group := range data.Groups {
+			for _, path := range group.Paths {
+				if assigned[path] {
+					t.Errorf("path assigned twice: %q", path)
+				}
+				assigned[path] = true
+			}
+		}
+		if len(assigned) != len(expected) {
+			t.Errorf("assigned %d paths, want %d", len(assigned), len(expected))
+		}
+		for _, file := range expected {
+			if !assigned[file.Path] {
+				t.Errorf("unassigned path in context: %q", file.Path)
+			}
+		}
+	}
+	if _, err := runner.executeStep(context.Background(), stepReview, input); err != nil {
+		t.Fatal(err)
+	}
+	if len(agent.starts) != 4 {
+		t.Fatalf("starts = %d, want three groups and final review", len(agent.starts))
+	}
+	if contextPath != "" {
+		if _, err := os.Stat(filepath.Dir(contextPath)); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("group context directory remains after completion: %v", err)
+		}
 	}
 }
