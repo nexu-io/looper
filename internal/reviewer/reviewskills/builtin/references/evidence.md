@@ -2,35 +2,48 @@
 
 Use existing comment `body` plus `scopeEvidence`. Do not invent evidence records, confidence scores, finding quotas, or a second filter model.
 
-Comment shape for every finding: trigger condition → actual path → wrong consequence → suggested fix.
+Match the evidence shape to the review phase:
 
-## Race / deadlock
+- Implementation: trigger condition → actual code path → wrong consequence → suggested fix.
+- Spec/docs: changed section or omission → resulting ambiguity or contradiction → implementation or validation consequence → specific clarification. A spec finding does not require an execution path that has not been implemented yet.
+
+The examples below guide investigation; they are not an exhaustive list of reportable defects or a filter that excludes other concrete findings.
+
+## Data race
 
 Establish a real concurrent call path, the shared state, and the synchronization that is supposed to protect it. Do not infer a race from a mutex, channel, or `go` keyword alone.
 
-Positive: two goroutines have conflicting concurrent accesses to the same shared memory location (for example a struct field, map, slice header, ordinary variable, pointer target, array or slice element, interface value, or an object's internal storage), with at least one access a write and no lock, atomic, or channel handoff on that path.
+Positive: two goroutines have conflicting concurrent accesses to the same shared memory location (for example a struct field, map, slice header, ordinary variable, pointer target, array or slice element, interface value, or an object's internal storage), with at least one access a write, no happens-before ordering between the conflicting accesses, and at least one access that is not a compatible atomic operation.
 
-Negative: a per-call local variable, a value copied into a closure, or a field only mutated on a single-owner goroutine.
+Negative: a per-call local that is never shared with another goroutine, a copied value that does not reference shared mutable storage, or a field whose reads and writes are all confined to one owner goroutine. A local captured by multiple goroutines or a single writer with unsynchronized readers is not a negative example.
 
-Drop a race finding only when existing synchronization or single-owner access already excludes the claimed interleaving. A type documented as not concurrent does not disprove a race; report the caller's unsynchronized shared use (for example concurrent writes to a shared `bytes.Buffer`).
+Synchronization is negative evidence only when it actually orders the conflicting accesses. Different mutexes alone, unrelated channel operations, or an atomic operation paired with an unsynchronized plain access do not establish safety. An atomic-based drop requires compatible atomic operations for all concurrent accesses to that location; plain accesses in an ordered initialization or teardown phase are a separate case. A type documented as not concurrent does not disprove a race; report the caller's unsynchronized shared use (for example concurrent writes to a shared `bytes.Buffer`).
+
+## Deadlock / permanently blocked operation
+
+Establish a reachable wait cycle or an operation that cannot complete, the progress the contract requires, and why the relevant release or cancellation paths cannot unblock it. This can happen in one goroutine and does not require shared state: recursively locking a non-reentrant mutex or sending/receiving on a nil channel can block indefinitely.
+
+Distinguish a defect from intended waiting. A nil-channel case disabled inside a select is not itself a deadlock when another case can make the required progress; a reachable release, handoff, or cancellation path may also disprove the claimed permanent block.
 
 ## Resource leak
 
 Name the owner, the lifecycle, and whether ownership transferred.
 
-Positive: a handle, file, connection, ticker, or context cancel is created on a success path that can return without close/stop, and no caller is documented to take ownership.
+Track each acquired resource until release or ownership transfer. Positive: a resource (for example a handle, file, connection, or context created with cancellation) stays allocated beyond its intended lifetime because its owner is lost, overwritten, or fails to release it. Check normal/error exits, partial initialization, replacement, and repeated acquisition in long-running or non-returning loops; accumulation need not wait for a return. For timers and tickers, also establish the effective Go version semantics and reachability described below before claiming a leak.
 
-Negative: ownership is returned to the caller (`io.ReadCloser`, constructor that documents Close), or a `defer` on every return path already releases it.
+Negative: ownership is transferred to an identified owner with an established release responsibility (for example `io.ReadCloser` or a caller that closes the result), or a reachable release keeps resource use within its intended lifetime and bounds. A function-scoped `defer` alone does not disprove accumulation across loop iterations; establish when it actually runs. Intentional bounded pools or caches need an ownership/lifetime analysis, not a missing-close keyword finding.
 
 ## Security
 
-Name the untrusted input, a reachable path from that input, and the actual trust boundary.
+Name the protected asset, expected security property or policy, the reachable operation that violates it, and the confidentiality, integrity, access-control, or availability consequence. Require untrusted-input evidence when the claim depends on such input, as in injection-style findings; it is not a prerequisite for every security defect.
 
-Positive (unsafe interpretation): attacker-controlled bytes reach a sink (exec, query, path, template) that interprets them unsafely—missing parameterization, contextual escaping, or path confinement—without validation or a trust-boundary change.
+Positive (asset or boundary violation): credentials are exposed through logging, required file permissions are weakened, certificate verification is disabled on a path that requires it, or trusted configuration data reaches an unauthorized observer. Establish the affected asset, boundary or policy, and concrete exposure/consequence even when no attacker-supplied bytes trigger the defect.
+
+Positive (unsafe interpretation): attacker-controlled bytes reach a sink (exec, query, path, template) that interprets them unsafely, such as missing parameterization, contextual escaping, or path confinement. Crossing a component or trust boundary does not sanitize those bytes; require an effective, sink-appropriate transformation before treating them as safe.
 
 Positive (authorization): a reachable path lets a principal perform an action on a resource that the policy forbids, because an ownership, tenant, or other authorization check is missing or applied to the wrong principal/resource. A valid, sink-constrained identifier (for example a UUID in a parameterized query) is not a drop reason for this case.
 
-Negative: the specific value has already been constrained for the destination sink, comes from a trusted config/operator surface, or never reaches the sink on the claimed path. Authentication or authorization to invoke an operation does not make user-supplied repository names, query strings, or template values trusted. Sink-constrained bytes do not disprove a missing or misapplied authorization check.
+Negative for an unsafe-interpretation claim: the specific value has already been constrained for the destination sink, comes from an appropriately trusted config/operator surface, or never reaches that sink on the claimed path. These are not drop reasons for asset disclosure, weakened permissions, missing certificate verification, or authorization flaws. Authentication or authorization to invoke an operation does not make user-supplied repository names, query strings, or template values trusted. Sink-constrained bytes do not disprove a missing or misapplied authorization check.
 
 ## Go loop variable / timer
 
@@ -46,17 +59,17 @@ Timer findings depend on the module's Go version and whether the timer stays rea
 
 Before Go 1.23, `time.After` keeps the timer alive until it fires. Flag it when a long-lived loop or a canceled request can accumulate or retain those timers. A short one-shot that remains referenced until fire is not automatically a leak, but a long-duration `time.After` after cancel can still retain the timer.
 
-On Go 1.23+, the garbage collector can recover unreferenced, unstopped timers, so `time.After` in a loop is not inherently a leak. Prefer `time.NewTimer` with `Stop`/`Reset` only when the code still holds the timer, needs cancel/reset, or the module targets a pre-1.23 toolchain.
+With Go 1.23+ timer semantics, the garbage collector can recover unreferenced, unstopped timers and tickers, so `time.After` in a loop or an unreachable `time.Ticker` without `Stop` is not inherently a leak. Check the module version and any runtime override of those semantics. Still report retained timers/tickers or ticking beyond the intended lifecycle when a concrete resource or behavior consequence is reachable. Prefer `time.NewTimer` with `Stop`/`Reset` only when the code still holds the timer, needs cancel/reset, or uses pre-1.23 timer semantics.
 
 ## Contract errors
 
 Distinguish caller-dependent contracts from intentional best-effort.
 
-Positive: a function whose documented contract is to return the error (or fail closed) instead logs-and-continues, returns `nil`, or wraps into a success object, and a caller would act on the missing failure.
+Establish the error contract from documentation, the signature together with caller behavior, or a required invariant. Positive: an operation required for success fails, but its wrapper logs-and-continues, returns `nil`, or wraps the failure into a success object, causing a caller to act on an incorrect success. A failed write, commit, or initialization can establish this chain even when the wrapper has no comment or spec.
 
-Negative: the comment/spec says best-effort, the error is explicitly allowed (retry, optional hook, cache fill), or a higher frame already handles it.
+Negative: an established best-effort or optional-operation contract explicitly allows the failure (retry, optional hook, cache fill), or a higher frame already handles it. Missing documentation alone neither proves best-effort behavior nor requires propagation of every error.
 
-Do not treat "callers already guarantee this precondition" as a defect unless a public/exported caller can violate it.
+Use the established contract (from documentation, API semantics, callers, or required invariants) to identify who must enforce each precondition, then trace the reachable call paths. Report a concrete caller that violates its obligation, or a callee that omits validation its contract promises. Public/exported visibility alone neither establishes nor excludes a defect: an exported API may require callers to satisfy a precondition, and an unexported caller can still violate it. When the relevant callers satisfy the contract, do not demand a redundant callee check.
 
 ## Test suggestions
 
@@ -66,13 +79,13 @@ Never write only "add tests". Name the failing behavior, the test file or packag
 
 Run this pass in the same review context before finalizing. It is a conservative self-check, not a second model stage. The authority for a drop is that same context (diff, callers, tests, contracts), not the first structured candidate list.
 
-This pass prevents publishing a finding the same context already disproves. Cost: one extra same-context pass and retained unverified findings (unverified is not a drop). It adds no persisted state, no second model, and no new evidence schema. Requiring stronger structured evidence fields is insufficient: extra fields would not catch a claimed path the existing context already falsifies, and this skill forbids inventing evidence records.
+First establish the candidate's concrete evidence chain for the review phase described above. If that chain is uncertain, investigate it; if it still cannot be established, omit the unsupported claim from published findings. Source, contracts, tests, or a concrete spec section/omission can establish the chain without executing a reproduction. A missing reproduction is not disproof.
 
-Drop a candidate only when evidence proves it factually wrong, or when it is the same root cause as another finding (keep one representative).
+For an evidence-backed candidate, drop it in this counterexample pass only when evidence proves it factually wrong, or when it is the same root cause as another finding (keep one representative).
 
-Unverified is not wrong. Do not silent-drop because the finding count is high or the issue looks low-value.
+Do not silently drop an evidence-backed finding because the finding count is high or the issue looks low-value. An unproven counterargument does not invalidate established evidence.
 
-Ask, then keep unless the answer is proven:
+For those evidence-backed candidates, check:
 
 - Do callers already guarantee the precondition on every reachable path?
 - Does existing synchronization exclude the claimed race/deadlock?

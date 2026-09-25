@@ -1,6 +1,7 @@
 package reviewskills
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -8,6 +9,28 @@ import (
 
 	"github.com/nexu-io/looper/internal/config"
 )
+
+func TestResolveReplacementUsesProjectMethodBeforeBuiltinLoader(t *testing.T) {
+	t.Parallel()
+	worktree := t.TempDir()
+	dir := filepath.Join(worktree, ".agents", "skills", "looper-review")
+	writeNamedSkill(t, dir, "looper-review", "project replacement")
+	unavailable := errors.New("builtin storage unavailable")
+	in := ResolveInput{Mode: config.ReviewerSkillsModeReplace, Required: []string{"looper-review"}, Worktree: worktree, LoadBuiltin: func() (string, error) { return "", unavailable }}
+	result, err := Resolve(in)
+	if err != nil || len(result.Entries) != 1 || result.Entries[0].Source != "project" {
+		t.Fatalf("project replacement = %#v, %v", result, err)
+	}
+	in.Mode = config.ReviewerSkillsModeExtend
+	if _, err := Resolve(in); !errors.Is(err, unavailable) {
+		t.Fatalf("extend error = %v, want required builtin failure", err)
+	}
+	in.Mode = config.ReviewerSkillsModeReplace
+	in.Worktree = ""
+	if _, err := Resolve(in); !errors.Is(err, unavailable) {
+		t.Fatalf("builtin fallback error = %v, want selected builtin failure", err)
+	}
+}
 
 func TestResolveThreeLayerLookupAndProjectOverridesUser(t *testing.T) {
 	t.Parallel()
@@ -44,21 +67,91 @@ func TestResolveThreeLayerLookupAndProjectOverridesUser(t *testing.T) {
 	}
 }
 
-func TestResolveSameLevelConflict(t *testing.T) {
+func TestResolveNamedDirectoryMustDeclareConfiguredName(t *testing.T) {
 	t.Parallel()
 
 	worktree := t.TempDir()
-	writeNamedSkill(t, filepath.Join(worktree, ".agents", "skills", "alpha"), "dup", "a")
-	writeNamedSkill(t, filepath.Join(worktree, ".agents", "skills", "beta"), "dup", "b")
-
+	userHome := t.TempDir()
+	writeNamedSkill(t, filepath.Join(userHome, ".agents", "skills", "security-review"), "security-review", "user method")
+	writeNamedSkill(t, filepath.Join(worktree, ".agents", "skills", "security-review"), "different-method", "project method")
 	_, err := Resolve(ResolveInput{
 		Mode:     config.ReviewerSkillsModeReplace,
-		Required: []string{"dup"},
+		Required: []string{"security-review"},
+		Worktree: worktree,
+		UserHome: userHome,
+	})
+	if err == nil || !strings.Contains(err.Error(), "name mismatch") {
+		t.Fatalf("Resolve() error = %v, want a mismatched project method to prevent fallback", err)
+	}
+}
+
+func TestResolveArbitraryDirectoryRequiresExplicitPath(t *testing.T) {
+	t.Parallel()
+
+	worktree := t.TempDir()
+	dir := filepath.Join(worktree, ".agents", "skills", "team-method")
+	writeNamedSkill(t, dir, "security-review", "team method")
+	_, err := Resolve(ResolveInput{Mode: config.ReviewerSkillsModeReplace, Required: []string{"security-review"}, Worktree: worktree})
+	if err == nil || !isMissingSkill(err) {
+		t.Fatalf("Resolve() error = %v, want YAML-only aliases to require an explicit path", err)
+	}
+	result, err := Resolve(ResolveInput{Mode: config.ReviewerSkillsModeReplace, Required: []string{"./.agents/skills/team-method"}, Worktree: worktree})
+	if err != nil || len(result.Entries) != 1 || result.Entries[0].Name != "security-review" {
+		t.Fatalf("explicit path = %#v, %v", result, err)
+	}
+}
+
+func TestResolveBoundsSkillFrontmatter(t *testing.T) {
+	t.Parallel()
+
+	worktree := t.TempDir()
+	root := filepath.Join(worktree, ".agents", "skills")
+	writeNamedSkill(t, filepath.Join(root, "large-body"), "large-body", "small metadata")
+	f, err := os.OpenFile(filepath.Join(root, "large-body", "SKILL.md"), os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(strings.Repeat("body text\n", 128<<10)); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	writeNamedSkill(t, filepath.Join(root, "second"), "second", "another method")
+	writeNamedSkill(t, filepath.Join(root, "oversized"), "oversized", strings.Repeat("x", 128<<10))
+
+	result, err := Resolve(ResolveInput{Mode: config.ReviewerSkillsModeReplace, Required: []string{"large-body", "second"}, Worktree: worktree})
+	if err != nil || len(result.Entries) != 2 {
+		t.Fatalf("large bodies and unrelated oversized metadata must not block selected methods: %#v, %v", result, err)
+	}
+	for _, ref := range []string{"oversized", "./.agents/skills/oversized/SKILL.md"} {
+		_, err := Resolve(ResolveInput{Mode: config.ReviewerSkillsModeReplace, Required: []string{ref}, Worktree: worktree})
+		if err == nil || !strings.Contains(err.Error(), "frontmatter") {
+			t.Fatalf("Resolve(%q) error = %v, want oversized metadata rejected", ref, err)
+		}
+	}
+}
+
+func TestReplacementIndexOnlyNamesResolvedMethods(t *testing.T) {
+	t.Parallel()
+
+	worktree := t.TempDir()
+	writeNamedSkill(t, filepath.Join(worktree, ".agents", "skills", "team-review"), "team-review", "team method")
+	result, err := Resolve(ResolveInput{
+		Mode:     config.ReviewerSkillsModeReplace,
+		Required: []string{"team-review"},
 		Worktree: worktree,
 		UserHome: t.TempDir(),
 	})
-	if err == nil || !strings.Contains(err.Error(), "multiple files") {
-		t.Fatalf("Resolve() error = %v, want same-level conflict", err)
+	if err != nil {
+		t.Fatalf("Resolve() error = %v", err)
+	}
+	index := FormatIndex(result.Entries)
+	if strings.Contains(index, "looper-review") {
+		t.Fatalf("replacement index instructs the agent to use an unavailable builtin:\n%s", index)
+	}
+	if !strings.Contains(index, result.Entries[0].Path) || !strings.Contains(index, "complete the full review") {
+		t.Fatalf("replacement index lost the custom method or full-review contract:\n%s", index)
 	}
 }
 
@@ -66,7 +159,7 @@ func TestResolveSymlinkAliasDedupes(t *testing.T) {
 	t.Parallel()
 
 	worktree := t.TempDir()
-	realDir := filepath.Join(worktree, ".agents", "skills", "real")
+	realDir := filepath.Join(worktree, ".agents", "skills", "aliased")
 	writeNamedSkill(t, realDir, "aliased", "real skill")
 	aliasDir := filepath.Join(worktree, ".agents", "skills", "alias")
 	if err := os.MkdirAll(filepath.Dir(aliasDir), 0o755); err != nil {
@@ -78,7 +171,7 @@ func TestResolveSymlinkAliasDedupes(t *testing.T) {
 
 	result, err := Resolve(ResolveInput{
 		Mode:     config.ReviewerSkillsModeReplace,
-		Required: []string{"aliased"},
+		Required: []string{"aliased", "./.agents/skills/alias/SKILL.md"},
 		Worktree: worktree,
 		UserHome: t.TempDir(),
 	})

@@ -88,7 +88,7 @@ func previewLifecycleSafety(role string, project config.ProjectRefConfig, cfg co
 	agentModel := promptDerefString(cfg.Agent.Model)
 	switch role {
 	case "reviewer":
-		return previewReviewerLifecycleSafety(promptDerefString(cfg.Tools.LooperPath), cfg.Disclosure, agentRuntime, agentModel)
+		return previewReviewerLifecycleSafety(promptDerefString(cfg.Tools.LooperPath), cfg.Disclosure, agentRuntime, agentModel, config.ProjectRoleConfigs(cfg, project.ID).Reviewer.Skills)
 	case "worker":
 		if !previewWorkerAllowsRemoteLifecycle(cfg) {
 			return previewNoRemoteLifecyclePromptInstruction(role, branch, baseBranch, cfg.Disclosure, agentRuntime, agentModel)
@@ -131,7 +131,7 @@ func previewWorkerAllowsRemoteLifecycle(cfg config.Config) bool {
 	return cfg.Defaults.AllowAutoPush && cfg.Defaults.OpenPRStrategy != config.OpenPRStrategyManual
 }
 
-func previewReviewerLifecycleSafety(looperCLIPath string, disclosureCfg config.DisclosureConfig, agentRuntime string, agentModel string) string {
+func previewReviewerLifecycleSafety(looperCLIPath string, disclosureCfg config.DisclosureConfig, agentRuntime string, agentModel string, skillsCfg config.ReviewerSkillsConfig) string {
 	minimalSeedContract := strings.Join([]string{
 		"PR handoff contract: Looper provides a minimal PR seed by default: repo, pr_number/url, base_ref, head_ref, head_sha, expected state/draft status, task intent, and optional scope such as paths, comment IDs, review thread IDs, or constraints.",
 		"Local checkout contract: when Looper starts a reviewer agent in a prepared worktree, treat that working directory as the canonical local checkout. Reuse it for git fetch, git checkout, diff inspection, and local validation. Do not run `gh repo clone`, `git clone`, or create any additional checkout for this PR's base or head repository unless the provided worktree is missing or unusable.",
@@ -142,7 +142,7 @@ func previewReviewerLifecycleSafety(looperCLIPath string, disclosureCfg config.D
 		return strings.Join([]string{
 			minimalSeedContract,
 			"GitHub operation contract: a trusted Looper CLI path was not detected for reviewer runs, so agents cannot safely publish a GitHub review. Do not call PATH-based `looper`, repository-local `go run ./cmd/looper`, `gh api repos/.../pulls/.../reviews`, or `gh pr review` directly; exit non-zero with the exact message `trusted looper review submit wrapper unavailable`.",
-			reviewskills.PreviewIndexPlaceholder(),
+			reviewskills.PreviewIndex(skillsCfg),
 			lifecycle.DisclosurePromptInstruction("reviewer", disclosureCfg, agentRuntime, agentModel),
 		}, "\n")
 	}
@@ -153,7 +153,7 @@ func previewReviewerLifecycleSafety(looperCLIPath string, disclosureCfg config.D
 		"Before posting, confirm the PR is still open, the head SHA still matches the expected head SHA, and the current GitHub user is still requested for review unless the run is manual.",
 		"Every review body must include exactly one stable idempotency marker with id, head, and outcome fields: `<!-- looper:review id=... head=... outcome=clean|actionable -->`.",
 		"For clean reviews, submit COMMENT unless reviewer policy allows APPROVE; for actionable reviews, submit COMMENT with resolvable inline comments whenever anchors can be validated.",
-		reviewskills.PreviewIndexPlaceholder(),
+		reviewskills.PreviewIndex(skillsCfg),
 		lifecycle.DisclosurePromptInstruction("reviewer", disclosureCfg, agentRuntime, agentModel),
 	}, "\n")
 }

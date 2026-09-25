@@ -4956,11 +4956,8 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 		return checkpoint, fmt.Errorf("resolve run agent identity: %w", err)
 	}
 	lastPublishedHeadSHA, _ := stringFromAny(parseJSONObject(input.Loop.MetadataJSON)["lastPublishedHeadSha"])
-	skillBundle, err := reviewskills.MaterializeBuiltin()
-	if err != nil {
-		return checkpoint, fmt.Errorf("materialize reviewer skills: %w", err)
-	}
-	defer skillBundle.Close()
+	var skillBundle *reviewskills.Bundle
+	defer func() { skillBundle.Close() }()
 	skillsCfg := config.ReviewerSkillsConfig{Mode: config.ReviewerSkillsModeExtend}
 	if r.projectRoleConfig != nil {
 		skillsCfg = config.ProjectRoleConfigs(*r.projectRoleConfig, input.Project.ID).Reviewer.Skills
@@ -4970,12 +4967,19 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 		return checkpoint, failureclass.WithBoundary(fmt.Errorf("resolve reviewer skills: %w", homeErr), failureclass.BoundaryConfig)
 	}
 	resolvedSkills, err := reviewskills.Resolve(reviewskills.ResolveInput{
-		Mode:       skillsCfg.Mode,
-		Required:   skillsCfg.Required,
-		Optional:   skillsCfg.Optional,
-		Worktree:   worktree.Path,
-		UserHome:   userHome,
-		BuiltinDir: skillBundle.Dir,
+		Mode:     skillsCfg.Mode,
+		Required: skillsCfg.Required,
+		Optional: skillsCfg.Optional,
+		Worktree: worktree.Path,
+		UserHome: userHome,
+		LoadBuiltin: func() (string, error) {
+			var err error
+			skillBundle, err = reviewskills.MaterializeBuiltin()
+			if err != nil {
+				return "", fmt.Errorf("materialize reviewer skills: %w", err)
+			}
+			return skillBundle.Dir, nil
+		},
 	})
 	if err != nil {
 		return checkpoint, failureclass.WithBoundary(fmt.Errorf("resolve reviewer skills: %w", err), failureclass.BoundaryConfig)
@@ -9775,7 +9779,7 @@ func buildPullRequestLockKey(item storage.QueueItemRecord) string {
 func buildReviewPrompt(repo string, prNumber int64, checkpoint reviewerCheckpoint, runID string, idempotencyKey string, reviewEvents config.ReviewerReviewEventsConfig, manual bool, scope config.ReviewerScope, disclosureCfg config.DisclosureConfig, agentRuntime string, agentModel string, looperCLIPath string) string {
 	cfg, _ := config.Normalize("")
 	cfg.Instructions.Enabled = false
-	prompt, _ := buildReviewPromptWithInstructions("", cfg, repo, prNumber, checkpoint, runID, idempotencyKey, reviewEvents, manual, true, "", scope, disclosureCfg, agentRuntime, agentModel, looperCLIPath, false, false, "", reviewskills.PreviewIndexPlaceholder())
+	prompt, _ := buildReviewPromptWithInstructions("", cfg, repo, prNumber, checkpoint, runID, idempotencyKey, reviewEvents, manual, true, "", scope, disclosureCfg, agentRuntime, agentModel, looperCLIPath, false, false, "", reviewskills.PreviewIndex(config.ProjectRoleConfigs(cfg, "").Reviewer.Skills))
 	return prompt
 }
 
