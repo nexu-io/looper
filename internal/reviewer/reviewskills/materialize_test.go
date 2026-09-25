@@ -101,7 +101,7 @@ func TestFormatIndexUsesAbsoluteMaterializedPath(t *testing.T) {
 	index := FormatIndex(bundle.Entries)
 	for _, want := range []string{
 		"Review method skills:",
-		"Required skills MUST be read from the given absolute paths before reviewing.",
+		"Every listed skill MUST be read from the given absolute paths before reviewing.",
 		"still complete the base review using looper-review",
 		"name: looper-review",
 		"source: builtin",
@@ -174,6 +174,38 @@ func TestFormatIndexPathsChangeAcrossBundles(t *testing.T) {
 	}
 	if reminder := ResumeReminder(second.Entries); !strings.Contains(reminder, secondPath) || strings.Contains(reminder, firstPath) {
 		t.Fatalf("resume reminder = %q, want current path %q", reminder, secondPath)
+	}
+}
+
+func TestParseFrontmatterDecodesQuotedYAMLName(t *testing.T) {
+	t.Parallel()
+
+	name, description, err := parseFrontmatter("---\nname: \"security-review\" # quoted\ndescription: 'team method'\n---\n\n# body\n")
+	if err != nil {
+		t.Fatalf("parseFrontmatter() error = %v", err)
+	}
+	if name != "security-review" || description != "team method" {
+		t.Fatalf("parseFrontmatter() = name %q description %q", name, description)
+	}
+}
+
+func TestFormatIndexAndResumeReminderRequireReadingResolvedOptionalSkills(t *testing.T) {
+	t.Parallel()
+
+	entries := []Entry{
+		{Name: "looper-review", Path: "/tmp/looper-review/SKILL.md", Source: "builtin", Required: true, Description: "base"},
+		{Name: "perf-review", Path: "/tmp/perf-review/SKILL.md", Source: "project", Required: false, Description: "optional present"},
+	}
+	index := FormatIndex(entries)
+	if !strings.Contains(index, "Every listed skill MUST be read") {
+		t.Fatalf("index missing read-all instruction:\n%s", index)
+	}
+	if !strings.Contains(index, "required: false") || !strings.Contains(index, "perf-review") {
+		t.Fatalf("index missing optional entry:\n%s", index)
+	}
+	reminder := ResumeReminder(entries)
+	if !strings.Contains(reminder, "/tmp/perf-review/SKILL.md") {
+		t.Fatalf("resume reminder omitted resolved optional path: %q", reminder)
 	}
 }
 

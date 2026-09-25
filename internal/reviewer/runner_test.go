@@ -8224,6 +8224,21 @@ func TestEnhancedTransientClassificationHonorsExtraPatterns(t *testing.T) {
 	}
 }
 
+func TestReviewerSkillResolutionFailureIsNonRetryable(t *testing.T) {
+	runner := New(Options{})
+	err := failureclass.WithBoundary(fmt.Errorf(`resolve reviewer skills: reviewer skill "missing" not found`), failureclass.BoundaryConfig)
+	got := runner.classifyFailureForProjectAndBoundary("", err, reviewerFailureBoundaryForStep(stepReview))
+	if got == nil || got.kind != FailureNonRetryable {
+		t.Fatalf("classified skill resolution error = %#v, want FailureNonRetryable", got)
+	}
+
+	bare := fmt.Errorf(`resolve reviewer skills: reviewer skill "missing" not found`)
+	retry := runner.classifyFailureForProjectAndBoundary("", bare, reviewerFailureBoundaryForStep(stepReview))
+	if retry == nil || retry.kind != FailureRetryableTransient {
+		t.Fatalf("unwrapped skill error at stepReview = %#v, want FailureRetryableTransient", retry)
+	}
+}
+
 func TestIsTransientExternalFailureDetectsModelProviderHTTPAndNetworkFailures(t *testing.T) {
 	runner := New(Options{})
 	for _, message := range []string{
@@ -9175,7 +9190,7 @@ func TestBuildReviewPromptIncludesActionableQualityContract(t *testing.T) {
 		"every must_fix finding must live in inline `comments`",
 		"Looper **does** parse this findings list",
 		"Review method skills:",
-		"Required skills MUST be read from the given absolute paths before reviewing.",
+		"Every listed skill MUST be read from the given absolute paths before reviewing.",
 		"looper-review",
 		"<run-local builtin skill path>",
 	} {
