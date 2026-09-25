@@ -26,7 +26,7 @@ Name the owner, the lifecycle, and whether ownership transferred.
 
 Track each acquired resource until release or ownership transfer. Positive: a resource (for example a handle, file, connection, or context created with cancellation) stays allocated beyond its intended lifetime because its owner is lost, overwritten, or fails to release it. Check normal/error exits, partial initialization, replacement, and repeated acquisition in long-running or non-returning loops; accumulation need not wait for a return. For timers and tickers, also establish the effective Go version semantics and reachability described below before claiming a leak.
 
-Negative: ownership is transferred to a documented owner (`io.ReadCloser`, constructor that documents Close), or a reachable release keeps resource use within its intended lifetime and bounds. A function-scoped `defer` alone does not disprove accumulation across loop iterations; establish when it actually runs. Intentional bounded pools or caches need an ownership/lifetime analysis, not a missing-close keyword finding.
+Negative: ownership is transferred to an identified owner with an established release responsibility (for example `io.ReadCloser` or a caller that closes the result), or a reachable release keeps resource use within its intended lifetime and bounds. A function-scoped `defer` alone does not disprove accumulation across loop iterations; establish when it actually runs. Intentional bounded pools or caches need an ownership/lifetime analysis, not a missing-close keyword finding.
 
 ## Security
 
@@ -58,11 +58,11 @@ With Go 1.23+ timer semantics, the garbage collector can recover unreferenced, u
 
 Distinguish caller-dependent contracts from intentional best-effort.
 
-Positive: a function whose documented contract is to return the error (or fail closed) instead logs-and-continues, returns `nil`, or wraps into a success object, and a caller would act on the missing failure.
+Establish the error contract from documentation, the signature together with caller behavior, or a required invariant. Positive: an operation required for success fails, but its wrapper logs-and-continues, returns `nil`, or wraps the failure into a success object, causing a caller to act on an incorrect success. A failed write, commit, or initialization can establish this chain even when the wrapper has no comment or spec.
 
-Negative: the comment/spec says best-effort, the error is explicitly allowed (retry, optional hook, cache fill), or a higher frame already handles it.
+Negative: an established best-effort or optional-operation contract explicitly allows the failure (retry, optional hook, cache fill), or a higher frame already handles it. Missing documentation alone neither proves best-effort behavior nor requires propagation of every error.
 
-Use the documented contract to identify who must enforce each precondition, then trace the reachable call paths. Report a concrete caller that violates its obligation, or a callee that omits validation its contract promises. Public/exported visibility alone neither establishes nor excludes a defect: an exported API may require callers to satisfy a precondition, and an unexported caller can still violate it. When the relevant callers satisfy the contract, do not demand a redundant callee check.
+Use the established contract (from documentation, API semantics, callers, or required invariants) to identify who must enforce each precondition, then trace the reachable call paths. Report a concrete caller that violates its obligation, or a callee that omits validation its contract promises. Public/exported visibility alone neither establishes nor excludes a defect: an exported API may require callers to satisfy a precondition, and an unexported caller can still violate it. When the relevant callers satisfy the contract, do not demand a redundant callee check.
 
 ## Test suggestions
 
