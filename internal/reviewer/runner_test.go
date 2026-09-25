@@ -7819,6 +7819,40 @@ func TestRunReviewStepRechecksHoldBeforeAgentStart(t *testing.T) {
 	}
 }
 
+func TestRunReviewStepHoldPreventsGroupedStarts(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{labels: []string{domain.HoldLabelReviewer}}
+	agent := &fakeAgentExecutor{}
+	cfg := config.Config{}
+	cfg.Roles.Reviewer.Behavior.RelatedFileGroups = config.ReviewerRelatedFileGroupsConfig{Enabled: true, MinChangedFiles: 1}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, CustomInstructions: &cfg})
+
+	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	if err != nil || project == nil {
+		t.Fatalf("Projects.GetByID() = (%#v, %v), want project", project, err)
+	}
+	_, err = runner.runReviewStep(context.Background(), stepInput{
+		Project:  *project,
+		Loop:     storage.LoopRecord{ID: "loop_hold_before_groups", Type: "reviewer"},
+		Run:      storage.RunRecord{ID: "run_hold_before_groups"},
+		Repo:     "acme/looper",
+		PRNumber: 42,
+		Checkpoint: reviewerCheckpoint{
+			Detail:   &checkpointDetail{HeadRefName: "feature/review-me", BaseRefName: "main", Labels: []string{}},
+			Snapshot: &checkpointSnapshot{HeadSHA: "abc123"},
+			Worktree: &checkpointWorktree{Path: t.TempDir(), Branch: "feature/review-me", PreparedAt: fixture.nowISO()},
+		},
+	})
+	var holdErr *holdSkipError
+	if !errors.As(err, &holdErr) {
+		t.Fatalf("runReviewStep() error = %v, want hold skip", err)
+	}
+	if len(agent.starts) != 0 {
+		t.Fatalf("agent.starts = %#v, want none", agent.starts)
+	}
+}
+
 func TestRunReviewStepStopsAfterStaleReprepareDuringReview(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
@@ -13783,6 +13817,8 @@ type fakeGitHubGateway struct {
 	listReviewThreadsErr            error
 	listReviewThreadsErrAfter       int // fail on call N (1-based); 0 = always if err set
 	viewHeadSHA                     string
+	viewBaseSHA                     string
+	viewBaseRef                     string
 	headSHACalls                    int
 	issueCommentCalls               []IssueCommentInput
 	updateIssueCommentCalls         []UpdateIssueCommentInput
@@ -13914,7 +13950,7 @@ func (g *fakeGitHubGateway) ViewPullRequest(context.Context, ViewPullRequestInpu
 	if g.omitReviewsOnView {
 		reviews = nil
 	}
-	return PullRequestDetail{Number: 42, Title: "Review me", Body: body, State: state, IsDraft: g.viewDraft, ReviewDecision: reviewDecision, Labels: append([]string(nil), g.labels...), HeadSHA: headSHA, BaseSHA: "base123", HeadRefName: "feature/review-me", BaseRefName: "main", Author: g.effectiveAuthor(), ReviewRequests: reviewRequests, ReviewRequestUsers: users, HasConflicts: g.hasConflicts, ChecksSummary: "SUCCESS", Comments: cloneCommentMaps(comments), IssueComments: cloneCommentMaps(g.issueComments), Reviews: reviews}, nil
+	return PullRequestDetail{Number: 42, Title: "Review me", Body: body, State: state, IsDraft: g.viewDraft, ReviewDecision: reviewDecision, Labels: append([]string(nil), g.labels...), HeadSHA: headSHA, BaseSHA: firstNonEmpty(g.viewBaseSHA, "base123"), HeadRefName: "feature/review-me", BaseRefName: firstNonEmpty(g.viewBaseRef, "main"), Author: g.effectiveAuthor(), ReviewRequests: reviewRequests, ReviewRequestUsers: users, HasConflicts: g.hasConflicts, ChecksSummary: "SUCCESS", Comments: cloneCommentMaps(comments), IssueComments: cloneCommentMaps(g.issueComments), Reviews: reviews}, nil
 }
 
 func (g *fakeGitHubGateway) LoadPullRequestReviews(context.Context, ViewPullRequestInput) ([]map[string]any, error) {

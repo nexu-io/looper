@@ -254,6 +254,10 @@
               "requireCurrentReviewRequest": true,
               "requireNewHeadSinceThread": true,
               "scope": "looper_authored_only"
+            },
+            "relatedFileGroups": {
+              "enabled": false,
+              "minChangedFiles": 24
             }
           },
           "discovery": {

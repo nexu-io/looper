@@ -416,17 +416,19 @@ type GitGateway interface {
 }
 
 type AgentRunInput struct {
-	ExecutionID        string
-	ProjectID          string
-	LoopID             string
-	RunID              string
-	Prompt             string
-	NativeResumePrompt string
-	WorkingDirectory   string
-	Timeout            time.Duration
-	HeartbeatTimeout   time.Duration
-	Metadata           map[string]any
-	IdempotencyKey     string
+	ExecutionID         string
+	ProjectID           string
+	LoopID              string
+	RunID               string
+	Prompt              string
+	NativeResumePrompt  string
+	DisableNativeResume bool
+
+	WorkingDirectory string
+	Timeout          time.Duration
+	HeartbeatTimeout time.Duration
+	Metadata         map[string]any
+	IdempotencyKey   string
 	// UseSnapshot + SnapshotVendor/Model override the executor config for this
 	// start when the run has a durable agent snapshot (execution authority).
 	UseSnapshot    bool
@@ -2699,7 +2701,8 @@ func (r *Runner) executeStepOnce(ctx context.Context, step ReviewerStep, input s
 }
 
 func (r *Runner) executeStepWithTransientExternalRetry(ctx context.Context, step ReviewerStep, input stepInput) (reviewerCheckpoint, error) {
-	if _, ok := ctx.Deadline(); !ok && r.agentTimeout > 0 {
+	groupedReview := step == stepReview && relatedFileGroupsConfig(r, input.Project.ID).Enabled
+	if _, ok := ctx.Deadline(); !ok && r.agentTimeout > 0 && !groupedReview {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, r.agentTimeout)
 		defer cancel()
@@ -4985,13 +4988,52 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 		return checkpoint, failureclass.WithBoundary(fmt.Errorf("resolve reviewer skills: %w", err), failureclass.BoundaryConfig)
 	}
 	skillIndex := reviewskills.FormatIndex(resolvedSkills.Entries)
-	prompt, instructionBlock := buildReviewPromptWithInstructions(input.Project.ID, r.customInstructions, input.Repo, input.PRNumber, checkpoint, input.Run.ID, idempotencyKey, reviewEvents, isManualReviewerLoop(input.Loop), requireReviewRequest, reviewRequestBypassReason, r.scope, r.disclosure, agentVendor, derefString(agentModel), r.looperCLIPath, r.reviewerAutoMergeConfigForProject(input.Project.ID).Enabled, commentOnlyCompletion, lastPublishedHeadSHA, skillIndex, hostingKindForContext(ctx))
 	nativeResumePrompt := r.nativeResumePromptForReview(ctx, input, checkpoint.Snapshot.HeadSHA, idempotencyKey, lastPublishedHeadSHA)
 	if nativeResumePrompt != "" {
 		if reminder := reviewskills.ResumeReminder(resolvedSkills.Entries); reminder != "" {
 			nativeResumePrompt = nativeResumePrompt + "\n\n" + reminder
 		}
 	}
+	groupedContext, closeGroupedContext, err := r.applyRelatedFileGroups(ctx, input, checkpoint, worktree.Path, skillIndex)
+	if closeGroupedContext != nil {
+		defer closeGroupedContext()
+	}
+	if err != nil {
+		var interrupted *loopError
+		if errors.As(err, &interrupted) && interrupted.interrupted {
+			checkpoint.PendingReview = nil
+			checkpoint.ResumePolicy = "restart_from_discover"
+		}
+		return checkpoint, err
+	}
+	if groupedContext != "" {
+		skillIndex = strings.TrimSpace(skillIndex + "\n\n" + groupedContext)
+		if nativeResumePrompt != "" {
+			nativeResumePrompt += "\n\n" + groupedContext
+		}
+	}
+	if freshDetail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.Project.RepoPath}); err != nil {
+		return checkpoint, &loopError{message: fmt.Sprintf("Failed to refresh pull request before starting reviewer agent: %v", err), kind: FailureRetryableAfterResume}
+	} else {
+		checkpoint.Detail.Labels = cloneStrings(freshDetail.Labels)
+		if domain.IsAutomaticLoopHeld(domain.LoopTypeReviewer, isManualReviewerLoop(input.Loop), freshDetail.Labels) {
+			return checkpoint, &holdSkipError{summary: fmt.Sprintf("Reviewer stopped because %s#%d is currently held", input.Repo, input.PRNumber)}
+		}
+		if relatedFileGroupsConfig(r, input.Project.ID).Enabled && strings.TrimSpace(freshDetail.HeadSHA) != strings.TrimSpace(checkpoint.Snapshot.HeadSHA) {
+			checkpoint.PendingReview = nil
+			checkpoint.ResumePolicy = "restart_from_discover"
+			return checkpoint, &loopError{message: fmt.Sprintf("PR head changed before final grouped reviewer: expected %s, got %s", checkpoint.Snapshot.HeadSHA, freshDetail.HeadSHA), kind: FailureRetryableAfterResume, interrupted: true}
+		}
+		if relatedFileGroupsConfig(r, input.Project.ID).Enabled {
+			if reason := reviewerPublishDriftReason(input, checkpoint, freshDetail); reason != "" {
+				checkpoint.PendingReview = nil
+				checkpoint.ResumePolicy = "restart_from_discover"
+				return checkpoint, &loopError{message: reason, kind: FailureRetryableAfterResume, interrupted: true}
+			}
+		}
+	}
+	prompt, instructionBlock := buildReviewPromptWithInstructions(input.Project.ID, r.customInstructions, input.Repo, input.PRNumber, checkpoint, input.Run.ID, idempotencyKey, reviewEvents, isManualReviewerLoop(input.Loop), requireReviewRequest, reviewRequestBypassReason, r.scope, r.disclosure, agentVendor, derefString(agentModel), r.looperCLIPath, r.reviewerAutoMergeConfigForProject(input.Project.ID).Enabled, commentOnlyCompletion, lastPublishedHeadSHA, skillIndex, hostingKindForContext(ctx))
+
 	metadata := map[string]any{
 		"loopType":                "reviewer",
 		"phase":                   "review",
@@ -5011,17 +5053,12 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 	for key, value := range config.CustomInstructionMetadata(instructionBlock, prompt) {
 		metadata[key] = value
 	}
-	if freshDetail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.Project.RepoPath}); err != nil {
-		return checkpoint, &loopError{message: fmt.Sprintf("Failed to refresh pull request before starting reviewer agent: %v", err), kind: FailureRetryableAfterResume}
-	} else {
-		checkpoint.Detail.Labels = cloneStrings(freshDetail.Labels)
-		if domain.IsAutomaticLoopHeld(domain.LoopTypeReviewer, isManualReviewerLoop(input.Loop), freshDetail.Labels) {
-			return checkpoint, &holdSkipError{summary: fmt.Sprintf("Reviewer stopped because %s#%d is currently held", input.Repo, input.PRNumber)}
-		}
-	}
+
 	useSnap, snapVendor, snapModel := agentRunSnapshotFields(agentVendor, agentModel, useSnapshot)
 	_ = r.tryAddReaction(ctx, input, reviewerInProgressReaction)
-	execution, err := r.agentExecutor.Start(ctx, AgentRunInput{
+	agentCtx, cancelAgent := reviewerAgentContext(ctx, r.agentTimeout)
+	defer cancelAgent()
+	execution, err := r.agentExecutor.Start(agentCtx, AgentRunInput{
 		ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID,
 		Prompt: prompt, NativeResumePrompt: nativeResumePrompt, WorkingDirectory: worktree.Path,
 		Timeout: r.agentTimeout, HeartbeatTimeout: r.agentIdleTimeout, Metadata: metadata, IdempotencyKey: idempotencyKey,
@@ -5041,8 +5078,8 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 			r.logger.Warn("reviewer agent start notification failed", map[string]any{"loopId": input.Loop.ID, "runId": input.Run.ID, "error": err.Error()})
 		}
 	}
-	headMonitor := r.startReviewerHeadChangeMonitor(ctx, input, checkpoint, execution, executionID)
-	result, err := execution.Wait(ctx)
+	headMonitor := r.startReviewerHeadChangeMonitor(agentCtx, input, checkpoint, execution, executionID)
+	result, err := execution.Wait(agentCtx)
 	headChange := headMonitor.stop()
 	if headChange.Reason != "" {
 		if r.nativeResume.OnHeadChange {
@@ -8344,7 +8381,7 @@ func (r *Runner) pendingNativeResume(ctx context.Context, loopID string) *storag
 	if strings.TrimSpace(loopID) == "" || r.repos == nil || r.repos.AgentExecutions == nil {
 		return nil
 	}
-	latest, err := r.repos.AgentExecutions.GetLatestByLoopID(ctx, loopID)
+	latest, err := r.repos.AgentExecutions.GetLatestByLoopIDExcludingPhase(ctx, loopID, "review-group")
 	if err != nil {
 		r.logWarn("reviewer native resume pending lookup failed", map[string]any{"loopId": loopID, "error": err.Error()})
 		return nil
@@ -8353,6 +8390,33 @@ func (r *Runner) pendingNativeResume(ctx context.Context, loopID string) *storag
 		return nil
 	}
 	return latest
+}
+
+func (r *Runner) refreshGroupedReview(ctx context.Context, input stepInput, expectedHead string) (PullRequestDetail, error) {
+	if r == nil || r.github == nil {
+		return PullRequestDetail{}, nil
+	}
+	freshDetail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.Project.RepoPath})
+	if err != nil {
+		return freshDetail, &loopError{message: fmt.Sprintf("Failed to refresh pull request before starting reviewer agent: %v", err), kind: FailureRetryableAfterResume}
+	}
+	if domain.IsAutomaticLoopHeld(domain.LoopTypeReviewer, isManualReviewerLoop(input.Loop), freshDetail.Labels) {
+		return freshDetail, &holdSkipError{summary: fmt.Sprintf("Reviewer stopped because %s#%d is currently held", input.Repo, input.PRNumber)}
+	}
+	if strings.TrimSpace(freshDetail.HeadSHA) != strings.TrimSpace(expectedHead) {
+		return freshDetail, &loopError{message: fmt.Sprintf("PR head changed during grouped review: expected %s, got %s", expectedHead, freshDetail.HeadSHA), kind: FailureRetryableAfterResume, interrupted: true}
+	}
+	if reason := reviewerPublishDriftReason(input, input.Checkpoint, freshDetail); reason != "" {
+		return freshDetail, &loopError{message: reason, kind: FailureRetryableAfterResume, interrupted: true}
+	}
+	return freshDetail, nil
+}
+
+func reviewerAgentContext(ctx context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+	if timeout > 0 {
+		return context.WithTimeout(ctx, timeout)
+	}
+	return context.WithCancel(ctx)
 }
 
 func (r *Runner) hasPendingNativeResume(ctx context.Context, loopID string) bool {
@@ -9919,10 +9983,7 @@ func buildReviewPromptWithInstructions(projectID string, instructionConfig confi
 	looperCLIPath = normalizeLooperCLIPath(looperCLIPath)
 	looperCLICommand := shellQuote(looperCLIPath)
 	phase := resolvePullRequestPhase(detailLabels(checkpoint.Detail))
-	phaseInstruction := "This is an implementation review. Focus on code correctness, safety, tests, and maintainability."
-	if phase == "spec" {
-		phaseInstruction = "This is a spec review. Focus on scope, correctness, feasibility, risks, and validation. Do not review implementation details beyond whether the spec is actionable."
-	}
+	phaseInstruction := reviewerPhaseInstruction(phase)
 	isForgejo := reviewerProjectProviderKind(instructionConfig, projectID) == config.ProviderKindForgejo
 	forgejoNative := isForgejo && !commentOnlyPublish
 	forgeName := "GitHub"
@@ -10764,6 +10825,13 @@ func resolvePullRequestPhase(labels []string) string {
 		return "spec"
 	}
 	return "implementation"
+}
+
+func reviewerPhaseInstruction(phase string) string {
+	if phase == "spec" {
+		return "This is a spec review. Focus on scope, correctness, feasibility, risks, and validation. Do not review implementation details beyond whether the spec is actionable."
+	}
+	return "This is an implementation review. Focus on code correctness, safety, tests, and maintainability."
 }
 
 func detailLabels(detail *checkpointDetail) []string {

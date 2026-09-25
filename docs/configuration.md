@@ -1008,6 +1008,17 @@ required = ["security-review", "./review-skills/team-bar.md"]
 optional = ["perf-review"]
 ```
 
+### Related-file groups
+
+Large-PR grouping is off by default. See [DESIGN-reviewer-related-file-groups.md](DESIGN-reviewer-related-file-groups.md).
+
+| Path | Purpose | Default |
+| --- | --- | --- |
+| `roles.reviewer.behavior.relatedFileGroups.enabled` | Run sequential finding-only subtasks then one top-level publish | `false` |
+| `roles.reviewer.behavior.relatedFileGroups.minChangedFiles` | Minimum `git diff --name-status` paths before grouping | `24` |
+
+Subtasks cannot publish. A subtask failure fails the whole review. Small PRs keep the single-agent path.
+
 ### Review-fix budget
 
 Unlimited reviewer ⇄ fixer ping-pong is a cost and quality problem: each side can keep inventing new work. The old `maxIterationsPerPR` / `maxIterationsPerHead` knobs are still accepted but **ignored**. The live caps are separate per role:

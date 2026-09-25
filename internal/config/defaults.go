@@ -254,6 +254,7 @@ func DefaultConfig(cwd string) (Config, error) {
 					ReviewEvents:            ReviewerReviewEventsConfig{Clean: ReviewerReviewEventApprove, Blocking: ReviewerReviewEventRequestChanges},
 					DetectDuplicateFindings: true,
 					NativeResume:            ReviewerNativeResumeConfig{OnHeadChange: false, ReReviewPromptOnHeadChange: false},
+					RelatedFileGroups:       ReviewerRelatedFileGroupsConfig{Enabled: false, MinChangedFiles: 24},
 					ThreadResolution: ReviewerThreadResolutionConfig{
 						Enabled:                     false,
 						Mode:                        ReviewerThreadResolutionModeReportOnly,

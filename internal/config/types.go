@@ -434,14 +434,20 @@ type ReviewerLoopConfig struct {
 }
 
 type ReviewerConfig struct {
-	Loop                    ReviewerLoopConfig             `json:"loop"`
-	Retry                   ReviewerRetryConfig            `json:"retry"`
-	Scope                   ReviewerScope                  `json:"scope"`
-	PublishMode             ReviewerPublishMode            `json:"publishMode"`
-	ReviewEvents            ReviewerReviewEventsConfig     `json:"reviewEvents"`
-	DetectDuplicateFindings bool                           `json:"detectDuplicateFindings"`
-	NativeResume            ReviewerNativeResumeConfig     `json:"nativeResume"`
-	ThreadResolution        ReviewerThreadResolutionConfig `json:"threadResolution"`
+	Loop                    ReviewerLoopConfig              `json:"loop"`
+	Retry                   ReviewerRetryConfig             `json:"retry"`
+	Scope                   ReviewerScope                   `json:"scope"`
+	PublishMode             ReviewerPublishMode             `json:"publishMode"`
+	ReviewEvents            ReviewerReviewEventsConfig      `json:"reviewEvents"`
+	DetectDuplicateFindings bool                            `json:"detectDuplicateFindings"`
+	NativeResume            ReviewerNativeResumeConfig      `json:"nativeResume"`
+	ThreadResolution        ReviewerThreadResolutionConfig  `json:"threadResolution"`
+	RelatedFileGroups       ReviewerRelatedFileGroupsConfig `json:"relatedFileGroups"`
+}
+
+type ReviewerRelatedFileGroupsConfig struct {
+	Enabled         bool `json:"enabled"`
+	MinChangedFiles int  `json:"minChangedFiles"`
 }
 
 type ReviewerRetryConfig struct {
@@ -956,15 +962,21 @@ type PartialReviewerLoopConfig struct {
 }
 
 type PartialReviewerConfig struct {
-	Loop                    *PartialReviewerLoopConfig             `json:"loop,omitempty"`
-	Retry                   *PartialReviewerRetryConfig            `json:"retry,omitempty"`
-	Scope                   *ReviewerScope                         `json:"scope,omitempty"`
-	PublishMode             *ReviewerPublishMode                   `json:"publishMode,omitempty"`
-	ReviewEvents            *PartialReviewerReviewEventsConfig     `json:"reviewEvents,omitempty"`
-	DetectDuplicateFindings *bool                                  `json:"detectDuplicateFindings,omitempty"`
-	DedupeFindings          *bool                                  `json:"dedupeFindings,omitempty"`
-	NativeResume            *PartialReviewerNativeResumeConfig     `json:"nativeResume,omitempty"`
-	ThreadResolution        *PartialReviewerThreadResolutionConfig `json:"threadResolution,omitempty"`
+	Loop                    *PartialReviewerLoopConfig              `json:"loop,omitempty"`
+	Retry                   *PartialReviewerRetryConfig             `json:"retry,omitempty"`
+	Scope                   *ReviewerScope                          `json:"scope,omitempty"`
+	PublishMode             *ReviewerPublishMode                    `json:"publishMode,omitempty"`
+	ReviewEvents            *PartialReviewerReviewEventsConfig      `json:"reviewEvents,omitempty"`
+	DetectDuplicateFindings *bool                                   `json:"detectDuplicateFindings,omitempty"`
+	DedupeFindings          *bool                                   `json:"dedupeFindings,omitempty"`
+	NativeResume            *PartialReviewerNativeResumeConfig      `json:"nativeResume,omitempty"`
+	ThreadResolution        *PartialReviewerThreadResolutionConfig  `json:"threadResolution,omitempty"`
+	RelatedFileGroups       *PartialReviewerRelatedFileGroupsConfig `json:"relatedFileGroups,omitempty"`
+}
+
+type PartialReviewerRelatedFileGroupsConfig struct {
+	Enabled         *bool `json:"enabled,omitempty"`
+	MinChangedFiles *int  `json:"minChangedFiles,omitempty"`
 }
 
 type PartialReviewerRetryConfig struct {

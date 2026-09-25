@@ -243,6 +243,9 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 	if config.Roles.Reviewer.Behavior.PublishMode != ReviewerPublishModeSingleReview && config.Roles.Reviewer.Behavior.PublishMode != ReviewerPublishModeSummaryComment {
 		issues = append(issues, ValidationIssue{Path: "roles.reviewer.behavior.publishMode", Message: fmt.Sprintf("must be %s or %s", ReviewerPublishModeSingleReview, ReviewerPublishModeSummaryComment)})
 	}
+	if config.Roles.Reviewer.Behavior.RelatedFileGroups.MinChangedFiles < 1 {
+		issues = append(issues, ValidationIssue{Path: "roles.reviewer.behavior.relatedFileGroups.minChangedFiles", Message: "must be a positive integer"})
+	}
 	if !isValidReviewerThreadResolutionMode(config.Roles.Reviewer.Behavior.ThreadResolution.Mode) {
 		issues = append(issues, ValidationIssue{Path: "roles.reviewer.behavior.threadResolution.mode", Message: fmt.Sprintf("must be one of: %s, %s, %s, %s", ReviewerThreadResolutionModeReportOnly, ReviewerThreadResolutionModeCommentOnly, ReviewerThreadResolutionModeSuggestResolution, ReviewerThreadResolutionModeResolveObjective)})
 	}
@@ -722,6 +725,11 @@ func validateProjectRoleOverrides(roles *PartialRoleConfigs, prefix string, maxI
 			}
 			if roles.Reviewer.Behavior.Loop.MaxPublishesPerPR != nil {
 				validateReviewFixBudgetCap(*roles.Reviewer.Behavior.Loop.MaxPublishesPerPR, prefix+".reviewer.behavior.loop.maxPublishesPerPR", issues)
+			}
+		}
+		if roles.Reviewer.Behavior != nil && roles.Reviewer.Behavior.RelatedFileGroups != nil && roles.Reviewer.Behavior.RelatedFileGroups.MinChangedFiles != nil {
+			if *roles.Reviewer.Behavior.RelatedFileGroups.MinChangedFiles < 1 {
+				*issues = append(*issues, ValidationIssue{Path: prefix + ".reviewer.behavior.relatedFileGroups.minChangedFiles", Message: "must be a positive integer"})
 			}
 		}
 		if roles.Reviewer.AutoMerge != nil {
