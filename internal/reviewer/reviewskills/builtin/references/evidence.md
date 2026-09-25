@@ -26,7 +26,7 @@ Negative: ownership is returned to the caller (`io.ReadCloser`, constructor that
 
 Name the untrusted input, a reachable path from that input, and the actual trust boundary.
 
-Positive (unsafe interpretation): attacker-controlled bytes reach a sink (exec, query, path, template) that interprets them unsafely—missing parameterization, contextual escaping, or path confinement—without validation or a trust-boundary change.
+Positive (unsafe interpretation): attacker-controlled bytes reach a sink (exec, query, path, template) that interprets them unsafely, such as missing parameterization, contextual escaping, or path confinement. Crossing a component or trust boundary does not sanitize those bytes; require an effective, sink-appropriate transformation before treating them as safe.
 
 Positive (authorization): a reachable path lets a principal perform an action on a resource that the policy forbids, because an ownership, tenant, or other authorization check is missing or applied to the wrong principal/resource. A valid, sink-constrained identifier (for example a UUID in a parameterized query) is not a drop reason for this case.
 
