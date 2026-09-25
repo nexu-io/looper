@@ -4,7 +4,7 @@ Use existing comment `body` plus `scopeEvidence`. Do not invent evidence records
 
 Comment shape for every finding: trigger condition → actual path → wrong consequence → suggested fix.
 
-## Race / deadlock
+## Data race
 
 Establish a real concurrent call path, the shared state, and the synchronization that is supposed to protect it. Do not infer a race from a mutex, channel, or `go` keyword alone.
 
@@ -14,11 +14,17 @@ Negative: a per-call local that is never shared with another goroutine, a copied
 
 Drop a race finding only when existing synchronization or single-owner access already excludes the claimed interleaving. A type documented as not concurrent does not disprove a race; report the caller's unsynchronized shared use (for example concurrent writes to a shared `bytes.Buffer`).
 
+## Deadlock / permanently blocked operation
+
+Establish a reachable wait cycle or an operation that cannot complete, the progress the contract requires, and why the relevant release or cancellation paths cannot unblock it. This can happen in one goroutine and does not require shared state: recursively locking a non-reentrant mutex or sending/receiving on a nil channel can block indefinitely.
+
+Distinguish a defect from intended waiting. A nil-channel case disabled inside a select is not itself a deadlock when another case can make the required progress; a reachable release, handoff, or cancellation path may also disprove the claimed permanent block.
+
 ## Resource leak
 
 Name the owner, the lifecycle, and whether ownership transferred.
 
-Positive: a handle, file, connection, or context cancel is created on a success path that can return without release, and no caller is documented to take ownership. For timers and tickers, also establish the effective Go version semantics and reachability described below before claiming a leak.
+After a resource has been acquired, inspect every exit path, including later errors and partial initialization. Positive: a handle, file, connection, or context cancel remains owned here but unreleased on a reachable return, and ownership has not transferred to a caller. For timers and tickers, also establish the effective Go version semantics and reachability described below before claiming a leak.
 
 Negative: ownership is returned to the caller (`io.ReadCloser`, constructor that documents Close), or a `defer` on every return path already releases it.
 
@@ -66,13 +72,13 @@ Never write only "add tests". Name the failing behavior, the test file or packag
 
 Run this pass in the same review context before finalizing. It is a conservative self-check, not a second model stage. The authority for a drop is that same context (diff, callers, tests, contracts), not the first structured candidate list.
 
-This pass prevents publishing a finding the same context already disproves. Cost: one extra same-context pass and retained unverified findings (unverified is not a drop). It adds no persisted state, no second model, and no new evidence schema. Requiring stronger structured evidence fields is insufficient: extra fields would not catch a claimed path the existing context already falsifies, and this skill forbids inventing evidence records.
+First establish the candidate's concrete trigger → actual path → wrong consequence. If that chain is uncertain, investigate it; if it still cannot be established, omit the unsupported claim from published findings. Source, contracts, and tests can establish the chain without executing a reproduction. A missing reproduction is not disproof.
 
-Drop a candidate only when evidence proves it factually wrong, or when it is the same root cause as another finding (keep one representative).
+For an evidence-backed candidate, drop it in this counterexample pass only when evidence proves it factually wrong, or when it is the same root cause as another finding (keep one representative).
 
-Unverified is not wrong. Do not silent-drop because the finding count is high or the issue looks low-value.
+Do not silently drop an evidence-backed finding because the finding count is high or the issue looks low-value. An unproven counterargument does not invalidate established evidence.
 
-Ask, then keep unless the answer is proven:
+For those evidence-backed candidates, check:
 
 - Do callers already guarantee the precondition on every reachable path?
 - Does existing synchronization exclude the claimed race/deadlock?
