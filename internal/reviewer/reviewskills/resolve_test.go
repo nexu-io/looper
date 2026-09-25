@@ -1,6 +1,7 @@
 package reviewskills
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -8,6 +9,28 @@ import (
 
 	"github.com/nexu-io/looper/internal/config"
 )
+
+func TestResolveReplacementUsesProjectMethodBeforeBuiltinLoader(t *testing.T) {
+	t.Parallel()
+	worktree := t.TempDir()
+	dir := filepath.Join(worktree, ".agents", "skills", "looper-review")
+	writeNamedSkill(t, dir, "looper-review", "project replacement")
+	unavailable := errors.New("builtin storage unavailable")
+	in := ResolveInput{Mode: config.ReviewerSkillsModeReplace, Required: []string{"looper-review"}, Worktree: worktree, LoadBuiltin: func() (string, error) { return "", unavailable }}
+	result, err := Resolve(in)
+	if err != nil || len(result.Entries) != 1 || result.Entries[0].Source != "project" {
+		t.Fatalf("project replacement = %#v, %v", result, err)
+	}
+	in.Mode = config.ReviewerSkillsModeExtend
+	if _, err := Resolve(in); !errors.Is(err, unavailable) {
+		t.Fatalf("extend error = %v, want required builtin failure", err)
+	}
+	in.Mode = config.ReviewerSkillsModeReplace
+	in.Worktree = ""
+	if _, err := Resolve(in); !errors.Is(err, unavailable) {
+		t.Fatalf("builtin fallback error = %v, want selected builtin failure", err)
+	}
+}
 
 func TestResolveThreeLayerLookupAndProjectOverridesUser(t *testing.T) {
 	t.Parallel()

@@ -12,12 +12,13 @@ import (
 
 // ResolveInput selects configured reviewer skills against a prepared worktree.
 type ResolveInput struct {
-	Mode       config.ReviewerSkillsMode
-	Required   []string
-	Optional   []string
-	Worktree   string
-	UserHome   string
-	BuiltinDir string // materialized bundle.Dir
+	Mode        config.ReviewerSkillsMode
+	Required    []string
+	Optional    []string
+	Worktree    string
+	UserHome    string
+	BuiltinDir  string                 // materialized bundle.Dir
+	LoadBuiltin func() (string, error) // optional lazy loader; caller owns cleanup
 }
 
 // ResolveResult is the ordered skill index plus optional refs that were missing.
@@ -60,6 +61,9 @@ func Resolve(in ResolveInput) (ResolveResult, error) {
 	builtinName := ""
 
 	if mode == config.ReviewerSkillsModeExtend {
+		if err := in.loadBuiltin(); err != nil {
+			return ResolveResult{}, err
+		}
 		entry, err := loadBuiltinLooperReview(in.BuiltinDir)
 		if err != nil {
 			return ResolveResult{}, err
@@ -77,7 +81,7 @@ func Resolve(in ResolveInput) (ResolveResult, error) {
 			}
 			return nil
 		}
-		entry, err := resolveRef(in, ref)
+		entry, err := resolveRef(&in, ref)
 		if err != nil {
 			if !required && isMissingSkill(err) {
 				result.Unavailable = append(result.Unavailable, ref)
@@ -114,6 +118,18 @@ func Resolve(in ResolveInput) (ResolveResult, error) {
 	return result, nil
 }
 
+func (in *ResolveInput) loadBuiltin() error {
+	if strings.TrimSpace(in.BuiltinDir) != "" || in.LoadBuiltin == nil {
+		return nil
+	}
+	dir, err := in.LoadBuiltin()
+	if err != nil {
+		return err
+	}
+	in.BuiltinDir = dir
+	return nil
+}
+
 func loadBuiltinLooperReview(builtinDir string) (Entry, error) {
 	if strings.TrimSpace(builtinDir) == "" {
 		return Entry{}, fmt.Errorf("builtin reviewer skill directory is empty")
@@ -136,9 +152,9 @@ func loadBuiltinLooperReview(builtinDir string) (Entry, error) {
 	}, nil
 }
 
-func resolveRef(in ResolveInput, ref string) (Entry, error) {
+func resolveRef(in *ResolveInput, ref string) (Entry, error) {
 	if isPathRef(ref) {
-		return resolvePathRef(in, ref)
+		return resolvePathRef(*in, ref)
 	}
 	return resolveNameRef(in, ref)
 }
@@ -208,11 +224,23 @@ func skillFileFromPath(path string) (string, error) {
 	return path, nil
 }
 
-func resolveNameRef(in ResolveInput, name string) (Entry, error) {
+func resolveNameRef(in *ResolveInput, name string) (Entry, error) {
 	if name == "." || name == ".." || strings.ContainsAny(name, `/\`) {
 		return Entry{}, fmt.Errorf("skill name %q must be a single directory name; use an explicit path for other locations", name)
 	}
-	for _, layer := range nameLayers(in) {
+	for _, layer := range nameLayers(*in) {
+		if layer.source == "builtin" && layer.dir == "" {
+			if name != "looper-review" {
+				continue
+			}
+			if err := in.loadBuiltin(); err != nil {
+				return Entry{}, err
+			}
+			layer.dir = in.BuiltinDir
+			if layer.dir == "" {
+				continue
+			}
+		}
 		entry, err := lookupNameAtLayer(layer, name)
 		if err != nil {
 			return Entry{}, err
@@ -232,7 +260,7 @@ func nameLayers(in ResolveInput) []skillLayer {
 	if dir := strings.TrimSpace(in.UserHome); dir != "" {
 		layers = append(layers, skillLayer{dir: filepath.Join(dir, ".agents", "skills"), source: "user"})
 	}
-	if dir := strings.TrimSpace(in.BuiltinDir); dir != "" {
+	if dir := strings.TrimSpace(in.BuiltinDir); dir != "" || in.LoadBuiltin != nil {
 		layers = append(layers, skillLayer{dir: dir, source: "builtin"})
 	}
 	return layers

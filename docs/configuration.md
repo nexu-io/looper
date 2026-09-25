@@ -975,6 +975,8 @@ Skill files must be regular files (symlinks to regular files are supported). YAM
 
 In `extend` mode, builtin `looper-review` is injected from the builtin bundle directly. A project or user file named `looper-review` cannot shadow it; use `replace` to drop builtin.
 
+The builtin bundle is materialized only when selected: always in `extend`, or when `replace` resolves `looper-review` from the builtin layer. Custom-only replacement does not require a writable system temporary directory for builtin skills.
+
 References to the same real path are deduped, including symlink aliases. A selected high-priority file that exists but is unreadable, has invalid frontmatter, or declares a different name fails the review; Looper does not fall back to a lower layer. Missing required skills fail the review; missing optional skills are recorded as `reviewSkillsUnavailable` and the run continues.
 
 Required references reject blank entries, surrounding whitespace and duplicates during config validation. Optional references are trimmed, empty entries are ignored, and references resolving to the same real file are deduplicated.
