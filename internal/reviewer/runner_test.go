@@ -13817,6 +13817,8 @@ type fakeGitHubGateway struct {
 	listReviewThreadsErr            error
 	listReviewThreadsErrAfter       int // fail on call N (1-based); 0 = always if err set
 	viewHeadSHA                     string
+	viewBaseSHA                     string
+	viewBaseRef                     string
 	headSHACalls                    int
 	issueCommentCalls               []IssueCommentInput
 	updateIssueCommentCalls         []UpdateIssueCommentInput
@@ -13948,7 +13950,7 @@ func (g *fakeGitHubGateway) ViewPullRequest(context.Context, ViewPullRequestInpu
 	if g.omitReviewsOnView {
 		reviews = nil
 	}
-	return PullRequestDetail{Number: 42, Title: "Review me", Body: body, State: state, IsDraft: g.viewDraft, ReviewDecision: reviewDecision, Labels: append([]string(nil), g.labels...), HeadSHA: headSHA, BaseSHA: "base123", HeadRefName: "feature/review-me", BaseRefName: "main", Author: g.effectiveAuthor(), ReviewRequests: reviewRequests, ReviewRequestUsers: users, HasConflicts: g.hasConflicts, ChecksSummary: "SUCCESS", Comments: cloneCommentMaps(comments), IssueComments: cloneCommentMaps(g.issueComments), Reviews: reviews}, nil
+	return PullRequestDetail{Number: 42, Title: "Review me", Body: body, State: state, IsDraft: g.viewDraft, ReviewDecision: reviewDecision, Labels: append([]string(nil), g.labels...), HeadSHA: headSHA, BaseSHA: firstNonEmpty(g.viewBaseSHA, "base123"), HeadRefName: "feature/review-me", BaseRefName: firstNonEmpty(g.viewBaseRef, "main"), Author: g.effectiveAuthor(), ReviewRequests: reviewRequests, ReviewRequestUsers: users, HasConflicts: g.hasConflicts, ChecksSummary: "SUCCESS", Comments: cloneCommentMaps(comments), IssueComments: cloneCommentMaps(g.issueComments), Reviews: reviews}, nil
 }
 
 func (g *fakeGitHubGateway) LoadPullRequestReviews(context.Context, ViewPullRequestInput) ([]map[string]any, error) {

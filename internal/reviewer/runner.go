@@ -5024,6 +5024,13 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 			checkpoint.ResumePolicy = "restart_from_discover"
 			return checkpoint, &loopError{message: fmt.Sprintf("PR head changed before final grouped reviewer: expected %s, got %s", checkpoint.Snapshot.HeadSHA, freshDetail.HeadSHA), kind: FailureRetryableAfterResume, interrupted: true}
 		}
+		if relatedFileGroupsConfig(r, input.Project.ID).Enabled {
+			if reason := reviewerPublishDriftReason(input, checkpoint, freshDetail); reason != "" {
+				checkpoint.PendingReview = nil
+				checkpoint.ResumePolicy = "restart_from_discover"
+				return checkpoint, &loopError{message: reason, kind: FailureRetryableAfterResume, interrupted: true}
+			}
+		}
 	}
 	prompt, instructionBlock := buildReviewPromptWithInstructions(input.Project.ID, r.customInstructions, input.Repo, input.PRNumber, checkpoint, input.Run.ID, idempotencyKey, reviewEvents, isManualReviewerLoop(input.Loop), requireReviewRequest, reviewRequestBypassReason, r.scope, r.disclosure, agentVendor, derefString(agentModel), r.looperCLIPath, r.reviewerAutoMergeConfigForProject(input.Project.ID).Enabled, commentOnlyCompletion, lastPublishedHeadSHA, skillIndex, hostingKindForContext(ctx))
 
@@ -8398,6 +8405,9 @@ func (r *Runner) refreshGroupedReview(ctx context.Context, input stepInput, expe
 	}
 	if strings.TrimSpace(freshDetail.HeadSHA) != strings.TrimSpace(expectedHead) {
 		return freshDetail, &loopError{message: fmt.Sprintf("PR head changed during grouped review: expected %s, got %s", expectedHead, freshDetail.HeadSHA), kind: FailureRetryableAfterResume, interrupted: true}
+	}
+	if reason := reviewerPublishDriftReason(input, input.Checkpoint, freshDetail); reason != "" {
+		return freshDetail, &loopError{message: reason, kind: FailureRetryableAfterResume, interrupted: true}
 	}
 	return freshDetail, nil
 }

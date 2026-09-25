@@ -8,8 +8,8 @@ A single reviewer context on a large PR can drop cross-file contracts. The built
 
 - Scope comes from the fixed `base_sha`/`head_sha` plus existing reviewer scope. The group list is work assignment only.
 - Findings and dispositions come from agent structured output.
-- Publish stays on the existing top-level wrapper / comment-only path. Subtasks cannot call `review submit`.
-- Git state and the live PR head detect source drift; hold labels represent user control. These checks do not infer review completeness or override agent findings.
+- Authorized publication stays on the existing top-level wrapper / comment-only path. Subtasks receive no trusted review-submit capability and are instructed not to publish. This orchestration contract does not sandbox other commands or credentials.
+- Git state and the existing live PR target checks (head, base SHA/ref, state/draft) detect source drift; hold labels represent user control. These checks do not infer review completeness or override agent findings.
 - Git's raw path identifiers are authoritative for context transport. Non-UTF-8 names stop grouped execution before agents start because JSON strings cannot preserve them; this encoding check does not judge agent findings.
 
 ## Enablement
@@ -34,9 +34,13 @@ Grouped execution supports UTF-8 path names, including control characters escape
 
 Subtasks run **sequentially** on the same prepared worktree. They must not move checkout or write the worktree. Each returns `__LOOPER_RESULT__` findings only.
 
-The runner checks the live hold state and expected PR head before grouping, between groups, and before starting the final reviewer. A changed remote head restarts discovery. Each group and the final prompt use phase guidance derived from the labels returned by their existing live refresh, including label changes on the same head. Each agent receives its own timeout budget; a caller's deadline or cancellation still bounds the whole operation.
+The runner checks the live hold state and expected PR target before grouping, between groups, and before starting the final reviewer. It reuses the existing pre-publication drift rules, including base SHA/ref changes on the same head; target drift restarts discovery. Each group and the final prompt use phase guidance derived from the labels returned by their existing live refresh, including label changes on the same head. Each agent receives its own timeout budget; a caller's deadline or cancellation stops review work.
+
+When a group context ends, `Wait` can return before the process exits. The runner requests termination and waits through the executor's existing shutdown/containment contract before checking the worktree. This cleanup uses a cancellation-independent budget of at most 30 seconds; a failed kill/drain requires manual intervention instead of continuing the grouped pass. The cost is bounded shutdown latency after cancellation, not a new recovery record or process supervisor.
 
 The local Git check detects a changed checkout and Git-visible tracked/untracked changes after each group, including start/wait failures and incomplete agent results. The invariant failure takes precedence over a transient provider error so the retry loop cannot start another agent on detected contamination; a clean checkout retains normal provider retries. It is not a filesystem write audit: ignored build output and caches are outside that check. The no-write prompt remains an agent instruction, not an OS sandbox guarantee. This feature does not add filesystem baselines, hashes, cleanup, or ignored-file gates.
+
+Non-hosted agents retain the existing operator-controlled CLI environment and credentials. A finding-only prompt is not a read-only credential boundary: those credentials can still permit direct GitHub/Forgejo mutations. Hosted executions retain their existing broker restrictions. This PR does not add a credential sandbox, command allowlist, or new auth mode, and does not claim to prevent a non-hosted agent from violating the publication instruction.
 
 If any subtask fails, times out, or source drift is detected, the grouped pass stops before the final publisher starts. There is no per-group resume ledger; retry the whole pass. Group executions always start fresh. Native resume selects the latest non-group execution from existing execution metadata, so persisted group records cannot hide a pending main-review session after a restart. Vendor and recoverability checks still apply; a newer completed main review supersedes an older pending session.
 
@@ -52,4 +56,4 @@ Deleting execution grouping and relying on the skill's related-file plan is the 
 
 ## Out of scope
 
-Daemon queues, per-group databases, concurrent worktree writes, comprehensive filesystem isolation/auditing, multiple remote reviews, merge gates, and model-quality datasets/replay/scoring.
+Daemon queues, per-group databases, concurrent worktree writes, comprehensive filesystem isolation/auditing, new credential/command sandboxes, multiple authorized remote reviews, merge gates, and model-quality datasets/replay/scoring.

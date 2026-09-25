@@ -64,10 +64,10 @@ func groupedReviewLifecycleFixture(t *testing.T) (*Runner, stepInput, *fakeGitHu
 	cfg.Roles.Reviewer.Behavior.ReviewEvents.Clean = config.ReviewerReviewEventComment
 	completed := AgentResult{Status: "completed", Summary: "No actionable findings", Stdout: `__LOOPER_RESULT__={"summary":"No actionable findings","outcome":"clean","findings":[]}`}
 	agent := &fakeAgentExecutor{results: []AgentResult{completed, completed, completed}}
-	github := &fakeGitHubGateway{viewHeadSHA: head}
+	github := &fakeGitHubGateway{viewHeadSHA: head, viewBaseSHA: base}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AgentRuntime: string(config.AgentVendorCodex), CustomInstructions: &cfg})
 	input := stepInput{Project: *project, Loop: loop, Run: run, Repo: "acme/looper", PRNumber: 42, Checkpoint: reviewerCheckpoint{
-		Detail: &checkpointDetail{HeadRefName: "feature", BaseRefName: "main"}, Snapshot: &checkpointSnapshot{BaseSHA: base, HeadSHA: head},
+		Detail: &checkpointDetail{HeadRefName: "feature/review-me", BaseRefName: "main"}, Snapshot: &checkpointSnapshot{BaseSHA: base, HeadSHA: head},
 		Worktree: &checkpointWorktree{Path: worktree, Branch: "feature", PreparedAt: fixture.nowISO()},
 	}}
 	return runner, input, github, agent
@@ -609,5 +609,39 @@ func TestGroupedReviewRejectsNonUTF8Paths(t *testing.T) {
 	_, err := runner.executeStep(context.Background(), stepReview, input)
 	if err == nil || !strings.Contains(err.Error(), "non-UTF-8") || len(agent.starts) != 0 {
 		t.Fatalf("non-UTF-8 path: err=%v, starts=%d; want explicit failure before any agent", err, len(agent.starts))
+	}
+}
+
+func TestGroupedReviewRestartsOnBaseDrift(t *testing.T) {
+	for _, field := range []string{"sha", "ref"} {
+		for _, afterStarts := range []int{0, 1, 2} {
+			t.Run(fmt.Sprintf("%s_after_%d_groups", field, afterStarts), func(t *testing.T) {
+				t.Parallel()
+				runner, input, github, agent := groupedReviewLifecycleFixture(t)
+				drift := func() {
+					if field == "sha" {
+						github.viewBaseSHA = "advanced-base"
+					} else {
+						github.viewBaseRef = "release"
+					}
+				}
+				if afterStarts == 0 {
+					drift()
+				}
+				agent.onStart = func(AgentRunInput) {
+					if len(agent.starts) == afterStarts {
+						drift()
+					}
+				}
+				checkpoint, err := runner.executeStep(context.Background(), stepReview, input)
+				var failure *loopError
+				if !errors.As(err, &failure) || !failure.interrupted || checkpoint.ResumePolicy != "restart_from_discover" || !strings.Contains(err.Error(), "base") {
+					t.Fatalf("base drift: checkpoint=%+v, err=%v; want rediscovery", checkpoint, err)
+				}
+				if len(agent.starts) != afterStarts || checkpoint.PendingReview != nil {
+					t.Fatalf("started %d agents, want %d and no pending publication", len(agent.starts), afterStarts)
+				}
+			})
+		}
 	}
 }

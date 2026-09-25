@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/nexu-io/looper/internal/config"
@@ -175,6 +176,7 @@ func (r *Runner) applyRelatedFileGroups(ctx context.Context, input stepInput, ch
 	}
 	base := strings.TrimSpace(checkpoint.Snapshot.BaseSHA)
 	head := strings.TrimSpace(checkpoint.Snapshot.HeadSHA)
+	input.Checkpoint = checkpoint
 	freshDetail, err := r.refreshGroupedReview(ctx, input, head)
 	if err != nil {
 		return "", nil, err
@@ -182,7 +184,6 @@ func (r *Runner) applyRelatedFileGroups(ctx context.Context, input stepInput, ch
 	if checkpoint.Detail != nil {
 		checkpoint.Detail.Labels = cloneStrings(freshDetail.Labels)
 	}
-	input.Checkpoint = checkpoint
 	last, _ := stringFromAny(parseJSONObject(input.Loop.MetadataJSON)["lastPublishedHeadSha"])
 	repairFrontier := isRepairFrontierPass(last, head)
 	if repairFrontier {
@@ -288,10 +289,26 @@ func (r *Runner) runGroupedFindingAgents(ctx context.Context, input stepInput, w
 		if err == nil {
 			result, err = execution.Wait(agentCtx)
 		}
+		needsDrain := execution != nil && agentCtx.Err() != nil
 		cancelAgent()
+		checkCtx := ctx
+		cancelCheck := func() {}
+		if needsDrain {
+			// Wait can return on cancellation before the executor's process has
+			// stopped. Reuse its kill/drain contract before inspecting any files.
+			checkCtx, cancelCheck = context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+			killErr := execution.Kill("grouped review canceled")
+			_, drainErr := execution.Wait(checkCtx)
+			if killErr != nil || drainErr != nil {
+				cancelCheck()
+				return nil, &loopError{message: fmt.Sprintf("grouped review %s shutdown not confirmed: kill=%v, wait=%v", group.ID, killErr, drainErr), kind: FailureManualIntervention}
+			}
+		}
 		// A transient provider failure must not bypass the same invariant used
 		// for successful groups and retry against a contaminated checkout.
-		if invariantErr := r.assertGroupedWorktreeUnchanged(ctx, worktreePath, head); invariantErr != nil {
+		invariantErr := r.assertGroupedWorktreeUnchanged(checkCtx, worktreePath, head)
+		cancelCheck()
+		if invariantErr != nil {
 			return nil, fmt.Errorf("grouped review %s: %w", group.ID, invariantErr)
 		}
 		if err != nil {
