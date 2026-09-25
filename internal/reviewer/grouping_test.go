@@ -236,8 +236,8 @@ func TestApplyRelatedFileGroupsLeavesSmallDiffUngrouped(t *testing.T) {
 	if err != nil {
 		t.Fatalf("applyRelatedFileGroups() error = %v", err)
 	}
-	if got != "skills" {
-		t.Fatalf("skillIndex = %q, want unchanged", got)
+	if got != "" {
+		t.Fatalf("grouped context = %q, want none below threshold", got)
 	}
 }
 
@@ -261,7 +261,7 @@ func TestRunGroupedFindingAgentsRequiresCompletedStatus(t *testing.T) {
 	t.Parallel()
 	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "failed", Stdout: `__LOOPER_RESULT__={"summary":"No actionable findings","outcome":"clean","findings":[]}`}}}
 	runner := &Runner{agentExecutor: agent}
-	_, err := runner.runGroupedFindingAgents(context.Background(), stepInput{}, t.TempDir(), []fileGroup{{ID: "go:pkg", Paths: []string{"a.go"}}}, []changedFile{{Path: "a.go"}}, "base", "head")
+	_, err := runner.runGroupedFindingAgents(context.Background(), stepInput{}, t.TempDir(), []fileGroup{{ID: "go:pkg", Paths: []string{"a.go"}}}, []changedFile{{Path: "a.go"}}, "base", "head", "")
 	if err == nil || !strings.Contains(err.Error(), "agent failed") {
 		t.Fatalf("runGroupedFindingAgents() error = %v", err)
 	}
@@ -272,7 +272,7 @@ func TestRunGroupedFindingAgentsRequiresCommentOnlyMarker(t *testing.T) {
 	repo, _, head := groupingTestRepoWithRename(t)
 	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Stdout: "reviewed without a marker"}}}
 	runner := &Runner{agentExecutor: agent, projectRoleConfig: &config.Config{}}
-	_, err := runner.runGroupedFindingAgents(context.Background(), stepInput{}, repo, []fileGroup{{ID: "go:pkg", Paths: []string{"new name.go"}}}, []changedFile{{Path: "new name.go"}}, "base", head)
+	_, err := runner.runGroupedFindingAgents(context.Background(), stepInput{}, repo, []fileGroup{{ID: "go:pkg", Paths: []string{"new name.go"}}}, []changedFile{{Path: "new name.go"}}, "base", head, "")
 	if err == nil || !strings.Contains(err.Error(), "completion marker is required") {
 		t.Fatalf("runGroupedFindingAgents() error = %v", err)
 	}
@@ -288,7 +288,7 @@ func TestRunGroupedFindingAgentsPassesRunSnapshot(t *testing.T) {
 	}
 	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Stdout: `__LOOPER_RESULT__={"summary":"No actionable findings","outcome":"clean","findings":[]}`}}}
 	runner := &Runner{agentExecutor: agent, projectRoleConfig: &config.Config{}}
-	if _, err := runner.runGroupedFindingAgents(context.Background(), stepInput{Run: storage.RunRecord{AgentSnapshotJSON: &snapshot}}, repo, []fileGroup{{ID: "go:pkg", Paths: []string{"new name.go"}}}, []changedFile{{Path: "new name.go"}}, "base", head); err != nil {
+	if _, err := runner.runGroupedFindingAgents(context.Background(), stepInput{Run: storage.RunRecord{AgentSnapshotJSON: &snapshot}}, repo, []fileGroup{{ID: "go:pkg", Paths: []string{"new name.go"}}}, []changedFile{{Path: "new name.go"}}, "base", head, ""); err != nil {
 		t.Fatalf("runGroupedFindingAgents() error = %v", err)
 	}
 	if len(agent.starts) != 1 || !agent.starts[0].UseSnapshot || agent.starts[0].SnapshotVendor != "codex" {
@@ -314,7 +314,7 @@ func TestRunGroupedFindingAgentsStopsOnHoldBetweenGroups(t *testing.T) {
 		},
 	}
 	runner := &Runner{agentExecutor: agent, github: github, projectRoleConfig: &config.Config{}}
-	_, err := runner.runGroupedFindingAgents(context.Background(), stepInput{Repo: "acme/looper", PRNumber: 42}, repo, []fileGroup{{ID: "a", Paths: []string{"new name.go"}}, {ID: "b", Paths: []string{"other.go"}}}, []changedFile{{Path: "new name.go"}, {Path: "other.go"}}, "base", head)
+	_, err := runner.runGroupedFindingAgents(context.Background(), stepInput{Repo: "acme/looper", PRNumber: 42}, repo, []fileGroup{{ID: "a", Paths: []string{"new name.go"}}, {ID: "b", Paths: []string{"other.go"}}}, []changedFile{{Path: "new name.go"}, {Path: "other.go"}}, "base", head, "")
 	var hold *holdSkipError
 	if !errors.As(err, &hold) {
 		t.Fatalf("runGroupedFindingAgents() error = %v, want hold skip", err)

@@ -192,10 +192,10 @@ func relatedFileGroupsConfig(r *Runner, projectID string) config.ReviewerRelated
 func (r *Runner) applyRelatedFileGroups(ctx context.Context, input stepInput, checkpoint reviewerCheckpoint, worktreePath, skillIndex string) (string, error) {
 	cfg := relatedFileGroupsConfig(r, input.Project.ID)
 	if !cfg.Enabled {
-		return skillIndex, nil
+		return "", nil
 	}
 	if checkpoint.Snapshot == nil {
-		return skillIndex, nil
+		return "", nil
 	}
 	base := strings.TrimSpace(checkpoint.Snapshot.BaseSHA)
 	head := strings.TrimSpace(checkpoint.Snapshot.HeadSHA)
@@ -210,29 +210,35 @@ func (r *Runner) applyRelatedFileGroups(ctx context.Context, input stepInput, ch
 		return "", fmt.Errorf("related-file groups: enumerate changed paths: %w", err)
 	}
 	if len(files) < cfg.MinChangedFiles {
-		return skillIndex, nil
+		return "", nil
 	}
 	groups := groupChangedFiles(files)
 	plan := groupingPlanText(groups, files)
-	if plan != "" {
-		skillIndex = strings.TrimSpace(skillIndex + "\n\n" + plan)
+	phase := resolvePullRequestPhase(detailLabels(checkpoint.Detail))
+	guidance := []string{
+		fmt.Sprintf("Review pull request %s#%d.", input.Repo, input.PRNumber),
+		"Phase: " + phase, reviewerPhaseInstruction(phase), reviewerScopeInstruction(r.scope),
+		config.BuildCustomInstructionBlock(r.customInstructions, input.Project.ID, "reviewer").Text,
+		skillIndex,
 	}
-	findings, err := r.runGroupedFindingAgents(ctx, input, worktreePath, groups, files, base, head)
+	if last, _ := stringFromAny(parseJSONObject(input.Loop.MetadataJSON)["lastPublishedHeadSha"]); isRepairFrontierPass(last, head) {
+		guidance = append(guidance, repairFrontierPassContract(last, head, true))
+	}
+	findings, err := r.runGroupedFindingAgents(ctx, input, worktreePath, groups, files, base, head, strings.Join(guidance, "\n\n"))
 	if err != nil {
 		return "", err
 	}
 	if len(findings) == 0 {
-		return skillIndex, nil
+		return plan, nil
 	}
 	payload, err := json.Marshal(findings)
 	if err != nil {
 		return "", err
 	}
-	skillIndex = skillIndex + "\n\nSubtask findings to merge (do not publish from subtasks; dedupe and apply disposition, then publish once through the existing wrapper):\n" + string(payload)
-	return skillIndex, nil
+	return plan + "\n\nSubtask findings to merge (do not publish from subtasks; dedupe and apply disposition, then publish once through the existing wrapper):\n" + string(payload), nil
 }
 
-func (r *Runner) runGroupedFindingAgents(ctx context.Context, input stepInput, worktreePath string, groups []fileGroup, all []changedFile, base, head string) ([]reviewerCommentOnlyFindingResult, error) {
+func (r *Runner) runGroupedFindingAgents(ctx context.Context, input stepInput, worktreePath string, groups []fileGroup, all []changedFile, base, head, guidance string) ([]reviewerCommentOnlyFindingResult, error) {
 	if r == nil || r.agentExecutor == nil {
 		return nil, nil
 	}
@@ -246,7 +252,7 @@ func (r *Runner) runGroupedFindingAgents(ctx context.Context, input stepInput, w
 		if err := r.rejectIfReviewerHeldOrHeadChanged(ctx, input, head); err != nil {
 			return nil, err
 		}
-		prompt := groupedFindingPrompt(group, all, base, head)
+		prompt := strings.TrimSpace(guidance + "\n\n" + groupedFindingPrompt(group, all, base, head))
 		agentCtx, cancelAgent := reviewerAgentContext(ctx, r.agentTimeout)
 		execution, err := r.agentExecutor.Start(agentCtx, AgentRunInput{
 			ExecutionID: eventlog.NewEventID("agent"), ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID,

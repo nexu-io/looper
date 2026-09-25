@@ -4994,7 +4994,7 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 			nativeResumePrompt = nativeResumePrompt + "\n\n" + reminder
 		}
 	}
-	groupedContext, err := r.applyRelatedFileGroups(ctx, input, checkpoint, worktree.Path, "")
+	groupedContext, err := r.applyRelatedFileGroups(ctx, input, checkpoint, worktree.Path, skillIndex)
 	if err != nil {
 		var interrupted *loopError
 		if errors.As(err, &interrupted) && interrupted.interrupted {
@@ -9969,10 +9969,7 @@ func buildReviewPromptWithInstructions(projectID string, instructionConfig confi
 	looperCLIPath = normalizeLooperCLIPath(looperCLIPath)
 	looperCLICommand := shellQuote(looperCLIPath)
 	phase := resolvePullRequestPhase(detailLabels(checkpoint.Detail))
-	phaseInstruction := "This is an implementation review. Focus on code correctness, safety, tests, and maintainability."
-	if phase == "spec" {
-		phaseInstruction = "This is a spec review. Focus on scope, correctness, feasibility, risks, and validation. Do not review implementation details beyond whether the spec is actionable."
-	}
+	phaseInstruction := reviewerPhaseInstruction(phase)
 	isForgejo := reviewerProjectProviderKind(instructionConfig, projectID) == config.ProviderKindForgejo
 	forgejoNative := isForgejo && !commentOnlyPublish
 	forgeName := "GitHub"
@@ -10814,6 +10811,13 @@ func resolvePullRequestPhase(labels []string) string {
 		return "spec"
 	}
 	return "implementation"
+}
+
+func reviewerPhaseInstruction(phase string) string {
+	if phase == "spec" {
+		return "This is a spec review. Focus on scope, correctness, feasibility, risks, and validation. Do not review implementation details beyond whether the spec is actionable."
+	}
+	return "This is an implementation review. Focus on code correctness, safety, tests, and maintainability."
 }
 
 func detailLabels(detail *checkpointDetail) []string {

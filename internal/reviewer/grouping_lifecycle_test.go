@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/nexu-io/looper/internal/config"
+	"github.com/nexu-io/looper/internal/infra/specpr"
 	"github.com/nexu-io/looper/internal/storage"
 )
 
@@ -135,6 +136,7 @@ func TestGroupedReviewRetainsResumeContextAfterRetry(t *testing.T) {
 	t.Parallel()
 	runner, input, _, agent := groupedReviewLifecycleFixture(t)
 	ctx := context.Background()
+	input.Loop.MetadataJSON = stringPtr(fmt.Sprintf(`{"lastPublishedHeadSha":%q}`, input.Checkpoint.Snapshot.BaseSHA))
 	for i, phase := range []string{"review", "review-group"} {
 		record := storage.AgentExecutionRecord{
 			ID: fmt.Sprintf("previous_%d", i), ProjectID: &input.Project.ID, LoopID: &input.Loop.ID, RunID: &input.Run.ID,
@@ -155,6 +157,11 @@ func TestGroupedReviewRetainsResumeContextAfterRetry(t *testing.T) {
 	if len(agent.starts) != 3 {
 		t.Fatalf("starts = %d, want two groups and final review", len(agent.starts))
 	}
+	for _, start := range agent.starts[:2] {
+		if !strings.Contains(start.Prompt, "Repair frontier contract") {
+			t.Fatal("grouped retry lost the repair-frontier scope")
+		}
+	}
 	final := agent.starts[2]
 	for _, prompt := range []string{final.Prompt, final.NativeResumePrompt} {
 		if !strings.Contains(prompt, "Related-file group plan") || !strings.Contains(prompt, "Grouped contract finding") {
@@ -163,5 +170,49 @@ func TestGroupedReviewRetainsResumeContextAfterRetry(t *testing.T) {
 	}
 	if !strings.Contains(final.NativeResumePrompt, "Continue the existing Looper reviewer review task") {
 		t.Fatalf("lost pending session after a persisted group: %s", final.NativeResumePrompt)
+	}
+}
+
+func TestGroupedReviewUsesConfiguredGuidance(t *testing.T) {
+	for _, tc := range []struct {
+		phase       string
+		labels      []string
+		instruction string
+	}{
+		{phase: "implementation", instruction: "Focus on code correctness, safety, tests, and maintainability."},
+		{phase: "spec", labels: []string{specpr.ReviewingLabel}, instruction: "Focus on scope, correctness, feasibility, risks, and validation."},
+	} {
+		t.Run(tc.phase, func(t *testing.T) {
+			t.Parallel()
+			runner, input, github, agent := groupedReviewLifecycleFixture(t)
+			skillPath := filepath.Join(t.TempDir(), "SKILL.md")
+			if err := os.WriteFile(skillPath, []byte("---\nname: project-review\ndescription: Project review method\n---\nCheck the project contract.\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			runner.projectRoleConfig.Roles.Reviewer.Skills = config.ReviewerSkillsConfig{Mode: config.ReviewerSkillsModeReplace, Required: []string{skillPath}}
+			custom := "Audit project-specific compatibility requirements."
+			runner.customInstructions.Instructions.Enabled = true
+			runner.customInstructions.Roles.Reviewer.Instructions = "Superseded global review guidance."
+			runner.customInstructions.Projects = []config.ProjectRefConfig{{ID: input.Project.ID, Roles: &config.PartialRoleConfigs{Reviewer: &config.PartialReviewerRoleConfig{Instructions: &custom}}}}
+			runner.scope = config.ReviewerScopeChangedFiles
+			input.Checkpoint.Detail.Labels = tc.labels
+			github.labels = tc.labels
+			if _, err := runner.executeStep(context.Background(), stepReview, input); err != nil {
+				t.Fatal(err)
+			}
+			if len(agent.starts) != 3 {
+				t.Fatalf("starts = %d, want two groups and final review", len(agent.starts))
+			}
+			for _, start := range agent.starts[:2] {
+				for _, want := range []string{skillPath, "required: true", "Every listed skill MUST be read", custom, "Phase: " + tc.phase, tc.instruction, "Review scope: changed_files", "Do not publish", "Review only these paths"} {
+					if !strings.Contains(start.Prompt, want) {
+						t.Errorf("group prompt missing %q", want)
+					}
+				}
+				if strings.Contains(start.Prompt, "Superseded global review guidance") || strings.Contains(start.Prompt, "name: looper-review") {
+					t.Error("group prompt ignored configured instruction/skill replacement")
+				}
+			}
+		})
 	}
 }

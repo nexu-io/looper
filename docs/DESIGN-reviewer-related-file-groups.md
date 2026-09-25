@@ -25,7 +25,7 @@ Small PRs and the default config keep the current single-agent path. Disable gro
 - Go files share a group by directory (package + `_test.go`)
 - Remaining paths go to an `other` group
 
-Each subtask receives its group paths plus the list of other changed files.
+Each subtask receives its group paths plus the list of other changed files, the resolved review-skill index, configured reviewer instructions with their existing project/global precedence, and the same phase/scope guidance used by the final reviewer. Repair-frontier guidance also applies to grouped later passes. These methods apply within the assigned group; publication remains with the final reviewer.
 
 ## Execution
 
