@@ -8,11 +8,11 @@ Comment shape for every finding: trigger condition → actual path → wrong con
 
 Establish a real concurrent call path, the shared state, and the synchronization that is supposed to protect it. Do not infer a race from a mutex, channel, or `go` keyword alone.
 
-Positive: two goroutines have conflicting concurrent accesses to the same shared memory location (for example a struct field, map, slice header, ordinary variable, pointer target, array or slice element, interface value, or an object's internal storage), with at least one access a write and no lock, atomic, or channel handoff on that path.
+Positive: two goroutines have conflicting concurrent accesses to the same shared memory location (for example a struct field, map, slice header, ordinary variable, pointer target, array or slice element, interface value, or an object's internal storage), with at least one access a write, no happens-before ordering between the conflicting accesses, and at least one access that is not a compatible atomic operation.
 
 Negative: a per-call local that is never shared with another goroutine, a copied value that does not reference shared mutable storage, or a field whose reads and writes are all confined to one owner goroutine. A local captured by multiple goroutines or a single writer with unsynchronized readers is not a negative example.
 
-Drop a race finding only when existing synchronization or single-owner access already excludes the claimed interleaving. A type documented as not concurrent does not disprove a race; report the caller's unsynchronized shared use (for example concurrent writes to a shared `bytes.Buffer`).
+Synchronization is negative evidence only when it actually orders the conflicting accesses. Different mutexes alone, unrelated channel operations, or an atomic operation paired with an unsynchronized plain access do not establish safety. An atomic-based drop requires compatible atomic operations for all concurrent accesses to that location; plain accesses in an ordered initialization or teardown phase are a separate case. A type documented as not concurrent does not disprove a race; report the caller's unsynchronized shared use (for example concurrent writes to a shared `bytes.Buffer`).
 
 ## Deadlock / permanently blocked operation
 
@@ -24,9 +24,9 @@ Distinguish a defect from intended waiting. A nil-channel case disabled inside a
 
 Name the owner, the lifecycle, and whether ownership transferred.
 
-After a resource has been acquired, inspect every exit path, including later errors and partial initialization. Positive: a handle, file, connection, or context cancel remains owned here but unreleased on a reachable return, and ownership has not transferred to a caller. For timers and tickers, also establish the effective Go version semantics and reachability described below before claiming a leak.
+Track each acquired resource until release or ownership transfer. Positive: a resource (for example a handle, file, connection, or context created with cancellation) stays allocated beyond its intended lifetime because its owner is lost, overwritten, or fails to release it. Check normal/error exits, partial initialization, replacement, and repeated acquisition in long-running or non-returning loops; accumulation need not wait for a return. For timers and tickers, also establish the effective Go version semantics and reachability described below before claiming a leak.
 
-Negative: ownership is returned to the caller (`io.ReadCloser`, constructor that documents Close), or a `defer` on every return path already releases it.
+Negative: ownership is transferred to a documented owner (`io.ReadCloser`, constructor that documents Close), or a reachable release keeps resource use within its intended lifetime and bounds. A function-scoped `defer` alone does not disprove accumulation across loop iterations; establish when it actually runs. Intentional bounded pools or caches need an ownership/lifetime analysis, not a missing-close keyword finding.
 
 ## Security
 

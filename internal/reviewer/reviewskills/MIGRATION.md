@@ -53,7 +53,7 @@ Measured from the migrated METHOD string bodies (UTF-8) plus the injected skill-
 | Skill index placeholder | 0 | 495 | +495 |
 | Native first-pass net | | | **-3368** |
 | Comment-only extra METHOD body (non-overlapping) | 661 | 0 | -661 |
-| Embedded skill tree (`builtin/`) | 0 | 15482 | +15482 (not in the core prompt) |
+| Embedded skill tree (`builtin/`) | 0 | 16303 | +16303 (not in the core prompt) |
 
 Approximate assembled native first-pass prompt with typical seed/disclosure: **~21.5 KiB before**, **~18.2 KiB after** (net about -3.3 KiB from METHOD extraction, plus a ~0.5 KiB index). Comment-only prompts lose the extra ~0.6 KiB duplicate METHOD copy. Runtime materialized indexes add an absolute temp path (~80–120 bytes) instead of the placeholder.
 
