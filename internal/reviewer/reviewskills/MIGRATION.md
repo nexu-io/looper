@@ -35,7 +35,7 @@ Equivalent METHOD migration from `buildReviewPromptWithInstructions`. Execution 
 | Long severity rubric ("mark a finding as BLOCKING only when…") | `builtin/references/implementation-rubric.md` |
 | Long finding-accumulator essay | `builtin/references/implementation-rubric.md` |
 | Spec/docs review rubric | `builtin/references/spec-rubric.md` |
-| Procedure (intent → enumerate without shrinking → large-PR related-file plan → accumulate → same-context counterexample pass → existing schema) | `builtin/SKILL.md` |
+| Procedure (intent → enumerate without shrinking → surrounding context → large-PR related-file plan → accumulate → same-context counterexample pass → existing schema) | `builtin/SKILL.md` |
 
 ## DELETED-DUPLICATE
 
@@ -57,4 +57,4 @@ Measured from the migrated METHOD string bodies (UTF-8) plus the injected skill-
 
 Approximate assembled native first-pass prompt with typical seed/disclosure: **~21.5 KiB before**, **~18.2 KiB after** (net about -3.3 KiB from METHOD extraction, plus a ~0.5 KiB index). Comment-only prompts lose the extra ~0.6 KiB duplicate METHOD copy. Runtime materialized indexes add an absolute temp path (~80–120 bytes) instead of the placeholder.
 
-PR4 added evidence, counterexample, on-demand CSS lint, and large-PR related-file plan text to the builtin skill tree. That is a method-text change only. A quality comparison versus the PR1 baseline is not claimed without a model run.
+The builtin skill includes evidence, counterexample, on-demand CSS lint, and large-PR related-file planning guidance. Model-quality evaluations are maintained in a separate system. This repository keeps functional and regression tests for the review contracts; method-text changes alone do not establish a quality improvement.

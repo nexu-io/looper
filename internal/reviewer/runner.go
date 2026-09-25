@@ -4967,7 +4967,7 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 	}
 	userHome, homeErr := os.UserHomeDir()
 	if homeErr != nil {
-		return checkpoint, fmt.Errorf("resolve reviewer skills: %w", homeErr)
+		return checkpoint, failureclass.WithBoundary(fmt.Errorf("resolve reviewer skills: %w", homeErr), failureclass.BoundaryConfig)
 	}
 	resolvedSkills, err := reviewskills.Resolve(reviewskills.ResolveInput{
 		Mode:       skillsCfg.Mode,
@@ -4978,7 +4978,7 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 		BuiltinDir: skillBundle.Dir,
 	})
 	if err != nil {
-		return checkpoint, fmt.Errorf("resolve reviewer skills: %w", err)
+		return checkpoint, failureclass.WithBoundary(fmt.Errorf("resolve reviewer skills: %w", err), failureclass.BoundaryConfig)
 	}
 	skillIndex := reviewskills.FormatIndex(resolvedSkills.Entries)
 	prompt, instructionBlock := buildReviewPromptWithInstructions(input.Project.ID, r.customInstructions, input.Repo, input.PRNumber, checkpoint, input.Run.ID, idempotencyKey, reviewEvents, isManualReviewerLoop(input.Loop), requireReviewRequest, reviewRequestBypassReason, r.scope, r.disclosure, agentVendor, derefString(agentModel), r.looperCLIPath, r.reviewerAutoMergeConfigForProject(input.Project.ID).Enabled, commentOnlyCompletion, lastPublishedHeadSHA, skillIndex, hostingKindForContext(ctx))

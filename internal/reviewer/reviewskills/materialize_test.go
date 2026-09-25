@@ -101,7 +101,7 @@ func TestFormatIndexUsesAbsoluteMaterializedPath(t *testing.T) {
 	index := FormatIndex(bundle.Entries)
 	for _, want := range []string{
 		"Review method skills:",
-		"Required skills MUST be read from the given absolute paths before reviewing.",
+		"Every listed skill MUST be read from the given absolute paths before reviewing.",
 		"still complete the base review using looper-review",
 		"name: looper-review",
 		"source: builtin",
@@ -177,6 +177,38 @@ func TestFormatIndexPathsChangeAcrossBundles(t *testing.T) {
 	}
 }
 
+func TestParseFrontmatterDecodesQuotedYAMLName(t *testing.T) {
+	t.Parallel()
+
+	name, description, err := parseFrontmatter("---\nname: \"security-review\" # quoted\ndescription: 'team method'\n---\n\n# body\n")
+	if err != nil {
+		t.Fatalf("parseFrontmatter() error = %v", err)
+	}
+	if name != "security-review" || description != "team method" {
+		t.Fatalf("parseFrontmatter() = name %q description %q", name, description)
+	}
+}
+
+func TestFormatIndexAndResumeReminderRequireReadingResolvedOptionalSkills(t *testing.T) {
+	t.Parallel()
+
+	entries := []Entry{
+		{Name: "looper-review", Path: "/tmp/looper-review/SKILL.md", Source: "builtin", Required: true, Description: "base"},
+		{Name: "perf-review", Path: "/tmp/perf-review/SKILL.md", Source: "project", Required: false, Description: "optional present"},
+	}
+	index := FormatIndex(entries)
+	if !strings.Contains(index, "Every listed skill MUST be read") {
+		t.Fatalf("index missing read-all instruction:\n%s", index)
+	}
+	if !strings.Contains(index, "required: false") || !strings.Contains(index, "perf-review") {
+		t.Fatalf("index missing optional entry:\n%s", index)
+	}
+	reminder := ResumeReminder(entries)
+	if !strings.Contains(reminder, "/tmp/perf-review/SKILL.md") {
+		t.Fatalf("resume reminder omitted resolved optional path: %q", reminder)
+	}
+}
+
 func TestBuiltinSkillFilesContainMigratedMethodText(t *testing.T) {
 	bundle, err := MaterializeBuiltin()
 	if err != nil {
@@ -201,7 +233,18 @@ func TestBuiltinSkillFilesContainMigratedMethodText(t *testing.T) {
 		"Unverified is not wrong",
 		"Drop a candidate only when evidence proves it factually wrong",
 		"internal related-file plan",
-		"only if CSS or style files are in the changed set",
+		"Read the surrounding context needed to judge each change",
+		"CSS parsing or linting logic",
+		"A type documented as not concurrent does not disprove a race",
+		"conflicting concurrent accesses",
+		"same shared memory location",
+		"interprets them unsafely",
+		"ownership, tenant, or other authorization check",
+		"Authentication or authorization to invoke an operation does not make",
+		"The authority for dropping a candidate is that same review context",
+		"Requiring stronger structured evidence fields is insufficient",
+		"the preexisting `v` is reused",
+		"On Go 1.23+, the garbage collector can recover unreferenced, unstopped timers",
 		"Stay one reviewer",
 	} {
 		if !strings.Contains(joined, want) {
