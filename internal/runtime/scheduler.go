@@ -2192,7 +2192,6 @@ func (a reviewerAgentExecutorAdapter) Start(ctx context.Context, input reviewer.
 		RunID:               input.RunID,
 		Prompt:              input.Prompt,
 		NativeResumePrompt:  input.NativeResumePrompt,
-		NativeSessionID:     input.NativeSessionID,
 		DisableNativeResume: input.DisableNativeResume,
 		WorkingDirectory:    input.WorkingDirectory,
 		Timeout:             input.Timeout,

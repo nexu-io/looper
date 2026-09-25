@@ -422,7 +422,6 @@ type AgentRunInput struct {
 	RunID               string
 	Prompt              string
 	NativeResumePrompt  string
-	NativeSessionID     string
 	DisableNativeResume bool
 
 	WorkingDirectory string
@@ -2702,7 +2701,8 @@ func (r *Runner) executeStepOnce(ctx context.Context, step ReviewerStep, input s
 }
 
 func (r *Runner) executeStepWithTransientExternalRetry(ctx context.Context, step ReviewerStep, input stepInput) (reviewerCheckpoint, error) {
-	if _, ok := ctx.Deadline(); !ok && r.agentTimeout > 0 {
+	groupedReview := step == stepReview && relatedFileGroupsConfig(r, input.Project.ID).Enabled
+	if _, ok := ctx.Deadline(); !ok && r.agentTimeout > 0 && !groupedReview {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, r.agentTimeout)
 		defer cancel()
@@ -4994,15 +4994,20 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 			nativeResumePrompt = nativeResumePrompt + "\n\n" + reminder
 		}
 	}
-	nativeSessionID := r.pendingNativeResumeSessionID(ctx, input.Loop.ID)
-	if relatedFileGroupsConfig(r, input.Project.ID).Enabled {
-		if err := r.rejectIfReviewerHeld(ctx, input); err != nil {
-			return checkpoint, err
-		}
-	}
-	skillIndex, err = r.applyRelatedFileGroups(ctx, input, checkpoint, worktree.Path, skillIndex)
+	groupedContext, err := r.applyRelatedFileGroups(ctx, input, checkpoint, worktree.Path, "")
 	if err != nil {
+		var interrupted *loopError
+		if errors.As(err, &interrupted) && interrupted.interrupted {
+			checkpoint.PendingReview = nil
+			checkpoint.ResumePolicy = "restart_from_discover"
+		}
 		return checkpoint, err
+	}
+	if groupedContext != "" {
+		skillIndex = strings.TrimSpace(skillIndex + "\n\n" + groupedContext)
+		if nativeResumePrompt != "" {
+			nativeResumePrompt += "\n\n" + groupedContext
+		}
 	}
 	prompt, instructionBlock := buildReviewPromptWithInstructions(input.Project.ID, r.customInstructions, input.Repo, input.PRNumber, checkpoint, input.Run.ID, idempotencyKey, reviewEvents, isManualReviewerLoop(input.Loop), requireReviewRequest, reviewRequestBypassReason, r.scope, r.disclosure, agentVendor, derefString(agentModel), r.looperCLIPath, r.reviewerAutoMergeConfigForProject(input.Project.ID).Enabled, commentOnlyCompletion, lastPublishedHeadSHA, skillIndex, hostingKindForContext(ctx))
 
@@ -5032,12 +5037,19 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 		if domain.IsAutomaticLoopHeld(domain.LoopTypeReviewer, isManualReviewerLoop(input.Loop), freshDetail.Labels) {
 			return checkpoint, &holdSkipError{summary: fmt.Sprintf("Reviewer stopped because %s#%d is currently held", input.Repo, input.PRNumber)}
 		}
+		if relatedFileGroupsConfig(r, input.Project.ID).Enabled && strings.TrimSpace(freshDetail.HeadSHA) != strings.TrimSpace(checkpoint.Snapshot.HeadSHA) {
+			checkpoint.PendingReview = nil
+			checkpoint.ResumePolicy = "restart_from_discover"
+			return checkpoint, &loopError{message: fmt.Sprintf("PR head changed before final grouped reviewer: expected %s, got %s", checkpoint.Snapshot.HeadSHA, freshDetail.HeadSHA), kind: FailureRetryableAfterResume, interrupted: true}
+		}
 	}
 	useSnap, snapVendor, snapModel := agentRunSnapshotFields(agentVendor, agentModel, useSnapshot)
 	_ = r.tryAddReaction(ctx, input, reviewerInProgressReaction)
-	execution, err := r.agentExecutor.Start(ctx, AgentRunInput{
+	agentCtx, cancelAgent := reviewerAgentContext(ctx, r.agentTimeout)
+	defer cancelAgent()
+	execution, err := r.agentExecutor.Start(agentCtx, AgentRunInput{
 		ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID,
-		Prompt: prompt, NativeResumePrompt: nativeResumePrompt, NativeSessionID: nativeSessionID, WorkingDirectory: worktree.Path,
+		Prompt: prompt, NativeResumePrompt: nativeResumePrompt, WorkingDirectory: worktree.Path,
 		Timeout: r.agentTimeout, HeartbeatTimeout: r.agentIdleTimeout, Metadata: metadata, IdempotencyKey: idempotencyKey,
 		UseSnapshot: useSnap, SnapshotVendor: snapVendor, SnapshotModel: snapModel,
 	})
@@ -5055,8 +5067,8 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 			r.logger.Warn("reviewer agent start notification failed", map[string]any{"loopId": input.Loop.ID, "runId": input.Run.ID, "error": err.Error()})
 		}
 	}
-	headMonitor := r.startReviewerHeadChangeMonitor(ctx, input, checkpoint, execution, executionID)
-	result, err := execution.Wait(ctx)
+	headMonitor := r.startReviewerHeadChangeMonitor(agentCtx, input, checkpoint, execution, executionID)
+	result, err := execution.Wait(agentCtx)
 	headChange := headMonitor.stop()
 	if headChange.Reason != "" {
 		if r.nativeResume.OnHeadChange {
@@ -8358,7 +8370,7 @@ func (r *Runner) pendingNativeResume(ctx context.Context, loopID string) *storag
 	if strings.TrimSpace(loopID) == "" || r.repos == nil || r.repos.AgentExecutions == nil {
 		return nil
 	}
-	latest, err := r.repos.AgentExecutions.GetLatestByLoopID(ctx, loopID)
+	latest, err := r.repos.AgentExecutions.GetLatestByLoopIDExcludingPhase(ctx, loopID, "review-group")
 	if err != nil {
 		r.logWarn("reviewer native resume pending lookup failed", map[string]any{"loopId": loopID, "error": err.Error()})
 		return nil
@@ -8369,15 +8381,7 @@ func (r *Runner) pendingNativeResume(ctx context.Context, loopID string) *storag
 	return latest
 }
 
-func (r *Runner) pendingNativeResumeSessionID(ctx context.Context, loopID string) string {
-	record := r.pendingNativeResume(ctx, loopID)
-	if record == nil || record.NativeSessionID == nil {
-		return ""
-	}
-	return strings.TrimSpace(*record.NativeSessionID)
-}
-
-func (r *Runner) rejectIfReviewerHeld(ctx context.Context, input stepInput) error {
+func (r *Runner) rejectIfReviewerHeldOrHeadChanged(ctx context.Context, input stepInput, expectedHead string) error {
 	if r == nil || r.github == nil {
 		return nil
 	}
@@ -8388,7 +8392,17 @@ func (r *Runner) rejectIfReviewerHeld(ctx context.Context, input stepInput) erro
 	if domain.IsAutomaticLoopHeld(domain.LoopTypeReviewer, isManualReviewerLoop(input.Loop), freshDetail.Labels) {
 		return &holdSkipError{summary: fmt.Sprintf("Reviewer stopped because %s#%d is currently held", input.Repo, input.PRNumber)}
 	}
+	if strings.TrimSpace(freshDetail.HeadSHA) != strings.TrimSpace(expectedHead) {
+		return &loopError{message: fmt.Sprintf("PR head changed during grouped review: expected %s, got %s", expectedHead, freshDetail.HeadSHA), kind: FailureRetryableAfterResume, interrupted: true}
+	}
 	return nil
+}
+
+func reviewerAgentContext(ctx context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+	if timeout > 0 {
+		return context.WithTimeout(ctx, timeout)
+	}
+	return context.WithCancel(ctx)
 }
 
 func (r *Runner) hasPendingNativeResume(ctx context.Context, loopID string) bool {

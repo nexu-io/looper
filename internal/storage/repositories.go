@@ -1230,7 +1230,19 @@ func (r *AgentExecutionsRepository) GetLatestActiveByRunID(ctx context.Context, 
 }
 
 func (r *AgentExecutionsRepository) GetLatestByLoopID(ctx context.Context, loopID string) (*AgentExecutionRecord, error) {
-	row := r.q.QueryRowContext(ctx, `SELECT `+agentExecutionColumns+` FROM agent_executions WHERE loop_id = ? ORDER BY started_at DESC, id DESC LIMIT 1`, loopID)
+	return r.GetLatestByLoopIDExcludingPhase(ctx, loopID, "")
+}
+
+// GetLatestByLoopIDExcludingPhase ignores auxiliary executions without skipping
+// newer non-resumable main executions in favor of older pending sessions.
+func (r *AgentExecutionsRepository) GetLatestByLoopIDExcludingPhase(ctx context.Context, loopID, phase string) (*AgentExecutionRecord, error) {
+	where := "loop_id = ?"
+	args := []any{loopID}
+	if phase != "" {
+		where += ` AND COALESCE(CASE WHEN json_valid(metadata_json) THEN json_extract(metadata_json, '$.metadata.phase') END, '') != ?`
+		args = append(args, phase)
+	}
+	row := r.q.QueryRowContext(ctx, `SELECT `+agentExecutionColumns+` FROM agent_executions WHERE `+where+` ORDER BY started_at DESC, id DESC LIMIT 1`, args...)
 	record, err := scanAgentExecution(row)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {

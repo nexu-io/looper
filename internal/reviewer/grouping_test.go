@@ -169,8 +169,8 @@ func TestGroupingPlanTextEncodesPathsAsJSON(t *testing.T) {
 			if err := json.Unmarshal([]byte(strings.TrimPrefix(line, "All changed paths (JSON array): ")), &allPaths); err != nil {
 				t.Fatalf("all paths JSON: %v (%q)", err, line)
 			}
-		case strings.HasPrefix(line, "- other: "):
-			if err := json.Unmarshal([]byte(strings.TrimPrefix(line, "- other: ")), &groupPaths); err != nil {
+		case strings.HasPrefix(line, "- \"other\": "):
+			if err := json.Unmarshal([]byte(strings.TrimPrefix(line, "- \"other\": ")), &groupPaths); err != nil {
 				t.Fatalf("group paths JSON: %v (%q)", err, line)
 			}
 		}
@@ -195,6 +195,21 @@ func TestGroupedFindingPromptSpecifiesCompletionVocabulary(t *testing.T) {
 		if !strings.Contains(prompt, want) {
 			t.Fatalf("prompt missing %q: %s", want, prompt)
 		}
+	}
+}
+
+func TestGroupingPlanTextEscapesDirectoryDerivedIdentifiers(t *testing.T) {
+	t.Parallel()
+	files := []changedFile{{Path: "pkg/line\nwith\x01control/file.go"}}
+	groups := groupChangedFiles(files)
+	plan := groupingPlanText(groups, files)
+	if strings.Contains(plan, groups[0].ID) || len(strings.Split(plan, "\n")) != 3 {
+		t.Fatalf("directory text escaped its data boundary: %q", plan)
+	}
+	line := strings.Split(plan, "\n")[2]
+	var identifier string
+	if err := json.NewDecoder(strings.NewReader(strings.TrimPrefix(line, "- "))).Decode(&identifier); err != nil || identifier != groups[0].ID {
+		t.Fatalf("group identifier failed JSON round trip: %q, %v", identifier, err)
 	}
 }
 
@@ -290,7 +305,7 @@ func TestRunGroupedFindingAgentsPassesRunSnapshot(t *testing.T) {
 func TestRunGroupedFindingAgentsStopsOnHoldBetweenGroups(t *testing.T) {
 	t.Parallel()
 	repo, _, head := groupingTestRepoWithRename(t)
-	github := &fakeGitHubGateway{}
+	github := &fakeGitHubGateway{viewHeadSHA: head}
 	completed := AgentResult{Status: "completed", Stdout: `__LOOPER_RESULT__={"summary":"No actionable findings","outcome":"clean","findings":[]}`}
 	agent := &fakeAgentExecutor{
 		results: []AgentResult{completed, completed},

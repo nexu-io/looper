@@ -127,7 +127,8 @@ func groupingPlanText(groups []fileGroup, all []changedFile) string {
 	sort.Strings(allPaths)
 	b.WriteString("All changed paths (JSON array): " + marshalPromptPaths(allPaths) + "\n")
 	for _, group := range groups {
-		b.WriteString("- " + group.ID + ": " + marshalPromptPaths(group.Paths) + "\n")
+		identifier, _ := json.Marshal(group.ID)
+		fmt.Fprintf(&b, "- %s: %s\n", identifier, marshalPromptPaths(group.Paths))
 	}
 	return strings.TrimSpace(b.String())
 }
@@ -198,6 +199,9 @@ func (r *Runner) applyRelatedFileGroups(ctx context.Context, input stepInput, ch
 	}
 	base := strings.TrimSpace(checkpoint.Snapshot.BaseSHA)
 	head := strings.TrimSpace(checkpoint.Snapshot.HeadSHA)
+	if err := r.rejectIfReviewerHeldOrHeadChanged(ctx, input, head); err != nil {
+		return "", err
+	}
 	if last, _ := stringFromAny(parseJSONObject(input.Loop.MetadataJSON)["lastPublishedHeadSha"]); last != "" && last != head {
 		base = last
 	}
@@ -239,11 +243,12 @@ func (r *Runner) runGroupedFindingAgents(ctx context.Context, input stepInput, w
 	useSnap, snapVendor, snapModel := agentRunSnapshotFields(agentVendor, agentModel, useSnapshot)
 	var batches [][]reviewerCommentOnlyFindingResult
 	for _, group := range groups {
-		if err := r.rejectIfReviewerHeld(ctx, input); err != nil {
+		if err := r.rejectIfReviewerHeldOrHeadChanged(ctx, input, head); err != nil {
 			return nil, err
 		}
 		prompt := groupedFindingPrompt(group, all, base, head)
-		execution, err := r.agentExecutor.Start(ctx, AgentRunInput{
+		agentCtx, cancelAgent := reviewerAgentContext(ctx, r.agentTimeout)
+		execution, err := r.agentExecutor.Start(agentCtx, AgentRunInput{
 			ExecutionID: eventlog.NewEventID("agent"), ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID,
 			Prompt: prompt, WorkingDirectory: worktreePath, Timeout: r.agentTimeout, HeartbeatTimeout: r.agentIdleTimeout,
 			Metadata:            map[string]any{"loopType": "reviewer", "phase": "review-group", "groupId": group.ID, "repo": input.Repo, "prNumber": input.PRNumber},
@@ -253,9 +258,11 @@ func (r *Runner) runGroupedFindingAgents(ctx context.Context, input stepInput, w
 			DisableNativeResume: true,
 		})
 		if err != nil {
+			cancelAgent()
 			return nil, fmt.Errorf("grouped review %s: %w", group.ID, err)
 		}
-		result, err := execution.Wait(ctx)
+		result, err := execution.Wait(agentCtx)
+		cancelAgent()
 		if err != nil {
 			return nil, fmt.Errorf("grouped review %s: %w", group.ID, err)
 		}

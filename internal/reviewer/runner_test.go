@@ -7565,10 +7565,6 @@ func TestRunReviewStepKeepsFullPromptForPendingNativeResumeFallback(t *testing.T
 	if len(agent.starts) != 1 {
 		t.Fatalf("len(agent.starts) = %d, want 1", len(agent.starts))
 	}
-	if agent.starts[0].NativeSessionID != "session-123" {
-		t.Fatalf("NativeSessionID = %q, want captured pending session", agent.starts[0].NativeSessionID)
-	}
-
 	prompt := agent.starts[0].Prompt
 	if strings.Contains(prompt, "Continue the existing Looper reviewer review task") {
 		t.Fatalf("prompt = %q, want full review prompt for checkpoint fallback safety", prompt)

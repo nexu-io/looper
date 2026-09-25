@@ -412,7 +412,7 @@ func (e *ConfiguredExecutor) resolveNativeResume(ctx context.Context, input RunI
 	if e.repos == nil || e.repos.AgentExecutions == nil || strings.TrimSpace(input.LoopID) == "" {
 		return nativeResumeInfo{Mode: "checkpoint_restart", Status: "unavailable"}, nil
 	}
-	latest, err := e.repos.AgentExecutions.GetLatestByLoopID(ctx, input.LoopID)
+	latest, err := e.repos.AgentExecutions.GetLatestByLoopIDExcludingPhase(ctx, input.LoopID, "review-group")
 	if err != nil {
 		return nativeResumeInfo{}, fmt.Errorf("load latest agent execution for native resume: %w", err)
 	}

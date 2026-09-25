@@ -442,7 +442,7 @@ func TestExecutorResumesPersistedNativeSession(t *testing.T) {
 	}
 }
 
-func TestDisableNativeResumeLeavesPendingSessionForExplicitResume(t *testing.T) {
+func TestGroupedExecutionsPreserveNativeResumeAcrossRestart(t *testing.T) {
 	coordinator := openAgentCoordinator(t)
 	repos := storage.NewRepositories(coordinator.DB())
 	now := time.Date(2026, time.April, 20, 12, 0, 0, 0, time.UTC)
@@ -480,7 +480,7 @@ func TestDisableNativeResumeLeavesPendingSessionForExplicitResume(t *testing.T) 
 	if err := os.WriteFile(scriptPath, []byte(script), 0o755); err != nil {
 		t.Fatalf("WriteFile(scriptPath) error = %v", err)
 	}
-	executor := New(ExecutorOptions{
+	options := ExecutorOptions{
 		Config: ExecutorConfig{Vendor: config.AgentVendorCodex, Params: map[string]any{"command": scriptPath}, NativeResumeEnabled: true},
 		Repos:  repos,
 		Now: func() time.Time {
@@ -488,9 +488,10 @@ func TestDisableNativeResumeLeavesPendingSessionForExplicitResume(t *testing.T) 
 			return now
 		},
 		ParamsOwnerVendor: codexOwner(),
-	})
+	}
+	executor := New(options)
 
-	grouped, err := executor.Start(context.Background(), RunInput{ExecutionID: "agent_group", LoopID: "loop_1", WorkingDirectory: t.TempDir(), Prompt: "grouped findings", DisableNativeResume: true, Timeout: 15 * time.Second, Env: map[string]string{"ARGS_PATH": groupedArgsPath}})
+	grouped, err := executor.Start(context.Background(), RunInput{ExecutionID: "agent_group", LoopID: "loop_1", WorkingDirectory: t.TempDir(), Prompt: "grouped findings", DisableNativeResume: true, Metadata: map[string]any{"phase": "review-group"}, Timeout: 15 * time.Second, Env: map[string]string{"ARGS_PATH": groupedArgsPath}})
 	if err != nil {
 		t.Fatalf("Start(group) error = %v", err)
 	}
@@ -509,7 +510,14 @@ func TestDisableNativeResumeLeavesPendingSessionForExplicitResume(t *testing.T) 
 		t.Fatalf("GetLatestByLoopID() = %#v, %v, want grouped execution", latest, err)
 	}
 
-	finalExec, err := executor.Start(context.Background(), RunInput{ExecutionID: "agent_final", LoopID: "loop_1", WorkingDirectory: t.TempDir(), Prompt: "full checkpoint prompt", NativeResumePrompt: "continue work", NativeSessionID: sessionID, Timeout: 15 * time.Second, Env: map[string]string{"ARGS_PATH": finalArgsPath}})
+	// Reconstruct the executor after the group has been persisted. Resume must
+	// work from durable records without a captured session ID in memory.
+	executor = New(options)
+	foreignResume, err := executor.resolveNativeResume(context.Background(), RunInput{LoopID: "loop_1", UseSnapshot: true, SnapshotVendor: string(config.AgentVendorOpenCode)})
+	if err != nil || foreignResume.Enabled {
+		t.Fatalf("resume after vendor change = %#v, %v", foreignResume, err)
+	}
+	finalExec, err := executor.Start(context.Background(), RunInput{ExecutionID: "agent_final", LoopID: "loop_1", WorkingDirectory: t.TempDir(), Prompt: "full checkpoint prompt", NativeResumePrompt: "continue work with grouped finding", Timeout: 15 * time.Second, Env: map[string]string{"ARGS_PATH": finalArgsPath}})
 	if err != nil {
 		t.Fatalf("Start(final) error = %v", err)
 	}
@@ -520,8 +528,12 @@ func TestDisableNativeResumeLeavesPendingSessionForExplicitResume(t *testing.T) 
 	if err != nil {
 		t.Fatalf("ReadFile(finalArgsPath) error = %v", err)
 	}
-	if got, want := strings.TrimSpace(string(finalArgs)), "exec resume codex-session-1 continue work"; got != want {
+	if got, want := strings.TrimSpace(string(finalArgs)), "exec resume codex-session-1 continue work with grouped finding"; got != want {
 		t.Fatalf("final resume args = %q, want %q", got, want)
+	}
+	nextResume, err := executor.resolveNativeResume(context.Background(), RunInput{LoopID: "loop_1"})
+	if err != nil || nextResume.Enabled {
+		t.Fatalf("completed final review must supersede older pending sessions: %#v, %v", nextResume, err)
 	}
 }
 
