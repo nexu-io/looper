@@ -56,7 +56,7 @@ Positive: a function whose documented contract is to return the error (or fail c
 
 Negative: the comment/spec says best-effort, the error is explicitly allowed (retry, optional hook, cache fill), or a higher frame already handles it.
 
-Do not treat "callers already guarantee this precondition" as a defect unless a public/exported caller can violate it.
+Use the documented contract to identify who must enforce each precondition, then trace the reachable call paths. Report a concrete caller that violates its obligation, or a callee that omits validation its contract promises. Public/exported visibility alone neither establishes nor excludes a defect: an exported API may require callers to satisfy a precondition, and an unexported caller can still violate it. When the relevant callers satisfy the contract, do not demand a redundant callee check.
 
 ## Test suggestions
 

@@ -28,7 +28,7 @@ Equivalent METHOD migration from `buildReviewPromptWithInstructions`. Execution 
 | "Write substantially more detail" | `builtin/references/comment-quality.md` |
 | "Do not repeat the overall body/summary as a comment" | `builtin/references/comment-quality.md` |
 | fixture-matrix paragraph | `builtin/references/comment-quality.md` |
-| CSS linting (on-demand; CSS/style files only) | `builtin/references/css-lint.md` |
+| CSS linting (on-demand for CSS parser/linter implementation changes, including non-style files; not ordinary CSS-only edits) | `builtin/references/css-lint.md` |
 | Evidence rules (race/leak/security/loop-var/contract/test suggestions) | `builtin/references/evidence.md` |
 | Counterexample pass (drop only if factually wrong or same root cause) | `builtin/references/evidence.md` |
 | Implementation review rubric | `builtin/references/implementation-rubric.md` |
