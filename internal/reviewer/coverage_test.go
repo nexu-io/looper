@@ -236,14 +236,17 @@ func TestRunReviewStepPersistsCleanNativeCoverage(t *testing.T) {
 
 func TestProcessClaimedItemRetainsCoverageAcrossRecoveryAndScopePark(t *testing.T) {
 	for _, tc := range []struct {
-		name        string
-		status      string
-		parseStatus string
-		needsHuman  bool
-		publishMode config.ReviewerPublishMode
+		name         string
+		status       string
+		parseStatus  string
+		needsHuman   bool
+		publishMode  config.ReviewerPublishMode
+		findingsJSON string
 	}{
 		{name: "failed native marker recovery", status: "failed", parseStatus: "parsed"},
 		{name: "unparsed native marker recovery", status: "completed", parseStatus: "failed"},
+		{name: "failed recovery with legacy finding", status: "failed", parseStatus: "parsed", findingsJSON: `[{"title":"Legacy finding"}]`},
+		{name: "unparsed recovery with malformed findings", status: "completed", parseStatus: "failed", findingsJSON: `{"legacy":"findings format"}`},
 		{name: "native scope park", status: "completed", parseStatus: "parsed", needsHuman: true},
 		{name: "comment-only scope park", status: "completed", parseStatus: "parsed", needsHuman: true, publishMode: config.ReviewerPublishModeSummaryComment},
 	} {
@@ -265,6 +268,17 @@ func TestProcessClaimedItemRetainsCoverageAcrossRecoveryAndScopePark(t *testing.
 			payload, err := json.Marshal(completion)
 			if err != nil {
 				t.Fatal(err)
+			}
+			if tc.findingsJSON != "" {
+				var envelope map[string]json.RawMessage
+				if err := json.Unmarshal(payload, &envelope); err != nil {
+					t.Fatal(err)
+				}
+				envelope["findings"] = json.RawMessage(tc.findingsJSON)
+				payload, err = json.Marshal(envelope)
+				if err != nil {
+					t.Fatal(err)
+				}
 			}
 			github := &fakeGitHubGateway{reviewRequests: []string{"octocat"}, reviewMarkerMissing: tc.needsHuman, reviewMarkerOutcome: "clean", reviewMarkerEvent: ReviewEventComment}
 			agent := &fakeAgentExecutor{results: []AgentResult{{Status: tc.status, Summary: completion.Summary, ParseStatus: tc.parseStatus, Stdout: "__LOOPER_RESULT__=" + string(payload)}}}

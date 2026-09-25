@@ -6602,13 +6602,19 @@ func parseReviewerNativeCompletion(result AgentResult) (reviewerCommentOnlyCompl
 // coverage. Store only the advisory report here: conditionally adding findings
 // would change pendingNativeMustFixRequiresActionableMarker based on coverage.
 func recoveredReviewerSummaryJSON(result AgentResult) string {
-	completion, err := parseReviewerNativeCompletion(result)
-	if err != nil || completion.Coverage == nil {
+	var envelope struct {
+		Coverage json.RawMessage `json:"coverage"`
+	}
+	if err := decodeReviewerCompletionMarker(result, &envelope); err != nil {
+		return ""
+	}
+	coverage := sanitizeReviewerCoverage(decodeOptionalReviewerCoverage(envelope.Coverage))
+	if coverage == nil {
 		return ""
 	}
 	payload, err := json.Marshal(struct {
 		Coverage *reviewerCoverageReport `json:"coverage"`
-	}{Coverage: completion.Coverage})
+	}{Coverage: coverage})
 	if err != nil {
 		return ""
 	}
@@ -6617,6 +6623,11 @@ func recoveredReviewerSummaryJSON(result AgentResult) string {
 
 func unmarshalReviewerCompletionMarker(result AgentResult) (reviewerCommentOnlyCompletion, error) {
 	var completion reviewerCommentOnlyCompletion
+	err := decodeReviewerCompletionMarker(result, &completion)
+	return completion, err
+}
+
+func decodeReviewerCompletionMarker(result AgentResult, target any) error {
 	raw := result.Stdout
 	if strings.TrimSpace(result.Stderr) != "" {
 		raw += "\n" + result.Stderr
@@ -6628,12 +6639,9 @@ func unmarshalReviewerCompletionMarker(result AgentResult) (reviewerCommentOnlyC
 			continue
 		}
 		payload := strings.TrimPrefix(line, agent.CompletionMarkerPrefix)
-		if err := json.Unmarshal([]byte(payload), &completion); err != nil {
-			return reviewerCommentOnlyCompletion{}, err
-		}
-		return completion, nil
+		return json.Unmarshal([]byte(payload), target)
 	}
-	return reviewerCommentOnlyCompletion{}, fmt.Errorf("completion marker is required")
+	return fmt.Errorf("completion marker is required")
 }
 
 func validateReviewerCommentOnlyCompletion(completion reviewerCommentOnlyCompletion) (reviewerCommentOnlyCompletion, error) {
