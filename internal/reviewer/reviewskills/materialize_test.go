@@ -244,7 +244,7 @@ func TestBuiltinSkillFilesContainMigratedMethodText(t *testing.T) {
 		"The authority for dropping a candidate is that same review context",
 		"Requiring stronger structured evidence fields is insufficient",
 		"the preexisting `v` is reused",
-		"On Go 1.23+, the garbage collector can recover unreferenced, unstopped timers",
+		"With Go 1.23+ timer semantics, the garbage collector can recover unreferenced, unstopped timers and tickers",
 		"Stay one reviewer",
 	} {
 		if !strings.Contains(joined, want) {
