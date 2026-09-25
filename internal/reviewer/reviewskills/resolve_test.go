@@ -44,21 +44,37 @@ func TestResolveThreeLayerLookupAndProjectOverridesUser(t *testing.T) {
 	}
 }
 
-func TestResolveSameLevelConflict(t *testing.T) {
+func TestResolveNamedDirectoryMustDeclareConfiguredName(t *testing.T) {
 	t.Parallel()
 
 	worktree := t.TempDir()
-	writeNamedSkill(t, filepath.Join(worktree, ".agents", "skills", "alpha"), "dup", "a")
-	writeNamedSkill(t, filepath.Join(worktree, ".agents", "skills", "beta"), "dup", "b")
-
+	userHome := t.TempDir()
+	writeNamedSkill(t, filepath.Join(userHome, ".agents", "skills", "security-review"), "security-review", "user method")
+	writeNamedSkill(t, filepath.Join(worktree, ".agents", "skills", "security-review"), "different-method", "project method")
 	_, err := Resolve(ResolveInput{
 		Mode:     config.ReviewerSkillsModeReplace,
-		Required: []string{"dup"},
+		Required: []string{"security-review"},
 		Worktree: worktree,
-		UserHome: t.TempDir(),
+		UserHome: userHome,
 	})
-	if err == nil || !strings.Contains(err.Error(), "multiple files") {
-		t.Fatalf("Resolve() error = %v, want same-level conflict", err)
+	if err == nil || !strings.Contains(err.Error(), "name mismatch") {
+		t.Fatalf("Resolve() error = %v, want a mismatched project method to prevent fallback", err)
+	}
+}
+
+func TestResolveArbitraryDirectoryRequiresExplicitPath(t *testing.T) {
+	t.Parallel()
+
+	worktree := t.TempDir()
+	dir := filepath.Join(worktree, ".agents", "skills", "team-method")
+	writeNamedSkill(t, dir, "security-review", "team method")
+	_, err := Resolve(ResolveInput{Mode: config.ReviewerSkillsModeReplace, Required: []string{"security-review"}, Worktree: worktree})
+	if err == nil || !isMissingSkill(err) {
+		t.Fatalf("Resolve() error = %v, want YAML-only aliases to require an explicit path", err)
+	}
+	result, err := Resolve(ResolveInput{Mode: config.ReviewerSkillsModeReplace, Required: []string{"./.agents/skills/team-method"}, Worktree: worktree})
+	if err != nil || len(result.Entries) != 1 || result.Entries[0].Name != "security-review" {
+		t.Fatalf("explicit path = %#v, %v", result, err)
 	}
 }
 
@@ -120,7 +136,7 @@ func TestResolveSymlinkAliasDedupes(t *testing.T) {
 	t.Parallel()
 
 	worktree := t.TempDir()
-	realDir := filepath.Join(worktree, ".agents", "skills", "real")
+	realDir := filepath.Join(worktree, ".agents", "skills", "aliased")
 	writeNamedSkill(t, realDir, "aliased", "real skill")
 	aliasDir := filepath.Join(worktree, ".agents", "skills", "alias")
 	if err := os.MkdirAll(filepath.Dir(aliasDir), 0o755); err != nil {
@@ -132,7 +148,7 @@ func TestResolveSymlinkAliasDedupes(t *testing.T) {
 
 	result, err := Resolve(ResolveInput{
 		Mode:     config.ReviewerSkillsModeReplace,
-		Required: []string{"aliased"},
+		Required: []string{"aliased", "./.agents/skills/alias/SKILL.md"},
 		Worktree: worktree,
 		UserHome: t.TempDir(),
 	})
