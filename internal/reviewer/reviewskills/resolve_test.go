@@ -62,6 +62,37 @@ func TestResolveSameLevelConflict(t *testing.T) {
 	}
 }
 
+func TestResolveBoundsSkillFrontmatter(t *testing.T) {
+	t.Parallel()
+
+	worktree := t.TempDir()
+	root := filepath.Join(worktree, ".agents", "skills")
+	writeNamedSkill(t, filepath.Join(root, "large-body"), "large-body", "small metadata")
+	f, err := os.OpenFile(filepath.Join(root, "large-body", "SKILL.md"), os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(strings.Repeat("body text\n", 128<<10)); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	writeNamedSkill(t, filepath.Join(root, "second"), "second", "another method")
+	writeNamedSkill(t, filepath.Join(root, "oversized"), "oversized", strings.Repeat("x", 128<<10))
+
+	result, err := Resolve(ResolveInput{Mode: config.ReviewerSkillsModeReplace, Required: []string{"large-body", "second"}, Worktree: worktree})
+	if err != nil || len(result.Entries) != 2 {
+		t.Fatalf("large bodies and unrelated oversized metadata must not block selected methods: %#v, %v", result, err)
+	}
+	for _, ref := range []string{"oversized", "./.agents/skills/oversized/SKILL.md"} {
+		_, err := Resolve(ResolveInput{Mode: config.ReviewerSkillsModeReplace, Required: []string{ref}, Worktree: worktree})
+		if err == nil || !strings.Contains(err.Error(), "frontmatter") {
+			t.Fatalf("Resolve(%q) error = %v, want oversized metadata rejected", ref, err)
+		}
+	}
+}
+
 func TestReplacementIndexOnlyNamesResolvedMethods(t *testing.T) {
 	t.Parallel()
 

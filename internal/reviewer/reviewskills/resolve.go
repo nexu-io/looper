@@ -44,6 +44,16 @@ type skillLayer struct {
 	source string
 }
 
+type skillLayerIndex struct {
+	entries map[string][]Entry
+	err     error
+}
+
+type skillNameLookup struct {
+	names  map[string]bool
+	layers map[string]skillLayerIndex
+}
+
 // Resolve locates configured reviewer skills. extend always prepends builtin
 // looper-review from BuiltinDir/SKILL.md and ignores same-name overlays.
 func Resolve(in ResolveInput) (ResolveResult, error) {
@@ -58,6 +68,14 @@ func Resolve(in ResolveInput) (ResolveResult, error) {
 	var result ResolveResult
 	seenReal := make(map[string]int)
 	builtinName := ""
+	lookup := skillNameLookup{names: make(map[string]bool), layers: make(map[string]skillLayerIndex)}
+	for _, refs := range [][]string{in.Required, in.Optional} {
+		for _, ref := range refs {
+			if ref = strings.TrimSpace(ref); ref != "" && !isPathRef(ref) {
+				lookup.names[ref] = true
+			}
+		}
+	}
 
 	if mode == config.ReviewerSkillsModeExtend {
 		entry, err := loadBuiltinLooperReview(in.BuiltinDir)
@@ -77,7 +95,7 @@ func Resolve(in ResolveInput) (ResolveResult, error) {
 			}
 			return nil
 		}
-		entry, err := resolveRef(in, ref)
+		entry, err := resolveRef(in, ref, &lookup)
 		if err != nil {
 			if !required && isMissingSkill(err) {
 				result.Unavailable = append(result.Unavailable, ref)
@@ -136,11 +154,11 @@ func loadBuiltinLooperReview(builtinDir string) (Entry, error) {
 	}, nil
 }
 
-func resolveRef(in ResolveInput, ref string) (Entry, error) {
+func resolveRef(in ResolveInput, ref string, lookup *skillNameLookup) (Entry, error) {
 	if isPathRef(ref) {
 		return resolvePathRef(in, ref)
 	}
-	return resolveNameRef(in, ref)
+	return resolveNameRef(in, ref, lookup)
 }
 
 func isPathRef(ref string) bool {
@@ -208,9 +226,9 @@ func skillFileFromPath(path string) (string, error) {
 	return path, nil
 }
 
-func resolveNameRef(in ResolveInput, name string) (Entry, error) {
+func resolveNameRef(in ResolveInput, name string, lookup *skillNameLookup) (Entry, error) {
 	for _, layer := range nameLayers(in) {
-		entry, err := lookupNameAtLayer(layer, name)
+		entry, err := lookupNameAtLayer(layer, name, lookup)
 		if err != nil {
 			return Entry{}, err
 		}
@@ -235,7 +253,7 @@ func nameLayers(in ResolveInput) []skillLayer {
 	return layers
 }
 
-func lookupNameAtLayer(layer skillLayer, name string) (*Entry, error) {
+func lookupNameAtLayer(layer skillLayer, name string, lookup *skillNameLookup) (*Entry, error) {
 	intended := filepath.Join(layer.dir, name, "SKILL.md")
 	if _, err := os.Lstat(intended); err == nil {
 		if _, _, readErr := readSkillFrontmatter(intended); readErr != nil {
@@ -245,40 +263,15 @@ func lookupNameAtLayer(layer skillLayer, name string) (*Entry, error) {
 		return nil, fmt.Errorf("skill %q at %s is unreadable: %w", name, intended, err)
 	}
 
-	files, err := listSkillFiles(layer.dir)
-	if err != nil {
-		return nil, fmt.Errorf("skill %q in %s is unreadable: %w", name, layer.dir, err)
+	index, ok := lookup.layers[layer.dir]
+	if !ok {
+		index = indexSkillLayer(layer, lookup.names)
+		lookup.layers[layer.dir] = index
 	}
-
-	var matches []Entry
-	seenReal := make(map[string]struct{})
-	for _, file := range files {
-		parsedName, description, readErr := readSkillFrontmatter(file)
-		if readErr != nil {
-			if sameSkillFile(file, intended) {
-				return nil, fmt.Errorf("skill %q at %s is unreadable: %w", name, file, readErr)
-			}
-			continue
-		}
-		if parsedName != name {
-			continue
-		}
-		abs, absErr := filepath.Abs(file)
-		if absErr != nil {
-			return nil, absErr
-		}
-		real := canonicalSkillPath(abs)
-		if _, ok := seenReal[real]; ok {
-			continue
-		}
-		seenReal[real] = struct{}{}
-		matches = append(matches, Entry{
-			Name:        parsedName,
-			Description: description,
-			Path:        abs,
-			Source:      layer.source,
-		})
+	if index.err != nil {
+		return nil, fmt.Errorf("skill %q in %s is unreadable: %w", name, layer.dir, index.err)
 	}
+	matches := index.entries[name]
 	if len(matches) == 0 {
 		return nil, nil
 	}
@@ -286,6 +279,39 @@ func lookupNameAtLayer(layer skillLayer, name string) (*Entry, error) {
 		return nil, fmt.Errorf("skill %q is provided by multiple files: %s and %s", name, matches[0].Path, matches[1].Path)
 	}
 	return &matches[0], nil
+}
+
+func indexSkillLayer(layer skillLayer, names map[string]bool) skillLayerIndex {
+	index := skillLayerIndex{entries: make(map[string][]Entry)}
+	files, err := listSkillFiles(layer.dir)
+	if err != nil {
+		index.err = err
+		return index
+	}
+	seenReal := make(map[string]struct{})
+	for _, file := range files {
+		parsedName, description, readErr := readSkillFrontmatter(file)
+		if readErr != nil || !names[parsedName] {
+			continue
+		}
+		abs, absErr := filepath.Abs(file)
+		if absErr != nil {
+			index.err = absErr
+			return index
+		}
+		real := canonicalSkillPath(abs)
+		if _, ok := seenReal[real]; ok {
+			continue
+		}
+		seenReal[real] = struct{}{}
+		index.entries[parsedName] = append(index.entries[parsedName], Entry{
+			Name:        parsedName,
+			Description: description,
+			Path:        abs,
+			Source:      layer.source,
+		})
+	}
+	return index
 }
 
 func listSkillFiles(dir string) ([]string, error) {
@@ -327,8 +353,4 @@ func canonicalSkillPath(path string) string {
 		return abs
 	}
 	return real
-}
-
-func sameSkillFile(a, b string) bool {
-	return canonicalSkillPath(a) == canonicalSkillPath(b)
 }

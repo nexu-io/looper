@@ -971,6 +971,8 @@ Reviewer skills live at `roles.reviewer.skills` (and `projects[].roles.reviewer.
 
 Name lookup (first match wins): `{worktree}/.agents/skills/`, then `~/.agents/skills/`, then Looper's materialized builtin bundle. Matching uses the `SKILL.md` YAML `name:` field, not the directory name alone. Unconfigured user/project skills are never auto-enabled.
 
+Skill files must be regular files (symlinks to regular files are supported). YAML frontmatter, including its delimiters, must fit within the first 64 KiB. Resolution reads only that bounded prefix, so a long skill body does not increase discovery memory use. Each lookup layer is scanned once per resolution for all configured names.
+
 In `extend` mode, builtin `looper-review` is injected from the builtin bundle directly. A project or user file named `looper-review` cannot shadow it; use `replace` to drop builtin.
 
 Two different real files at the same lookup layer with the same `name:` is a configuration error. Symlink aliases of one real path are deduped. A high-priority file that exists but is unreadable or has invalid frontmatter fails the review; Looper does not fall back to a lower layer. Missing required skills fail the review; missing optional skills are recorded as `reviewSkillsUnavailable` and the run continues.

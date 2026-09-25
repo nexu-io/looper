@@ -2,6 +2,7 @@ package reviewskills
 
 import (
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -100,12 +101,30 @@ func copyBuiltin(dest string) error {
 	})
 }
 
+const maxSkillFrontmatterBytes = 64 << 10
+
 func readSkillFrontmatter(skillPath string) (name, description string, err error) {
-	data, err := os.ReadFile(skillPath)
+	info, err := os.Stat(skillPath)
 	if err != nil {
 		return "", "", err
 	}
-	return parseFrontmatter(string(data))
+	if !info.Mode().IsRegular() {
+		return "", "", fmt.Errorf("skill must be a regular file")
+	}
+	file, err := os.Open(skillPath)
+	if err != nil {
+		return "", "", err
+	}
+	defer file.Close()
+	data, err := io.ReadAll(io.LimitReader(file, maxSkillFrontmatterBytes))
+	if err != nil {
+		return "", "", err
+	}
+	name, description, err = parseFrontmatter(string(data))
+	if err != nil && len(data) == maxSkillFrontmatterBytes {
+		return "", "", fmt.Errorf("skill frontmatter must fit within %d bytes: %w", maxSkillFrontmatterBytes, err)
+	}
+	return name, description, err
 }
 
 type skillFrontmatter struct {
