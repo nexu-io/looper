@@ -19,6 +19,7 @@ import (
 	"github.com/nexu-io/looper/internal/networkpolicy"
 	"github.com/nexu-io/looper/internal/reviewer/automerge"
 	"github.com/nexu-io/looper/internal/reviewer/criteria"
+	"github.com/nexu-io/looper/internal/reviewer/reviewskills"
 	"github.com/nexu-io/looper/internal/storage"
 	"github.com/nexu-io/looper/internal/worktreesafety"
 	"os"
@@ -8988,7 +8989,7 @@ func TestNewDefaultsReviewerTimeoutToNinetyMinutes(t *testing.T) {
 func TestBuildReviewPromptLaterPassUsesRepairFrontier(t *testing.T) {
 	t.Parallel()
 
-	prompt, _ := buildReviewPromptWithInstructions("", config.Config{}, "acme/looper", 42, reviewerCheckpoint{Snapshot: &checkpointSnapshot{HeadSHA: "new-head"}}, "run_1", "reviewer:loop:new-head", config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventComment, Blocking: config.ReviewerReviewEventComment}, false, true, "", config.ReviewerScopeChangedRanges, config.DefaultDisclosureConfig(), "opencode", "", "/opt/looper/bin/looper", false, false, "old-head")
+	prompt, _ := buildReviewPromptWithInstructions("", config.Config{}, "acme/looper", 42, reviewerCheckpoint{Snapshot: &checkpointSnapshot{HeadSHA: "new-head"}}, "run_1", "reviewer:loop:new-head", config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventComment, Blocking: config.ReviewerReviewEventComment}, false, true, "", config.ReviewerScopeChangedRanges, config.DefaultDisclosureConfig(), "opencode", "", "/opt/looper/bin/looper", false, false, "old-head", "")
 	for _, want := range []string{
 		"Repair frontier contract (later pass)",
 		"Last reviewed head SHA: old-head",
@@ -9023,7 +9024,7 @@ func TestBuildReviewPromptLaterPassUsesRepairFrontier(t *testing.T) {
 func TestBuildReviewPromptFirstPassKeepsExhaustiveContract(t *testing.T) {
 	t.Parallel()
 
-	prompt, _ := buildReviewPromptWithInstructions("", config.Config{}, "acme/looper", 42, reviewerCheckpoint{Snapshot: &checkpointSnapshot{HeadSHA: "abc123"}}, "run_1", "reviewer:loop:abc123", config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventComment, Blocking: config.ReviewerReviewEventComment}, false, true, "", config.ReviewerScopeChangedRanges, config.DefaultDisclosureConfig(), "opencode", "", "/opt/looper/bin/looper", false, false, "")
+	prompt, _ := buildReviewPromptWithInstructions("", config.Config{}, "acme/looper", 42, reviewerCheckpoint{Snapshot: &checkpointSnapshot{HeadSHA: "abc123"}}, "run_1", "reviewer:loop:abc123", config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventComment, Blocking: config.ReviewerReviewEventComment}, false, true, "", config.ReviewerScopeChangedRanges, config.DefaultDisclosureConfig(), "opencode", "", "/opt/looper/bin/looper", false, false, "", "")
 	for _, want := range []string{
 		"Review pass contract: complete one full review pass before publishing",
 		"scan every changed file/range in scope",
@@ -9094,14 +9095,10 @@ func TestBuildReviewPromptIncludesActionableQualityContract(t *testing.T) {
 
 	prompt := buildReviewPrompt("acme/looper", 42, reviewerCheckpoint{Detail: &checkpointDetail{Labels: []string{specpr.ReviewingLabel}}, Snapshot: &checkpointSnapshot{Title: "Spec PR", HeadSHA: "abc123"}}, "run_1", "reviewer:loop:abc123", config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventApprove, Blocking: config.ReviewerReviewEventComment}, false, config.ReviewerScopeChangedRanges, config.DefaultDisclosureConfig(), "opencode", "", "/opt/looper/bin/looper")
 	for _, want := range []string{
-		"Every comment MUST include",
-		"Bad comment example",
-		"Good spec/docs comment example",
-		"Spec/docs review rubric",
 		"suggestedChange",
 		"do not write or publish a bare LGTM review body",
 		"Group findings only when they share the same root cause",
-		"fixture-matrix tests",
+		"Accumulate every independent in-scope must_fix",
 		"'/opt/looper/bin/looper' review submit acme/looper#42 --event COMMENT --commit-id abc123 --reviewer-run-id run_1 --clean-review-event APPROVE --blocking-review-event COMMENT`",
 		"wrapper validates inline anchors against the live PR diff before it calls GitHub",
 		"Review pass contract",
@@ -9109,14 +9106,9 @@ func TestBuildReviewPromptIncludesActionableQualityContract(t *testing.T) {
 		"include it in this review rather than deferring it to a later pass",
 		"Finding disposition contract",
 		"disposition must_fix|follow_up|needs_human",
+		"severity blocking|non_blocking|nit",
 		"Looper parses this JSON",
 		"__LOOPER_RESULT__.findings",
-		"Finding accumulator contract",
-		"group repeated patterns into systemic comments with representative examples only when they share a root cause",
-		"Severity rubric",
-		"mark a finding as BLOCKING only when",
-		"Mark actionable but merge-safe improvements as NON_BLOCKING",
-		"NITs must not block merge",
 		"Finalization gate before submit",
 		"disposition=must_fix with scopeBasis/scopeEvidence",
 		"rejects `follow_up`/`needs_human` in actionable comments or the visible review body",
@@ -9182,6 +9174,10 @@ func TestBuildReviewPromptIncludesActionableQualityContract(t *testing.T) {
 		"`start_line` and `start_side`",
 		"every must_fix finding must live in inline `comments`",
 		"Looper **does** parse this findings list",
+		"Review method skills:",
+		"Required skills MUST be read from the given absolute paths before reviewing.",
+		"looper-review",
+		"<run-local builtin skill path>",
 	} {
 		if !strings.Contains(prompt, want) {
 			t.Fatalf("prompt missing %q:\n%s", want, prompt)
@@ -9214,6 +9210,117 @@ func TestBuildReviewPromptIncludesActionableQualityContract(t *testing.T) {
 			t.Fatalf("prompt contains conflicting no-actionable clean-review instruction %q:\n%s", forbidden, prompt)
 		}
 	}
+	for _, method := range migratedReviewMethodPhrases() {
+		if strings.Contains(prompt, method) {
+			t.Fatalf("core prompt retained migrated METHOD text %q:\n%s", method, prompt)
+		}
+	}
+	bundle, err := reviewskills.MaterializeBuiltin()
+	if err != nil {
+		t.Fatalf("MaterializeBuiltin: %v", err)
+	}
+	t.Cleanup(func() { _ = bundle.Close() })
+	skillText := readReviewSkillTree(t, bundle.Dir)
+	for _, method := range migratedReviewMethodPhrases() {
+		if !strings.Contains(skillText, method) {
+			t.Fatalf("materialized skills missing METHOD text %q", method)
+		}
+	}
+	if strings.Contains(prompt, bundle.Dir) || strings.Contains(prompt, bundle.Entries[0].Path) {
+		t.Fatalf("preview-style builder leaked materialized temp path %q:\n%s", bundle.Entries[0].Path, prompt)
+	}
+}
+
+func TestBuildReviewPromptIncludesMaterializedSkillIndex(t *testing.T) {
+	t.Parallel()
+	bundle, err := reviewskills.MaterializeBuiltin()
+	if err != nil {
+		t.Fatalf("MaterializeBuiltin: %v", err)
+	}
+	t.Cleanup(func() { _ = bundle.Close() })
+	index := reviewskills.FormatIndex(bundle.Entries)
+	prompt, _ := buildReviewPromptWithInstructions("", config.Config{}, "acme/looper", 42, reviewerCheckpoint{Snapshot: &checkpointSnapshot{HeadSHA: "abc123"}}, "run_1", "reviewer:loop:abc123", config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventComment, Blocking: config.ReviewerReviewEventComment}, false, true, "", config.ReviewerScopeChangedRanges, config.DefaultDisclosureConfig(), "opencode", "", "/opt/looper/bin/looper", false, false, "", index)
+	if !strings.Contains(prompt, index) {
+		t.Fatalf("prompt missing skill index:\n%s", prompt)
+	}
+	if !filepath.IsAbs(bundle.Entries[0].Path) {
+		t.Fatalf("skill path is not absolute: %q", bundle.Entries[0].Path)
+	}
+	if !strings.Contains(prompt, bundle.Entries[0].Path) {
+		t.Fatalf("prompt missing absolute skill path %q:\n%s", bundle.Entries[0].Path, prompt)
+	}
+	if strings.Contains(prompt, "<run-local builtin skill path>") {
+		t.Fatalf("materialized prompt used preview placeholder:\n%s", prompt)
+	}
+}
+
+func TestBuildReviewPromptCommentOnlyKeepsPublishContracts(t *testing.T) {
+	t.Parallel()
+	prompt, _ := buildReviewPromptWithInstructions("", config.Config{}, "acme/looper", 42, reviewerCheckpoint{Snapshot: &checkpointSnapshot{HeadSHA: "abc123"}}, "run_1", "reviewer:loop:abc123", config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventComment, Blocking: config.ReviewerReviewEventComment}, false, false, "", config.ReviewerScopeChangedRanges, config.DefaultDisclosureConfig(), "opencode", "", "/opt/looper/bin/looper", false, true, "", reviewskills.PreviewIndexPlaceholder())
+	for _, want := range []string{
+		"Comment-only publish contract",
+		"Review pass contract: complete one full review pass before finalizing",
+		"Finding disposition contract",
+		"disposition must_fix|follow_up|needs_human",
+		"severity blocking|non_blocking|nit",
+		"Group findings only when they share the same root cause",
+		"Accumulate every independent in-scope must_fix",
+		"Review method skills:",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("comment-only prompt missing %q:\n%s", want, prompt)
+		}
+	}
+	for _, method := range migratedReviewMethodPhrases() {
+		if strings.Contains(prompt, method) {
+			t.Fatalf("comment-only prompt retained migrated METHOD text %q:\n%s", method, prompt)
+		}
+	}
+}
+
+func migratedReviewMethodPhrases() []string {
+	return []string{
+		"Every comment MUST include",
+		"Every finding MUST include",
+		"Bad comment example",
+		"Good spec/docs comment example",
+		"Spec/docs review rubric",
+		"Implementation review rubric",
+		"fixture-matrix tests",
+		"Write substantially more detail",
+		"Finding accumulator contract",
+		"group repeated patterns into systemic comments with representative examples only when they share a root cause",
+		"Severity rubric",
+		"mark a finding as BLOCKING only when",
+		"Mark actionable but merge-safe improvements as NON_BLOCKING",
+		"NITs must not block merge",
+		"A comment is invalid if it only names a category",
+		"Do not repeat the overall body/summary as a comment",
+	}
+}
+
+func readReviewSkillTree(t *testing.T, dir string) string {
+	t.Helper()
+	var b strings.Builder
+	err := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info.IsDir() {
+			return nil
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		b.Write(data)
+		b.WriteByte('\n')
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk %s: %v", dir, err)
+	}
+	return b.String()
 }
 
 func TestBuildReviewPromptForgejoNativeKeepsMustFixInline(t *testing.T) {
@@ -9224,7 +9331,7 @@ func TestBuildReviewPromptForgejoNativeKeepsMustFixInline(t *testing.T) {
 	}
 	cfg.Providers = []config.ProviderConfig{{ID: "forgejo-main", Kind: config.ProviderKindForgejo, BaseURL: "https://forgejo.example.test", TokenEnv: stringPtr("FORGEJO_TOKEN")}}
 	cfg.Projects = []config.ProjectRefConfig{{ID: "project_1", Provider: "forgejo-main", Repo: "acme/looper"}}
-	prompt, _ := buildReviewPromptWithInstructions("project_1", cfg, "acme/looper", 42, reviewerCheckpoint{Snapshot: &checkpointSnapshot{HeadSHA: "abc123"}}, "run_1", "reviewer:loop:abc123", config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventApprove, Blocking: config.ReviewerReviewEventRequestChanges}, false, true, "", config.ReviewerScopeChangedRanges, config.DefaultDisclosureConfig(), "opencode", "", "/opt/looper/bin/looper", false, false, "")
+	prompt, _ := buildReviewPromptWithInstructions("project_1", cfg, "acme/looper", 42, reviewerCheckpoint{Snapshot: &checkpointSnapshot{HeadSHA: "abc123"}}, "run_1", "reviewer:loop:abc123", config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventApprove, Blocking: config.ReviewerReviewEventRequestChanges}, false, true, "", config.ReviewerScopeChangedRanges, config.DefaultDisclosureConfig(), "opencode", "", "/opt/looper/bin/looper", false, false, "", "")
 	if !strings.Contains(prompt, "every must_fix must remain an inline comment") {
 		t.Fatalf("forgejo prompt missing inline-only must_fix contract:\n%s", prompt)
 	}
@@ -9288,7 +9395,7 @@ func TestBuildReviewPromptOmitsSubmitPathInstructionWhenTrustedWrapperUnavailabl
 				cfg.Providers = []config.ProviderConfig{{ID: "fj", Kind: config.ProviderKindForgejo, BaseURL: "https://code.example", TokenEnv: stringPtr("FORGEJO_TOKEN")}}
 				cfg.Projects = []config.ProjectRefConfig{{ID: "p", Provider: "fj", Repo: "acme/looper"}}
 			}
-			prompt, _ := buildReviewPromptWithInstructions("p", cfg, "acme/looper", 42, reviewerCheckpoint{Snapshot: &checkpointSnapshot{Title: "Spec PR", HeadSHA: "abc123"}}, "run_1", "reviewer:loop:abc123", config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventApprove, Blocking: config.ReviewerReviewEventComment}, false, true, "", config.ReviewerScopeChangedRanges, config.DefaultDisclosureConfig(), "opencode", "", "", false, false, "")
+			prompt, _ := buildReviewPromptWithInstructions("p", cfg, "acme/looper", 42, reviewerCheckpoint{Snapshot: &checkpointSnapshot{Title: "Spec PR", HeadSHA: "abc123"}}, "run_1", "reviewer:loop:abc123", config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventApprove, Blocking: config.ReviewerReviewEventComment}, false, true, "", config.ReviewerScopeChangedRanges, config.DefaultDisclosureConfig(), "opencode", "", "", false, false, "", "")
 
 			if !strings.Contains(prompt, "trusted looper review submit wrapper unavailable") {
 				t.Fatalf("prompt missing trusted wrapper unavailable failure instruction:\n%s", prompt)
@@ -10197,7 +10304,7 @@ func TestBuildReviewPromptDoesNotTransitionSpecLabelsWithoutApprove(t *testing.T
 func TestBuildReviewPromptOmitsReviewRequestGuardrailWhenDisabled(t *testing.T) {
 	t.Parallel()
 
-	prompt, _ := buildReviewPromptWithInstructions("", config.Config{}, "acme/looper", 42, reviewerCheckpoint{Snapshot: &checkpointSnapshot{HeadSHA: "abc123"}}, "run_1", "reviewer:loop:abc123", config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventComment, Blocking: config.ReviewerReviewEventComment}, false, false, "", config.ReviewerScopeChangedRanges, config.DefaultDisclosureConfig(), "opencode", "", "/opt/looper/bin/looper", false, false, "")
+	prompt, _ := buildReviewPromptWithInstructions("", config.Config{}, "acme/looper", 42, reviewerCheckpoint{Snapshot: &checkpointSnapshot{HeadSHA: "abc123"}}, "run_1", "reviewer:loop:abc123", config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventComment, Blocking: config.ReviewerReviewEventComment}, false, false, "", config.ReviewerScopeChangedRanges, config.DefaultDisclosureConfig(), "opencode", "", "/opt/looper/bin/looper", false, false, "", "")
 
 	if strings.Contains(prompt, "review request removed before publish") {
 		t.Fatalf("prompt retained review-request guardrail while disabled:\n%s", prompt)
@@ -10210,7 +10317,7 @@ func TestBuildReviewPromptOmitsReviewRequestGuardrailWhenDisabled(t *testing.T) 
 func TestBuildReviewPromptBindsAutomaticReviewerRunID(t *testing.T) {
 	t.Parallel()
 
-	prompt, _ := buildReviewPromptWithInstructions("", config.Config{}, "acme/looper", 42, reviewerCheckpoint{Snapshot: &checkpointSnapshot{HeadSHA: "abc123"}}, "run_auto", "reviewer:loop:abc123", config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventComment, Blocking: config.ReviewerReviewEventComment}, false, true, "", config.ReviewerScopeChangedRanges, config.DefaultDisclosureConfig(), "opencode", "", "/opt/looper/bin/looper", false, false, "")
+	prompt, _ := buildReviewPromptWithInstructions("", config.Config{}, "acme/looper", 42, reviewerCheckpoint{Snapshot: &checkpointSnapshot{HeadSHA: "abc123"}}, "run_auto", "reviewer:loop:abc123", config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventComment, Blocking: config.ReviewerReviewEventComment}, false, true, "", config.ReviewerScopeChangedRanges, config.DefaultDisclosureConfig(), "opencode", "", "/opt/looper/bin/looper", false, false, "", "")
 	if !strings.Contains(prompt, "--reviewer-run-id run_auto") {
 		t.Fatalf("automatic prompt missing --reviewer-run-id:\n%s", prompt)
 	}
@@ -10222,7 +10329,7 @@ func TestBuildReviewPromptBindsAutomaticReviewerRunID(t *testing.T) {
 func TestBuildReviewPromptNamesFollowUpReviewRequestBypass(t *testing.T) {
 	t.Parallel()
 
-	prompt, _ := buildReviewPromptWithInstructions("", config.Config{}, "acme/looper", 42, reviewerCheckpoint{Snapshot: &checkpointSnapshot{HeadSHA: "abc123"}}, "run_1", "reviewer:loop:abc123", config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventComment, Blocking: config.ReviewerReviewEventComment}, false, false, "follow_up_new_head", config.ReviewerScopeChangedRanges, config.DefaultDisclosureConfig(), "opencode", "", "/opt/looper/bin/looper", false, false, "")
+	prompt, _ := buildReviewPromptWithInstructions("", config.Config{}, "acme/looper", 42, reviewerCheckpoint{Snapshot: &checkpointSnapshot{HeadSHA: "abc123"}}, "run_1", "reviewer:loop:abc123", config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventComment, Blocking: config.ReviewerReviewEventComment}, false, false, "follow_up_new_head", config.ReviewerScopeChangedRanges, config.DefaultDisclosureConfig(), "opencode", "", "/opt/looper/bin/looper", false, false, "", "")
 
 	if strings.Contains(prompt, "review request removed before publish") {
 		t.Fatalf("prompt retained review-request guardrail for follow-up bypass:\n%s", prompt)
@@ -10238,7 +10345,7 @@ func TestBuildReviewPromptNamesFollowUpReviewRequestBypass(t *testing.T) {
 func TestBuildReviewPromptCommentOnlyOmitsGitHubPublishInstructions(t *testing.T) {
 	t.Parallel()
 
-	prompt, _ := buildReviewPromptWithInstructions("", config.Config{}, "acme/looper", 42, reviewerCheckpoint{Snapshot: &checkpointSnapshot{HeadSHA: "abc123"}}, "run_1", "reviewer:loop:abc123", config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventComment, Blocking: config.ReviewerReviewEventComment}, false, false, "", config.ReviewerScopeChangedRanges, config.DefaultDisclosureConfig(), "opencode", "", "/opt/looper/bin/looper", false, true, "")
+	prompt, _ := buildReviewPromptWithInstructions("", config.Config{}, "acme/looper", 42, reviewerCheckpoint{Snapshot: &checkpointSnapshot{HeadSHA: "abc123"}}, "run_1", "reviewer:loop:abc123", config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventComment, Blocking: config.ReviewerReviewEventComment}, false, false, "", config.ReviewerScopeChangedRanges, config.DefaultDisclosureConfig(), "opencode", "", "/opt/looper/bin/looper", false, true, "", "")
 
 	for _, forbidden := range []string{"gh pr view", "gh pr diff", "gh api", "GitHub operation contract", "review request removed before publish", "trusted Looper CLI at", "review-thread resolution"} {
 		if strings.Contains(prompt, forbidden) {
@@ -10268,7 +10375,7 @@ func TestBuildReviewPromptCommentOnlyIncludesExistingReviewerSummaryAuthority(t 
 	if err != nil {
 		t.Fatalf("renderReviewerSummaryComment() error = %v", err)
 	}
-	prompt, _ := buildReviewPromptWithInstructions("", config.Config{}, "acme/looper", 42, reviewerCheckpoint{Snapshot: &checkpointSnapshot{HeadSHA: "abc123"}, Detail: &checkpointDetail{IssueComments: []map[string]any{{"id": int64(91), "body": existingBody}}}}, "run_1", "reviewer:loop:abc123", config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventComment, Blocking: config.ReviewerReviewEventComment}, false, false, "", config.ReviewerScopeChangedRanges, config.DefaultDisclosureConfig(), "opencode", "", "/opt/looper/bin/looper", false, true, "")
+	prompt, _ := buildReviewPromptWithInstructions("", config.Config{}, "acme/looper", 42, reviewerCheckpoint{Snapshot: &checkpointSnapshot{HeadSHA: "abc123"}, Detail: &checkpointDetail{IssueComments: []map[string]any{{"id": int64(91), "body": existingBody}}}}, "run_1", "reviewer:loop:abc123", config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventComment, Blocking: config.ReviewerReviewEventComment}, false, false, "", config.ReviewerScopeChangedRanges, config.DefaultDisclosureConfig(), "opencode", "", "/opt/looper/bin/looper", false, true, "", "")
 
 	if !strings.Contains(prompt, "Existing Reviewer Summary authority") {
 		t.Fatalf("prompt missing reviewer summary authority:\n%s", prompt)

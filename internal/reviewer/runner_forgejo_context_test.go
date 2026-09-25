@@ -29,7 +29,7 @@ func TestForgejoReviewerPromptUsesPersistedURLAndConfiguredTransport(t *testing.
 			if err := json.Unmarshal(encoded, &resumed); err != nil {
 				t.Fatal(err)
 			}
-			prompt, _ := buildReviewPromptWithInstructions("p", cfg, "core/looper", 42, resumed, "run", "reviewer:loop:abc123", config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventApprove, Blocking: config.ReviewerReviewEventRequestChanges}, false, true, "", config.ReviewerScopeChangedRanges, config.DefaultDisclosureConfig(), "codex", "", "/opt/looper", false, legacy, "")
+			prompt, _ := buildReviewPromptWithInstructions("p", cfg, "core/looper", 42, resumed, "run", "reviewer:loop:abc123", config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventApprove, Blocking: config.ReviewerReviewEventRequestChanges}, false, true, "", config.ReviewerScopeChangedRanges, config.DefaultDisclosureConfig(), "codex", "", "/opt/looper", false, legacy, "", "")
 			wantURL := actualURL
 			if wantURL == "" {
 				wantURL = "https://code.example/forge/core/looper/pulls/42"

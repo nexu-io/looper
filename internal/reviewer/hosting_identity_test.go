@@ -8,7 +8,7 @@ import (
 )
 
 func TestHostingIdentityReviewerPromptUsesBrokerForEveryRead(t *testing.T) {
-	prompt, _ := buildReviewPromptWithInstructions("project", config.Config{}, "acme/looper", 42, reviewerCheckpoint{Snapshot: &checkpointSnapshot{HeadSHA: "abc123"}}, "run", "reviewer:head", config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventComment, Blocking: config.ReviewerReviewEventComment}, false, true, "", config.ReviewerScopeFullPR, config.DefaultDisclosureConfig(), "opencode", "", "/opt/looper/bin/looper", false, false, "", config.HostingIdentityGitHubApp)
+	prompt, _ := buildReviewPromptWithInstructions("project", config.Config{}, "acme/looper", 42, reviewerCheckpoint{Snapshot: &checkpointSnapshot{HeadSHA: "abc123"}}, "run", "reviewer:head", config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventComment, Blocking: config.ReviewerReviewEventComment}, false, true, "", config.ReviewerScopeFullPR, config.DefaultDisclosureConfig(), "opencode", "", "/opt/looper/bin/looper", false, false, "", "", config.HostingIdentityGitHubApp)
 	for _, want := range []string{`"$LOOPER_HOST_CLI" host api pulls/42`, `host api pulls/42/reviews --paginate`, `git diff --name-status <base_sha>...<head_sha>`, `host threads 42`, `review submit`, `findings`, `scopeEvidence`} {
 		if !strings.Contains(prompt, want) {
 			t.Errorf("bot reviewer prompt lost %q", want)
@@ -34,7 +34,7 @@ func TestHostingIdentityReviewerPromptRetainsSeedDriftChecks(t *testing.T) {
 				Detail:   &checkpointDetail{State: "OPEN", BaseRefName: "main", HeadRefName: "looper/feature", IsDraft: false},
 				Snapshot: &checkpointSnapshot{HeadSHA: "abc123"},
 			}
-			prompt, _ := buildReviewPromptWithInstructions("project", cfg, "acme/looper", 42, checkpoint, "run", "reviewer:head", config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventComment, Blocking: config.ReviewerReviewEventComment}, false, true, "", config.ReviewerScopeFullPR, config.DefaultDisclosureConfig(), "opencode", "", "/opt/looper/bin/looper", false, false, "", kind)
+			prompt, _ := buildReviewPromptWithInstructions("project", cfg, "acme/looper", 42, checkpoint, "run", "reviewer:head", config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventComment, Blocking: config.ReviewerReviewEventComment}, false, true, "", config.ReviewerScopeFullPR, config.DefaultDisclosureConfig(), "opencode", "", "/opt/looper/bin/looper", false, false, "", "", kind)
 			for _, want := range []string{
 				"Minimal PR seed (authoritative handoff fields",
 				`"head_sha": "abc123"`, `"base_ref": "main"`, `"head_ref": "looper/feature"`,
