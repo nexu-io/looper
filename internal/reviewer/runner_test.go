@@ -9228,7 +9228,7 @@ func TestBuildReviewPromptIncludesActionableQualityContract(t *testing.T) {
 		"every must_fix finding must live in inline `comments`",
 		"Looper **does** parse this findings list",
 		"Review method skills:",
-		"Every listed skill MUST be read from the given absolute paths before reviewing.",
+		"configured references and absolute paths are resolved at review time in the prepared worktree",
 		"looper-review",
 		"<run-local builtin skill path>",
 	} {

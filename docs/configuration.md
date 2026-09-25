@@ -969,11 +969,17 @@ Reviewer skills live at `roles.reviewer.skills` (and `projects[].roles.reviewer.
 
 `replace` requires at least one entry in `required`. Arrays replace as a whole; an explicit empty array clears the inherited list.
 
-Name lookup (first match wins): `{worktree}/.agents/skills/`, then `~/.agents/skills/`, then Looper's materialized builtin bundle. Matching uses the `SKILL.md` YAML `name:` field, not the directory name alone. Unconfigured user/project skills are never auto-enabled.
+Name lookup (first match wins): `{worktree}/.agents/skills/`, then `~/.agents/skills/`, then Looper's materialized builtin bundle. A name `security-review` selects `security-review/SKILL.md` in that layer, and its YAML `name:` must equal `security-review`. Name references are single directory names; arbitrary directory names or standalone files must be selected with an explicit path. The builtin `looper-review` uses the materialized bundle root. Unconfigured user/project skills are never auto-enabled.
+
+Skill files must be regular files (symlinks to regular files are supported). YAML frontmatter, including its delimiters, must fit within the first 64 KiB. Resolution reads only that bounded prefix, so a long skill body does not increase discovery memory use. Resolution opens only the configured names or paths; it does not scan unrelated skill files.
 
 In `extend` mode, builtin `looper-review` is injected from the builtin bundle directly. A project or user file named `looper-review` cannot shadow it; use `replace` to drop builtin.
 
-Two different real files at the same lookup layer with the same `name:` is a configuration error. Symlink aliases of one real path are deduped. A high-priority file that exists but is unreadable or has invalid frontmatter fails the review; Looper does not fall back to a lower layer. Missing required skills fail the review; missing optional skills are recorded as `reviewSkillsUnavailable` and the run continues.
+The builtin bundle is materialized only when selected: always in `extend`, or when `replace` resolves `looper-review` from the builtin layer. Custom-only replacement does not require a writable system temporary directory for builtin skills.
+
+References to the same real path are deduped, including symlink aliases. A selected high-priority file that exists but is unreadable, has invalid frontmatter, or declares a different name fails the review; Looper does not fall back to a lower layer. Missing required skills fail the review; missing optional skills are recorded as `reviewSkillsUnavailable` and the run continues.
+
+Required references reject blank entries, surrounding whitespace and duplicates during config validation. Optional references are trimmed, empty entries are ignored, and references resolving to the same real file are deduplicated.
 
 Refs that start with `./`, `../`, `/`, or `~/` are paths. `~/` expands to the daemon user's home directory. Relative paths are resolved against the prepared reviewer worktree. Absolute paths are user-managed.
 

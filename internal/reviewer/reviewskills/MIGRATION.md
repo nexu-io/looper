@@ -28,14 +28,14 @@ Equivalent METHOD migration from `buildReviewPromptWithInstructions`. Execution 
 | "Write substantially more detail" | `builtin/references/comment-quality.md` |
 | "Do not repeat the overall body/summary as a comment" | `builtin/references/comment-quality.md` |
 | fixture-matrix paragraph | `builtin/references/comment-quality.md` |
-| CSS linting (on-demand; CSS/style files only) | `builtin/references/css-lint.md` |
+| CSS linting (on-demand for CSS parser/linter implementation changes, including non-style files; not ordinary CSS-only edits) | `builtin/references/css-lint.md` |
 | Evidence rules (race/leak/security/loop-var/contract/test suggestions) | `builtin/references/evidence.md` |
-| Counterexample pass (drop only if factually wrong or same root cause) | `builtin/references/evidence.md` |
+| Counterexample pass on evidence-backed candidates (drop disproved findings or same-root-cause duplicates) | `builtin/references/evidence.md` |
 | Implementation review rubric | `builtin/references/implementation-rubric.md` |
 | Long severity rubric ("mark a finding as BLOCKING only when…") | `builtin/references/implementation-rubric.md` |
 | Long finding-accumulator essay | `builtin/references/implementation-rubric.md` |
 | Spec/docs review rubric | `builtin/references/spec-rubric.md` |
-| Procedure (intent → enumerate without shrinking → surrounding context → large-PR related-file plan → accumulate → same-context counterexample pass → existing schema) | `builtin/SKILL.md` |
+| Procedure (intent → enumerate without shrinking → surrounding context → large-PR related-file plan → establish findings with concrete evidence → same-context counterexample pass → existing schema) | `builtin/SKILL.md` |
 
 ## DELETED-DUPLICATE
 
@@ -53,7 +53,7 @@ Measured from the migrated METHOD string bodies (UTF-8) plus the injected skill-
 | Skill index placeholder | 0 | 495 | +495 |
 | Native first-pass net | | | **-3368** |
 | Comment-only extra METHOD body (non-overlapping) | 661 | 0 | -661 |
-| Embedded skill tree (`builtin/`) | 0 | 5674 | +5674 (not in the core prompt) |
+| Embedded skill tree (`builtin/`) | 0 | 18190 | +18190 (not in the core prompt) |
 
 Approximate assembled native first-pass prompt with typical seed/disclosure: **~21.5 KiB before**, **~18.2 KiB after** (net about -3.3 KiB from METHOD extraction, plus a ~0.5 KiB index). Comment-only prompts lose the extra ~0.6 KiB duplicate METHOD copy. Runtime materialized indexes add an absolute temp path (~80–120 bytes) instead of the placeholder.
 

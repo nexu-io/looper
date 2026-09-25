@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/nexu-io/looper/internal/config"
+	"github.com/nexu-io/looper/internal/loops"
 	"github.com/nexu-io/looper/internal/storage"
 )
 
@@ -14,6 +15,24 @@ func coverageMustFix() reviewerCommentOnlyFindingResult {
 	return reviewerCommentOnlyFindingResult{
 		Title: "Bug", Body: "Nil deref", Disposition: reviewFindingDispositionMustFix, Severity: reviewFindingSeverityBlocking,
 		ScopeBasis: reviewFindingScopeIntroducedRegression, ScopeEvidence: "new path",
+	}
+}
+
+func TestRecoveredCoverageDoesNotChangeMarkerRequirements(t *testing.T) {
+	t.Parallel()
+	completion := reviewerCommentOnlyCompletion{Summary: "Bug", Outcome: "blocking", Findings: []reviewerCommentOnlyFindingResult{coverageMustFix()}}
+	var requirements []bool
+	for _, coverage := range []*reviewerCoverageReport{nil, {PassKind: "first_pass", Incomplete: []string{"unreviewed.go"}}} {
+		completion.Coverage = coverage
+		payload, err := json.Marshal(completion)
+		if err != nil {
+			t.Fatal(err)
+		}
+		summary := recoveredReviewerSummaryJSON(AgentResult{Stdout: "__LOOPER_RESULT__=" + string(payload)})
+		requirements = append(requirements, pendingNativeMustFixRequiresActionableMarker(pendingReviewCheckpoint{ReviewerSummaryJSON: summary}))
+	}
+	if requirements[0] != requirements[1] {
+		t.Fatalf("adding advisory coverage changed recovered marker requirements: %v", requirements)
 	}
 }
 
@@ -212,5 +231,116 @@ func TestRunReviewStepPersistsCleanNativeCoverage(t *testing.T) {
 	}
 	if checkpoint.PendingReview == nil || !strings.Contains(checkpoint.PendingReview.ReviewerSummaryJSON, `"passKind":"first_pass"`) {
 		t.Fatalf("pending = %#v, want persisted coverage for clean native review", checkpoint.PendingReview)
+	}
+}
+
+func TestProcessClaimedItemRetainsCoverageAcrossRecoveryAndScopePark(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		status       string
+		parseStatus  string
+		needsHuman   bool
+		publishMode  config.ReviewerPublishMode
+		findingsJSON string
+	}{
+		{name: "failed native marker recovery", status: "failed", parseStatus: "parsed"},
+		{name: "unparsed native marker recovery", status: "completed", parseStatus: "failed"},
+		{name: "failed recovery with legacy finding", status: "failed", parseStatus: "parsed", findingsJSON: `[{"title":"Legacy finding"}]`},
+		{name: "unparsed recovery with malformed findings", status: "completed", parseStatus: "failed", findingsJSON: `{"legacy":"findings format"}`},
+		{name: "native scope park", status: "completed", parseStatus: "parsed", needsHuman: true},
+		{name: "comment-only scope park", status: "completed", parseStatus: "parsed", needsHuman: true, publishMode: config.ReviewerPublishModeSummaryComment},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			fixture := newRunnerFixture(t)
+			ctx := context.Background()
+			completion := reviewerCommentOnlyCompletion{
+				Summary: "No actionable findings", Outcome: "clean",
+				Coverage: &reviewerCoverageReport{PassKind: "first_pass", Incomplete: []string{"unreviewed.go"}, IncompleteReasons: []string{"budget exhausted"}},
+			}
+			if tc.needsHuman {
+				completion.Summary, completion.Outcome = "Need human", "blocking"
+				completion.Findings = []reviewerCommentOnlyFindingResult{{
+					Title: "Ambiguous scope", Body: "Clarify the requested behavior", Disposition: "needs_human", Severity: "blocking",
+					ScopeBasis: "ambiguous_intent", ScopeEvidence: "PR non-goals", Path: "a.go", Line: 1,
+				}}
+			}
+			payload, err := json.Marshal(completion)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.findingsJSON != "" {
+				var envelope map[string]json.RawMessage
+				if err := json.Unmarshal(payload, &envelope); err != nil {
+					t.Fatal(err)
+				}
+				envelope["findings"] = json.RawMessage(tc.findingsJSON)
+				payload, err = json.Marshal(envelope)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			github := &fakeGitHubGateway{reviewRequests: []string{"octocat"}, reviewMarkerMissing: tc.needsHuman, reviewMarkerOutcome: "clean", reviewMarkerEvent: ReviewEventComment}
+			agent := &fakeAgentExecutor{results: []AgentResult{{Status: tc.status, Summary: completion.Summary, ParseStatus: tc.parseStatus, Stdout: "__LOOPER_RESULT__=" + string(payload)}}}
+			cfg, err := config.DefaultConfig(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			cfg.HITL.Enabled = false
+			cfg.Roles.Reviewer.Behavior.ReviewEvents.Clean = config.ReviewerReviewEventComment
+			if tc.publishMode != "" {
+				cfg.Roles.Reviewer.Behavior.PublishMode = tc.publishMode
+			}
+			runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, CustomInstructions: &cfg, LoopConfig: testReviewerLoopConfig()})
+			repo, prNumber := "acme/looper", int64(42)
+			metadata := `{"followUpdates":true,"loop":{"enabled":true}}`
+			loop := storage.LoopRecord{ID: "coverage_lifecycle", Seq: 1, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "queued", MetadataJSON: &metadata, CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+			if err := fixture.repos.Loops.Upsert(ctx, loop); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := runner.enqueue(ctx, enqueueInput{ProjectID: "project_1", LoopID: loop.ID, Repo: repo, PRNumber: prNumber}); err != nil {
+				t.Fatal(err)
+			}
+			claim, err := fixture.repos.Queue.ClaimNextOfType(ctx, fixture.nowISO(), "coverage-worker", "reviewer")
+			if err != nil || claim == nil {
+				t.Fatalf("ClaimNextOfType() = (%#v, %v)", claim, err)
+			}
+			result, err := runner.ProcessClaimedItem(ctx, *claim)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var persisted reviewerCommentOnlyCompletion
+			if tc.needsHuman {
+				updated, err := fixture.repos.Loops.GetByID(ctx, loop.ID)
+				if err != nil || updated == nil || !loops.IsReviewScopeHumanHold(*updated) || result.Status != "skipped" {
+					t.Fatalf("scope park = (%#v, %v), result = %#v", updated, err, result)
+				}
+				evidence := loops.ReadReviewScopeHumanState(updated.MetadataJSON).Evidence
+				if err := json.Unmarshal([]byte(evidence), &persisted); err != nil {
+					t.Fatalf("parked evidence did not preserve the completion: %v; %s", err, evidence)
+				}
+				if len(persisted.Findings) != 1 || persisted.Findings[0].Disposition != "needs_human" {
+					t.Fatalf("parked findings = %#v", persisted.Findings)
+				}
+			} else {
+				if result.Status != "success" {
+					t.Fatalf("recovered result = %#v", result)
+				}
+				run, err := fixture.repos.Runs.GetByID(ctx, result.RunID)
+				if err != nil || run == nil {
+					t.Fatalf("Runs.GetByID() = (%#v, %v)", run, err)
+				}
+				pending := parseCheckpoint(run.CheckpointJSON).PendingReview
+				if pending == nil {
+					t.Fatal("recovered run has no pending review checkpoint")
+				}
+				if err := json.Unmarshal([]byte(pending.ReviewerSummaryJSON), &persisted); err != nil {
+					t.Fatalf("recovered completion was not persisted: %v", err)
+				}
+			}
+			if persisted.Coverage == nil || len(persisted.Coverage.Incomplete) != 1 || persisted.Coverage.Incomplete[0] != "unreviewed.go" {
+				t.Fatalf("persisted coverage = %#v", persisted.Coverage)
+			}
+		})
 	}
 }

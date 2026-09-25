@@ -4959,11 +4959,8 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 		return checkpoint, fmt.Errorf("resolve run agent identity: %w", err)
 	}
 	lastPublishedHeadSHA, _ := stringFromAny(parseJSONObject(input.Loop.MetadataJSON)["lastPublishedHeadSha"])
-	skillBundle, err := reviewskills.MaterializeBuiltin()
-	if err != nil {
-		return checkpoint, fmt.Errorf("materialize reviewer skills: %w", err)
-	}
-	defer skillBundle.Close()
+	var skillBundle *reviewskills.Bundle
+	defer func() { skillBundle.Close() }()
 	skillsCfg := config.ReviewerSkillsConfig{Mode: config.ReviewerSkillsModeExtend}
 	if r.projectRoleConfig != nil {
 		skillsCfg = config.ProjectRoleConfigs(*r.projectRoleConfig, input.Project.ID).Reviewer.Skills
@@ -4973,12 +4970,19 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 		return checkpoint, failureclass.WithBoundary(fmt.Errorf("resolve reviewer skills: %w", homeErr), failureclass.BoundaryConfig)
 	}
 	resolvedSkills, err := reviewskills.Resolve(reviewskills.ResolveInput{
-		Mode:       skillsCfg.Mode,
-		Required:   skillsCfg.Required,
-		Optional:   skillsCfg.Optional,
-		Worktree:   worktree.Path,
-		UserHome:   userHome,
-		BuiltinDir: skillBundle.Dir,
+		Mode:     skillsCfg.Mode,
+		Required: skillsCfg.Required,
+		Optional: skillsCfg.Optional,
+		Worktree: worktree.Path,
+		UserHome: userHome,
+		LoadBuiltin: func() (string, error) {
+			var err error
+			skillBundle, err = reviewskills.MaterializeBuiltin()
+			if err != nil {
+				return "", fmt.Errorf("materialize reviewer skills: %w", err)
+			}
+			return skillBundle.Dir, nil
+		},
 	})
 	if err != nil {
 		return checkpoint, failureclass.WithBoundary(fmt.Errorf("resolve reviewer skills: %w", err), failureclass.BoundaryConfig)
@@ -5082,7 +5086,7 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 		if found, err := r.verifyAgentNativeReviewMarker(ctx, input, checkpoint.Snapshot.HeadSHA, idempotencyKey, cleanReviewAuthorLogin(checkpoint, PullRequestDetail{})); err != nil {
 			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 		} else if found.Found {
-			checkpoint.PendingReview = &pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, IdempotencyKey: idempotencyKey, Event: reviewEventAgentNative, Summary: result.Summary, Outcome: normalizeCommentOnlyOutcome(found.Outcome), ContentFingerprint: reviewMarkerFingerprint(found)}
+			checkpoint.PendingReview = &pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, IdempotencyKey: idempotencyKey, Event: reviewEventAgentNative, Summary: result.Summary, Outcome: normalizeCommentOnlyOutcome(found.Outcome), ContentFingerprint: reviewMarkerFingerprint(found), ReviewerSummaryJSON: recoveredReviewerSummaryJSON(result)}
 			checkpoint.ResumePolicy = "advance_from_checkpoint"
 			return checkpoint, nil
 		}
@@ -5105,7 +5109,7 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 		if found, err := r.verifyAgentNativeReviewMarker(ctx, input, checkpoint.Snapshot.HeadSHA, idempotencyKey, cleanReviewAuthorLogin(checkpoint, PullRequestDetail{})); err != nil {
 			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 		} else if found.Found {
-			checkpoint.PendingReview = &pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, IdempotencyKey: idempotencyKey, Event: reviewEventAgentNative, Summary: result.Summary, Outcome: normalizeCommentOnlyOutcome(found.Outcome), ContentFingerprint: reviewMarkerFingerprint(found)}
+			checkpoint.PendingReview = &pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, IdempotencyKey: idempotencyKey, Event: reviewEventAgentNative, Summary: result.Summary, Outcome: normalizeCommentOnlyOutcome(found.Outcome), ContentFingerprint: reviewMarkerFingerprint(found), ReviewerSummaryJSON: recoveredReviewerSummaryJSON(result)}
 			checkpoint.ResumePolicy = "advance_from_checkpoint"
 			return checkpoint, nil
 		}
@@ -6608,8 +6612,36 @@ func parseReviewerNativeCompletion(result AgentResult) (reviewerCommentOnlyCompl
 	return validateReviewerCommentOnlyCompletion(completion)
 }
 
+// Recovery accepts the already-published marker independently of optional
+// coverage. Store only the advisory report here: conditionally adding findings
+// would change pendingNativeMustFixRequiresActionableMarker based on coverage.
+func recoveredReviewerSummaryJSON(result AgentResult) string {
+	var envelope struct {
+		Coverage json.RawMessage `json:"coverage"`
+	}
+	if err := decodeReviewerCompletionMarker(result, &envelope); err != nil {
+		return ""
+	}
+	coverage := sanitizeReviewerCoverage(decodeOptionalReviewerCoverage(envelope.Coverage))
+	if coverage == nil {
+		return ""
+	}
+	payload, err := json.Marshal(struct {
+		Coverage *reviewerCoverageReport `json:"coverage"`
+	}{Coverage: coverage})
+	if err != nil {
+		return ""
+	}
+	return string(payload)
+}
+
 func unmarshalReviewerCompletionMarker(result AgentResult) (reviewerCommentOnlyCompletion, error) {
 	var completion reviewerCommentOnlyCompletion
+	err := decodeReviewerCompletionMarker(result, &completion)
+	return completion, err
+}
+
+func decodeReviewerCompletionMarker(result AgentResult, target any) error {
 	raw := result.Stdout
 	if strings.TrimSpace(result.Stderr) != "" {
 		raw += "\n" + result.Stderr
@@ -6621,12 +6653,9 @@ func unmarshalReviewerCompletionMarker(result AgentResult) (reviewerCommentOnlyC
 			continue
 		}
 		payload := strings.TrimPrefix(line, agent.CompletionMarkerPrefix)
-		if err := json.Unmarshal([]byte(payload), &completion); err != nil {
-			return reviewerCommentOnlyCompletion{}, err
-		}
-		return completion, nil
+		return json.Unmarshal([]byte(payload), target)
 	}
-	return reviewerCommentOnlyCompletion{}, fmt.Errorf("completion marker is required")
+	return fmt.Errorf("completion marker is required")
 }
 
 func validateReviewerCommentOnlyCompletion(completion reviewerCommentOnlyCompletion) (reviewerCommentOnlyCompletion, error) {
@@ -6923,7 +6952,11 @@ func authorityInputChangeHint(scopeBasis, scopeEvidence string) string {
 }
 
 func commentOnlyNeedsHumanEvidence(completion reviewerCommentOnlyCompletion) string {
-	payload, err := json.Marshal(completion.Findings)
+	var evidence any = completion.Findings
+	if completion.Coverage != nil {
+		evidence = completion
+	}
+	payload, err := json.Marshal(evidence)
 	if err != nil {
 		return ""
 	}
@@ -9790,7 +9823,7 @@ func buildPullRequestLockKey(item storage.QueueItemRecord) string {
 func buildReviewPrompt(repo string, prNumber int64, checkpoint reviewerCheckpoint, runID string, idempotencyKey string, reviewEvents config.ReviewerReviewEventsConfig, manual bool, scope config.ReviewerScope, disclosureCfg config.DisclosureConfig, agentRuntime string, agentModel string, looperCLIPath string) string {
 	cfg, _ := config.Normalize("")
 	cfg.Instructions.Enabled = false
-	prompt, _ := buildReviewPromptWithInstructions("", cfg, repo, prNumber, checkpoint, runID, idempotencyKey, reviewEvents, manual, true, "", scope, disclosureCfg, agentRuntime, agentModel, looperCLIPath, false, false, "", reviewskills.PreviewIndexPlaceholder())
+	prompt, _ := buildReviewPromptWithInstructions("", cfg, repo, prNumber, checkpoint, runID, idempotencyKey, reviewEvents, manual, true, "", scope, disclosureCfg, agentRuntime, agentModel, looperCLIPath, false, false, "", reviewskills.PreviewIndex(config.ProjectRoleConfigs(cfg, "").Reviewer.Skills))
 	return prompt
 }
 
