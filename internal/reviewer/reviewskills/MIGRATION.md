@@ -27,12 +27,15 @@ Equivalent METHOD migration from `buildReviewPromptWithInstructions`. Execution 
 | Bad comment example / Good spec/docs comment example | `builtin/references/comment-quality.md` |
 | "Write substantially more detail" | `builtin/references/comment-quality.md` |
 | "Do not repeat the overall body/summary as a comment" | `builtin/references/comment-quality.md` |
-| fixture-matrix + CSS linting paragraph | `builtin/references/comment-quality.md` |
+| fixture-matrix paragraph | `builtin/references/comment-quality.md` |
+| CSS linting (on-demand for CSS parser/linter implementation changes, including non-style files; not ordinary CSS-only edits) | `builtin/references/css-lint.md` |
+| Evidence rules (race/leak/security/loop-var/contract/test suggestions) | `builtin/references/evidence.md` |
+| Counterexample pass on evidence-backed candidates (drop disproved findings or same-root-cause duplicates) | `builtin/references/evidence.md` |
 | Implementation review rubric | `builtin/references/implementation-rubric.md` |
 | Long severity rubric ("mark a finding as BLOCKING only when…") | `builtin/references/implementation-rubric.md` |
 | Long finding-accumulator essay | `builtin/references/implementation-rubric.md` |
 | Spec/docs review rubric | `builtin/references/spec-rubric.md` |
-| Short procedure (understand intent → enumerate → read context → accumulate → apply prompt disposition schema) | `builtin/SKILL.md` |
+| Procedure (intent → enumerate without shrinking → surrounding context → large-PR related-file plan → establish findings with concrete evidence → same-context counterexample pass → existing schema) | `builtin/SKILL.md` |
 
 ## DELETED-DUPLICATE
 
@@ -50,6 +53,8 @@ Measured from the migrated METHOD string bodies (UTF-8) plus the injected skill-
 | Skill index placeholder | 0 | 495 | +495 |
 | Native first-pass net | | | **-3368** |
 | Comment-only extra METHOD body (non-overlapping) | 661 | 0 | -661 |
-| Embedded skill tree (`builtin/`) | 0 | 5674 | +5674 (not in the core prompt) |
+| Embedded skill tree (`builtin/`) | 0 | 18190 | +18190 (not in the core prompt) |
 
 Approximate assembled native first-pass prompt with typical seed/disclosure: **~21.5 KiB before**, **~18.2 KiB after** (net about -3.3 KiB from METHOD extraction, plus a ~0.5 KiB index). Comment-only prompts lose the extra ~0.6 KiB duplicate METHOD copy. Runtime materialized indexes add an absolute temp path (~80–120 bytes) instead of the placeholder.
+
+The builtin skill includes evidence, counterexample, on-demand CSS lint, and large-PR related-file planning guidance. Model-quality evaluations are maintained in a separate system. This repository keeps functional and regression tests for the review contracts; method-text changes alone do not establish a quality improvement.

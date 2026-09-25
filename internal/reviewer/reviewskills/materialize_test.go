@@ -55,6 +55,8 @@ func TestMaterializeBuiltinReadableFromUnrelatedCwd(t *testing.T) {
 	}
 	for _, rel := range []string{
 		"references/comment-quality.md",
+		"references/css-lint.md",
+		"references/evidence.md",
 		"references/implementation-rubric.md",
 		"references/spec-rubric.md",
 	} {
@@ -228,6 +230,21 @@ func TestBuiltinSkillFilesContainMigratedMethodText(t *testing.T) {
 		"Spec/docs review rubric",
 		"mark a finding as BLOCKING only when",
 		"group repeated patterns into systemic comments with representative examples only when they share a root cause",
+		"A missing reproduction is not disproof",
+		"Drop an evidence-backed candidate only when evidence proves it factually wrong",
+		"internal related-file plan",
+		"Read the surrounding context needed to judge each change",
+		"CSS parsing or linting logic",
+		"A type documented as not concurrent does not disprove a race",
+		"conflicting concurrent accesses",
+		"same shared memory location",
+		"interprets them unsafely",
+		"ownership, tenant, or other authorization check",
+		"Authentication or authorization to invoke an operation does not make",
+		"The authority for dropping a candidate is that same review context",
+		"the preexisting `v` is reused",
+		"With Go 1.23+ timer semantics, the garbage collector can recover unreferenced, unstopped timers and tickers",
+		"Stay one reviewer",
 	} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("materialized skills missing %q", want)
