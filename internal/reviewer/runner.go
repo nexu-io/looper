@@ -669,6 +669,32 @@ type reviewerCommentOnlyCompletion struct {
 	Summary  string                             `json:"summary"`
 	Outcome  string                             `json:"outcome"`
 	Findings []reviewerCommentOnlyFindingResult `json:"findings"`
+	Coverage *reviewerCoverageReport            `json:"coverage,omitempty"`
+}
+
+func (c *reviewerCommentOnlyCompletion) UnmarshalJSON(data []byte) error {
+	var envelope struct {
+		Summary  string                             `json:"summary"`
+		Outcome  string                             `json:"outcome"`
+		Findings []reviewerCommentOnlyFindingResult `json:"findings"`
+		Coverage json.RawMessage                    `json:"coverage,omitempty"`
+	}
+	if err := json.Unmarshal(data, &envelope); err != nil {
+		return err
+	}
+	c.Summary = envelope.Summary
+	c.Outcome = envelope.Outcome
+	c.Findings = envelope.Findings
+	c.Coverage = decodeOptionalReviewerCoverage(envelope.Coverage)
+	return nil
+}
+
+type reviewerCoverageReport struct {
+	PassKind          string   `json:"passKind,omitempty"`
+	ScopeBasis        string   `json:"scopeBasis,omitempty"`
+	Reviewed          []string `json:"reviewed,omitempty"`
+	Incomplete        []string `json:"incomplete,omitempty"`
+	IncompleteReasons []string `json:"incompleteReasons,omitempty"`
 }
 
 type reviewerCommentOnlyFindingResult struct {
@@ -5046,7 +5072,7 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 		if found, err := r.verifyAgentNativeReviewMarker(ctx, input, checkpoint.Snapshot.HeadSHA, idempotencyKey, cleanReviewAuthorLogin(checkpoint, PullRequestDetail{})); err != nil {
 			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 		} else if found.Found {
-			checkpoint.PendingReview = &pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, IdempotencyKey: idempotencyKey, Event: reviewEventAgentNative, Summary: result.Summary, Outcome: normalizeCommentOnlyOutcome(found.Outcome), ContentFingerprint: reviewMarkerFingerprint(found)}
+			checkpoint.PendingReview = &pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, IdempotencyKey: idempotencyKey, Event: reviewEventAgentNative, Summary: result.Summary, Outcome: normalizeCommentOnlyOutcome(found.Outcome), ContentFingerprint: reviewMarkerFingerprint(found), ReviewerSummaryJSON: recoveredReviewerSummaryJSON(result)}
 			checkpoint.ResumePolicy = "advance_from_checkpoint"
 			return checkpoint, nil
 		}
@@ -5069,7 +5095,7 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 		if found, err := r.verifyAgentNativeReviewMarker(ctx, input, checkpoint.Snapshot.HeadSHA, idempotencyKey, cleanReviewAuthorLogin(checkpoint, PullRequestDetail{})); err != nil {
 			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 		} else if found.Found {
-			checkpoint.PendingReview = &pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, IdempotencyKey: idempotencyKey, Event: reviewEventAgentNative, Summary: result.Summary, Outcome: normalizeCommentOnlyOutcome(found.Outcome), ContentFingerprint: reviewMarkerFingerprint(found)}
+			checkpoint.PendingReview = &pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, IdempotencyKey: idempotencyKey, Event: reviewEventAgentNative, Summary: result.Summary, Outcome: normalizeCommentOnlyOutcome(found.Outcome), ContentFingerprint: reviewMarkerFingerprint(found), ReviewerSummaryJSON: recoveredReviewerSummaryJSON(result)}
 			checkpoint.ResumePolicy = "advance_from_checkpoint"
 			return checkpoint, nil
 		}
@@ -5137,7 +5163,7 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 		return r.finishNativeNeedsHumanCompletion(ctx, input, checkpoint, result, nativeCompletion, idempotencyKey)
 	}
 	nativeFindingsJSON := ""
-	if len(nativeCompletion.Findings) > 0 {
+	if len(nativeCompletion.Findings) > 0 || nativeCompletion.Coverage != nil {
 		payload, marshalErr := json.Marshal(nativeCompletion)
 		if marshalErr != nil {
 			return checkpoint, &loopError{message: fmt.Sprintf("marshal reviewer native completion: %v", marshalErr), kind: FailureRetryableAfterResume}
@@ -6566,13 +6592,42 @@ func parseReviewerNativeCompletion(result AgentResult) (reviewerCommentOnlyCompl
 	if len(completion.Findings) == 0 {
 		completion.Summary = strings.TrimSpace(completion.Summary)
 		completion.Outcome = normalizeCommentOnlyOutcome(completion.Outcome)
+		completion.Coverage = sanitizeReviewerCoverage(completion.Coverage)
 		return completion, nil
 	}
 	return validateReviewerCommentOnlyCompletion(completion)
 }
 
+// Recovery accepts the already-published marker independently of optional
+// coverage. Store only the advisory report here: conditionally adding findings
+// would change pendingNativeMustFixRequiresActionableMarker based on coverage.
+func recoveredReviewerSummaryJSON(result AgentResult) string {
+	var envelope struct {
+		Coverage json.RawMessage `json:"coverage"`
+	}
+	if err := decodeReviewerCompletionMarker(result, &envelope); err != nil {
+		return ""
+	}
+	coverage := sanitizeReviewerCoverage(decodeOptionalReviewerCoverage(envelope.Coverage))
+	if coverage == nil {
+		return ""
+	}
+	payload, err := json.Marshal(struct {
+		Coverage *reviewerCoverageReport `json:"coverage"`
+	}{Coverage: coverage})
+	if err != nil {
+		return ""
+	}
+	return string(payload)
+}
+
 func unmarshalReviewerCompletionMarker(result AgentResult) (reviewerCommentOnlyCompletion, error) {
 	var completion reviewerCommentOnlyCompletion
+	err := decodeReviewerCompletionMarker(result, &completion)
+	return completion, err
+}
+
+func decodeReviewerCompletionMarker(result AgentResult, target any) error {
 	raw := result.Stdout
 	if strings.TrimSpace(result.Stderr) != "" {
 		raw += "\n" + result.Stderr
@@ -6584,17 +6639,15 @@ func unmarshalReviewerCompletionMarker(result AgentResult) (reviewerCommentOnlyC
 			continue
 		}
 		payload := strings.TrimPrefix(line, agent.CompletionMarkerPrefix)
-		if err := json.Unmarshal([]byte(payload), &completion); err != nil {
-			return reviewerCommentOnlyCompletion{}, err
-		}
-		return completion, nil
+		return json.Unmarshal([]byte(payload), target)
 	}
-	return reviewerCommentOnlyCompletion{}, fmt.Errorf("completion marker is required")
+	return fmt.Errorf("completion marker is required")
 }
 
 func validateReviewerCommentOnlyCompletion(completion reviewerCommentOnlyCompletion) (reviewerCommentOnlyCompletion, error) {
 	completion.Summary = strings.TrimSpace(completion.Summary)
 	completion.Outcome = normalizeCommentOnlyOutcome(completion.Outcome)
+	completion.Coverage = sanitizeReviewerCoverage(completion.Coverage)
 	if completion.Summary == "" {
 		return reviewerCommentOnlyCompletion{}, fmt.Errorf("reviewer comment-only completion summary is required")
 	}
@@ -6694,6 +6747,51 @@ func validateReviewerCommentOnlyCompletion(completion reviewerCommentOnlyComplet
 		}
 	}
 	return completion, nil
+}
+
+func decodeOptionalReviewerCoverage(raw json.RawMessage) *reviewerCoverageReport {
+	trimmed := strings.TrimSpace(string(raw))
+	if trimmed == "" || trimmed == "null" {
+		return nil
+	}
+	var coverage reviewerCoverageReport
+	if err := json.Unmarshal([]byte(trimmed), &coverage); err != nil {
+		return nil
+	}
+	return &coverage
+}
+
+func sanitizeReviewerCoverage(coverage *reviewerCoverageReport) *reviewerCoverageReport {
+	if coverage == nil {
+		return nil
+	}
+	coverage.PassKind = strings.TrimSpace(coverage.PassKind)
+	coverage.ScopeBasis = strings.TrimSpace(coverage.ScopeBasis)
+	if coverage.PassKind != "first_pass" && coverage.PassKind != "repair_frontier" {
+		return nil
+	}
+	coverage.Reviewed = trimCoverageList(coverage.Reviewed)
+	coverage.Incomplete = trimCoverageList(coverage.Incomplete)
+	coverage.IncompleteReasons = trimCoverageList(coverage.IncompleteReasons)
+	return coverage
+}
+
+func trimCoverageList(values []string) []string {
+	out := values[:0]
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value != "" {
+			out = append(out, value)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func reviewerCoveragePromptInstruction() string {
+	return "You MAY include optional `coverage` in `__LOOPER_RESULT__` with passKind `first_pass` or `repair_frontier`, plus scopeBasis, reviewed paths, incomplete paths, and incompleteReasons. Missing coverage means unknown, not complete. Reading a file or running git diff does not prove semantic review finished. A repair-frontier pass must not claim completeness against the original full diff. Coverage never changes publish eligibility."
 }
 
 func commentOnlyCompletionHasNeedsHuman(completion reviewerCommentOnlyCompletion) bool {
@@ -6840,7 +6938,11 @@ func authorityInputChangeHint(scopeBasis, scopeEvidence string) string {
 }
 
 func commentOnlyNeedsHumanEvidence(completion reviewerCommentOnlyCompletion) string {
-	payload, err := json.Marshal(completion.Findings)
+	var evidence any = completion.Findings
+	if completion.Coverage != nil {
+		evidence = completion
+	}
+	payload, err := json.Marshal(evidence)
 	if err != nil {
 		return ""
 	}
@@ -9960,6 +10062,7 @@ func buildReviewPromptWithInstructions(projectID string, instructionConfig confi
 			"Finding disposition contract: every candidate uses disposition must_fix|follow_up|needs_human, severity blocking|non_blocking|nit, scopeBasis (stated_intent|introduced_regression|required_invariant|independent_improvement|ambiguous_intent), scopeEvidence (specific repository rule, PR goal/non-goal, linked spec section, or regression evidence), plus title/body/location. must_fix becomes remote feedback; follow_up is retained only in structured completion; needs_human must not be published as a change request and parks the pair for human judgment.",
 			"Finalization gate before completion: verify that the scoped changed files/ranges were reviewed, all observed in-scope must_fix findings are included, repeated patterns are consolidated only when they share a root cause, non-blocking/nit feedback is not escalated, every finding has disposition/scope evidence and a suggested fix, and the summary outcome matches the highest must_fix severity.",
 			cleanResultCompletionInstruction,
+			reviewerCoveragePromptInstruction(),
 		)
 		return agent.AppendCompletionInstruction(strings.Join(parts, "\n\n")), instructionBlock
 	}
@@ -10009,6 +10112,7 @@ func buildReviewPromptWithInstructions(projectID string, instructionConfig confi
 		cleanInstruction,
 		blockingInstruction,
 		cleanResultCompletionInstruction,
+		reviewerCoveragePromptInstruction(),
 		"When follow-up findings target the same subsystem or topic as an existing unresolved thread, reply to that thread where possible instead of opening a separate top-level review round.",
 		"Prefer inline comments for specific code-level feedback when you can anchor them confidently to the diff using the changed file path and file line numbers shown in the PR diff.",
 		"Cross-cutting or otherwise unanchorable must_fix findings still require an inline comment on a representative changed-file location; do not submit them as body-only top-level feedback.",
