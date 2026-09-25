@@ -243,6 +243,33 @@ func TestResolveRequiredAndOptionalSamePathDedupes(t *testing.T) {
 	}
 }
 
+func TestResolveQuotedYAMLNameMatchesConfiguredName(t *testing.T) {
+	t.Parallel()
+
+	worktree := t.TempDir()
+	dir := filepath.Join(worktree, ".agents", "skills", "security-review")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+	content := "---\nname: \"security-review\"\ndescription: quoted yaml name\n---\n\n# security-review\n"
+	if err := os.WriteFile(filepath.Join(dir, "SKILL.md"), []byte(content), 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	result, err := Resolve(ResolveInput{
+		Mode:     config.ReviewerSkillsModeReplace,
+		Required: []string{"security-review"},
+		Worktree: worktree,
+		UserHome: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("Resolve() error = %v", err)
+	}
+	if len(result.Entries) != 1 || result.Entries[0].Name != "security-review" {
+		t.Fatalf("entries = %#v, want quoted YAML name match", result.Entries)
+	}
+}
+
 func writeNamedSkill(t *testing.T, dir, name, description string) {
 	t.Helper()
 	if err := os.MkdirAll(dir, 0o755); err != nil {

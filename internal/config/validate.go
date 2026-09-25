@@ -1171,6 +1171,7 @@ func validateReviewerSkillsConfig(skills ReviewerSkillsConfig, path string, issu
 	if mode == "" {
 		mode = ReviewerSkillsModeExtend
 	}
+	validateStringList(skills.Required, path+".required", issues)
 	if mode == ReviewerSkillsModeReplace && len(skills.Required) == 0 {
 		*issues = append(*issues, ValidationIssue{Path: path + ".required", Message: "must contain at least one skill when mode is replace"})
 	}

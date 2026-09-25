@@ -4970,7 +4970,7 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 	}
 	userHome, homeErr := os.UserHomeDir()
 	if homeErr != nil {
-		return checkpoint, fmt.Errorf("resolve reviewer skills: %w", homeErr)
+		return checkpoint, failureclass.WithBoundary(fmt.Errorf("resolve reviewer skills: %w", homeErr), failureclass.BoundaryConfig)
 	}
 	resolvedSkills, err := reviewskills.Resolve(reviewskills.ResolveInput{
 		Mode:       skillsCfg.Mode,
@@ -4981,7 +4981,7 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 		BuiltinDir: skillBundle.Dir,
 	})
 	if err != nil {
-		return checkpoint, fmt.Errorf("resolve reviewer skills: %w", err)
+		return checkpoint, failureclass.WithBoundary(fmt.Errorf("resolve reviewer skills: %w", err), failureclass.BoundaryConfig)
 	}
 	skillIndex := reviewskills.FormatIndex(resolvedSkills.Entries)
 	nativeResumePrompt := r.nativeResumePromptForReview(ctx, input, checkpoint.Snapshot.HeadSHA, idempotencyKey, lastPublishedHeadSHA)
