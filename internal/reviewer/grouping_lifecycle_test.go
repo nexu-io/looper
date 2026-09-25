@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/nexu-io/looper/internal/config"
+	"github.com/nexu-io/looper/internal/hostingidentity"
 	"github.com/nexu-io/looper/internal/infra/specpr"
 	"github.com/nexu-io/looper/internal/storage"
 )
@@ -293,7 +294,7 @@ func TestGroupedReviewBoundsLargePathContext(t *testing.T) {
 		input.Checkpoint.Snapshot.HeadSHA = strings.TrimSpace(string(out))
 	}
 	github.viewHeadSHA = input.Checkpoint.Snapshot.HeadSHA
-	expected, err := listChangedPaths(context.Background(), "git", worktree, input.Checkpoint.Snapshot.BaseSHA, github.viewHeadSHA)
+	expected, err := listChangedPaths(context.Background(), "git", worktree, input.Checkpoint.Snapshot.BaseSHA, github.viewHeadSHA, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -348,5 +349,146 @@ func TestGroupedReviewBoundsLargePathContext(t *testing.T) {
 		if _, err := os.Stat(filepath.Dir(contextPath)); !errors.Is(err, os.ErrNotExist) {
 			t.Fatalf("group context directory remains after completion: %v", err)
 		}
+	}
+}
+
+func TestGroupedReviewDiffsRewrittenRepairFrontierDirectly(t *testing.T) {
+	for _, repair := range []bool{false, true} {
+		t.Run(fmt.Sprintf("repair_%t", repair), func(t *testing.T) {
+			t.Parallel()
+			runner, input, github, agent := groupedReviewLifecycleFixture(t)
+			worktree := input.Checkpoint.Worktree.Path
+			git := func(args ...string) string {
+				t.Helper()
+				out, err := exec.Command("git", append([]string{"-C", worktree}, args...)...).CombinedOutput()
+				if err != nil {
+					t.Fatalf("git %v: %v: %s", args, err, out)
+				}
+				return strings.TrimSpace(string(out))
+			}
+			if err := os.WriteFile(filepath.Join(worktree, "removed-after-rewrite.go"), []byte("package removed\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			git("add", ".")
+			git("commit", "-qm", "feat: previously reviewed file")
+			previous := git("rev-parse", "HEAD")
+			git("checkout", "--detach", input.Checkpoint.Snapshot.BaseSHA)
+			if err := os.WriteFile(filepath.Join(worktree, "README.md"), []byte("rewritten head\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			git("add", ".")
+			git("commit", "-qm", "feat: rewritten branch")
+			head := git("rev-parse", "HEAD")
+			input.Checkpoint.Snapshot.HeadSHA, github.viewHeadSHA = head, head
+			if repair {
+				input.Loop.MetadataJSON = stringPtr(fmt.Sprintf(`{"lastPublishedHeadSha":%q}`, previous))
+			}
+			agent.onStart = func(start AgentRunInput) {
+				_, payload, err := groupedContextPayload(start.Prompt)
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				var data struct {
+					ChangedFiles []changedFile `json:"changedFiles"`
+				}
+				if err := json.Unmarshal(payload, &data); err != nil {
+					t.Error(err)
+					return
+				}
+				found := false
+				for _, file := range data.ChangedFiles {
+					if file.Path == "removed-after-rewrite.go" && file.Status == "D" {
+						found = true
+					}
+				}
+				if found != repair {
+					t.Errorf("prior-head-only deletion present=%t, repair=%t", found, repair)
+				}
+				if repair && start.Metadata["phase"] == "review-group" && !strings.Contains(start.Prompt, "git diff "+previous+" "+head+" -- <path>") {
+					t.Error("repair group missing direct endpoint diff instruction")
+				}
+			}
+			if _, err := runner.executeStep(context.Background(), stepReview, input); err != nil {
+				t.Fatal(err)
+			}
+			wantStarts := 2
+			if repair {
+				wantStarts = 3
+			}
+			if len(agent.starts) != wantStarts {
+				t.Fatalf("starts=%d, want %d", len(agent.starts), wantStarts)
+			}
+		})
+	}
+}
+
+func TestGroupedReviewUsesRefreshedPhaseLabels(t *testing.T) {
+	t.Parallel()
+	runner, input, github, agent := groupedReviewLifecycleFixture(t)
+	github.labels = []string{specpr.ReviewingLabel}
+	agent.onStart = func(AgentRunInput) {
+		if len(agent.starts) == 1 {
+			github.labels = nil
+		}
+		if len(agent.starts) == 2 {
+			github.labels = []string{specpr.ReviewingLabel}
+		}
+	}
+	if _, err := runner.executeStep(context.Background(), stepReview, input); err != nil {
+		t.Fatal(err)
+	}
+	if len(agent.starts) != 3 {
+		t.Fatalf("starts=%d", len(agent.starts))
+	}
+	for i, phase := range []string{"spec", "implementation", "spec"} {
+		if !strings.Contains(agent.starts[i].Prompt, "Phase: "+phase) {
+			t.Errorf("execution %d did not use live %s phase", i, phase)
+		}
+	}
+}
+
+func TestGroupedReviewIncludesProviderContext(t *testing.T) {
+	for _, mode := range []string{"github", "forgejo", "hosted-github", "hosted-forgejo"} {
+		t.Run(mode, func(t *testing.T) {
+			t.Parallel()
+			runner, input, _, agent := groupedReviewLifecycleFixture(t)
+			ctx := context.Background()
+			isForgejo := strings.Contains(mode, "forgejo")
+			kind, identityKind, baseURL := config.ProviderKindGitHub, config.HostingIdentityGitHubApp, "https://github.com"
+			if isForgejo {
+				kind, identityKind, baseURL = config.ProviderKindForgejo, config.HostingIdentityForgejoToken, "https://forge.example"
+				runner.customInstructions.Providers = []config.ProviderConfig{{ID: "forge", Kind: kind, BaseURL: baseURL, Auth: config.ProviderAuthTea, TeaLogin: stringPtr("review-test")}}
+				runner.customInstructions.Projects = []config.ProjectRefConfig{{ID: input.Project.ID, Provider: "forge", Repo: input.Repo}}
+			}
+			if strings.HasPrefix(mode, "hosted-") {
+				var err error
+				ctx, err = hostingidentity.BindResolved(ctx, config.ResolvedHostingIdentity{Name: "test", ProjectID: input.Project.ID, Role: "reviewer", Definition: config.HostingIdentityConfig{Kind: identityKind, BaseURL: baseURL, AppID: 1, InstallationID: 2, PrivateKeyFile: "unused.pem", TokenEnv: "UNUSED_TEST_TOKEN"}, Target: config.RepositoryIdentity{Kind: kind, BaseURL: baseURL, Repo: input.Repo}})
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := runner.executeStep(ctx, stepReview, input); err != nil {
+				t.Fatal(err)
+			}
+			for _, start := range agent.starts[:2] {
+				for _, want := range []string{"Minimal PR seed", `"pr_number": 42`, input.Checkpoint.Snapshot.HeadSHA, "Do not publish"} {
+					if !strings.Contains(start.Prompt, want) {
+						t.Errorf("group missing %q", want)
+					}
+				}
+				if strings.HasPrefix(mode, "hosted-") {
+					if !strings.Contains(start.Prompt, `"$LOOPER_HOST_CLI" host api pulls/42`) || strings.Contains(start.Prompt, "gh pr view") || strings.Contains(start.Prompt, "tea' api") {
+						t.Error("hosted group did not get exclusive host transport")
+					}
+				} else if isForgejo {
+					if !strings.Contains(start.Prompt, "https://forge.example/acme/looper/pulls/42") || !strings.Contains(start.Prompt, "'tea' api --login 'review-test'") || strings.Contains(start.Prompt, "gh pr view") {
+						t.Error("Forgejo group did not get configured PR/read transport")
+					}
+				} else if !strings.Contains(start.Prompt, "gh pr view") {
+					t.Error("GitHub group missing read context")
+				}
+			}
+		})
 	}
 }

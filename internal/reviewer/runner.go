@@ -5012,6 +5012,19 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 			nativeResumePrompt += "\n\n" + groupedContext
 		}
 	}
+	if freshDetail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.Project.RepoPath}); err != nil {
+		return checkpoint, &loopError{message: fmt.Sprintf("Failed to refresh pull request before starting reviewer agent: %v", err), kind: FailureRetryableAfterResume}
+	} else {
+		checkpoint.Detail.Labels = cloneStrings(freshDetail.Labels)
+		if domain.IsAutomaticLoopHeld(domain.LoopTypeReviewer, isManualReviewerLoop(input.Loop), freshDetail.Labels) {
+			return checkpoint, &holdSkipError{summary: fmt.Sprintf("Reviewer stopped because %s#%d is currently held", input.Repo, input.PRNumber)}
+		}
+		if relatedFileGroupsConfig(r, input.Project.ID).Enabled && strings.TrimSpace(freshDetail.HeadSHA) != strings.TrimSpace(checkpoint.Snapshot.HeadSHA) {
+			checkpoint.PendingReview = nil
+			checkpoint.ResumePolicy = "restart_from_discover"
+			return checkpoint, &loopError{message: fmt.Sprintf("PR head changed before final grouped reviewer: expected %s, got %s", checkpoint.Snapshot.HeadSHA, freshDetail.HeadSHA), kind: FailureRetryableAfterResume, interrupted: true}
+		}
+	}
 	prompt, instructionBlock := buildReviewPromptWithInstructions(input.Project.ID, r.customInstructions, input.Repo, input.PRNumber, checkpoint, input.Run.ID, idempotencyKey, reviewEvents, isManualReviewerLoop(input.Loop), requireReviewRequest, reviewRequestBypassReason, r.scope, r.disclosure, agentVendor, derefString(agentModel), r.looperCLIPath, r.reviewerAutoMergeConfigForProject(input.Project.ID).Enabled, commentOnlyCompletion, lastPublishedHeadSHA, skillIndex, hostingKindForContext(ctx))
 
 	metadata := map[string]any{
@@ -5033,19 +5046,7 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 	for key, value := range config.CustomInstructionMetadata(instructionBlock, prompt) {
 		metadata[key] = value
 	}
-	if freshDetail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.Project.RepoPath}); err != nil {
-		return checkpoint, &loopError{message: fmt.Sprintf("Failed to refresh pull request before starting reviewer agent: %v", err), kind: FailureRetryableAfterResume}
-	} else {
-		checkpoint.Detail.Labels = cloneStrings(freshDetail.Labels)
-		if domain.IsAutomaticLoopHeld(domain.LoopTypeReviewer, isManualReviewerLoop(input.Loop), freshDetail.Labels) {
-			return checkpoint, &holdSkipError{summary: fmt.Sprintf("Reviewer stopped because %s#%d is currently held", input.Repo, input.PRNumber)}
-		}
-		if relatedFileGroupsConfig(r, input.Project.ID).Enabled && strings.TrimSpace(freshDetail.HeadSHA) != strings.TrimSpace(checkpoint.Snapshot.HeadSHA) {
-			checkpoint.PendingReview = nil
-			checkpoint.ResumePolicy = "restart_from_discover"
-			return checkpoint, &loopError{message: fmt.Sprintf("PR head changed before final grouped reviewer: expected %s, got %s", checkpoint.Snapshot.HeadSHA, freshDetail.HeadSHA), kind: FailureRetryableAfterResume, interrupted: true}
-		}
-	}
+
 	useSnap, snapVendor, snapModel := agentRunSnapshotFields(agentVendor, agentModel, useSnapshot)
 	_ = r.tryAddReaction(ctx, input, reviewerInProgressReaction)
 	agentCtx, cancelAgent := reviewerAgentContext(ctx, r.agentTimeout)
@@ -8384,21 +8385,21 @@ func (r *Runner) pendingNativeResume(ctx context.Context, loopID string) *storag
 	return latest
 }
 
-func (r *Runner) rejectIfReviewerHeldOrHeadChanged(ctx context.Context, input stepInput, expectedHead string) error {
+func (r *Runner) refreshGroupedReview(ctx context.Context, input stepInput, expectedHead string) (PullRequestDetail, error) {
 	if r == nil || r.github == nil {
-		return nil
+		return PullRequestDetail{}, nil
 	}
 	freshDetail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.Project.RepoPath})
 	if err != nil {
-		return &loopError{message: fmt.Sprintf("Failed to refresh pull request before starting reviewer agent: %v", err), kind: FailureRetryableAfterResume}
+		return freshDetail, &loopError{message: fmt.Sprintf("Failed to refresh pull request before starting reviewer agent: %v", err), kind: FailureRetryableAfterResume}
 	}
 	if domain.IsAutomaticLoopHeld(domain.LoopTypeReviewer, isManualReviewerLoop(input.Loop), freshDetail.Labels) {
-		return &holdSkipError{summary: fmt.Sprintf("Reviewer stopped because %s#%d is currently held", input.Repo, input.PRNumber)}
+		return freshDetail, &holdSkipError{summary: fmt.Sprintf("Reviewer stopped because %s#%d is currently held", input.Repo, input.PRNumber)}
 	}
 	if strings.TrimSpace(freshDetail.HeadSHA) != strings.TrimSpace(expectedHead) {
-		return &loopError{message: fmt.Sprintf("PR head changed during grouped review: expected %s, got %s", expectedHead, freshDetail.HeadSHA), kind: FailureRetryableAfterResume, interrupted: true}
+		return freshDetail, &loopError{message: fmt.Sprintf("PR head changed during grouped review: expected %s, got %s", expectedHead, freshDetail.HeadSHA), kind: FailureRetryableAfterResume, interrupted: true}
 	}
-	return nil
+	return freshDetail, nil
 }
 
 func reviewerAgentContext(ctx context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {

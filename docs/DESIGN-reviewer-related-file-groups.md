@@ -20,18 +20,18 @@ Small PRs and the default config keep the current single-agent path. Disable gro
 
 ## Grouping
 
-`git diff --name-status base...head` in the prepared worktree enumerates every changed path, including deletions. Each path belongs to exactly one group:
+On the first pass, `git diff --name-status base...head` in the prepared worktree enumerates every changed path, including deletions. Repair-frontier passes compare the previous reviewed head directly with the current head (`git diff --name-status previousHead currentHead`), so rewrites and rebases retain paths removed from the previously reviewed tree. Each path belongs to exactly one group:
 
 - Go files share a group by directory (package + `_test.go`)
 - Remaining paths go to an `other` group
 
-Each subtask receives a JSON context-file reference and its group index, the resolved review-skill index, configured reviewer instructions with their existing project/global precedence, and the same phase/scope guidance used by the final reviewer. The file preserves all group paths and changed-file records, including rename/deletion paths. Agents select their group and page other-file context as needed. Repair-frontier guidance also applies to grouped later passes. These methods apply within the assigned group; publication remains with the final reviewer.
+Each subtask receives a JSON context-file reference and its group index, the resolved review-skill index, configured reviewer instructions with their existing project/global precedence, and the same phase/scope guidance used by the final reviewer. It also receives the minimal PR seed and the configured GitHub, Forgejo, or hosting-identity read transport, restricted to reading PR intent and review context. The file preserves all group paths and changed-file records, including rename/deletion paths. Agents select their group and page other-file context as needed. Repair-frontier guidance also applies to grouped later passes; explicit comparison endpoints distinguish the previous reviewed head from the PR metadata seed's base. These methods apply within the assigned group; publication remains with the final reviewer.
 
 ## Execution
 
 Subtasks run **sequentially** on the same prepared worktree. They must not move checkout or write the worktree. Each returns `__LOOPER_RESULT__` findings only.
 
-The runner checks the live hold state and expected PR head before grouping, between groups, and before starting the final reviewer. A changed remote head restarts discovery. Each agent receives its own timeout budget; a caller's deadline or cancellation still bounds the whole operation.
+The runner checks the live hold state and expected PR head before grouping, between groups, and before starting the final reviewer. A changed remote head restarts discovery. Each group and the final prompt use phase guidance derived from the labels returned by their existing live refresh, including label changes on the same head. Each agent receives its own timeout budget; a caller's deadline or cancellation still bounds the whole operation.
 
 The local Git check detects a changed checkout and Git-visible tracked/untracked changes after each group. It is not a filesystem write audit: ignored build output and caches are outside that check. The no-write prompt remains an agent instruction, not an OS sandbox guarantee. This feature does not add filesystem baselines, hashes, cleanup, or ignored-file gates.
 

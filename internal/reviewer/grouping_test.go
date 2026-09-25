@@ -105,7 +105,7 @@ func TestGroupingGitPathUsesConfiguredExecutable(t *testing.T) {
 
 func TestGroupedFindingPromptForbidsWorktreeMutation(t *testing.T) {
 	t.Parallel()
-	prompt := groupedFindingPrompt("context.json", 0, "base", "head")
+	prompt := groupedFindingPrompt("context.json", 0, "base", "head", false)
 	if !strings.Contains(prompt, "Do not checkout another revision") {
 		t.Fatalf("prompt missing read-only contract: %s", prompt)
 	}
@@ -116,7 +116,7 @@ func TestGroupedFindingPromptForbidsWorktreeMutation(t *testing.T) {
 
 func TestGroupedFindingPromptSpecifiesCompletionVocabulary(t *testing.T) {
 	t.Parallel()
-	prompt := groupedFindingPrompt("context.json", 0, "base", "head")
+	prompt := groupedFindingPrompt("context.json", 0, "base", "head", false)
 	for _, want := range []string{
 		"must_fix", "follow_up", "needs_human",
 		"blocking", "non_blocking", "nit",
@@ -166,7 +166,7 @@ func TestApplyRelatedFileGroupsLeavesSmallDiffUngrouped(t *testing.T) {
 func TestListChangedPathsParsesNULNameStatus(t *testing.T) {
 	t.Parallel()
 	repo, base, head := groupingTestRepoWithRename(t)
-	files, err := listChangedPaths(context.Background(), "git", repo, base, head)
+	files, err := listChangedPaths(context.Background(), "git", repo, base, head, false)
 	if err != nil {
 		t.Fatalf("listChangedPaths() error = %v", err)
 	}
