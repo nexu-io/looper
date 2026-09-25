@@ -492,3 +492,94 @@ func TestGroupedReviewIncludesProviderContext(t *testing.T) {
 		})
 	}
 }
+
+func TestGroupedReviewChecksWorktreeBeforeRetry(t *testing.T) {
+	for _, mode := range []string{"tracked_wait", "untracked_wait", "checkout_wait", "tracked_start", "tracked_failed", "clean_wait"} {
+		t.Run(mode, func(t *testing.T) {
+			t.Parallel()
+			runner, input, _, agent := groupedReviewLifecycleFixture(t)
+			runner.retryBaseDelay, runner.retryMaxAttempts = time.Nanosecond, 2
+			agent.results = append(agent.results, agent.results[0])
+			providerErr := errors.New("server_is_overloaded")
+			switch mode {
+			case "tracked_start":
+				agent.startErr = providerErr
+			case "tracked_failed":
+				agent.results[0].Status = "failed"
+			default:
+				agent.waitErrs = []error{providerErr}
+			}
+			agent.onStart = func(start AgentRunInput) {
+				if len(agent.starts) != 1 || mode == "clean_wait" {
+					return
+				}
+				if mode == "checkout_wait" {
+					if out, err := exec.Command("git", "-C", start.WorkingDirectory, "checkout", "--detach", input.Checkpoint.Snapshot.BaseSHA).CombinedOutput(); err != nil {
+						t.Fatalf("change checkout: %v: %s", err, out)
+					}
+					return
+				}
+				path := "README.md"
+				if mode == "untracked_wait" {
+					path = "unexpected.txt"
+				}
+				if err := os.WriteFile(filepath.Join(start.WorkingDirectory, path), []byte("unexpected mutation\n"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			checkpoint, err := runner.executeStep(context.Background(), stepReview, input)
+			if mode == "clean_wait" {
+				if err != nil || len(agent.starts) != 4 || checkpoint.PendingReview == nil {
+					t.Fatalf("clean retry: err=%v, starts=%d, pending=%v", err, len(agent.starts), checkpoint.PendingReview)
+				}
+				return
+			}
+			wantError := "worktree is dirty"
+			if mode == "checkout_wait" {
+				wantError = "worktree HEAD drifted"
+			}
+			if err == nil || !strings.Contains(err.Error(), wantError) || len(agent.starts) != 1 || checkpoint.PendingReview != nil {
+				t.Fatalf("mutated worktree: err=%v, starts=%d, pending=%v; want %q before any retry", err, len(agent.starts), checkpoint.PendingReview, wantError)
+			}
+		})
+	}
+}
+
+func TestGroupedReviewRestoresContextBeforeEachAgent(t *testing.T) {
+	for _, mutation := range []string{"rewrite", "remove"} {
+		t.Run(mutation, func(t *testing.T) {
+			t.Parallel()
+			runner, input, _, agent := groupedReviewLifecycleFixture(t)
+			var expected []byte
+			agent.onStart = func(start AgentRunInput) {
+				path, payload, err := groupedContextPayload(start.Prompt)
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				if len(agent.starts) == 1 {
+					expected = payload
+				} else if string(payload) != string(expected) {
+					t.Errorf("execution %d inherited modified group assignments: %s", len(agent.starts), payload)
+				}
+				if start.Metadata["phase"] != "review-group" {
+					return
+				}
+				if mutation == "remove" {
+					err = os.Remove(path)
+				} else {
+					err = os.WriteFile(path, []byte(`{"groups":[],"changedFiles":[]}`), 0o600)
+				}
+				if err != nil {
+					t.Error(err)
+				}
+			}
+			if _, err := runner.executeStep(context.Background(), stepReview, input); err != nil {
+				t.Fatal(err)
+			}
+			if len(agent.starts) != 3 {
+				t.Fatalf("starts=%d, want two groups and final reviewer", len(agent.starts))
+			}
+		})
+	}
+}
