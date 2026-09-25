@@ -328,6 +328,11 @@
               "includeReviewingLabel": true,
               "reviewingLabel": "looper:spec-reviewing"
             }
+          },
+          "skills": {
+            "mode": "extend",
+            "required": [],
+            "optional": []
           }
         },
         "fixer": {

@@ -30,6 +30,10 @@ func TestIsHotEditablePathUsesExplicitAllowlist(t *testing.T) {
 		"instructions.enabled",
 		"roles.worker.triggers.planeAssigneeId",
 		"roles.reviewer.behavior.scope",
+		"roles.reviewer.instructions",
+		"roles.reviewer.skills.mode",
+		"roles.reviewer.skills.required",
+		"roles.reviewer.skills.optional",
 		"tools.looperPath",
 		"tools.osascriptPath",
 	}

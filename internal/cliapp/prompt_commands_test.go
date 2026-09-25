@@ -170,6 +170,35 @@ func TestPromptPreviewReviewerUsesReviewSubmitContract(t *testing.T) {
 	}
 }
 
+func TestPromptPreviewReviewerUsesEffectiveSkills(t *testing.T) {
+	t.Parallel()
+	for _, mode := range []string{"extend", "replace"} {
+		for _, trustedWrapper := range []bool{true, false} {
+			t.Run(mode+"/"+map[bool]string{true: "wrapper", false: "no-wrapper"}[trustedWrapper], func(t *testing.T) {
+				payload := promptPreviewConfigPayload(t.TempDir(), true)
+				payload["roles"] = map[string]any{"reviewer": map[string]any{"skills": map[string]any{"required": []string{"global-review"}, "optional": []string{"optional-review"}}}}
+				payload["projects"].([]map[string]any)[0]["roles"] = map[string]any{"reviewer": map[string]any{"skills": map[string]any{"mode": mode, "required": []string{"./team review/SKILL.md"}}}}
+				if trustedWrapper {
+					payload["tools"] = map[string]any{"looperPath": "/opt/looper/bin/looper"}
+				}
+				configPath := writeEditableCLIConfigWithPayload(t, payload)
+				code, stdout, stderr := runAppWithLookPath(t, func(string) (string, error) { return "", os.ErrNotExist }, "prompt", "preview", "--project", "project_1", "--role", "reviewer", "--config", configPath)
+				if code != 0 {
+					t.Fatalf("preview failed: %d, %s", code, stderr)
+				}
+				for _, want := range []string{"./team review/SKILL.md", "optional-review", "resolved at review time"} {
+					if !strings.Contains(stdout, want) {
+						t.Fatalf("preview missing effective skill %q:\n%s", want, stdout)
+					}
+				}
+				if strings.Contains(stdout, "global-review") || strings.Contains(stdout, "looper-review") != (mode == "extend") {
+					t.Fatalf("preview did not apply project replacement:\n%s", stdout)
+				}
+			})
+		}
+	}
+}
+
 func TestPromptPreviewReviewerReflectsMissingTrustedWrapper(t *testing.T) {
 	t.Parallel()
 

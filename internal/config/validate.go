@@ -267,6 +267,7 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 	if config.Roles.Reviewer.AutoMerge.Scope != ReviewerAutoMergeScopeLooperOnly {
 		issues = append(issues, ValidationIssue{Path: "roles.reviewer.autoMerge.scope", Message: fmt.Sprintf("must be %s", ReviewerAutoMergeScopeLooperOnly)})
 	}
+	validateReviewerSkillsConfig(config.Roles.Reviewer.Skills, "roles.reviewer.skills", &issues)
 	if config.Roles.Reviewer.Behavior.ReviewEvents.Clean != ReviewerReviewEventComment && config.Roles.Reviewer.Behavior.ReviewEvents.Clean != ReviewerReviewEventApprove {
 		issues = append(issues, ValidationIssue{Path: "roles.reviewer.behavior.reviewEvents.clean", Message: fmt.Sprintf("must be one of: %s, %s", ReviewerReviewEventComment, ReviewerReviewEventApprove)})
 	}
@@ -413,6 +414,9 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 		}
 		if effectiveProjectRoles.Reviewer.Discovery.SpecReview.IncludeReviewingLabel && strings.TrimSpace(effectiveProjectRoles.Reviewer.Discovery.SpecReview.ReviewingLabel) == "" {
 			issues = append(issues, ValidationIssue{Path: prefix + ".roles.reviewer.discovery.specReview.reviewingLabel", Message: "must be a non-empty string when includeReviewingLabel is true"})
+		}
+		if project.Roles != nil && project.Roles.Reviewer != nil && project.Roles.Reviewer.Skills != nil {
+			validateReviewerSkillsConfig(effectiveProjectRoles.Reviewer.Skills, prefix+".roles.reviewer.skills", &issues)
 		}
 		if project.Roles != nil && project.Roles.Coordinator != nil {
 			validateCoordinatorRoleConfig(effectiveProjectRoles.Coordinator, prefix+".roles.coordinator", &issues)
@@ -1147,6 +1151,30 @@ func validatePartialReviewerAutoMerge(partial PartialReviewerAutoMergeConfig, pa
 	}
 	if partial.Scope != nil && *partial.Scope != ReviewerAutoMergeScopeLooperOnly {
 		*issues = append(*issues, ValidationIssue{Path: path + ".scope", Message: fmt.Sprintf("must be %s", ReviewerAutoMergeScopeLooperOnly)})
+	}
+}
+
+func validateReviewerSkillsConfig(skills ReviewerSkillsConfig, path string, issues *[]ValidationIssue) {
+	if !isValidReviewerSkillsMode(skills.Mode) {
+		*issues = append(*issues, ValidationIssue{Path: path + ".mode", Message: fmt.Sprintf("must be one of: %s, %s", ReviewerSkillsModeExtend, ReviewerSkillsModeReplace)})
+		return
+	}
+	mode := skills.Mode
+	if mode == "" {
+		mode = ReviewerSkillsModeExtend
+	}
+	validateStringList(skills.Required, path+".required", issues)
+	if mode == ReviewerSkillsModeReplace && len(skills.Required) == 0 {
+		*issues = append(*issues, ValidationIssue{Path: path + ".required", Message: "must contain at least one skill when mode is replace"})
+	}
+}
+
+func isValidReviewerSkillsMode(mode ReviewerSkillsMode) bool {
+	switch mode {
+	case "", ReviewerSkillsModeExtend, ReviewerSkillsModeReplace:
+		return true
+	default:
+		return false
 	}
 }
 

@@ -2,10 +2,13 @@ package reviewskills
 
 import (
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
+
+	"gopkg.in/yaml.v3"
 )
 
 // Entry is one skill the reviewer agent must be able to read.
@@ -98,12 +101,35 @@ func copyBuiltin(dest string) error {
 	})
 }
 
+const maxSkillFrontmatterBytes = 64 << 10
+
 func readSkillFrontmatter(skillPath string) (name, description string, err error) {
-	data, err := os.ReadFile(skillPath)
+	info, err := os.Stat(skillPath)
 	if err != nil {
 		return "", "", err
 	}
-	return parseFrontmatter(string(data))
+	if !info.Mode().IsRegular() {
+		return "", "", fmt.Errorf("skill must be a regular file")
+	}
+	file, err := os.Open(skillPath)
+	if err != nil {
+		return "", "", err
+	}
+	defer file.Close()
+	data, err := io.ReadAll(io.LimitReader(file, maxSkillFrontmatterBytes))
+	if err != nil {
+		return "", "", err
+	}
+	name, description, err = parseFrontmatter(string(data))
+	if err != nil && len(data) == maxSkillFrontmatterBytes {
+		return "", "", fmt.Errorf("skill frontmatter must fit within %d bytes: %w", maxSkillFrontmatterBytes, err)
+	}
+	return name, description, err
+}
+
+type skillFrontmatter struct {
+	Name        string `yaml:"name"`
+	Description string `yaml:"description"`
 }
 
 func parseFrontmatter(content string) (name, description string, err error) {
@@ -116,21 +142,12 @@ func parseFrontmatter(content string) (name, description string, err error) {
 	if end < 0 {
 		return "", "", fmt.Errorf("skill frontmatter not terminated")
 	}
-	for _, line := range strings.Split(rest[:end], "\n") {
-		line = strings.TrimSpace(line)
-		key, value, ok := strings.Cut(line, ":")
-		if !ok {
-			continue
-		}
-		key = strings.TrimSpace(key)
-		value = strings.TrimSpace(value)
-		switch key {
-		case "name":
-			name = value
-		case "description":
-			description = value
-		}
+	var meta skillFrontmatter
+	if err := yaml.Unmarshal([]byte(rest[:end]), &meta); err != nil {
+		return "", "", fmt.Errorf("skill frontmatter is invalid YAML: %w", err)
 	}
+	name = strings.TrimSpace(meta.Name)
+	description = strings.TrimSpace(meta.Description)
 	if name == "" {
 		return "", "", fmt.Errorf("skill frontmatter missing name")
 	}
