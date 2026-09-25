@@ -5068,7 +5068,7 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 		if found, err := r.verifyAgentNativeReviewMarker(ctx, input, checkpoint.Snapshot.HeadSHA, idempotencyKey, cleanReviewAuthorLogin(checkpoint, PullRequestDetail{})); err != nil {
 			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 		} else if found.Found {
-			checkpoint.PendingReview = &pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, IdempotencyKey: idempotencyKey, Event: reviewEventAgentNative, Summary: result.Summary, Outcome: normalizeCommentOnlyOutcome(found.Outcome), ContentFingerprint: reviewMarkerFingerprint(found)}
+			checkpoint.PendingReview = &pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, IdempotencyKey: idempotencyKey, Event: reviewEventAgentNative, Summary: result.Summary, Outcome: normalizeCommentOnlyOutcome(found.Outcome), ContentFingerprint: reviewMarkerFingerprint(found), ReviewerSummaryJSON: recoveredReviewerSummaryJSON(result)}
 			checkpoint.ResumePolicy = "advance_from_checkpoint"
 			return checkpoint, nil
 		}
@@ -5091,7 +5091,7 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 		if found, err := r.verifyAgentNativeReviewMarker(ctx, input, checkpoint.Snapshot.HeadSHA, idempotencyKey, cleanReviewAuthorLogin(checkpoint, PullRequestDetail{})); err != nil {
 			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 		} else if found.Found {
-			checkpoint.PendingReview = &pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, IdempotencyKey: idempotencyKey, Event: reviewEventAgentNative, Summary: result.Summary, Outcome: normalizeCommentOnlyOutcome(found.Outcome), ContentFingerprint: reviewMarkerFingerprint(found)}
+			checkpoint.PendingReview = &pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, IdempotencyKey: idempotencyKey, Event: reviewEventAgentNative, Summary: result.Summary, Outcome: normalizeCommentOnlyOutcome(found.Outcome), ContentFingerprint: reviewMarkerFingerprint(found), ReviewerSummaryJSON: recoveredReviewerSummaryJSON(result)}
 			checkpoint.ResumePolicy = "advance_from_checkpoint"
 			return checkpoint, nil
 		}
@@ -6594,6 +6594,23 @@ func parseReviewerNativeCompletion(result AgentResult) (reviewerCommentOnlyCompl
 	return validateReviewerCommentOnlyCompletion(completion)
 }
 
+// Recovery accepts the already-published marker independently of optional
+// coverage. Store only the advisory report here: conditionally adding findings
+// would change pendingNativeMustFixRequiresActionableMarker based on coverage.
+func recoveredReviewerSummaryJSON(result AgentResult) string {
+	completion, err := parseReviewerNativeCompletion(result)
+	if err != nil || completion.Coverage == nil {
+		return ""
+	}
+	payload, err := json.Marshal(struct {
+		Coverage *reviewerCoverageReport `json:"coverage"`
+	}{Coverage: completion.Coverage})
+	if err != nil {
+		return ""
+	}
+	return string(payload)
+}
+
 func unmarshalReviewerCompletionMarker(result AgentResult) (reviewerCommentOnlyCompletion, error) {
 	var completion reviewerCommentOnlyCompletion
 	raw := result.Stdout
@@ -6909,7 +6926,11 @@ func authorityInputChangeHint(scopeBasis, scopeEvidence string) string {
 }
 
 func commentOnlyNeedsHumanEvidence(completion reviewerCommentOnlyCompletion) string {
-	payload, err := json.Marshal(completion.Findings)
+	var evidence any = completion.Findings
+	if completion.Coverage != nil {
+		evidence = completion
+	}
+	payload, err := json.Marshal(evidence)
 	if err != nil {
 		return ""
 	}
