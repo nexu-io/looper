@@ -416,7 +416,7 @@ func closeLoop(ctx context.Context, services looperdruntime.Services, loopID, re
 }
 
 // takeoverLoop parks a loop for interactive human takeover: it captures the loop's
-// latest agent session id + worktree + vendor, stops the daemon's in-flight run
+// latest main agent session id + worktree + vendor, stops the daemon's in-flight run
 // (reusing stopLoop — pause + kill + cancel queue, so the scheduler leaves it
 // alone), then transitions the loop to human_takeover. The session id lives on
 // disk, so a human resumes the exact session and a later handback (retry) lets the
@@ -427,7 +427,7 @@ func takeoverLoop(ctx context.Context, services looperdruntime.Services, loopID,
 		return result, fmt.Errorf("loops service is not configured")
 	}
 	if services.Repositories != nil && services.Repositories.AgentExecutions != nil {
-		if execution, err := services.Repositories.AgentExecutions.GetLatestByLoopID(ctx, loopID); err == nil && execution != nil {
+		if execution, err := services.Repositories.AgentExecutions.GetLatestByLoopIDExcludingPhase(ctx, loopID, "review-group"); err == nil && execution != nil {
 			result.Vendor = execution.Vendor
 			if execution.NativeSessionID != nil {
 				result.SessionID = strings.TrimSpace(*execution.NativeSessionID)

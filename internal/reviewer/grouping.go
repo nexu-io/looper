@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/eventlog"
@@ -193,6 +194,15 @@ func (r *Runner) applyRelatedFileGroups(ctx context.Context, input stepInput, ch
 	}
 	if len(files) < cfg.MinChangedFiles {
 		return "", nil, nil
+	}
+	// JSON strings cannot preserve arbitrary Git path bytes. Reject unsupported
+	// names rather than silently assigning a different path after UTF-8 repair.
+	for _, file := range files {
+		for _, path := range []string{file.Path, file.OldPath} {
+			if !utf8.ValidString(path) {
+				return "", nil, fmt.Errorf("related-file groups: non-UTF-8 path %q cannot be represented in JSON context", path)
+			}
+		}
 	}
 	groups := groupChangedFiles(files)
 	contextDir, err := os.MkdirTemp("", "looper-review-groups-*")

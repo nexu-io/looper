@@ -10,6 +10,7 @@ A single reviewer context on a large PR can drop cross-file contracts. The built
 - Findings and dispositions come from agent structured output.
 - Publish stays on the existing top-level wrapper / comment-only path. Subtasks cannot call `review submit`.
 - Git state and the live PR head detect source drift; hold labels represent user control. These checks do not infer review completeness or override agent findings.
+- Git's raw path identifiers are authoritative for context transport. Non-UTF-8 names stop grouped execution before agents start because JSON strings cannot preserve them; this encoding check does not judge agent findings.
 
 ## Enablement
 
@@ -27,6 +28,8 @@ On the first pass, `git diff --name-status base...head` in the prepared worktree
 
 Each subtask receives a JSON context-file reference and its group index, the resolved review-skill index, configured reviewer instructions with their existing project/global precedence, and the same phase/scope guidance used by the final reviewer. It also receives the minimal PR seed and the configured GitHub, Forgejo, or hosting-identity read transport, restricted to reading PR intent and review context. The file preserves all group paths and changed-file records, including rename/deletion paths. Agents select their group and page other-file context as needed. Repair-frontier guidance also applies to grouped later passes; explicit comparison endpoints distinguish the previous reviewed head from the PR metadata seed's base. These methods apply within the assigned group; publication remains with the final reviewer.
 
+Grouped execution supports UTF-8 path names, including control characters escaped by JSON. Other Git path bytes produce an explicit error instead of replacement characters. Failing loudly avoids adding a second path encoding and decoder contract to every group; the cost is that such PRs need the existing single-agent path with grouping disabled.
+
 ## Execution
 
 Subtasks run **sequentially** on the same prepared worktree. They must not move checkout or write the worktree. Each returns `__LOOPER_RESULT__` findings only.
@@ -36,6 +39,8 @@ The runner checks the live hold state and expected PR head before grouping, betw
 The local Git check detects a changed checkout and Git-visible tracked/untracked changes after each group, including start/wait failures and incomplete agent results. The invariant failure takes precedence over a transient provider error so the retry loop cannot start another agent on detected contamination; a clean checkout retains normal provider retries. It is not a filesystem write audit: ignored build output and caches are outside that check. The no-write prompt remains an agent instruction, not an OS sandbox guarantee. This feature does not add filesystem baselines, hashes, cleanup, or ignored-file gates.
 
 If any subtask fails, times out, or source drift is detected, the grouped pass stops before the final publisher starts. There is no per-group resume ledger; retry the whole pass. Group executions always start fresh. Native resume selects the latest non-group execution from existing execution metadata, so persisted group records cannot hide a pending main-review session after a restart. Vendor and recoverability checks still apply; a newer completed main review supersedes an older pending session.
+
+Interactive takeover and handback use that same non-group selection. Takeover still stops an active group, but returns the main review session; handback records that session for recovery. If no main session exists yet, takeover exposes no resumable session rather than a finding-only group session.
 
 Before each group, the runner writes the context file from its in-memory assignments; a prior group's edits to that transport file do not become the next group's input. After subtasks succeed, the runner rewrites the context with their structured findings. The top-level reviewer still runs once with the existing publish contract and reads that file for the group plan, findings to merge/dedupe, and cross-group contracts. Both the full prompt and native-resume prompt reference the current file. Identifiers, path arrays, and findings remain JSON data instead of expanding argv/environment prompts. Repair-frontier later passes group the frontier delta, not the original full diff.
 

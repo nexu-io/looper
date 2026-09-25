@@ -5910,7 +5910,7 @@ func (h *Handler) handbackLoop(ctx context.Context, r *http.Request, loopID stri
 		if loop == nil {
 			return struct{}{}, apiError{code: pkgapi.ErrorCodeLoopNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Loop not found: %s", loopID)}
 		}
-		if execution, err := repos.AgentExecutions.GetLatestByLoopID(ctx, loopID); err == nil && execution != nil && execution.NativeSessionID != nil && strings.TrimSpace(*execution.NativeSessionID) != "" {
+		if execution, err := repos.AgentExecutions.GetLatestByLoopIDExcludingPhase(ctx, loopID, "review-group"); err == nil && execution != nil && execution.NativeSessionID != nil && strings.TrimSpace(*execution.NativeSessionID) != "" {
 			meta, werr := loops.WriteTakeoverResume(loop.MetadataJSON, loops.TakeoverResume{SessionID: strings.TrimSpace(*execution.NativeSessionID)})
 			if werr == nil {
 				loop.MetadataJSON = &meta

@@ -583,3 +583,31 @@ func TestGroupedReviewRestoresContextBeforeEachAgent(t *testing.T) {
 		})
 	}
 }
+
+func TestGroupedReviewRejectsNonUTF8Paths(t *testing.T) {
+	t.Parallel()
+	runner, input, github, agent := groupedReviewLifecycleFixture(t)
+	worktree := input.Checkpoint.Worktree.Path
+	git := func(stdin string, args ...string) string {
+		t.Helper()
+		cmd := exec.Command("git", append([]string{"-C", worktree}, args...)...)
+		cmd.Stdin = strings.NewReader(stdin)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, out)
+		}
+		return string(out)
+	}
+	// Construct the Git tree directly so the test also works on filesystems
+	// that cannot check out arbitrary filename bytes.
+	blob := strings.TrimSpace(git("", "rev-parse", "HEAD:README.md"))
+	entries := git("", "ls-tree", "-z", "HEAD") + "100644 blob " + blob + "\tinvalid-\xff.go\x00"
+	tree := strings.TrimSpace(git(entries, "mktree", "-z"))
+	head := strings.TrimSpace(git("", "commit-tree", tree, "-p", "HEAD", "-m", "test: non UTF-8 path"))
+	git("", "update-ref", "HEAD", head)
+	input.Checkpoint.Snapshot.HeadSHA, github.viewHeadSHA = head, head
+	_, err := runner.executeStep(context.Background(), stepReview, input)
+	if err == nil || !strings.Contains(err.Error(), "non-UTF-8") || len(agent.starts) != 0 {
+		t.Fatalf("non-UTF-8 path: err=%v, starts=%d; want explicit failure before any agent", err, len(agent.starts))
+	}
+}
