@@ -2,7 +2,12 @@
 
 Use existing comment `body` plus `scopeEvidence`. Do not invent evidence records, confidence scores, finding quotas, or a second filter model.
 
-Comment shape for every finding: trigger condition → actual path → wrong consequence → suggested fix.
+Match the evidence shape to the review phase:
+
+- Implementation: trigger condition → actual code path → wrong consequence → suggested fix.
+- Spec/docs: changed section or omission → resulting ambiguity or contradiction → implementation or validation consequence → specific clarification. A spec finding does not require an execution path that has not been implemented yet.
+
+The examples below guide investigation; they are not an exhaustive list of reportable defects or a filter that excludes other concrete findings.
 
 ## Data race
 
@@ -30,13 +35,15 @@ Negative: ownership is transferred to an identified owner with an established re
 
 ## Security
 
-Name the untrusted input, a reachable path from that input, and the actual trust boundary.
+Name the protected asset, expected security property or policy, the reachable operation that violates it, and the confidentiality, integrity, access-control, or availability consequence. Require untrusted-input evidence when the claim depends on such input, as in injection-style findings; it is not a prerequisite for every security defect.
+
+Positive (asset or boundary violation): credentials are exposed through logging, required file permissions are weakened, certificate verification is disabled on a path that requires it, or trusted configuration data reaches an unauthorized observer. Establish the affected asset, boundary or policy, and concrete exposure/consequence even when no attacker-supplied bytes trigger the defect.
 
 Positive (unsafe interpretation): attacker-controlled bytes reach a sink (exec, query, path, template) that interprets them unsafely, such as missing parameterization, contextual escaping, or path confinement. Crossing a component or trust boundary does not sanitize those bytes; require an effective, sink-appropriate transformation before treating them as safe.
 
 Positive (authorization): a reachable path lets a principal perform an action on a resource that the policy forbids, because an ownership, tenant, or other authorization check is missing or applied to the wrong principal/resource. A valid, sink-constrained identifier (for example a UUID in a parameterized query) is not a drop reason for this case.
 
-Negative: the specific value has already been constrained for the destination sink, comes from a trusted config/operator surface, or never reaches the sink on the claimed path. Authentication or authorization to invoke an operation does not make user-supplied repository names, query strings, or template values trusted. Sink-constrained bytes do not disprove a missing or misapplied authorization check.
+Negative for an unsafe-interpretation claim: the specific value has already been constrained for the destination sink, comes from an appropriately trusted config/operator surface, or never reaches that sink on the claimed path. These are not drop reasons for asset disclosure, weakened permissions, missing certificate verification, or authorization flaws. Authentication or authorization to invoke an operation does not make user-supplied repository names, query strings, or template values trusted. Sink-constrained bytes do not disprove a missing or misapplied authorization check.
 
 ## Go loop variable / timer
 
@@ -72,7 +79,7 @@ Never write only "add tests". Name the failing behavior, the test file or packag
 
 Run this pass in the same review context before finalizing. It is a conservative self-check, not a second model stage. The authority for a drop is that same context (diff, callers, tests, contracts), not the first structured candidate list.
 
-First establish the candidate's concrete trigger → actual path → wrong consequence. If that chain is uncertain, investigate it; if it still cannot be established, omit the unsupported claim from published findings. Source, contracts, and tests can establish the chain without executing a reproduction. A missing reproduction is not disproof.
+First establish the candidate's concrete evidence chain for the review phase described above. If that chain is uncertain, investigate it; if it still cannot be established, omit the unsupported claim from published findings. Source, contracts, tests, or a concrete spec section/omission can establish the chain without executing a reproduction. A missing reproduction is not disproof.
 
 For an evidence-backed candidate, drop it in this counterexample pass only when evidence proves it factually wrong, or when it is the same root cause as another finding (keep one representative).
 
