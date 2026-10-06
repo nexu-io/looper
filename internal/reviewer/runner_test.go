@@ -11075,9 +11075,19 @@ func TestCommentOnlyPublishVisibleSummaryOmitsSuppressedFindings(t *testing.T) {
 			{Title: "Scope", Body: "unclear", Disposition: "needs_human", ScopeBasis: "ambiguous_intent", ScopeEvidence: "PR non-goals"},
 		},
 	}
-	visible := commentOnlyPublishVisibleSummary(completion)
-	if !strings.Contains(visible, "Nil deref") {
-		t.Fatalf("visible missing must_fix: %q", visible)
+	summary, err := buildReviewerSummaryFromCompletion(forge.ReviewerSummary{}, completion)
+	if err != nil {
+		t.Fatalf("build summary: %v", err)
+	}
+	body, err := renderReviewerSummaryComment(summary, commentOnlyPublishVisibleSummary(completion))
+	if err != nil {
+		t.Fatalf("render summary: %v", err)
+	}
+	visible := reviewHumanVisibleBody(body)
+	for _, text := range []string{"Nil deref", "Guard the pointer"} {
+		if count := strings.Count(visible, text); count != 1 {
+			t.Fatalf("visible contains %q %d times, want once: %q", text, count, visible)
+		}
 	}
 	for _, banned := range []string{"needs human", "follow-up", "Rename", "Scope", "unclear", "PR non-goals"} {
 		if strings.Contains(visible, banned) {
@@ -12719,6 +12729,12 @@ func TestPublishCommentOnlyMixedMustFixNeedsHumanPublishesThenParksScope(t *test
 			body := github.issueCommentCalls[0].Body
 			if strings.Contains(strings.ToLower(body), "ambiguous") || strings.Contains(body, "needs_human") {
 				t.Fatalf("published body smuggles needs_human: %s", body)
+			}
+			visible := reviewHumanVisibleBody(body)
+			for _, text := range []string{"Bug", "fix it"} {
+				if count := strings.Count(visible, text); count != 1 {
+					t.Fatalf("published body contains %q %d times, want once: %s", text, count, visible)
+				}
 			}
 			updated, err := fixture.repos.Loops.GetByID(context.Background(), loop.ID)
 			if err != nil || updated == nil {

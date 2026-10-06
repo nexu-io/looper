@@ -6889,23 +6889,8 @@ func commentOnlyPublishVisibleSummary(completion reviewerCommentOnlyCompletion) 
 	if len(mustFix) == 0 {
 		return "No actionable findings"
 	}
-	parts := make([]string, 0, len(mustFix))
-	for _, finding := range mustFix {
-		title := strings.TrimSpace(finding.Title)
-		body := strings.TrimSpace(finding.Body)
-		switch {
-		case title != "" && body != "":
-			parts = append(parts, title+": "+body)
-		case title != "":
-			parts = append(parts, title)
-		case body != "":
-			parts = append(parts, body)
-		}
-	}
-	if len(parts) == 0 {
-		return "Must-fix findings require attention."
-	}
-	return strings.Join(parts, "\n\n")
+	// The item list carries the actionable prose; do not duplicate it here.
+	return "Must-fix findings require attention."
 }
 
 func commentOnlyNeedsHumanQuestion(completion reviewerCommentOnlyCompletion) string {
