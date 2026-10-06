@@ -9154,6 +9154,9 @@ func TestBuildReviewPromptIncludesActionableQualityContract(t *testing.T) {
 		"Do not stop after the first issue",
 		"include it in this review rather than deferring it to a later pass",
 		"Finding disposition contract",
+		"Finding presentation contract",
+		"prefix every finding title with [P0], [P1], [P2], or [P3]",
+		"In native inline comments, start `body` with the same bold priority-prefixed title",
 		"disposition must_fix|follow_up|needs_human",
 		"severity blocking|non_blocking|nit",
 		"Looper parses this JSON",
@@ -9310,6 +9313,8 @@ func TestBuildReviewPromptCommentOnlyKeepsPublishContracts(t *testing.T) {
 		"Comment-only publish contract",
 		"Review pass contract: complete one full review pass before finalizing",
 		"Finding disposition contract",
+		"Finding presentation contract",
+		"In structured findings, keep the prefixed title in `title` and the explanation in `body`",
 		"disposition must_fix|follow_up|needs_human",
 		"severity blocking|non_blocking|nit",
 		"Group findings only when they share the same root cause",
@@ -9336,7 +9341,7 @@ func migratedReviewMethodPhrases() []string {
 		"Spec/docs review rubric",
 		"Implementation review rubric",
 		"fixture-matrix tests",
-		"Write substantially more detail",
+		"Use a short priority-prefixed title and one concise paragraph",
 		"Finding accumulator contract",
 		"group repeated patterns into systemic comments with representative examples only when they share a root cause",
 		"Severity rubric",
@@ -11070,9 +11075,19 @@ func TestCommentOnlyPublishVisibleSummaryOmitsSuppressedFindings(t *testing.T) {
 			{Title: "Scope", Body: "unclear", Disposition: "needs_human", ScopeBasis: "ambiguous_intent", ScopeEvidence: "PR non-goals"},
 		},
 	}
-	visible := commentOnlyPublishVisibleSummary(completion)
-	if !strings.Contains(visible, "Nil deref") {
-		t.Fatalf("visible missing must_fix: %q", visible)
+	summary, err := buildReviewerSummaryFromCompletion(forge.ReviewerSummary{}, completion)
+	if err != nil {
+		t.Fatalf("build summary: %v", err)
+	}
+	body, err := renderReviewerSummaryComment(summary, commentOnlyPublishVisibleSummary(completion))
+	if err != nil {
+		t.Fatalf("render summary: %v", err)
+	}
+	visible := reviewHumanVisibleBody(body)
+	for _, text := range []string{"Nil deref", "Guard the pointer"} {
+		if count := strings.Count(visible, text); count != 1 {
+			t.Fatalf("visible contains %q %d times, want once: %q", text, count, visible)
+		}
 	}
 	for _, banned := range []string{"needs human", "follow-up", "Rename", "Scope", "unclear", "PR non-goals"} {
 		if strings.Contains(visible, banned) {
@@ -12714,6 +12729,12 @@ func TestPublishCommentOnlyMixedMustFixNeedsHumanPublishesThenParksScope(t *test
 			body := github.issueCommentCalls[0].Body
 			if strings.Contains(strings.ToLower(body), "ambiguous") || strings.Contains(body, "needs_human") {
 				t.Fatalf("published body smuggles needs_human: %s", body)
+			}
+			visible := reviewHumanVisibleBody(body)
+			for _, text := range []string{"Bug", "fix it"} {
+				if count := strings.Count(visible, text); count != 1 {
+					t.Fatalf("published body contains %q %d times, want once: %s", text, count, visible)
+				}
 			}
 			updated, err := fixture.repos.Loops.GetByID(context.Background(), loop.ID)
 			if err != nil || updated == nil {

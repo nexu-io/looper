@@ -25,7 +25,7 @@ Equivalent METHOD migration from `buildReviewPromptWithInstructions`. Execution 
 | "Every comment MUST include" / "Every finding MUST include" | `builtin/references/comment-quality.md` |
 | Invalid comment criteria | `builtin/references/comment-quality.md` |
 | Bad comment example / Good spec/docs comment example | `builtin/references/comment-quality.md` |
-| "Write substantially more detail" | `builtin/references/comment-quality.md` |
+| Concise priority-prefixed titles and single-paragraph evidence/fix explanations (replaces "Write substantially more detail") | `builtin/references/comment-quality.md`; shared presentation contract in core prompt |
 | "Do not repeat the overall body/summary as a comment" | `builtin/references/comment-quality.md` |
 | fixture-matrix paragraph | `builtin/references/comment-quality.md` |
 | CSS linting (on-demand for CSS parser/linter implementation changes, including non-style files; not ordinary CSS-only edits) | `builtin/references/css-lint.md` |
