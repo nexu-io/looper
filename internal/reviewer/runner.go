@@ -10061,6 +10061,7 @@ func buildReviewPromptWithInstructions(projectID string, instructionConfig confi
 	if strings.TrimSpace(skillIndex) != "" {
 		parts = append(parts, skillIndex)
 	}
+	parts = append(parts, "Finding presentation contract: prefix every finding title with [P0], [P1], [P2], or [P3] (critical, high, normal, or low urgency). Use a short imperative title and one concise paragraph describing the trigger, consequence, and fix direction; aim for 2–4 sentences. In structured findings, keep the prefixed title in `title` and the explanation in `body`. In native inline comments, start `body` with the same bold priority-prefixed title, a blank line, then the explanation. Priority is a presentation label, not a new JSON field or a substitute for severity blocking|non_blocking|nit or disposition. Do not omit supported findings to shorten the review, and do not repeat each finding in the top-level overview.")
 	cleanReviewAuthorMention := cleanReviewAuthorTarget(checkpoint)
 	cleanNoopInstruction := "For no-actionable-finding results when the clean review policy is COMMENT, do not submit a clean COMMENT or APPROVE review; finish successfully with the `No actionable findings` summary only. After Looper validates that no clean review marker was required for this run, the runner will reconcile the clean-signal +1 reaction."
 	cleanInstruction := cleanNoopInstruction

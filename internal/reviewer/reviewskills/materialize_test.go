@@ -223,7 +223,7 @@ func TestBuiltinSkillFilesContainMigratedMethodText(t *testing.T) {
 		"Every finding MUST include",
 		"Bad comment example",
 		"Good spec/docs comment example",
-		"Write substantially more detail",
+		"Use a short priority-prefixed title and one concise paragraph",
 		"Do not repeat the overall body/summary as a comment",
 		"fixture-matrix tests",
 		"Implementation review rubric",
