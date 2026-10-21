@@ -907,6 +907,7 @@ Reviewer is the main migration example:
 - legacy top-level `reviewer.*` is compatibility input only
 - legacy reviewer discovery paths such as `roles.reviewer.autoDiscovery`, `roles.reviewer.triggers.*`, and `roles.reviewer.specReview.*` are compatibility input only
 - canonical reviewer discovery lives at `roles.reviewer.discovery.*`
+- `roles.reviewer.discovery.followUpInterval` is an optional `time.Duration` string such as `"1h"`: the minimum time between full sweeps of follow-up loops for one project and repo. New review requests are still discovered on every scheduler tick, and the first pass after the daemon starts always sweeps, which covers webhooks missed while it was down. Empty (the default) sweeps on every tick. Project overrides use `projects[].roles.reviewer.discovery.followUpInterval`.
 - canonical reviewer behavior lives at `roles.reviewer.behavior.*`
 
 Canonical reviewer example:

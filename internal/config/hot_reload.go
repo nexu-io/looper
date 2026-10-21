@@ -70,6 +70,7 @@ var hotEditablePaths = map[string]struct{}{
 	"roles.reviewer.discovery.triggers.labelMode":                          {},
 	"roles.reviewer.discovery.specReview.includeReviewingLabel":            {},
 	"roles.reviewer.discovery.specReview.reviewingLabel":                   {},
+	"roles.reviewer.discovery.followUpInterval":                            {},
 	"roles.reviewer.behavior.loop.enabledByDefault":                        {},
 	"roles.reviewer.behavior.loop.maxIterationsPerPR":                      {},
 	"roles.reviewer.behavior.loop.maxIterationsPerHead":                    {},

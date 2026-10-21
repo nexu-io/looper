@@ -289,6 +289,7 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 	} else if config.Roles.Reviewer.Discovery.SpecReview.ReviewingLabel != strings.TrimSpace(config.Roles.Reviewer.Discovery.SpecReview.ReviewingLabel) {
 		issues = append(issues, ValidationIssue{Path: "roles.reviewer.discovery.specReview.reviewingLabel", Message: "must not contain leading or trailing whitespace"})
 	}
+	validateReviewerFollowUpInterval(config.Roles.Reviewer.Discovery.FollowUpInterval, "roles.reviewer.discovery.followUpInterval", &issues)
 
 	providerIDs := make(map[string]ProviderKind, len(config.Providers))
 	for index, provider := range config.Providers {
@@ -418,6 +419,7 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 		if effectiveProjectRoles.Reviewer.Discovery.SpecReview.IncludeReviewingLabel && strings.TrimSpace(effectiveProjectRoles.Reviewer.Discovery.SpecReview.ReviewingLabel) == "" {
 			issues = append(issues, ValidationIssue{Path: prefix + ".roles.reviewer.discovery.specReview.reviewingLabel", Message: "must be a non-empty string when includeReviewingLabel is true"})
 		}
+		validateReviewerFollowUpInterval(effectiveProjectRoles.Reviewer.Discovery.FollowUpInterval, prefix+".roles.reviewer.discovery.followUpInterval", &issues)
 		if project.Roles != nil && project.Roles.Reviewer != nil && project.Roles.Reviewer.Skills != nil {
 			validateReviewerSkillsConfig(effectiveProjectRoles.Reviewer.Skills, prefix+".roles.reviewer.skills", &issues)
 		}
@@ -1198,6 +1200,17 @@ func validateFixerRoleTriggers(triggers FixerRoleTriggersConfig, path string, is
 	validateLabelTriggers(triggers.Labels, triggers.LabelMode, path, issues)
 	if !isValidFixerAuthorFilter(triggers.AuthorFilter) {
 		*issues = append(*issues, ValidationIssue{Path: path + ".authorFilter", Message: fmt.Sprintf("must be one of: %s, %s", FixerAuthorFilterCurrentUser, FixerAuthorFilterAny)})
+	}
+}
+
+func validateReviewerFollowUpInterval(value, path string, issues *[]ValidationIssue) {
+	if strings.TrimSpace(value) == "" {
+		return
+	}
+	if duration, err := time.ParseDuration(strings.TrimSpace(value)); err != nil {
+		*issues = append(*issues, ValidationIssue{Path: path, Message: "must be a valid time.Duration string"})
+	} else if duration < 0 {
+		*issues = append(*issues, ValidationIssue{Path: path, Message: "must not be negative"})
 	}
 }
 

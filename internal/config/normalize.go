@@ -1547,6 +1547,9 @@ func mergeReviewerRoleDiscoveryConfig(config *ReviewerRoleDiscoveryConfig, parti
 	if partial.SpecReview != nil {
 		mergeReviewerSpecReviewConfig(&config.SpecReview, *partial.SpecReview)
 	}
+	if partial.FollowUpInterval != nil {
+		config.FollowUpInterval = strings.TrimSpace(*partial.FollowUpInterval)
+	}
 }
 
 func mergeFixerRoleConfig(config *FixerRoleConfig, partial PartialFixerRoleConfig) {

@@ -193,6 +193,9 @@ var configFieldRegistry = map[string]configField{
 	}, func(p *config.PartialConfig) **bool {
 		return &ensurePartialReviewerSpecReview(p).IncludeReviewingLabel
 	}),
+	"roles.reviewer.discovery.followUpInterval": reviewerDiscoveryStringField("roles.reviewer.discovery.followUpInterval", "LOOPER_ROLES_REVIEWER_DISCOVERY_FOLLOW_UP_INTERVAL", "", func(c config.Config) any { return c.Roles.Reviewer.Discovery.FollowUpInterval }, func(p *config.PartialConfig) **string {
+		return &ensurePartialReviewerRoleDiscovery(p).FollowUpInterval
+	}, nil),
 	"roles.reviewer.discovery.specReview.reviewingLabel": reviewerDiscoveryStringFieldWithAlias("roles.reviewer.discovery.specReview.reviewingLabel", "LOOPER_ROLES_REVIEWER_DISCOVERY_SPEC_REVIEW_REVIEWING_LABEL", "LOOPER_ROLES_REVIEWER_SPEC_REVIEW_REVIEWING_LABEL", "", "", func(c config.Config) any { return c.Roles.Reviewer.Discovery.SpecReview.ReviewingLabel }, func(p *config.PartialConfig) **string {
 		return &ensurePartialReviewerRoleDiscoverySpecReview(p).ReviewingLabel
 	}, func(p *config.PartialConfig) **string {
@@ -1748,6 +1751,8 @@ func configFieldSet(partial config.PartialConfig, key string) bool {
 		return partial.Roles != nil && partial.Roles.Reviewer != nil && ((partial.Roles.Reviewer.Discovery != nil && partial.Roles.Reviewer.Discovery.SpecReview != nil && partial.Roles.Reviewer.Discovery.SpecReview.IncludeReviewingLabel != nil) || (partial.Roles.Reviewer.SpecReview != nil && partial.Roles.Reviewer.SpecReview.IncludeReviewingLabel != nil))
 	case "roles.reviewer.discovery.specReview.reviewingLabel", "roles.reviewer.specReview.reviewingLabel":
 		return partial.Roles != nil && partial.Roles.Reviewer != nil && ((partial.Roles.Reviewer.Discovery != nil && partial.Roles.Reviewer.Discovery.SpecReview != nil && partial.Roles.Reviewer.Discovery.SpecReview.ReviewingLabel != nil) || (partial.Roles.Reviewer.SpecReview != nil && partial.Roles.Reviewer.SpecReview.ReviewingLabel != nil))
+	case "roles.reviewer.discovery.followUpInterval":
+		return partial.Roles != nil && partial.Roles.Reviewer != nil && partial.Roles.Reviewer.Discovery != nil && partial.Roles.Reviewer.Discovery.FollowUpInterval != nil
 	case "roles.fixer.autoDiscovery":
 		return partial.Roles != nil && partial.Roles.Fixer != nil && partial.Roles.Fixer.AutoDiscovery != nil
 	case "roles.fixer.instructions":

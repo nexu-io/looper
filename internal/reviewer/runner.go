@@ -519,6 +519,9 @@ type DiscoveryPolicy struct {
 	SpecReviewingLabel        string
 	MatchAnyTrigger           bool
 	RoutedClaimPolicy         networkpolicy.ProjectPolicy
+	// FollowUpInterval is the minimum time between full follow-up sweeps for one
+	// project and repo. Zero sweeps on every discovery pass.
+	FollowUpInterval time.Duration
 }
 
 type Runner struct {
@@ -557,6 +560,12 @@ type Runner struct {
 	onAgentExecutionStarted AgentExecutionStartedFunc
 	onQueueItemEnqueued     func()
 	notifyHumanAttention    func(context.Context, string)
+
+	// followUpSweptAt records when each project/repo last completed a full
+	// follow-up sweep. It is process memory on purpose: a restarted daemon has
+	// no record, so its first pass sweeps and covers webhooks missed meanwhile.
+	followUpSweepMu sync.Mutex
+	followUpSweptAt map[string]time.Time
 }
 
 type DiscoveryInput struct {
@@ -997,6 +1006,9 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 			return DiscoveryResult{}, err
 		}
 	}
+	if !r.followUpSweepDue(project.ID, input.Repo, policy.FollowUpInterval) {
+		return result, nil
+	}
 	followUpLoops, err := r.listFollowUpLoops(ctx, project.ID, input.Repo)
 	if err != nil {
 		return DiscoveryResult{}, err
@@ -1026,6 +1038,7 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 			seen[key] = struct{}{}
 		}
 	}
+	r.recordFollowUpSweep(project.ID, input.Repo)
 	return result, nil
 }
 
@@ -1826,7 +1839,30 @@ func (r *Runner) discoveryPolicyForProject(projectID string) DiscoveryPolicy {
 	roles := config.ProjectRoleConfigs(*r.projectRoleConfig, projectID)
 	labels := append([]string(nil), roles.Reviewer.Discovery.Triggers.Labels...)
 	matchAnyTrigger := r.forgejoProject(projectID) && roles.Reviewer.Discovery.Triggers.RequireReviewRequest && len(prQueryLabels(labels)) > 0
-	return DiscoveryPolicy{AutoDiscovery: roles.Reviewer.Discovery.AutoDiscovery, IncludeDrafts: roles.Reviewer.Discovery.Triggers.IncludeDrafts, RequireReviewRequest: roles.Reviewer.Discovery.Triggers.RequireReviewRequest, EnableSelfReview: roles.Reviewer.Discovery.Triggers.EnableSelfReview, Labels: labels, LabelMode: roles.Reviewer.Discovery.Triggers.LabelMode, IncludeSpecReviewingLabel: roles.Reviewer.Discovery.SpecReview.IncludeReviewingLabel, SpecReviewingLabel: roles.Reviewer.Discovery.SpecReview.ReviewingLabel, MatchAnyTrigger: matchAnyTrigger, RoutedClaimPolicy: networkpolicy.ProjectPolicyForProject(*r.projectRoleConfig, projectID)}
+	// Validation rejects malformed intervals, so a parse error here means unset.
+	followUpInterval, _ := time.ParseDuration(strings.TrimSpace(roles.Reviewer.Discovery.FollowUpInterval))
+	return DiscoveryPolicy{AutoDiscovery: roles.Reviewer.Discovery.AutoDiscovery, IncludeDrafts: roles.Reviewer.Discovery.Triggers.IncludeDrafts, RequireReviewRequest: roles.Reviewer.Discovery.Triggers.RequireReviewRequest, EnableSelfReview: roles.Reviewer.Discovery.Triggers.EnableSelfReview, Labels: labels, LabelMode: roles.Reviewer.Discovery.Triggers.LabelMode, IncludeSpecReviewingLabel: roles.Reviewer.Discovery.SpecReview.IncludeReviewingLabel, SpecReviewingLabel: roles.Reviewer.Discovery.SpecReview.ReviewingLabel, MatchAnyTrigger: matchAnyTrigger, RoutedClaimPolicy: networkpolicy.ProjectPolicyForProject(*r.projectRoleConfig, projectID), FollowUpInterval: followUpInterval}
+}
+
+// followUpSweepDue reports whether the follow-up sweep for project/repo should
+// run on this pass. New review requests are discovered regardless.
+func (r *Runner) followUpSweepDue(projectID, repo string, interval time.Duration) bool {
+	if interval <= 0 {
+		return true
+	}
+	r.followUpSweepMu.Lock()
+	defer r.followUpSweepMu.Unlock()
+	last, ok := r.followUpSweptAt[projectID+"\x00"+repo]
+	return !ok || r.now().Sub(last) >= interval
+}
+
+func (r *Runner) recordFollowUpSweep(projectID, repo string) {
+	r.followUpSweepMu.Lock()
+	defer r.followUpSweepMu.Unlock()
+	if r.followUpSweptAt == nil {
+		r.followUpSweptAt = map[string]time.Time{}
+	}
+	r.followUpSweptAt[projectID+"\x00"+repo] = r.now()
 }
 
 func (r *Runner) forgejoProject(projectID string) bool {
