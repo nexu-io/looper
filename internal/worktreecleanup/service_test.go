@@ -335,3 +335,25 @@ func iso(value time.Time) string {
 func strPtr(value string) *string {
 	return &value
 }
+
+func TestPlanIgnoresCleanupAttemptTouchWhenApplyingRetention(t *testing.T) {
+	t.Parallel()
+
+	fixture := newFixture(t)
+	old := fixture.now.Add(-10 * 24 * time.Hour)
+
+	fixture.worktree("wt_touched", "branch-touched", old)
+	fixture.loop("loop_touched", "completed", "wt_touched", "branch-touched", old)
+	fixture.run("run_touched", "loop_touched", "success", `{"worktree":{"id":"wt_touched"}}`, old)
+	// An earlier cleanup pass skipped this worktree and rotated it to the back of
+	// the candidate order. That bookkeeping is not use of the worktree.
+	if err := fixture.repos.Worktrees.TouchCleanupAttempt(context.Background(), "wt_touched", iso(fixture.now)); err != nil {
+		t.Fatalf("TouchCleanupAttempt() error = %v", err)
+	}
+
+	result, err := fixture.service().Plan(context.Background())
+	if err != nil {
+		t.Fatalf("Plan() error = %v", err)
+	}
+	assertDecision(t, result, "wt_touched", ActionWouldClean, "eligible in dry-run plan")
+}
