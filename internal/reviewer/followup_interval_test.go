@@ -98,3 +98,35 @@ func TestDiscoverPullRequestsTracksFollowUpIntervalPerRepo(t *testing.T) {
 		t.Fatalf("viewCalls = %d, want the second repo swept on its own first pass", github.viewCalls)
 	}
 }
+
+// The scheduler rebuilds the Runner for every configuration snapshot. Sweep
+// times must survive that rebuild, or every pass looks like the first one.
+func TestDiscoverPullRequestsFollowUpIntervalSurvivesRunnerRebuild(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{reviewRequests: []string{"alice"}, currentLogin: "octocat"}
+	seedFollowUpLoop(t, fixture, 1, "loop_follow", "acme/looper")
+	cfg, err := config.DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Projects = []config.ProjectRefConfig{{ID: "project_1", Name: "Looper", RepoPath: t.TempDir()}}
+	cfg.Roles.Reviewer.Discovery.FollowUpInterval = "1h"
+	snapshot := func(state *FollowUpSweepState) *Runner {
+		return New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, DiscoveryPolicy: DiscoveryPolicy{AutoDiscovery: true}, CustomInstructions: &cfg, FollowUpSweeps: state})
+	}
+
+	shared := NewFollowUpSweepState()
+	discoverOnce(t, snapshot(shared), "acme/looper")
+	swept := github.viewCalls
+	fixture.current = fixture.current.Add(10 * time.Minute)
+	discoverOnce(t, snapshot(shared), "acme/looper")
+	if github.viewCalls != swept {
+		t.Fatalf("viewCalls = %d, want %d: a rebuilt runner sharing sweep state must not sweep inside the interval", github.viewCalls, swept)
+	}
+
+	discoverOnce(t, snapshot(nil), "acme/looper")
+	if github.viewCalls <= swept {
+		t.Fatalf("viewCalls = %d, want a runner with fresh state (daemon start) to sweep", github.viewCalls)
+	}
+}

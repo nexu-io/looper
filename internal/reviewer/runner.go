@@ -506,6 +506,9 @@ type Options struct {
 	// NotifyHumanAttention, when set, observes durable loop state after a new
 	// review-fix budget park (including discovery-time parks before claim).
 	NotifyHumanAttention func(context.Context, string)
+	// FollowUpSweeps carries follow-up sweep times across configuration
+	// snapshots. Nil gives the Runner its own state.
+	FollowUpSweeps *FollowUpSweepState
 }
 
 type DiscoveryPolicy struct {
@@ -561,11 +564,21 @@ type Runner struct {
 	onQueueItemEnqueued     func()
 	notifyHumanAttention    func(context.Context, string)
 
-	// followUpSweptAt records when each project/repo last completed a full
-	// follow-up sweep. It is process memory on purpose: a restarted daemon has
-	// no record, so its first pass sweeps and covers webhooks missed meanwhile.
-	followUpSweepMu sync.Mutex
-	followUpSweptAt map[string]time.Time
+	followUpSweeps *FollowUpSweepState
+}
+
+// FollowUpSweepState records when each project/repo last completed a full
+// follow-up sweep. The scheduler rebuilds the Runner for every configuration
+// snapshot, so this state must be created once and shared. It is process
+// memory on purpose: a restarted daemon has no record, so its first pass
+// sweeps and covers webhooks missed meanwhile.
+type FollowUpSweepState struct {
+	mu      sync.Mutex
+	sweptAt map[string]time.Time
+}
+
+func NewFollowUpSweepState() *FollowUpSweepState {
+	return &FollowUpSweepState{sweptAt: map[string]time.Time{}}
 }
 
 type DiscoveryInput struct {
@@ -846,6 +859,10 @@ func New(options Options) *Runner {
 	if !policy.AutoDiscovery && !policy.IncludeDrafts && !policy.RequireReviewRequest && !policy.EnableSelfReview && len(policy.Labels) == 0 && policy.LabelMode == "" && !policy.IncludeSpecReviewingLabel && policy.SpecReviewingLabel == "" {
 		policy = DiscoveryPolicy{AutoDiscovery: true, IncludeDrafts: false, RequireReviewRequest: true, EnableSelfReview: false, Labels: []string{}, LabelMode: config.LabelModeAll, IncludeSpecReviewingLabel: true, SpecReviewingLabel: specpr.ReviewingLabel}
 	}
+	followUpSweeps := options.FollowUpSweeps
+	if followUpSweeps == nil {
+		followUpSweeps = NewFollowUpSweepState()
+	}
 	return &Runner{
 		db:                      options.DB,
 		repos:                   options.Repos,
@@ -882,6 +899,7 @@ func New(options Options) *Runner {
 		onAgentExecutionStarted: options.OnAgentExecutionStarted,
 		onQueueItemEnqueued:     options.OnQueueItemEnqueued,
 		notifyHumanAttention:    options.NotifyHumanAttention,
+		followUpSweeps:          followUpSweeps,
 	}
 }
 
@@ -1850,19 +1868,16 @@ func (r *Runner) followUpSweepDue(projectID, repo string, interval time.Duration
 	if interval <= 0 {
 		return true
 	}
-	r.followUpSweepMu.Lock()
-	defer r.followUpSweepMu.Unlock()
-	last, ok := r.followUpSweptAt[projectID+"\x00"+repo]
+	r.followUpSweeps.mu.Lock()
+	defer r.followUpSweeps.mu.Unlock()
+	last, ok := r.followUpSweeps.sweptAt[projectID+"\x00"+repo]
 	return !ok || r.now().Sub(last) >= interval
 }
 
 func (r *Runner) recordFollowUpSweep(projectID, repo string) {
-	r.followUpSweepMu.Lock()
-	defer r.followUpSweepMu.Unlock()
-	if r.followUpSweptAt == nil {
-		r.followUpSweptAt = map[string]time.Time{}
-	}
-	r.followUpSweptAt[projectID+"\x00"+repo] = r.now()
+	r.followUpSweeps.mu.Lock()
+	defer r.followUpSweeps.mu.Unlock()
+	r.followUpSweeps.sweptAt[projectID+"\x00"+repo] = r.now()
 }
 
 func (r *Runner) forgejoProject(projectID string) bool {

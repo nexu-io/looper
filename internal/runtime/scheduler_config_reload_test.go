@@ -12,6 +12,7 @@ import (
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/infra/shell"
 	"github.com/nexu-io/looper/internal/projects"
+	"github.com/nexu-io/looper/internal/reviewer"
 	"github.com/nexu-io/looper/internal/storage"
 )
 
@@ -208,6 +209,7 @@ func TestBuildDefaultSchedulerHandlers_PerRoleAgentVendors(t *testing.T) {
 		nil,
 		newSchedulerNotificationGatewayFactory(),
 		coordinatorrole.NewRuntimeState(),
+		reviewer.NewFollowUpSweepState(),
 	)
 	if handlers.input == nil {
 		t.Fatal("handlers.input = nil")
