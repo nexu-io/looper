@@ -1011,6 +1011,11 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 		}
 		detail, viewErr := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: *loop.PRNumber, CWD: project.RepoPath})
 		if viewErr != nil {
+			if githubinfra.IsPullRequestNotFoundError(viewErr) {
+				if err := r.terminateLoop(ctx, loop, "pr_not_found"); err != nil {
+					return DiscoveryResult{}, err
+				}
+			}
 			result.Skipped++
 			continue
 		}
@@ -1527,14 +1532,14 @@ func (r *Runner) allowThreadResolutionFollowUpAfterNotRequestedSkip(ctx context.
 }
 
 func (r *Runner) discoverExistingReviewerLoop(ctx context.Context, project storage.ProjectRecord, repo string, policy DiscoveryPolicy, currentLogin *string, loop storage.LoopRecord, detail PullRequestDetail, result *DiscoveryResult) error {
-	if !policy.IncludeDrafts && detail.IsDraft {
-		result.Skipped++
-		return nil
-	}
 	if normalizePRState(detail.State) != "open" {
 		if err := r.terminateLoop(ctx, loop, "pr_closed_or_merged"); err != nil {
 			return err
 		}
+		result.Skipped++
+		return nil
+	}
+	if !policy.IncludeDrafts && detail.IsDraft {
 		result.Skipped++
 		return nil
 	}
