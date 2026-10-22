@@ -541,6 +541,9 @@ type ReviewerRoleDiscoveryConfig struct {
 	AutoDiscovery bool                       `json:"autoDiscovery"`
 	Triggers      ReviewerRoleTriggersConfig `json:"triggers"`
 	SpecReview    ReviewerSpecReviewConfig   `json:"specReview"`
+	// FollowUpInterval is the minimum time between full follow-up sweeps for one
+	// project and repo, as a time.Duration string. Empty sweeps on every tick.
+	FollowUpInterval string `json:"followUpInterval,omitempty"`
 }
 
 type FixerRoleTriggersConfig struct {
@@ -1066,9 +1069,10 @@ type PartialReviewerSpecReviewConfig struct {
 }
 
 type PartialReviewerRoleDiscoveryConfig struct {
-	AutoDiscovery *bool                              `json:"autoDiscovery,omitempty"`
-	Triggers      *PartialReviewerRoleTriggersConfig `json:"triggers,omitempty"`
-	SpecReview    *PartialReviewerSpecReviewConfig   `json:"specReview,omitempty"`
+	AutoDiscovery    *bool                              `json:"autoDiscovery,omitempty"`
+	Triggers         *PartialReviewerRoleTriggersConfig `json:"triggers,omitempty"`
+	SpecReview       *PartialReviewerSpecReviewConfig   `json:"specReview,omitempty"`
+	FollowUpInterval *string                            `json:"followUpInterval,omitempty"`
 }
 
 type PartialFixerRoleTriggersConfig struct {

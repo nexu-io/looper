@@ -4151,3 +4151,35 @@ func validationIssuesContainPath(issues []ValidationIssue, path string) bool {
 	}
 	return false
 }
+
+func TestValidateReviewerFollowUpInterval(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		value   string
+		message string
+	}{
+		{value: "soon", message: "must be a valid time.Duration string"},
+		{value: "-1h", message: "must not be negative"},
+	} {
+		config, err := DefaultConfig(t.TempDir())
+		if err != nil {
+			t.Fatalf("DefaultConfig() error = %v", err)
+		}
+		config.Roles.Reviewer.Discovery.FollowUpInterval = tc.value
+		validationErr, ok := Validate(config).(*ConfigValidationError)
+		if !ok || validationErr == nil {
+			t.Fatalf("Validate(%q) error = %v, want *ConfigValidationError", tc.value, Validate(config))
+		}
+		assertValidationIssue(t, validationErr, "roles.reviewer.discovery.followUpInterval", tc.message)
+	}
+
+	config, err := DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	config.Roles.Reviewer.Discovery.FollowUpInterval = "1h"
+	if err := Validate(config); err != nil {
+		t.Fatalf("Validate(1h) error = %v, want nil", err)
+	}
+}

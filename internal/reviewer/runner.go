@@ -506,6 +506,9 @@ type Options struct {
 	// NotifyHumanAttention, when set, observes durable loop state after a new
 	// review-fix budget park (including discovery-time parks before claim).
 	NotifyHumanAttention func(context.Context, string)
+	// FollowUpSweeps carries follow-up sweep times across configuration
+	// snapshots. Nil gives the Runner its own state.
+	FollowUpSweeps *FollowUpSweepState
 }
 
 type DiscoveryPolicy struct {
@@ -519,6 +522,9 @@ type DiscoveryPolicy struct {
 	SpecReviewingLabel        string
 	MatchAnyTrigger           bool
 	RoutedClaimPolicy         networkpolicy.ProjectPolicy
+	// FollowUpInterval is the minimum time between full follow-up sweeps for one
+	// project and repo. Zero sweeps on every discovery pass.
+	FollowUpInterval time.Duration
 }
 
 type Runner struct {
@@ -557,6 +563,22 @@ type Runner struct {
 	onAgentExecutionStarted AgentExecutionStartedFunc
 	onQueueItemEnqueued     func()
 	notifyHumanAttention    func(context.Context, string)
+
+	followUpSweeps *FollowUpSweepState
+}
+
+// FollowUpSweepState records when each project/repo last completed a full
+// follow-up sweep. The scheduler rebuilds the Runner for every configuration
+// snapshot, so this state must be created once and shared. It is process
+// memory on purpose: a restarted daemon has no record, so its first pass
+// sweeps and covers webhooks missed meanwhile.
+type FollowUpSweepState struct {
+	mu      sync.Mutex
+	sweptAt map[string]time.Time
+}
+
+func NewFollowUpSweepState() *FollowUpSweepState {
+	return &FollowUpSweepState{sweptAt: map[string]time.Time{}}
 }
 
 type DiscoveryInput struct {
@@ -837,6 +859,10 @@ func New(options Options) *Runner {
 	if !policy.AutoDiscovery && !policy.IncludeDrafts && !policy.RequireReviewRequest && !policy.EnableSelfReview && len(policy.Labels) == 0 && policy.LabelMode == "" && !policy.IncludeSpecReviewingLabel && policy.SpecReviewingLabel == "" {
 		policy = DiscoveryPolicy{AutoDiscovery: true, IncludeDrafts: false, RequireReviewRequest: true, EnableSelfReview: false, Labels: []string{}, LabelMode: config.LabelModeAll, IncludeSpecReviewingLabel: true, SpecReviewingLabel: specpr.ReviewingLabel}
 	}
+	followUpSweeps := options.FollowUpSweeps
+	if followUpSweeps == nil {
+		followUpSweeps = NewFollowUpSweepState()
+	}
 	return &Runner{
 		db:                      options.DB,
 		repos:                   options.Repos,
@@ -873,6 +899,7 @@ func New(options Options) *Runner {
 		onAgentExecutionStarted: options.OnAgentExecutionStarted,
 		onQueueItemEnqueued:     options.OnQueueItemEnqueued,
 		notifyHumanAttention:    options.NotifyHumanAttention,
+		followUpSweeps:          followUpSweeps,
 	}
 }
 
@@ -997,6 +1024,9 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 			return DiscoveryResult{}, err
 		}
 	}
+	if !r.followUpSweepDue(project.ID, input.Repo, policy.FollowUpInterval) {
+		return result, nil
+	}
 	followUpLoops, err := r.listFollowUpLoops(ctx, project.ID, input.Repo)
 	if err != nil {
 		return DiscoveryResult{}, err
@@ -1031,6 +1061,7 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 			seen[key] = struct{}{}
 		}
 	}
+	r.recordFollowUpSweep(project.ID, input.Repo)
 	return result, nil
 }
 
@@ -1831,7 +1862,27 @@ func (r *Runner) discoveryPolicyForProject(projectID string) DiscoveryPolicy {
 	roles := config.ProjectRoleConfigs(*r.projectRoleConfig, projectID)
 	labels := append([]string(nil), roles.Reviewer.Discovery.Triggers.Labels...)
 	matchAnyTrigger := r.forgejoProject(projectID) && roles.Reviewer.Discovery.Triggers.RequireReviewRequest && len(prQueryLabels(labels)) > 0
-	return DiscoveryPolicy{AutoDiscovery: roles.Reviewer.Discovery.AutoDiscovery, IncludeDrafts: roles.Reviewer.Discovery.Triggers.IncludeDrafts, RequireReviewRequest: roles.Reviewer.Discovery.Triggers.RequireReviewRequest, EnableSelfReview: roles.Reviewer.Discovery.Triggers.EnableSelfReview, Labels: labels, LabelMode: roles.Reviewer.Discovery.Triggers.LabelMode, IncludeSpecReviewingLabel: roles.Reviewer.Discovery.SpecReview.IncludeReviewingLabel, SpecReviewingLabel: roles.Reviewer.Discovery.SpecReview.ReviewingLabel, MatchAnyTrigger: matchAnyTrigger, RoutedClaimPolicy: networkpolicy.ProjectPolicyForProject(*r.projectRoleConfig, projectID)}
+	// Validation rejects malformed intervals, so a parse error here means unset.
+	followUpInterval, _ := time.ParseDuration(strings.TrimSpace(roles.Reviewer.Discovery.FollowUpInterval))
+	return DiscoveryPolicy{AutoDiscovery: roles.Reviewer.Discovery.AutoDiscovery, IncludeDrafts: roles.Reviewer.Discovery.Triggers.IncludeDrafts, RequireReviewRequest: roles.Reviewer.Discovery.Triggers.RequireReviewRequest, EnableSelfReview: roles.Reviewer.Discovery.Triggers.EnableSelfReview, Labels: labels, LabelMode: roles.Reviewer.Discovery.Triggers.LabelMode, IncludeSpecReviewingLabel: roles.Reviewer.Discovery.SpecReview.IncludeReviewingLabel, SpecReviewingLabel: roles.Reviewer.Discovery.SpecReview.ReviewingLabel, MatchAnyTrigger: matchAnyTrigger, RoutedClaimPolicy: networkpolicy.ProjectPolicyForProject(*r.projectRoleConfig, projectID), FollowUpInterval: followUpInterval}
+}
+
+// followUpSweepDue reports whether the follow-up sweep for project/repo should
+// run on this pass. New review requests are discovered regardless.
+func (r *Runner) followUpSweepDue(projectID, repo string, interval time.Duration) bool {
+	if interval <= 0 {
+		return true
+	}
+	r.followUpSweeps.mu.Lock()
+	defer r.followUpSweeps.mu.Unlock()
+	last, ok := r.followUpSweeps.sweptAt[projectID+"\x00"+repo]
+	return !ok || r.now().Sub(last) >= interval
+}
+
+func (r *Runner) recordFollowUpSweep(projectID, repo string) {
+	r.followUpSweeps.mu.Lock()
+	defer r.followUpSweeps.mu.Unlock()
+	r.followUpSweeps.sweptAt[projectID+"\x00"+repo] = r.now()
 }
 
 func (r *Runner) forgejoProject(projectID string) bool {

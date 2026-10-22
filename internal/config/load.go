@@ -1527,6 +1527,9 @@ func applyRoleEnvOverrides(overrides *PartialConfig, lookupEnv EnvLookupFunc) er
 	if value, ok := envValue("LOOPER_ROLES_REVIEWER_DISCOVERY_SPEC_REVIEW_REVIEWING_LABEL", "LOOPER_ROLES_REVIEWER_SPEC_REVIEW_REVIEWING_LABEL"); ok {
 		ensureReviewerSpecReviewConfig(overrides).ReviewingLabel = stringPtr(strings.TrimSpace(value))
 	}
+	if value, ok := envValue("LOOPER_ROLES_REVIEWER_DISCOVERY_FOLLOW_UP_INTERVAL"); ok {
+		ensureReviewerRoleDiscoveryConfig(overrides).FollowUpInterval = stringPtr(strings.TrimSpace(value))
+	}
 
 	if err := boolEnv("LOOPER_ROLES_FIXER_AUTO_DISCOVERY", func(v *bool) { ensureFixerRoleConfig(overrides).AutoDiscovery = v }); err != nil {
 		return err
@@ -1751,6 +1754,14 @@ func ensureReviewerRoleTriggersConfig(partial *PartialConfig) *PartialReviewerRo
 		reviewer.Triggers = &PartialReviewerRoleTriggersConfig{}
 	}
 	return reviewer.Triggers
+}
+
+func ensureReviewerRoleDiscoveryConfig(partial *PartialConfig) *PartialReviewerRoleDiscoveryConfig {
+	reviewer := ensureReviewerRoleConfig(partial)
+	if reviewer.Discovery == nil {
+		reviewer.Discovery = &PartialReviewerRoleDiscoveryConfig{}
+	}
+	return reviewer.Discovery
 }
 
 func ensureReviewerSpecReviewConfig(partial *PartialConfig) *PartialReviewerSpecReviewConfig {
