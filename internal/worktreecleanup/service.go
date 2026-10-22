@@ -98,7 +98,9 @@ func (s *Service) Plan(ctx context.Context) (PlanResult, error) {
 	states := make([]candidateState, 0, len(worktrees))
 	for _, worktree := range worktrees {
 		state := candidateState{worktree: worktree}
-		state.noteTime(worktree.UpdatedAt)
+		// UpdatedAt is not a use signal: cleanup rewrites it on every skipped or
+		// failed attempt to rotate candidate order, so reading it here would restart
+		// the retention clock forever. Runs, loops and queue items record real use.
 		state.noteTime(worktree.CreatedAt)
 		states = append(states, state)
 	}
