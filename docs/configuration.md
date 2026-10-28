@@ -1009,6 +1009,10 @@ required = ["security-review", "./review-skills/team-bar.md"]
 optional = ["perf-review"]
 ```
 
+#### Opt-in maintainability method
+
+The repository ships an optional [`maintainability-review` method](../skills/maintainability-review/README.md) with evidence requirements and positive/counterexamples for duplicated business rules, reuse, responsibilities, complexity, abstraction boundaries, and test maintainability. It is not embedded or enabled by default. Install it in the chosen project's `.agents/skills/maintainability-review/` (or the daemon user's skill directory), then explicitly select it with `mode: "extend"` and `required: ["maintainability-review"]` while retaining any other selected skills. Keep builtin correctness review enabled. Confirm pilot scope before enabling; see the method README for installation, rollback, and isolated effectiveness evaluation.
+
 ### Related-file groups
 
 Large-PR grouping is off by default. See [DESIGN-reviewer-related-file-groups.md](DESIGN-reviewer-related-file-groups.md).
