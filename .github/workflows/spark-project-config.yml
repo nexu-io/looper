@@ -1,0 +1,49 @@
+name: Spark project configuration validation
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/spark-project-config.yml
+      - tools/spark-project-config/**
+      - internal/config/**
+      - skills/maintainability-review/**
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/spark-project-config.yml
+      - tools/spark-project-config/**
+      - internal/config/**
+      - skills/maintainability-review/**
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: spark-project-config-validation-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out the candidate revision
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Test and build the configuration candidate tool
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          go test ./tools/spark-project-config
+          go test ./internal/reviewer -run '^TestMaintainabilitySkillSelectionAndPrompt$'
+          go build -o "$RUNNER_TEMP/spark-project-config" ./tools/spark-project-config
+      - name: Record validation scope
+        run: |
+          printf 'Validated configuration tooling at `%s` in run `%s`, attempt `%s`. No live configuration was used or applied.\n' \
+            "$GITHUB_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" >> "$GITHUB_STEP_SUMMARY"

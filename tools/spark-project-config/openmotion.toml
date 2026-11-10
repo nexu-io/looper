@@ -1,0 +1,31 @@
+[[projects]]
+id = "openmotion"
+name = "OpenMotion"
+repo = "nexu-io/html-anything"
+repoPath = "__OPENMOTION_REPO_PATH__"
+baseBranch = "feature/motion"
+
+[projects.network]
+mode = "off"
+
+[projects.roles.planner]
+autoDiscovery = false
+
+[projects.roles.worker]
+autoDiscovery = false
+
+[projects.roles.fixer]
+autoDiscovery = false
+
+[projects.roles.coordinator]
+enabled = false
+
+[projects.roles.reviewer.discovery]
+autoDiscovery = false
+
+[projects.roles.reviewer.autoMerge]
+enabled = false
+
+[projects.roles.reviewer.skills]
+mode = "extend"
+required = ["maintainability-review"]
