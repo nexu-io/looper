@@ -123,6 +123,9 @@ func TestLooksLikeLocalIntegrityError(t *testing.T) {
 	if !LooksLikeLocalIntegrityError(errors.New("fatal: not a git repository")) {
 		t.Fatal("expected true")
 	}
+	if !LooksLikeLocalIntegrityError(errors.New("fatal: gitfile does not point to a valid repository: /tmp/worktree/.git")) {
+		t.Fatal("expected an invalid gitfile target to trigger a local integrity check")
+	}
 	if LooksLikeLocalIntegrityError(errors.New("ssh: connection refused")) {
 		t.Fatal("expected false")
 	}
