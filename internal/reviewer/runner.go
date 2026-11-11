@@ -6688,6 +6688,9 @@ func parseReviewerNativeCompletion(result AgentResult) (reviewerCommentOnlyCompl
 		completion.Coverage = sanitizeReviewerCoverage(completion.Coverage)
 		return completion, nil
 	}
+	if strings.TrimSpace(completion.Outcome) == "" {
+		completion.Outcome = requiredOutcomeForMustFixFindings(completion.Findings)
+	}
 	return validateReviewerCommentOnlyCompletion(completion)
 }
 
@@ -10034,7 +10037,7 @@ func buildReviewPromptWithInstructions(projectID string, instructionConfig confi
 	currentHeadSHA := snapshotHeadSHA(checkpoint)
 	lastPublishedHeadSHA = strings.TrimSpace(lastPublishedHeadSHA)
 	laterPass := isRepairFrontierPass(lastPublishedHeadSHA, currentHeadSHA)
-	publishInstruction := fmt.Sprintf("For actionable must_fix findings, you must publish the %s review yourself by calling looper's enforced review-submit wrapper from the shell (inline comments only for must_fix). For no-actionable-finding results, follow the clean-result publishing instructions for this run. After the agent step, finish with `__LOOPER_RESULT__` JSON that includes `summary`, optional `outcome`, and `findings` using the same disposition fields as comment-only (`disposition`, `severity`, `scopeBasis`, `scopeEvidence`, `title`, `body`, optional `path`/`line`). Looper **does** parse this findings list: `follow_up` is retained locally only and must not be submitted; `needs_human` parks the pair and must not be submitted as change-request comments. Do not smuggle follow_up/needs_human into unstructured top-level review body prose as the only carrier of a blocking finding.", forgeName)
+	publishInstruction := fmt.Sprintf("For actionable must_fix findings, you must publish the %s review yourself by calling looper's enforced review-submit wrapper from the shell (inline comments only for must_fix). For no-actionable-finding results, follow the clean-result publishing instructions for this run. After the agent step, finish with `__LOOPER_RESULT__` JSON containing `summary`. When reporting `findings`, include `outcome` and use the same disposition fields as comment-only (`disposition`, `severity`, `scopeBasis`, `scopeEvidence`, `title`, `body`, optional `path`/`line`). Looper **does** parse this findings list: `follow_up` is retained locally only and must not be submitted; `needs_human` parks the pair and must not be submitted as change-request comments. Do not smuggle follow_up/needs_human into unstructured top-level review body prose as the only carrier of a blocking finding.", forgeName)
 	if looperCLIPath == "" {
 		publishInstruction = fmt.Sprintf("A trusted Looper CLI review-submit wrapper is unavailable for this run, so fail closed: do not publish any %s review, do not add or remove any %s reaction, and exit non-zero with the exact message `trusted looper review submit wrapper unavailable`.", forgeName, forgeName)
 	}

@@ -7067,13 +7067,26 @@ func TestProcessClaimedItemRecordsPublishedHeadForAgentNativeReview(t *testing.T
 	}
 }
 
-func TestProcessClaimedItemAgentNativeReviewCompletesWithoutPublishRetry(t *testing.T) {
+func TestProcessClaimedItemNativeCommentWithFindingsAndMissingOutcomeCompletesWithoutRetry(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
 	fixture.repos.Locks.SetNow(fixture.now)
-	github := &fakeGitHubGateway{}
-	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "Please add tests", Stdout: `__LOOPER_RESULT__={"summary":"posted review"}`}}}
-	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AllowAutoApprove: true})
+	github := &fakeGitHubGateway{
+		reviewMarkerEvent:               ReviewEventComment,
+		reviewMarkerOutcome:             "non_blocking",
+		reviewMarkerInlineCommentBodies: []string{"Add regression coverage for the retry."},
+	}
+	agent := &fakeAgentExecutor{results: []AgentResult{{
+		Status:      "completed",
+		ParseStatus: "parsed",
+		Summary:     "Posted one non-blocking finding",
+		Stdout:      `__LOOPER_RESULT__={"summary":"Posted one non-blocking finding","findings":[{"title":"Missing regression coverage","body":"Add regression coverage for the retry.","disposition":"must_fix","severity":"non_blocking","scopeBasis":"introduced_regression","scopeEvidence":"The new retry changes when an existing review is reused.","path":"runner.go","line":42}]}`,
+	}}}
+	runner := New(Options{
+		DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{},
+		AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now,
+		ReviewEvents: config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventComment, Blocking: config.ReviewerReviewEventComment},
+	})
 
 	if _, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
 		t.Fatalf("DiscoverPullRequests() error = %v", err)
@@ -7088,6 +7101,9 @@ func TestProcessClaimedItemAgentNativeReviewCompletesWithoutPublishRetry(t *test
 	}
 	if first.Status != "success" {
 		t.Fatalf("first = %#v, want success", first)
+	}
+	if len(agent.starts) != 1 || github.reviewMarkerCalls != 1 || len(github.issueCommentCalls) != 0 {
+		t.Fatalf("agent starts=%d, marker checks=%d, issue comments=%d, want one verified native review", len(agent.starts), github.reviewMarkerCalls, len(github.issueCommentCalls))
 	}
 	queue, err := fixture.repos.Queue.GetByID(context.Background(), claim1.ID)
 	if err != nil {
