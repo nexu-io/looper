@@ -81,7 +81,8 @@ func LooksLikeLocalIntegrityError(err error) bool {
 	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "not a working tree") ||
 		strings.Contains(msg, "not a git repository") ||
-		strings.Contains(msg, "invalid gitfile format")
+		strings.Contains(msg, "invalid gitfile format") ||
+		strings.Contains(msg, "gitfile does not point to a valid repository")
 }
 
 // ClearUnusableManagedPath removes empty or metadata-only unusable leftovers at
