@@ -6690,6 +6690,9 @@ func parseReviewerNativeCompletion(result AgentResult) (reviewerCommentOnlyCompl
 	}
 	if strings.TrimSpace(completion.Outcome) == "" {
 		completion.Outcome = requiredOutcomeForMustFixFindings(completion.Findings)
+		if completion.Outcome == "" && cleanReviewNoopSummary(completion.Summary) {
+			completion.Outcome = "clean"
+		}
 	}
 	return validateReviewerCommentOnlyCompletion(completion)
 }

@@ -4672,11 +4672,16 @@ func TestProcessClaimedItemDetectsDuplicatePublishedFindings(t *testing.T) {
 	}
 }
 
-func TestProcessClaimedItemRecordsCleanNoopWithoutReviewMarkerForCommentPolicy(t *testing.T) {
+func TestProcessClaimedItemRecordsCleanNoopWithFollowUpOnlyFindingsAndMissingOutcome(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
 	github := &fakeGitHubGateway{reviewRequests: []string{"octocat"}, reviewMarkerMissing: true}
-	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "No actionable findings; added clean signal", Stdout: `__LOOPER_RESULT__={"summary":"No actionable findings; added clean signal"}`, ParseStatus: "parsed"}}}
+	agent := &fakeAgentExecutor{results: []AgentResult{{
+		Status:      "completed",
+		ParseStatus: "parsed",
+		Summary:     "No actionable findings",
+		Stdout:      `__LOOPER_RESULT__={"summary":"No actionable findings","findings":[{"title":"Consolidate installer helpers","body":"The older helpers could share a test fixture in a separate change.","disposition":"follow_up","severity":"nit","scopeBasis":"independent_improvement","scopeEvidence":"Existing setup duplication is outside this PR."}]}`,
+	}}}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, LoopConfig: config.ReviewerLoopConfig{EnabledByDefault: true, QuietPeriodSeconds: 120, MaxIterationsPerPR: 20, MaxIterationsPerHead: 2, MaxWallClockSeconds: 14400, MaxConsecutiveFailures: 3, MaxAgentExecutionsPerPR: 25}})
 	ctx := context.Background()
 	nowISO := fixture.nowISO()
@@ -4702,6 +4707,10 @@ func TestProcessClaimedItemRecordsCleanNoopWithoutReviewMarkerForCommentPolicy(t
 	}
 	if result.Status != "success" {
 		t.Fatalf("result = %#v, want success", result)
+	}
+	queueAfterReview, err := fixture.repos.Queue.GetByID(ctx, queue.ID)
+	if err != nil || queueAfterReview == nil || queueAfterReview.Status != "completed" || queueAfterReview.Attempts != 0 {
+		t.Fatalf("queue after clean review = (%#v, %v), want completed without retries", queueAfterReview, err)
 	}
 	if github.reviewMarkerCalls != 0 {
 		t.Fatalf("reviewMarkerCalls = %d, want no review marker lookup for clean no-op", github.reviewMarkerCalls)
