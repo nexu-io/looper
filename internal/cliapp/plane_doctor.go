@@ -96,7 +96,7 @@ func (r *commandRuntime) runPlaneDoctor(ctx context.Context, args []string) plan
 	} else {
 		var identity planeLinkIdentity
 		apiCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		err := r.planeJSONRequest(apiCtx, provider.BaseURL, token, "GET", "users/me", "", nil, &identity)
+		err := r.planeJSONRequest(apiCtx, provider.BaseURL, token, "GET", "users/me/", "", nil, &identity)
 		cancel()
 		if err != nil {
 			add("plane-api-key", "failed", err.Error(), "Refresh the Plane API key and restart looperd.")
