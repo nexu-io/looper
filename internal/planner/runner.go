@@ -61,12 +61,14 @@ const (
 )
 
 type IssueSummary struct {
-	Number    int64
-	Title     string
-	Body      string
-	URL       string
-	Assignees []string
-	Labels    []string
+	Number           int64
+	Title            string
+	Body             string
+	URL              string
+	Assignees        []string
+	Labels           []string
+	StrictDispatchID string
+	StrictAttemptID  string
 }
 
 type IssueDetail struct {
@@ -182,6 +184,17 @@ type GitHubGateway interface {
 	UpdatePullRequestBody(context.Context, UpdatePullRequestBodyInput) error
 	AddPullRequestLabels(context.Context, PullRequestLabelsInput) error
 	AddPullRequestReviewers(context.Context, PullRequestReviewersInput) error
+}
+
+type strictDispatchGateway interface {
+	StartStrictDispatch(context.Context, StrictDispatchStartInput) error
+}
+
+type StrictDispatchStartInput struct {
+	Repo       string
+	CWD        string
+	DispatchID string
+	AttemptID  string
 }
 
 type CreateWorktreeInput struct {
@@ -561,7 +574,7 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 			result.Skipped++
 			continue
 		}
-		if !shouldClaimIssue(issue, login, policy) {
+		if issue.StrictDispatchID == "" && !shouldClaimIssue(issue, login, policy) {
 			result.Skipped++
 			continue
 		}
@@ -584,7 +597,7 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 			result.Skipped++
 			continue
 		}
-		queueItem, err := r.enqueue(ctx, enqueueInput{ProjectID: project.ID, LoopID: loopResult.record.ID, Repo: input.Repo, IssueNumber: issue.Number, Payload: map[string]any{"issueNumber": issue.Number, "title": issue.Title, "body": issue.Body, "url": issue.URL, "assignees": issue.Assignees, "labels": issue.Labels, "currentUserLogin": login, plannerQueuePayloadFPKey: fingerprint}})
+		queueItem, err := r.enqueue(ctx, enqueueInput{ProjectID: project.ID, LoopID: loopResult.record.ID, Repo: input.Repo, IssueNumber: issue.Number, Payload: map[string]any{"issueNumber": issue.Number, "title": issue.Title, "body": issue.Body, "url": issue.URL, "assignees": issue.Assignees, "labels": issue.Labels, "currentUserLogin": login, "strictDispatchId": issue.StrictDispatchID, "strictAttemptId": issue.StrictAttemptID, plannerQueuePayloadFPKey: fingerprint}})
 		if err != nil {
 			return DiscoveryResult{}, err
 		}
@@ -744,7 +757,20 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			return ProcessResult{}, err
 		}
 		r.appendEvent(ctx, eventInput{eventType: "loop.step.started", projectID: loop.ProjectID, loopID: loop.ID, runID: run.ID, entityType: "run", entityID: run.ID, payload: map[string]any{"step": string(step)}})
-		checkpoint, err = r.executeStep(ctx, step, stepInput{Project: *project, Loop: *loop, Run: run, QueueItem: queueItem, Checkpoint: checkpoint})
+		if step == resumedRun.StartStep {
+			payload := parseJSONObject(queueItem.PayloadJSON)
+			if id := stringFromAnyDefault(payload["strictDispatchId"]); id != "" {
+				gateway, ok := r.github.(strictDispatchGateway)
+				if !ok {
+					err = errors.New("strict dispatch gateway is not configured")
+				} else {
+					err = gateway.StartStrictDispatch(ctx, StrictDispatchStartInput{Repo: derefString(loop.Repo), CWD: project.RepoPath, DispatchID: id, AttemptID: stringFromAnyDefault(payload["strictAttemptId"])})
+				}
+			}
+		}
+		if err == nil {
+			checkpoint, err = r.executeStep(ctx, step, stepInput{Project: *project, Loop: *loop, Run: run, QueueItem: queueItem, Checkpoint: checkpoint})
+		}
 		if err != nil {
 			var holdErr *holdSkipError
 			if errors.As(err, &holdErr) {
@@ -879,6 +905,7 @@ func (r *Runner) runDiscoverIssueStep(ctx context.Context, input stepInput) (pla
 		}
 	}()
 	manual := isManualPlannerQueue(payload)
+	strictDispatch := strings.TrimSpace(stringFromAnyDefault(payload["strictDispatchId"])) != ""
 	policy := r.discoveryPolicyForProject(input.Project.ID)
 	if currentLogin == "" && (manual || policy.RequireAssigneeCurrentUser || hasRequestedReviewerSources(input.Project, input.Loop, detail.Assignees)) {
 		login, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
@@ -890,7 +917,7 @@ func (r *Runner) runDiscoverIssueStep(ctx context.Context, input stepInput) (pla
 			return input.Checkpoint, &loopError{message: fmt.Sprintf("Unable to resolve GitHub login for planner issue %s#%d", repo, issueNumber), kind: FailureRetryableAfterResume}
 		}
 	}
-	if !manual && !labelsMatch(detail.Labels, policy.Labels, policy.LabelMode) {
+	if !manual && !strictDispatch && !labelsMatch(detail.Labels, policy.Labels, policy.LabelMode) {
 		checkpoint := input.Checkpoint
 		checkpoint.Issue = &checkpointIssue{Repo: repo, IssueNumber: issueNumber, Title: detail.Title, Body: detail.Body, URL: detail.URL, Assignees: cloneStrings(detail.Assignees), Labels: cloneStrings(detail.Labels), CurrentUserLogin: currentLogin, SpecPath: buildSpecPath(r.now(), issueNumber, detail.Title), RequestedReviewers: resolveRequestedReviewers(input.Project, input.Loop, detail.Assignees, currentLogin)}
 		checkpoint.ClaimedLockKey = lockKey
@@ -899,7 +926,7 @@ func (r *Runner) runDiscoverIssueStep(ctx context.Context, input stepInput) (pla
 		releaseOnError = false
 		return checkpoint, nil
 	}
-	if !manual && policy.RequireAssigneeCurrentUser && currentLogin != "" && !includesLogin(detail.Assignees, currentLogin) {
+	if !manual && !strictDispatch && policy.RequireAssigneeCurrentUser && currentLogin != "" && !includesLogin(detail.Assignees, currentLogin) {
 		checkpoint := input.Checkpoint
 		checkpoint.Issue = &checkpointIssue{Repo: repo, IssueNumber: issueNumber, Title: detail.Title, Body: detail.Body, URL: detail.URL, Assignees: cloneStrings(detail.Assignees), Labels: cloneStrings(detail.Labels), CurrentUserLogin: currentLogin, SpecPath: buildSpecPath(r.now(), issueNumber, detail.Title), RequestedReviewers: resolveRequestedReviewers(input.Project, input.Loop, detail.Assignees, currentLogin)}
 		checkpoint.ClaimedLockKey = lockKey

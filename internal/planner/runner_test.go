@@ -1915,3 +1915,48 @@ func TestUpdateLoopPreservesTerminatedLoop(t *testing.T) {
 		t.Fatalf("Loops.GetByID() = %#v, want terminated loop", persisted)
 	}
 }
+
+type dispatchTestGateway struct {
+	*fakeGitHubGateway
+	start func(StrictDispatchStartInput) error
+}
+
+func (g dispatchTestGateway) StartStrictDispatch(_ context.Context, input StrictDispatchStartInput) error {
+	return g.start(input)
+}
+
+func TestDispatchedIssueStartsLocalPlannerOnlyAfterPlaneAcceptsAttempt(t *testing.T) {
+	for _, reject := range []bool{false, true} {
+		t.Run(fmt.Sprintf("reject=%v", reject), func(t *testing.T) {
+			f := newRunnerFixture(t)
+			agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "planned"}}}
+			calls := 0
+			g := dispatchTestGateway{fakeGitHubGateway: &fakeGitHubGateway{issues: []IssueSummary{{Number: 42, Title: "Dispatched", StrictDispatchID: "dispatch", StrictAttemptID: "attempt"}}, issueDetail: IssueDetail{Number: 42, Title: "Dispatched"}, createPRResult: CreatePullRequestResult{Number: 101}}, start: func(i StrictDispatchStartInput) error {
+				calls++
+				if i.DispatchID != "dispatch" || i.AttemptID != "attempt" || len(agent.starts) != 0 {
+					t.Fatalf("wrong run or order: %+v", i)
+				}
+				if reject {
+					return errors.New("Plane rejected claim")
+				}
+				return nil
+			}}
+			git := &fakeGitGateway{createResult: CreateWorktreeResult{ID: "wt", WorktreePath: filepath.Join(t.TempDir(), "wt"), Branch: "plan/42", BaseBranch: "main"}}
+			r := New(Options{DB: f.coordinator.DB(), Repos: f.repos, GitHub: g, Git: git, AgentExecutor: agent, Logger: f.logger, Now: f.now, AllowAutoPush: boolPtr(true)})
+			ctx := context.Background()
+			for i := 0; i < 2; i++ {
+				if _, err := r.DiscoverIssues(ctx, DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			q, err := f.repos.Queue.ClaimNextOfType(ctx, f.nowISO(), "local", "planner")
+			if q == nil || err != nil {
+				t.Fatalf("claim: %v %v", q, err)
+			}
+			_, err = r.ProcessClaimedItem(ctx, *q)
+			if calls != 1 || (reject && len(agent.starts) != 0) || (!reject && (err != nil || len(agent.starts) != 1)) {
+				t.Fatalf("reject=%v calls=%d starts=%d err=%v", reject, calls, len(agent.starts), err)
+			}
+		})
+	}
+}

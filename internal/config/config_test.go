@@ -725,6 +725,40 @@ func TestValidateTreatsPlaneCodeRepoAsGitHubIdentity(t *testing.T) {
 	}
 }
 
+func TestPlaneStrictDispatchConfigNormalizesAndValidates(t *testing.T) {
+	t.Parallel()
+
+	tokenEnv := "PLANE_TOKEN"
+	workspace := "open-design"
+	planeProjectID := "33333333-4444-4555-8666-777777777777"
+	providerID := "plane"
+	cfg, err := Normalize(t.TempDir(), PartialConfig{
+		Providers: &[]PartialProviderConfig{{
+			ID: providerID, Kind: providerKindPtr(ProviderKindPlane), TokenEnv: &tokenEnv,
+			Workspace: &workspace, ProjectID: &planeProjectID,
+			StrictDispatch: &PlaneStrictDispatchConfig{
+				Enabled: true, BaseURL: " https://plane.example.test/ ", NodeID: " node-cyan ",
+				BindingID: " 55555555-6666-4777-8888-999999999999 ", KeyRevision: 2,
+				PrivateKeyFile: " /secure/node-key.pem ",
+			},
+		}},
+		Projects: &[]PartialProjectRefConfig{{
+			ID: "plane-project", Name: "Plane", Provider: &providerID,
+			Repo: stringPtr("acme/app"), RepoPath: t.TempDir(),
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	strict := cfg.Providers[0].StrictDispatch
+	if strict == nil || strict.BaseURL != "https://plane.example.test" || strict.NodeID != "node-cyan" || strict.PrivateKeyFile != "/secure/node-key.pem" {
+		t.Fatalf("strict dispatch normalization = %#v", strict)
+	}
+	if err := ValidateWithOptions(cfg, ValidateOptions{DefaultWorktreeRoot: t.TempDir()}); err != nil {
+		t.Fatalf("ValidateWithOptions() error = %v", err)
+	}
+}
+
 func TestMixedGitHubWebhookAndForgejoPollingConfigValidates(t *testing.T) {
 	t.Parallel()
 

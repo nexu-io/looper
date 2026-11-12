@@ -22,6 +22,17 @@ Concretely, for a `plane` project Looper maps each Plane work-item onto its inte
 
 Provider capabilities: issues, labels, comments, and assignees are supported; pull requests, diffs, and native reviews are **not** (they are delegated to GitHub). Review discovery is by label, review publishing is comment-only, and issue discovery is by polling.
 
+## Dispatch to your own computer from Plane
+
+For a Plane project with the Looper integration enabled, use **Connect my Looper** from the project. This workflow requires a CLI and daemon with Plane dispatch support, a local Git checkout, a configured coding agent, and a Plane API key readable by the daemon (normally `PLANE_API_KEY`).
+
+1. Ask the operator of **the loopernet trusted by this Plane installation** for its HTTPS URL and a one-time join key. The operator issues a key with an authenticated `POST /v1/join-keys`. The service must implement signed link challenges and Plane must trust its network ID and signing key. A Plane connection code cannot enroll a machine in loopernet.
+2. In your terminal, run `looper network join <team-url> --key <one-time-key> --name <node-name> --no-enroll-projects`. Verify `looper network status` shows your node. Skipping enrollment keeps other local projects in their current mode.
+3. From the checkout for this Plane project, run the command from **Connect my Looper**. Keep its one-time code private. The CLI writes the binding, restarts the local daemon, and waits for Plane to see its signed inbox. Run `looper plane doctor` to check readiness.
+4. Dispatch a work item to your node. The planner claims that dispatch on its next poll; no trigger label or self-assignment is required. Check `looper ps` and `looper logs <loop>` for the local planner and agent activity. Plane's `running` means Looper accepted the run, not that a model returned an answer.
+
+Strict dispatch only starts the planner. The local planner uses the project's existing permissions (including publishing a spec PR if configured); this slice does not hand the task to a worker or report completion to Plane. Use a separate project/checkout for historical replays.
+
 ## One-command bootstrap
 
 ```bash
