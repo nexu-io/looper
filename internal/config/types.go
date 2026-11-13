@@ -214,6 +214,18 @@ type ProviderConfig struct {
 	// its work-items from. Ignored for github/forgejo providers.
 	Workspace *string `json:"workspace,omitempty"`
 	ProjectID *string `json:"projectId,omitempty"`
+	// StrictDispatch enables Plane-authoritative owner-only dispatch for this
+	// provider. The private key stays in a separate 0600 file, never inline.
+	StrictDispatch *PlaneStrictDispatchConfig `json:"strictDispatch,omitempty"`
+}
+
+type PlaneStrictDispatchConfig struct {
+	Enabled        bool   `json:"enabled"`
+	BaseURL        string `json:"baseUrl"`
+	NodeID         string `json:"nodeId"`
+	BindingID      string `json:"bindingId"`
+	KeyRevision    uint64 `json:"keyRevision"`
+	PrivateKeyFile string `json:"privateKeyFile"`
 }
 
 // AgentBindingConfig is vendor+model only (profiles).
@@ -710,16 +722,17 @@ type PartialProjectWebhookConfig struct {
 }
 
 type PartialProviderConfig struct {
-	ID        string            `json:"id"`
-	Kind      *ProviderKind     `json:"kind,omitempty"`
-	BaseURL   *string           `json:"baseUrl,omitempty"`
-	GHPath    *string           `json:"ghPath,omitempty"`
-	Auth      *ProviderAuthMode `json:"auth,omitempty"`
-	TokenEnv  *string           `json:"tokenEnv,omitempty"`
-	TeaLogin  *string           `json:"teaLogin,omitempty"`
-	TeaPath   *string           `json:"teaPath,omitempty"`
-	Workspace *string           `json:"workspace,omitempty"`
-	ProjectID *string           `json:"projectId,omitempty"`
+	ID             string                     `json:"id"`
+	Kind           *ProviderKind              `json:"kind,omitempty"`
+	BaseURL        *string                    `json:"baseUrl,omitempty"`
+	GHPath         *string                    `json:"ghPath,omitempty"`
+	Auth           *ProviderAuthMode          `json:"auth,omitempty"`
+	TokenEnv       *string                    `json:"tokenEnv,omitempty"`
+	TeaLogin       *string                    `json:"teaLogin,omitempty"`
+	TeaPath        *string                    `json:"teaPath,omitempty"`
+	Workspace      *string                    `json:"workspace,omitempty"`
+	ProjectID      *string                    `json:"projectId,omitempty"`
+	StrictDispatch *PlaneStrictDispatchConfig `json:"strictDispatch,omitempty"`
 }
 
 type Config struct {

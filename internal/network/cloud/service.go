@@ -2,23 +2,31 @@ package cloud
 
 import (
 	"context"
+	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/sha256"
+	"crypto/x509"
 	"database/sql"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/mattn/go-sqlite3"
 	"github.com/nexu-io/looper/internal/network/protocol"
+	"github.com/nexu-io/looper/internal/planeprotocol"
 	"github.com/nexu-io/looper/internal/storage"
 )
 
 var errUnauthorized = errors.New("unauthorized")
+var errChallengeSigningDisabled = errors.New("link challenge signing is not configured")
 var randRead = rand.Read
 
 const webhookSecretMetaKey = "github_webhook_secret"
@@ -34,19 +42,79 @@ type Service struct {
 	mu        sync.Mutex
 	subs      map[chan protocol.AuditEnvelope]struct{}
 	webhook   protocol.WebhookHealth
+	trustKey  ed25519.PrivateKey
 }
 
 func Open(ctx context.Context, cfg Config) (*Service, error) {
+	trustKey, err := loadTrustPrivateKey(cfg.TrustPrivateKeyFile)
+	if err != nil {
+		return nil, err
+	}
 	db, err := sql.Open(storage.DriverName, cfg.DBPath)
 	if err != nil {
 		return nil, err
 	}
-	service := &Service{config: cfg, db: db, now: time.Now, subs: map[chan protocol.AuditEnvelope]struct{}{}}
+	service := &Service{config: cfg, db: db, now: time.Now, subs: map[chan protocol.AuditEnvelope]struct{}{}, trustKey: trustKey}
 	if err := service.init(ctx); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
 	return service, nil
+}
+
+func (s *Service) CreateLinkChallenge(ctx context.Context, nodeToken string, req protocol.LinkChallengeRequest) (protocol.LinkChallengeResponse, error) {
+	nodeID, _, err := s.authenticateNode(ctx, nodeToken)
+	if err != nil {
+		return protocol.LinkChallengeResponse{}, err
+	}
+	if len(s.trustKey) != ed25519.PrivateKeySize || s.config.TrustKeyRevision == 0 {
+		return protocol.LinkChallengeResponse{}, errChallengeSigningDisabled
+	}
+	publicKeyHash, err := base64.RawURLEncoding.Strict().DecodeString(strings.TrimSpace(req.PublicKeySHA256))
+	if err != nil || len(publicKeyHash) != sha256.Size {
+		return protocol.LinkChallengeResponse{}, errors.New("publicKeySha256 must be unpadded base64url containing 32 bytes")
+	}
+	if !strings.HasPrefix(req.Audience, "plane:") || len(req.Audience) > 128 {
+		return protocol.LinkChallengeResponse{}, errors.New("audience must be a Plane workspace audience")
+	}
+	networkID, err := s.NetworkID(ctx)
+	if err != nil {
+		return protocol.LinkChallengeResponse{}, err
+	}
+	var challengeID planeprotocol.UUID
+	if _, err := rand.Read(challengeID[:]); err != nil {
+		return protocol.LinkChallengeResponse{}, err
+	}
+	challengeID[6] = challengeID[6]&0x0f | 0x40
+	challengeID[8] = challengeID[8]&0x3f | 0x80
+	var nonce [16]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return protocol.LinkChallengeResponse{}, err
+	}
+	var hash [32]byte
+	copy(hash[:], publicKeyHash)
+	now := s.now().UTC()
+	ttl := s.config.LinkChallengeTTL
+	if ttl <= 0 || ttl > 120 {
+		ttl = 120
+	}
+	expires := now.Add(time.Duration(ttl) * time.Second)
+	payload, err := planeprotocol.EncodeLinkChallenge(planeprotocol.LinkChallenge{
+		NetworkID: networkID, NodeID: nodeID, PublicKeySHA256: hash,
+		Audience: req.Audience, ChallengeID: challengeID, Nonce: nonce,
+		IssuedAtMS: now.UnixMilli(), ExpiresAtMS: expires.UnixMilli(),
+	})
+	if err != nil {
+		return protocol.LinkChallengeResponse{}, err
+	}
+	envelope, err := planeprotocol.SignEnvelope(s.trustKey, planeprotocol.LinkChallengeProfile, s.config.TrustKeyRevision, payload)
+	if err != nil {
+		return protocol.LinkChallengeResponse{}, err
+	}
+	return protocol.LinkChallengeResponse{
+		Challenge:   base64.RawURLEncoding.EncodeToString(envelope),
+		ExpiresAtMS: expires.UnixMilli(), KeyRevision: s.config.TrustKeyRevision,
+	}, nil
 }
 
 func (s *Service) Close() error { return s.db.Close() }
@@ -635,6 +703,29 @@ func randomToken(n int) (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(b), nil
+}
+
+func loadTrustPrivateKey(path string) (ed25519.PrivateKey, error) {
+	if strings.TrimSpace(path) == "" {
+		return nil, nil
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read loopernet trust private key: %w", err)
+	}
+	block, rest := pem.Decode(raw)
+	if block == nil || len(strings.TrimSpace(string(rest))) != 0 || block.Type != "PRIVATE KEY" {
+		return nil, errors.New("loopernet trust private key must be one PKCS#8 PRIVATE KEY PEM block")
+	}
+	parsed, err := x509.ParsePKCS8PrivateKey(block.Bytes)
+	if err != nil {
+		return nil, fmt.Errorf("parse loopernet trust private key: %w", err)
+	}
+	privateKey, ok := parsed.(ed25519.PrivateKey)
+	if !ok || len(privateKey) != ed25519.PrivateKeySize {
+		return nil, errors.New("loopernet trust private key must be Ed25519")
+	}
+	return privateKey, nil
 }
 
 func (s *Service) RecordWebhookDelivery(eventType, deliveryID, repo string) {

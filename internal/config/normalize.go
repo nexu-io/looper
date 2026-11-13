@@ -178,16 +178,17 @@ func normalizeLayerPartial(partial PartialConfig) PartialConfig {
 		partials := make([]PartialProviderConfig, len(providers))
 		for i, provider := range providers {
 			partials[i] = PartialProviderConfig{
-				ID:        provider.ID,
-				Kind:      &provider.Kind,
-				BaseURL:   &provider.BaseURL,
-				GHPath:    provider.GHPath,
-				Auth:      providerAuthModePtr(provider.Auth),
-				TokenEnv:  provider.TokenEnv,
-				TeaLogin:  provider.TeaLogin,
-				TeaPath:   provider.TeaPath,
-				Workspace: provider.Workspace,
-				ProjectID: provider.ProjectID,
+				ID:             provider.ID,
+				Kind:           &provider.Kind,
+				BaseURL:        &provider.BaseURL,
+				GHPath:         provider.GHPath,
+				Auth:           providerAuthModePtr(provider.Auth),
+				TokenEnv:       provider.TokenEnv,
+				TeaLogin:       provider.TeaLogin,
+				TeaPath:        provider.TeaPath,
+				Workspace:      provider.Workspace,
+				ProjectID:      provider.ProjectID,
+				StrictDispatch: clonePlaneStrictDispatchConfig(provider.StrictDispatch),
 			}
 		}
 		normalized.Providers = &partials
@@ -566,6 +567,20 @@ func normalizeProviderConfig(provider *ProviderConfig) {
 	if provider.ProjectID != nil {
 		provider.ProjectID = stringPtr(strings.TrimSpace(*provider.ProjectID))
 	}
+	if provider.StrictDispatch != nil {
+		provider.StrictDispatch.BaseURL = normalizeBaseURL(provider.StrictDispatch.BaseURL)
+		provider.StrictDispatch.NodeID = strings.TrimSpace(provider.StrictDispatch.NodeID)
+		provider.StrictDispatch.BindingID = strings.TrimSpace(provider.StrictDispatch.BindingID)
+		provider.StrictDispatch.PrivateKeyFile = strings.TrimSpace(provider.StrictDispatch.PrivateKeyFile)
+	}
+}
+
+func clonePlaneStrictDispatchConfig(value *PlaneStrictDispatchConfig) *PlaneStrictDispatchConfig {
+	if value == nil {
+		return nil
+	}
+	cloned := *value
+	return &cloned
 }
 
 // EffectiveProviderAuth resolves the authentication strategy for a provider.
@@ -1930,14 +1945,15 @@ func cloneProviderConfigs(providers []PartialProviderConfig) []ProviderConfig {
 			kind = *provider.Kind
 		}
 		cloned[index] = ProviderConfig{
-			ID:        strings.TrimSpace(provider.ID),
-			Kind:      kind,
-			GHPath:    cloneStringPtr(provider.GHPath),
-			TokenEnv:  cloneStringPtr(provider.TokenEnv),
-			TeaLogin:  cloneStringPtr(provider.TeaLogin),
-			TeaPath:   cloneStringPtr(provider.TeaPath),
-			Workspace: cloneStringPtr(provider.Workspace),
-			ProjectID: cloneStringPtr(provider.ProjectID),
+			ID:             strings.TrimSpace(provider.ID),
+			Kind:           kind,
+			GHPath:         cloneStringPtr(provider.GHPath),
+			TokenEnv:       cloneStringPtr(provider.TokenEnv),
+			TeaLogin:       cloneStringPtr(provider.TeaLogin),
+			TeaPath:        cloneStringPtr(provider.TeaPath),
+			Workspace:      cloneStringPtr(provider.Workspace),
+			ProjectID:      cloneStringPtr(provider.ProjectID),
+			StrictDispatch: clonePlaneStrictDispatchConfig(provider.StrictDispatch),
 		}
 		if provider.Auth != nil {
 			cloned[index].Auth = *provider.Auth

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html"
 	"io"
@@ -15,7 +16,9 @@ import (
 	"time"
 
 	"github.com/nexu-io/looper/internal/config"
+	"github.com/nexu-io/looper/internal/domain"
 	"github.com/nexu-io/looper/internal/outboundguard"
+	"github.com/nexu-io/looper/internal/planestrict"
 )
 
 const (
@@ -35,13 +38,14 @@ const (
 // those belong to the project's GitHub code repo and are handled by the GitHub
 // path in the scheduler adapters (see internal/runtime/scheduler.go).
 type PlaneClient struct {
-	baseURL    *url.URL
-	webBaseURL string
-	token      string
-	userAgent  string
-	workspace  string
-	projectID  string
-	httpClient *http.Client
+	baseURL      *url.URL
+	webBaseURL   string
+	token        string
+	userAgent    string
+	workspace    string
+	projectID    string
+	httpClient   *http.Client
+	strictClient *planestrict.Client
 	// repo carries the plane provider id/kind plus the GitHub code repo where
 	// pull requests are opened (Repo == owner/name on GitHub).
 	repo RepositoryRef
@@ -151,7 +155,22 @@ func NewPlaneClientFromConfig(provider config.ProviderConfig, codeRepo string, o
 	if baseURL == "" {
 		baseURL = defaultPlaneBaseURL
 	}
-	return NewPlaneClient(RepositoryRef{ProviderID: provider.ID, Kind: ProviderKindPlane, BaseURL: baseURL, Repo: codeRepo}, workspace, projectID, token, options...)
+	client, err := NewPlaneClient(RepositoryRef{ProviderID: provider.ID, Kind: ProviderKindPlane, BaseURL: baseURL, Repo: codeRepo}, workspace, projectID, token, options...)
+	if err != nil {
+		return nil, err
+	}
+	if strict := provider.StrictDispatch; strict != nil && strict.Enabled {
+		credentials, err := planestrict.LoadCredentials(strict.BindingID, strict.KeyRevision, strict.NodeID, strict.PrivateKeyFile)
+		if err != nil {
+			return nil, err
+		}
+		strictClient, err := planestrict.NewClient(strict.BaseURL, workspace, projectID, credentials)
+		if err != nil {
+			return nil, err
+		}
+		client.strictClient = strictClient
+	}
+	return client, nil
 }
 
 func (plane *PlaneClient) Kind() ProviderKind { return ProviderKindPlane }
@@ -179,6 +198,10 @@ func (plane *PlaneClient) CurrentUser(ctx context.Context) (Identity, error) {
 // input.Labels is non-empty the results are filtered client-side to those that
 // carry ALL requested label names (label UUIDs are resolved to names first).
 func (plane *PlaneClient) ListOpenIssues(ctx context.Context, input ListIssuesInput) ([]Issue, error) {
+	if plane.strictClient != nil {
+		// Other roles must never claim a planner dispatch or fall back to labels.
+		return nil, nil
+	}
 	labelNames, err := plane.labelNamesByID(ctx)
 	if err != nil {
 		return nil, err
@@ -211,6 +234,105 @@ func (plane *PlaneClient) ListOpenIssues(ctx context.Context, input ListIssuesIn
 		}
 	}
 	return issues, nil
+}
+
+func (plane *PlaneClient) ListPlannerIssues(ctx context.Context, input ListIssuesInput, issueNumber int64) ([]Issue, error) {
+	if plane.strictClient == nil {
+		return plane.ListOpenIssues(ctx, input)
+	}
+	inbox, err := plane.strictClient.Inbox(ctx, "")
+	if err != nil {
+		return nil, err
+	}
+	issues := make([]Issue, 0, len(inbox.Dispatches))
+	for _, dispatch := range inbox.Dispatches {
+		if dispatch.ActiveRole != "planner" || dispatch.Health != "ok" || (dispatch.State != "queued" && dispatch.State != "claimed") {
+			continue
+		}
+		item, err := plane.workItemByID(ctx, dispatch.IssueID)
+		if err != nil {
+			return nil, err
+		}
+		if issueNumber > 0 && int64(item.SequenceID) != issueNumber {
+			continue
+		}
+		labelNames, err := plane.labelNamesByID(ctx)
+		if err != nil {
+			return nil, err
+		}
+		issue := plane.convertWorkItem(item, labelNames)
+		names := make([]string, 0, len(issue.Labels))
+		for _, l := range issue.Labels {
+			names = append(names, l.Name)
+		}
+		if domain.IsAutoLaneHeld(domain.LoopTypePlanner, names) {
+			continue
+		}
+		if dispatch.State == "queued" {
+			claimed, err := plane.strictClient.Claim(ctx, dispatch, dispatch.ID)
+			if err != nil {
+				return nil, fmt.Errorf("claim strict dispatch %s: %w", dispatch.ID, err)
+			}
+			if claimed.Dispatch.ID != dispatch.ID || claimed.Dispatch.IssueID != dispatch.IssueID {
+				return nil, errors.New("Plane claim does not match the requested dispatch")
+			}
+			dispatch = claimed.Dispatch
+		}
+		if dispatch.State != "claimed" {
+			continue
+		}
+		issue.StrictDispatchID = dispatch.ID
+		if dispatch.ExecutionAttemptID == nil || *dispatch.ExecutionAttemptID == "" {
+			return nil, errors.New("Plane claim missing execution attempt")
+		}
+		issue.StrictAttemptID = *dispatch.ExecutionAttemptID
+		issues = append(issues, issue)
+		if input.Limit > 0 && len(issues) >= input.Limit {
+			break
+		}
+	}
+	return issues, nil
+}
+
+func (plane *PlaneClient) workItemByID(ctx context.Context, workItemID string) (planeWorkItem, error) {
+	var item planeWorkItem
+	if err := plane.do(ctx, http.MethodGet, plane.projectPath("work-items", workItemID), nil, nil, &item); err != nil {
+		return planeWorkItem{}, fmt.Errorf("read strict dispatch work item %s: %w", workItemID, err)
+	}
+	return item, nil
+}
+
+func (plane *PlaneClient) StartStrictDispatch(ctx context.Context, dispatchID, attemptID string) error {
+	if plane.strictClient == nil {
+		return errors.New("Plane strict dispatch is not configured")
+	}
+	inbox, err := plane.strictClient.Inbox(ctx, "")
+	if err != nil {
+		return err
+	}
+	for _, dispatch := range inbox.Dispatches {
+		if dispatch.ID != dispatchID {
+			continue
+		}
+		if dispatch.ActiveRole != "planner" || dispatch.Health != "ok" || dispatch.ExecutionAttemptID == nil || *dispatch.ExecutionAttemptID != attemptID || attemptID == "" {
+			return errors.New("stale Plane planner claim")
+		}
+		if dispatch.State == "running" {
+			return nil
+		}
+		if dispatch.State != "claimed" || (dispatch.ClaimLeaseExpiresAt != nil && !time.Now().Before(*dispatch.ClaimLeaseExpiresAt)) {
+			return fmt.Errorf("Plane planner claim is no longer startable: %s", dispatch.State)
+		}
+		result, err := plane.strictClient.Transition(ctx, dispatch, "running", nil)
+		if err != nil {
+			return err
+		}
+		if result.Dispatch.ID != dispatchID || result.Dispatch.State != "running" || result.Dispatch.ExecutionAttemptID == nil || *result.Dispatch.ExecutionAttemptID != attemptID {
+			return errors.New("Plane did not confirm this planner attempt started")
+		}
+		return nil
+	}
+	return fmt.Errorf("strict dispatch %s is not in this Node inbox", dispatchID)
 }
 
 // ViewIssue resolves a work-item by its per-project sequence_id (looper's Issue

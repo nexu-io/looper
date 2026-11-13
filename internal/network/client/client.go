@@ -40,6 +40,14 @@ func (c *Client) Heartbeat(ctx context.Context, req protocol.HeartbeatRequest) (
 	return out, nil
 }
 
+func (c *Client) LinkChallenge(ctx context.Context, req protocol.LinkChallengeRequest) (protocol.LinkChallengeResponse, error) {
+	var out protocol.LinkChallengeResponse
+	if err := c.request(ctx, http.MethodPost, "/v1/link-challenges", c.nodeToken, req, &out); err != nil {
+		return protocol.LinkChallengeResponse{}, err
+	}
+	return out, nil
+}
+
 func (c *Client) Leave(ctx context.Context) error {
 	return c.request(ctx, http.MethodPost, "/v1/leave", c.nodeToken, map[string]any{}, nil)
 }

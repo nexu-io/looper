@@ -749,6 +749,13 @@ Set `roles.reviewer.autoMerge.enabled = true` explicitly to opt into Forgejo aut
 `plane` splits the task source from the code forge: Planner/Worker read work-items from Plane (filtered by a trigger label), while pull requests are opened and reviewed on the project's GitHub `repo`. Plane rules:
 
 - `providers[].kind = "plane"` requires a non-empty `tokenEnv` (the env var holding the Plane API key), `workspace` (the Plane workspace slug), and `projectId` (the Plane project UUID). `baseUrl` is optional and defaults to the public Plane API base.
+- A Plane project that has activated strict owner-only dispatch also sets
+  `providers[].strictDispatch`: `enabled: true`, the Plane app origin in
+  `baseUrl` (for example `https://plane.example.com`), stable `nodeId`, approved
+  `bindingId`, positive `keyRevision`, and `privateKeyFile`. The key file must be
+  a PKCS#8 Ed25519 PEM readable only by its owner (`chmod 600`). Strict mode
+  discovers work only from the Node's signed inbox; trigger labels and assignees
+  are no longer execution authority.
 - The project bound to a plane provider requires explicit `provider` and `repo`, where `repo` is the **GitHub code repo** (`owner/name`) where PRs are opened, and `repoPath` is its local checkout.
 - Discovery keys on the trigger label only; because Plane assignees are UUIDs (not GitHub logins), set `roles.*.triggers.requireAssigneeCurrentUser = false`.
 - One command scaffolds all of this: `looper bootstrap --provider plane …` (see [Plane provider + Feishu HITL setup](plane-provider.md)).
