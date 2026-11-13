@@ -36,6 +36,7 @@ func stripRoleAgentBindings(partial PartialRoleConfigs) PartialRoleConfigs {
 	if partial.Reviewer != nil {
 		reviewer := *partial.Reviewer
 		reviewer.Agent = nil
+		reviewer.Nono = nil
 		stripped.Reviewer = &reviewer
 	}
 	if partial.Fixer != nil {

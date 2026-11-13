@@ -24,6 +24,7 @@ Each role is an agent that keeps looping until *its* exit condition is met — n
 
 - 🧭 **Planner** — *loops until the spec is reviewable.* Reads the issue, explores the repo, drafts a spec, critiques it, and revises until the plan is concrete enough to open a spec PR. Done when the spec PR is open and labeled `looper:spec-reviewing`.
 - 🔍 **Reviewer** — *loops until the PR meets the bar.* Re-reads the PR on every new commit, posts inline threads, and keeps re-reviewing as the fixer pushes changes. Done when no actionable threads remain and the review comes back clean.
+  Optional [nono subprocess isolation](docs/reviewer-nono.md) is available for Reviewer agents through operator-owned policy.
 - 🔧 **Fixer** — *loops until reviewer threads are handled.* Pulls open review comments, addresses them in the worktree, pushes, and waits for the reviewer's next pass. Ping-pongs with the reviewer until the PR converges. Done when every actionable thread is resolved, or replied to when human input is needed.
 - 🚢 **Worker** — *loops until the PR is ready for merge.* Takes the `looper:spec-ready` spec PR, implements the spec on top of it, runs checks, and iterates on its own output. Done when checks pass and the PR is ready for human review and merge.
 
