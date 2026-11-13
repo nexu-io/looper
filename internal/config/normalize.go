@@ -1477,6 +1477,10 @@ func mergeWorkerRoleConfig(config *WorkerRoleConfig, partial PartialWorkerRoleCo
 }
 
 func mergeReviewerRoleConfig(config *ReviewerRoleConfig, partial PartialReviewerRoleConfig) {
+	if partial.Nono != nil {
+		nono := *partial.Nono
+		config.Nono = &nono
+	}
 	if partial.Identity != nil {
 		config.Identity = strings.TrimSpace(*partial.Identity)
 	}
@@ -2182,6 +2186,10 @@ func clonePartialRoleConfigs(configs *PartialRoleConfigs) *PartialRoleConfigs {
 			reviewer.Skills = &skills
 		}
 		reviewer.Agent = cloneRoleAgentConfig(configs.Reviewer.Agent)
+		if configs.Reviewer.Nono != nil {
+			nono := *configs.Reviewer.Nono
+			reviewer.Nono = &nono
+		}
 		cloned.Reviewer = &reviewer
 	}
 	if configs.Fixer != nil {

@@ -569,7 +569,14 @@ type WorkerRoleConfig struct {
 	Agent         *RoleAgentConfig        `json:"agent,omitempty"`
 }
 
+// ReviewerNonoConfig is global operator policy, never a project-level override.
+type ReviewerNonoConfig struct {
+	Profile string `json:"profile"`
+	Command string `json:"command,omitempty"`
+}
+
 type ReviewerRoleConfig struct {
+	Nono         *ReviewerNonoConfig         `json:"nono,omitempty"`
 	Identity     string                      `json:"identity,omitempty"`
 	Discovery    ReviewerRoleDiscoveryConfig `json:"discovery"`
 	Behavior     ReviewerConfig              `json:"behavior"`
@@ -1099,6 +1106,7 @@ type PartialWorkerRoleConfig struct {
 }
 
 type PartialReviewerRoleConfig struct {
+	Nono         *ReviewerNonoConfig                 `json:"nono,omitempty"`
 	Identity     *string                             `json:"identity,omitempty"`
 	Discovery    *PartialReviewerRoleDiscoveryConfig `json:"discovery,omitempty"`
 	Behavior     *PartialReviewerConfig              `json:"behavior,omitempty"`

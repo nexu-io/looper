@@ -104,6 +104,8 @@ type ExecutorConfig struct {
 }
 
 type ExecutorOptions struct {
+	// Nono is set only for Reviewer executors by the runtime.
+	Nono   *config.ReviewerNonoConfig
 	Config ExecutorConfig
 	Repos  *storage.Repositories
 	LogDir string
@@ -218,6 +220,7 @@ type Execution interface {
 }
 
 type ConfiguredExecutor struct {
+	nono                 *config.ReviewerNonoConfig
 	config               ExecutorConfig
 	paramsOwner          *config.AgentVendor
 	repos                *storage.Repositories
@@ -237,6 +240,7 @@ func New(options ExecutorOptions) *ConfiguredExecutor {
 		now = time.Now
 	}
 	return &ConfiguredExecutor{
+		nono:                 options.Nono,
 		config:               options.Config,
 		paramsOwner:          options.ParamsOwnerVendor,
 		repos:                options.Repos,
@@ -528,13 +532,11 @@ func (e *ConfiguredExecutor) Start(ctx context.Context, input RunInput) (Executi
 	}
 	command, args := ResolveSpawnWithNativeResume(cfg, input.WorkingDirectory, spawnPrompt, resume.SessionID, resume.Enabled)
 
-	cmd := exec.Command(command, args...)
-	cmd.Dir = input.WorkingDirectory
-	processcontainment.Configure(cmd)
-	cmd.Env = buildCommandEnv(input.WorkingDirectory, spawnPrompt, cfg.Env, input.Env)
-	if hosting != nil {
-		cmd.Env = hosting.commandEnv(input.WorkingDirectory, spawnPrompt, cfg.Env, input.Env)
+	cmd, err := e.agentCommand(command, args, input, spawnPrompt, cfg, hosting)
+	if err != nil {
+		return nil, err
 	}
+	command, args = cmd.Args[0], cmd.Args[1:]
 
 	maxOutputBytes := input.MaxOutputBytes
 	if maxOutputBytes <= 0 {
@@ -593,13 +595,12 @@ func (e *ConfiguredExecutor) Start(ctx context.Context, input RunInput) (Executi
 				// best-effort marker only; command fallback is the important recovery behavior
 			}
 			command, args = ResolveSpawn(cfg, input.WorkingDirectory, input.Prompt)
-			cmd = exec.Command(command, args...)
-			cmd.Dir = input.WorkingDirectory
-			processcontainment.Configure(cmd)
-			cmd.Env = buildCommandEnv(input.WorkingDirectory, input.Prompt, cfg.Env, input.Env)
-			if hosting != nil {
-				cmd.Env = hosting.commandEnv(input.WorkingDirectory, input.Prompt, cfg.Env, input.Env)
+			var commandErr error
+			cmd, commandErr = e.agentCommand(command, args, input, input.Prompt, cfg, hosting)
+			if commandErr != nil {
+				return nil, commandErr
 			}
+			command, args = cmd.Args[0], cmd.Args[1:]
 			cmd.Stdout = &streamCapture{onChunk: func(chunk []byte) { x.onOutput("stdout", chunk) }}
 			cmd.Stderr = &streamCapture{onChunk: func(chunk []byte) { x.onOutput("stderr", chunk) }}
 			x.mu.Lock()
@@ -1142,13 +1143,11 @@ func (x *execution) runCheckpointFallback(ctx context.Context, nativeError strin
 
 	cfg := x.executor.effectiveConfig(x.input)
 	command, args := ResolveSpawn(cfg, x.input.WorkingDirectory, x.input.Prompt)
-	cmd := exec.Command(command, args...)
-	cmd.Dir = x.input.WorkingDirectory
-	processcontainment.Configure(cmd)
-	cmd.Env = buildCommandEnv(x.input.WorkingDirectory, x.input.Prompt, cfg.Env, x.input.Env)
-	if x.hosting != nil {
-		cmd.Env = x.hosting.commandEnv(x.input.WorkingDirectory, x.input.Prompt, cfg.Env, x.input.Env)
+	cmd, err := x.executor.agentCommand(command, args, x.input, x.input.Prompt, cfg, x.hosting)
+	if err != nil {
+		return Result{}, "", false, err
 	}
+	command, args = cmd.Args[0], cmd.Args[1:]
 	cmd.Stdout = &streamCapture{onChunk: func(chunk []byte) { x.onOutput("stdout", chunk) }}
 	cmd.Stderr = &streamCapture{onChunk: func(chunk []byte) { x.onOutput("stderr", chunk) }}
 

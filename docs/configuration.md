@@ -342,6 +342,10 @@ Coordinator triage LLM uses the **global** agent only (`agent.vendor` / `agent.m
 - In-flight runs keep the immutable config snapshot (and durable per-run agent snapshot) they started with; resume/retry copies the predecessor run's agent snapshot rather than re-resolving live config.
 - `agent.params` remain global, file-only, and restart-bound. The dashboard does not edit params.
 
+### Reviewer nono sandbox
+
+`roles.reviewer.nono` optionally sets an operator-owned `profile` (absolute path) and `command` (default `nono`) for Reviewer agent subprocesses only. It is global, file-only and restart-bound. See [Reviewer nono sandbox](reviewer-nono.md) for policy grants, hosting socket isolation, deployment checks and scope limits.
+
 ### Example: different reviewer vs worker models
 
 TOML:

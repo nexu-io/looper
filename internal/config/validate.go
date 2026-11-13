@@ -48,6 +48,16 @@ func Validate(config Config) error {
 
 func ValidateWithOptions(config Config, options ValidateOptions) error {
 	issues := make([]ValidationIssue, 0)
+	if nono := config.Roles.Reviewer.Nono; nono != nil {
+		if !filepath.IsAbs(nono.Profile) {
+			issues = append(issues, ValidationIssue{Path: "roles.reviewer.nono.profile", Message: "must be an absolute path to an operator-owned nono profile"})
+		}
+	}
+	for i, project := range config.Projects {
+		if project.Roles != nil && project.Roles.Reviewer != nil && project.Roles.Reviewer.Nono != nil {
+			issues = append(issues, ValidationIssue{Path: fmt.Sprintf("projects[%d].roles.reviewer.nono", i), Message: "is global-only; configure roles.reviewer.nono"})
+		}
+	}
 
 	if config.Server.Host == "" {
 		issues = append(issues, ValidationIssue{Path: "server.host", Message: "must be a non-empty string"})

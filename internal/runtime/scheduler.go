@@ -3548,7 +3548,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			activeExecutions.ReportHardPersistFailure(err)
 		}
 	}
-	newRoleAgentExecutor := func(resolved config.ResolvedAgent) *agent.ConfiguredExecutor {
+	newRoleAgentExecutor := func(resolved config.ResolvedAgent, nono *config.ReviewerNonoConfig) *agent.ConfiguredExecutor {
 		// agent.params (especially command/args) belong to the global agent
 		// vendor. Keep the unstripped map and the owner vendor on the executor
 		// so effectiveConfig can filter against the effective identity: live
@@ -3557,6 +3557,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 		// prefers params.command over vendor defaults).
 		return agent.New(agent.ExecutorOptions{
 			HostingConfig: &cfg, TrustedLooperPath: looperCLIPath, HostingTracker: activeExecutions,
+			Nono: nono,
 			Config: agent.ExecutorConfig{
 				Vendor:              resolved.Vendor,
 				Model:               resolved.Model,
@@ -3594,7 +3595,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 	resolvedPlanner, plannerConfigured := config.ResolveAgent(cfg, "", config.CodingRolePlanner)
 	{
 		resolved := resolvedPlanner
-		plannerExecutor := newRoleAgentExecutor(resolved)
+		plannerExecutor := newRoleAgentExecutor(resolved, nil)
 		var agentModel *string
 		if resolved.Model != nil {
 			model := *resolved.Model
@@ -3682,7 +3683,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 	resolvedReviewer, reviewerConfigured := config.ResolveAgent(cfg, "", config.CodingRoleReviewer)
 	{
 		resolved := resolvedReviewer
-		reviewerExecutor := newRoleAgentExecutor(resolved)
+		reviewerExecutor := newRoleAgentExecutor(resolved, cfg.Roles.Reviewer.Nono)
 		var agentModel *string
 		if resolved.Model != nil {
 			model := *resolved.Model
@@ -3748,7 +3749,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 	resolvedFixer, fixerConfigured := config.ResolveAgent(cfg, "", config.CodingRoleFixer)
 	{
 		resolved := resolvedFixer
-		fixerExecutor := newRoleAgentExecutor(resolved)
+		fixerExecutor := newRoleAgentExecutor(resolved, nil)
 		var agentModel *string
 		if resolved.Model != nil {
 			model := *resolved.Model
@@ -3812,7 +3813,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 	resolvedWorker, workerConfigured := config.ResolveAgent(cfg, "", config.CodingRoleWorker)
 	{
 		resolved := resolvedWorker
-		workerExecutor := newRoleAgentExecutor(resolved)
+		workerExecutor := newRoleAgentExecutor(resolved, nil)
 		var agentModel *string
 		if resolved.Model != nil {
 			model := *resolved.Model
