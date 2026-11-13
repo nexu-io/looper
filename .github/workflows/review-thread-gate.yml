@@ -1,0 +1,70 @@
+name: Configure review thread merge gate
+
+on:
+  workflow_dispatch:
+    inputs:
+      repository:
+        description: Repository whose native review threads must be resolved before merging
+        required: true
+        default: nexu-io/openmotion
+        type: string
+      branch:
+        description: Protected destination branch
+        required: true
+        default: main
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: review-thread-gate-${{ inputs.repository }}
+  cancel-in-progress: false
+
+jobs:
+  configure:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out exact workflow source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Test gate configuration
+        run: python3 -m unittest discover -s scripts -p 'test_review_thread_gate.py'
+
+      - name: Resolve target repository
+        id: target
+        env:
+          TARGET_REPOSITORY: ${{ inputs.repository }}
+        run: |
+          python3 - <<'PY'
+          import os, re
+          target = os.environ['TARGET_REPOSITORY']
+          if not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', target):
+              raise SystemExit('Repository must use owner/repo format')
+          owner, repository = target.split('/')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write(f'owner={owner}\nrepository={repository}\n')
+          PY
+
+      - name: Mint repository-scoped administration token
+        uses: actions/create-github-app-token@v3
+        id: token
+        with:
+          app-id: ${{ vars.REVIEW_GATE_APP_ID }}
+          private-key: ${{ secrets.REVIEW_GATE_APP_PRIVATE_KEY }}
+          owner: ${{ steps.target.outputs.owner }}
+          repositories: ${{ steps.target.outputs.repository }}
+          permission-administration: write
+
+      - name: Apply and verify native merge gate
+        env:
+          TARGET_REPOSITORY: ${{ inputs.repository }}
+          TARGET_BRANCH: ${{ inputs.branch }}
+          GITHUB_TOKEN: ${{ github.token }}
+          REVIEW_GATE_TOKEN: ${{ steps.token.outputs.token }}
+        run: python3 scripts/configure-review-thread-gate.py

@@ -327,6 +327,46 @@ If reviewer considers the spec review clean, it will:
 - there are no unresolved review threads
 - the review decision is not `CHANGES_REQUESTED`
 
+### Block merging until review conversations are resolved
+
+GitHub's native `required_review_thread_resolution` rule blocks merging while a
+native review thread remains unresolved. It covers Looper and human review
+threads, including outdated threads. A top-level PR conversation comment does
+not create a review thread and cannot block merging through this rule. Closing
+a thread clears its conversation gate. Code repair still requires review.
+
+The **Configure review thread merge gate** workflow installs a dedicated active
+repository ruleset for the selected destination branch. Other rulesets and
+branch protections continue to apply. This gate requires no resident Looper
+upgrade and does not enable auto-merge.
+
+To configure it through CI:
+
+1. Install a GitHub App on the target repository with **Administration: write**.
+   Store its app ID in the Looper repository variable `REVIEW_GATE_APP_ID` and
+   private key in the Actions secret `REVIEW_GATE_APP_PRIVATE_KEY`. Keep the key
+   in CI secret storage.
+2. Merge the reviewed workflow into Looper's `main`. Run **Configure review
+   thread merge gate** on `main` with the target repository and destination
+   branch. Defaults are `nexu-io/openmotion` and `main`. Repeat for each branch
+   that needs this gate.
+3. Check the run summary for the target, ruleset ID, tested source SHA and run
+   ID. The workflow reads the rule back after applying it. Verify an existing
+   unresolved review thread shows a merge blocker in the target PR.
+
+The workflow mints a short-lived token scoped to the selected repository,
+serializes configuration runs for that repository, rejects non-main execution
+and checks the latest remote main immediately before the write. Its ruleset
+has no bypass actors. Existing bypasses on other rulesets cannot bypass this
+rule. An administrator can still edit or remove the rule itself. Unexpected
+scope or bypass changes to this dedicated ruleset require manual review before
+rerunning the workflow. Repository rulesets require a supported GitHub plan.
+
+The authority is GitHub's review-thread resolution state. Looper's review
+judgment remains in its published findings and structured outcomes. This gate
+does not require that a new Looper review finish before merging, so separate
+required-review or check rules are needed if that is also desired.
+
 ### Reviewer auto-merge
 
 Reviewer can close a Looper code Issue end-to-end without a human pressing Merge.
