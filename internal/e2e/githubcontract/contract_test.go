@@ -94,7 +94,7 @@ func TestInvariantFixerDiscoveryUsesBoundedIssueCommentProjection(t *testing.T) 
 			"default": json.RawMessage(`{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":""}}}}}}`),
 		},
 		PullRequests: map[string]harness.GHPullRequest{
-			"acme/looper#42": {Number: 42, Repo: "acme/looper", State: "OPEN", HeadSHA: "head-42", BaseSHA: "base-42", HeadRefName: "feature", BaseRefName: "main"},
+			"acme/looper#42": {Number: 42, Repo: "acme/looper", State: "OPEN", HeadSHA: "head-42", BaseSHA: "base-42", HeadRefName: "feature", BaseRefName: "main", IsCrossRepository: true},
 		},
 	})
 	root := t.TempDir()
@@ -110,6 +110,9 @@ func TestInvariantFixerDiscoveryUsesBoundedIssueCommentProjection(t *testing.T) 
 	}
 	if len(detail.IssueComments) != 1 || detail.IssueComments[0].ID != 202 {
 		t.Fatalf("IssueComments = %#v, want projected automation comment", detail.IssueComments)
+	}
+	if !detail.IsCrossRepository {
+		t.Fatal("fork identity was lost through the real gh command boundary")
 	}
 
 	invocations := readInvocationsForContract(t, fakeGH.InvocationLog)

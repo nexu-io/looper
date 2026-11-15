@@ -37,7 +37,7 @@ var (
 	prListJSONFields          = []string{"number", "title", "url", "state", "updatedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "reviewRequests", "reviews", "mergeStateStatus"}
 	prDiscoveryListJSONFields = []string{"number", "title", "url", "state", "updatedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "reviewRequests", "mergeStateStatus"}
 	prViewMetadataJSONFields  = []string{"number", "title", "body", "url", "state", "createdAt", "updatedAt", "closedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "reviewRequests", "mergeStateStatus"}
-	prViewFixerJSONFields     = []string{"number", "title", "body", "url", "state", "createdAt", "updatedAt", "closedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "reviewRequests", "statusCheckRollup", "mergeStateStatus"}
+	prViewFixerJSONFields     = []string{"isCrossRepository", "number", "title", "body", "url", "state", "createdAt", "updatedAt", "closedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "reviewRequests", "statusCheckRollup", "mergeStateStatus"}
 	prViewReviewerJSONFields  = []string{"number", "title", "body", "url", "state", "createdAt", "updatedAt", "closedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "reviewRequests", "reviews", "statusCheckRollup", "mergeStateStatus"}
 )
 
@@ -125,6 +125,7 @@ type PullRequestSummary struct {
 }
 
 type PullRequestDetail struct {
+	IsCrossRepository  bool
 	Number             int64
 	Title              string
 	Body               string
@@ -1530,6 +1531,7 @@ func pullRequestDetailFromViewRow(row map[string]any, threads []map[string]any, 
 		ReviewRequests:     extractReviewRequestLogins(row["reviewRequests"]),
 		ReviewRequestUsers: extractReviewRequestUsers(row["reviewRequests"]),
 		HasConflicts:       asString(row["mergeStateStatus"]) == "DIRTY",
+		IsCrossRepository:  asBool(row["isCrossRepository"]),
 		Comments:           threads,
 		IssueComments:      issueComments,
 		Reviews:            toObjectSlice(row["reviews"]),

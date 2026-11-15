@@ -161,21 +161,22 @@ type PullRequestSummary struct {
 }
 
 type PullRequestDetail struct {
-	Number         int64
-	URL            string
-	State          string
-	IsDraft        bool
-	Labels         []string
-	HeadSHA        string
-	HeadRefName    string
-	BaseRefName    string
-	BaseSHA        string
-	ReviewDecision string
-	Comments       []map[string]any
-	IssueComments  []map[string]any
-	Checks         []map[string]any
-	HasConflicts   bool
-	Author         string
+	IsCrossRepository bool
+	Number            int64
+	URL               string
+	State             string
+	IsDraft           bool
+	Labels            []string
+	HeadSHA           string
+	HeadRefName       string
+	BaseRefName       string
+	BaseSHA           string
+	ReviewDecision    string
+	Comments          []map[string]any
+	IssueComments     []map[string]any
+	Checks            []map[string]any
+	HasConflicts      bool
+	Author            string
 }
 
 type ListOpenPullRequestsInput struct {
@@ -1962,6 +1963,11 @@ func (r *Runner) discoverPullRequestFromDetail(ctx context.Context, project stor
 		result.Skipped++
 		return nil
 	}
+	// Fixer publishes to the base repository's origin, not a contributor's fork.
+	if detail.IsCrossRepository {
+		result.Skipped++
+		return nil
+	}
 	detail, err = r.prepareForgejoDiscoveryDetail(ctx, project, repo, detail)
 	if err != nil {
 		return err
@@ -2739,6 +2745,10 @@ func (r *Runner) runDiscoverPRStep(ctx context.Context, input stepInput) (fixerC
 	checkpoint := input.Checkpoint
 	if !isManualFixerLoop(input.Loop) && domain.IsAutoLaneHeld(domain.LoopTypeFixer, detail.Labels) {
 		return checkpoint, &holdSkipError{summary: fmt.Sprintf("Fixer stopped because %s#%d is currently held", input.Repo, input.PRNumber)}
+	}
+	if detail.IsCrossRepository {
+		checkpoint.ResumePolicy = loops.ResumePolicyManualIntervention
+		return checkpoint, &loopError{message: fmt.Sprintf("Fixer cannot publish to the fork for %s#%d; manual intervention required", input.Repo, input.PRNumber), kind: FailureManualIntervention}
 	}
 	policy := r.discoveryPolicyForProject(input.Project.ID)
 	if !isManualFixerLoop(input.Loop) && len(prQueryLabels(policy.Labels)) > 0 && !labelsMatch(detail.Labels, policy.Labels, policy.LabelMode) {
@@ -3944,7 +3954,7 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 		commitSHA = resolveCommentsExpectedHeadSHA(checkpoint)
 	}
 	driftCount := 0
-	mutationFailureCount := 0
+	var mutationErrors []error
 	var nativeMutationErr error
 	// Drift detection must be anchored to when the agent recorded the
 	// reply explanations, not when the current (possibly retried) run
@@ -4046,7 +4056,7 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 			decisionFingerprint := buildDeclinedThreadFingerprint(item, liveDetail.HeadSHA)
 			replyState, replyError := r.replyToDeclinedComment(ctx, input, item, decisionFingerprint, decision.Explanation, checkpoint.ResolvedComments.Items)
 			if replyState == "failed" {
-				mutationFailureCount++
+				mutationErrors = append(mutationErrors, errors.New(replyError))
 				upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Action: string(replyActionDeclined), Status: "failed_mutation_retry", Message: decision.Explanation, UpdatedAt: r.nowISO(), ReplyState: replyState, ReplyError: replyError})
 				continue
 			}
@@ -4065,7 +4075,7 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 					upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Action: string(replyActionFixed), Status: "already_resolved", Message: message, UpdatedAt: r.nowISO(), ReplyState: replyState, ReplyError: replyError})
 					continue
 				}
-				mutationFailureCount++
+				mutationErrors = append(mutationErrors, err)
 				upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Action: string(replyActionFixed), Status: "failed_mutation_retry", Message: message, UpdatedAt: r.nowISO(), ReplyState: replyState, ReplyError: replyError})
 				continue
 			}
@@ -4114,9 +4124,16 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 		checkpoint.ResumePolicy = loops.ResumePolicyRestartFromDiscover
 		return checkpoint, &loopError{message: fmt.Sprintf("Skipped %d review thread(s) because the fixer response omitted or invalidated thread decisions", contractViolationCount), kind: FailureRetryableAfterResume}
 	}
-	if mutationFailureCount > 0 {
+	if len(mutationErrors) > 0 {
+		for _, err := range mutationErrors {
+			failure := r.classifyFailureWithBoundary(err, failureclass.BoundaryGitHubAPI)
+			if failure.kind == FailureNonRetryable || failure.kind == FailureManualIntervention {
+				checkpoint.ResumePolicy = loops.ResumePolicyManualIntervention
+				return checkpoint, &loopError{message: fmt.Sprintf("Review thread mutation requires manual intervention: %s", failure.message), kind: FailureManualIntervention}
+			}
+		}
 		checkpoint.ResumePolicy = loops.ResumePolicyReplayStep
-		return checkpoint, &loopError{message: fmt.Sprintf("Failed to resolve %d review thread(s); will retry on next run", mutationFailureCount), kind: FailureRetryableAfterResume}
+		return checkpoint, &loopError{message: fmt.Sprintf("Failed to resolve %d review thread(s); will retry on next run", len(mutationErrors)), kind: FailureRetryableAfterResume}
 	}
 	if nativeMutationErr != nil {
 		checkpoint.ResumePolicy = loops.ResumePolicyReplayStep

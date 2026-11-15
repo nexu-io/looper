@@ -53,6 +53,7 @@ type pullRequestState struct {
 	UpdatedAt         string              `json:"updatedAt,omitempty"`
 	ClosedAt          string              `json:"closedAt,omitempty"`
 	IsDraft           bool                `json:"isDraft,omitempty"`
+	IsCrossRepository bool                `json:"isCrossRepository,omitempty"`
 	ReviewDecision    string              `json:"reviewDecision,omitempty"`
 	Labels            []string            `json:"labels,omitempty"`
 	HeadRefName       string              `json:"headRefName,omitempty"`
@@ -833,6 +834,8 @@ func pullRequestFieldValue(pr pullRequestState, field string) any {
 		return pr.ClosedAt
 	case "isDraft":
 		return pr.IsDraft
+	case "isCrossRepository":
+		return pr.IsCrossRepository
 	case "reviewDecision":
 		return pr.ReviewDecision
 	case "labels":
@@ -1111,7 +1114,7 @@ func defaultValue(field string) any {
 		return "2026-05-12T00:00:00Z"
 	case "closedAt":
 		return ""
-	case "isDraft":
+	case "isDraft", "isCrossRepository":
 		return false
 	case "reviewDecision":
 		return ""
