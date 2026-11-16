@@ -151,6 +151,25 @@ func TestFeishuCLIPreservesOriginalCardsAcrossProgressDecisionsAndRestart(t *tes
 	}
 }
 
+func TestBridgeWaitingCardUsesSummaryWithoutDuplicatingQuestion(t *testing.T) {
+	ctx := context.Background()
+	repos := storage.NewRepositories(openNotifyCoordinator(t, t.TempDir()).DB())
+	metadata := `{"worker":{"summary":"已请罗高判断主题验收重点"}}`
+	loop := storage.LoopRecord{ID: "bridge", ProjectID: "p", Status: "awaiting_human", MetadataJSON: &metadata}
+	// The bridge keeps its question in the native conversation; only the
+	// waiting person is projected into HITL, so there is no duplicate Question.
+	metadata, err := loops.WriteHITLAsk(loop.MetadataJSON, loops.HITLAsk{Status: "awaiting", MentionOpenIDs: []string{"ou_qa"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	loop.MetadataJSON = &metadata
+	gateway := NewGateway(Options{Repositories: repos})
+	card, ok := gateway.feishuCollaborationCard(ctx, &loop, "orange", "⏸ 等你定夺", "", "", "", nil, 0)
+	if !ok || !strings.Contains(card, "已请罗高判断主题验收重点") || !strings.Contains(card, "ou_qa") || strings.Contains(card, "等你定夺") {
+		t.Fatalf("waiting card lost the agent's actual summary: %s", card)
+	}
+}
+
 func TestFeishuAskDoesNotRepeatQuestionAsTitle(t *testing.T) {
 	for _, title := range []string{"", "为什么推荐这个方案？"} {
 		card, err := buildFeishuAskCard(HITLAskCard{Transport: "feishu", Title: title, Question: "为什么推荐这个方案？"})

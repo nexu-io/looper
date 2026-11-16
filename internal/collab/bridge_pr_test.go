@@ -113,7 +113,7 @@ server.listen(init.socket);const stop=()=>server.close(()=>process.exit(0));proc
 			if err := json.Unmarshal(body, &task); err != nil {
 				t.Fatal(err)
 			}
-			for _, want := range []string{"Persist theme after refresh", "https://ci.example/log", h.resultPath(loop.ID)} {
+			for _, want := range []string{"Persist theme after refresh", "https://ci.example/log", h.resultPath(loop.ID), "chat_id：oc_private", "message_id：om_root"} {
 				if !strings.Contains(task.Prompt, want) {
 					t.Errorf("follow-up omitted actual evidence %q: %s", want, task.Prompt)
 				}

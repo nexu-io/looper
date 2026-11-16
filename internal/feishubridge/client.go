@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -91,7 +92,14 @@ func Start(ctx context.Context, entry, home string, init Init, log io.Writer) (*
 		}
 	}
 	cmd := exec.Command("node", entry)
-	cmd.Env = append(os.Environ(), "LOOPER_BRIDGE_HOME="+home)
+	for _, variable := range os.Environ() {
+		key, value, _ := strings.Cut(variable, "=")
+		if value == init.AppSecret || key == "FEISHU_APP_SECRET" || key == "LOOPER_BRIDGE_APP_SECRET" {
+			continue
+		}
+		cmd.Env = append(cmd.Env, variable)
+	}
+	cmd.Env = append(cmd.Env, "LOOPER_BRIDGE_HOME="+home)
 	cmd.Stdout, cmd.Stderr = log, log
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	pipe, err := cmd.StdinPipe()

@@ -19,6 +19,9 @@ func TestClientReplacesLiveSidecarThroughIPCAndDrainsChild(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer os.RemoveAll(dir)
+	t.Setenv("FEISHU_APP_SECRET", "private-bridge-fixture")
+	t.Setenv("LOOPER_BRIDGE_APP_SECRET", "private-bridge-fixture")
+	t.Setenv("CUSTOM_COLLAB_SECRET", "private-bridge-fixture")
 	entry := filepath.Join(dir, "fixture.mjs")
 	// Real Node process and Unix socket, with the same inherited-pipe lifecycle.
 	source := `import {createServer} from 'node:http';
@@ -27,6 +30,7 @@ import {createInterface} from 'node:readline';
 const input=createInterface({input:process.stdin});
 input.once('line',line=>{
  const init=JSON.parse(line);
+ if(Object.values(process.env).includes(init.appSecret))throw new Error('bot credential inherited by agent runtime');
  const stop=()=>{server.close(()=>{try{unlinkSync(init.socket)}catch{};process.exit(0)});};
  const server=createServer((req,res)=>{res.end('{}');if(req.url==='/shutdown')setImmediate(stop)});
  server.listen(init.socket);
@@ -38,7 +42,7 @@ input.once('line',line=>{
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	init := Init{Socket: filepath.Join(dir, "bridge.sock"), AppID: "fixture", AppSecret: "fixture"}
+	init := Init{Socket: filepath.Join(dir, "bridge.sock"), AppID: "fixture", AppSecret: "private-bridge-fixture"}
 	first, err := Start(ctx, entry, dir, init, io.Discard)
 	if err != nil {
 		t.Fatal(err)

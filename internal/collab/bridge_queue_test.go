@@ -2,7 +2,9 @@ package collab
 
 import (
 	"context"
+	"encoding/json"
 	"io"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -75,8 +77,18 @@ server.listen(init.socket);const stop=()=>server.close(()=>process.exit(0));proc
 	if err := h.dispatchQueued(ctx); err == nil {
 		t.Fatal("dispatch failure was hidden")
 	}
-	if body, err := os.ReadFile(filepath.Join(dir, "accepted.json")); err != nil || !strings.Contains(string(body), "om_accepted") {
+	body, err := os.ReadFile(filepath.Join(dir, "accepted.json"))
+	if err != nil || !strings.Contains(string(body), "om_accepted") {
 		t.Fatalf("another task was blocked: %s, %v", body, err)
+	}
+	var task feishubridge.Task
+	if err := json.Unmarshal(body, &task); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"chat_id：oc_private", "message_id：om_accepted"} {
+		if !strings.Contains(task.Prompt, want) {
+			t.Errorf("agent lacks current conversation context %q", want)
+		}
 	}
 	items, err := h.repos.Loops.List(ctx)
 	if err != nil {
@@ -84,12 +96,25 @@ server.listen(init.socket);const stop=()=>server.close(()=>process.exit(0));proc
 	}
 	for _, loop := range items {
 		input, _, _ := readBridgeTask(loop)
-		want := "running"
-		if input.Title == "om_rejected" {
-			want = "queued"
-		}
-		if loop.Status != want || h.active[loop.ID] != (want == "running") {
+		if loop.Status != "queued" || h.active[loop.ID] != (input.Title == "om_accepted") {
 			t.Errorf("task %s: status=%s active=%v", input.Title, loop.Status, h.active[loop.ID])
 		}
+	}
+	response := httptest.NewRecorder()
+	h.status(response, httptest.NewRequest("GET", "/status", nil))
+	var status Status
+	if err := json.Unmarshal(response.Body.Bytes(), &status); err != nil {
+		t.Fatal(err)
+	}
+	if status.ActiveExecutions != 0 {
+		t.Fatalf("reserved queue slot reported as execution: %+v", status)
+	}
+	id, err := h.recordTurnEvent(ctx, feishubridge.TurnEvent{Phase: "started", RootMessageID: "om_accepted", ThreadID: "omt_accepted", SessionID: "native"})
+	if err != nil || id == "" {
+		t.Fatalf("start callback: id=%s err=%v", id, err)
+	}
+	loop, err := h.repos.Loops.GetByID(ctx, id)
+	if err != nil || loop == nil || loop.Status != "running" {
+		t.Fatalf("started task not running: %+v, %v", loop, err)
 	}
 }

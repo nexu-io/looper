@@ -325,7 +325,9 @@ func (h *bridgeHost) dispatchTask(ctx context.Context, loop storage.LoopRecord) 
 	}
 	_, state, _ = readBridgeTask(*fresh)
 	state.RootID = root
-	err = h.patch(ctx, loop.ID, "running", state, "正在了解任务和影响面")
+	// Acceptance by the bridge may only reserve a global queue slot. Its
+	// existing started callback is the authority for actual execution.
+	err = h.patch(ctx, loop.ID, "queued", state, "等待开始")
 	if err == nil {
 		h.active[loop.ID] = true
 	}
@@ -333,7 +335,7 @@ func (h *bridgeHost) dispatchTask(ctx context.Context, loop storage.LoopRecord) 
 	if err != nil {
 		return err
 	}
-	prompt := h.taskPrompt(loop.ID, input)
+	prompt := bridgeConversationPrompt(h.taskPrompt(loop.ID, input), chat, root)
 	if state.SessionID != "" {
 		prompt = "继续原任务；先结合会话和实际文件确认已做过的工作，避免重复操作。\n\n" + prompt
 	}
@@ -462,12 +464,13 @@ func (h *bridgeHost) status(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	tasks := make([]Task, 0, len(items))
+	active := 0
 	for _, item := range items {
 		tasks = append(tasks, taskStatus(item))
+		if _, _, ok := readBridgeTask(item); ok && item.Status == "running" {
+			active++
+		}
 	}
-	h.mu.Lock()
-	active := len(h.active)
-	h.mu.Unlock()
 	state := "starting"
 	if h.ready.Load() {
 		state = "running"
@@ -481,6 +484,10 @@ func (h *bridgeHost) resultPath(id string) string {
 
 func (h *bridgeHost) taskPrompt(id string, input worker.EnqueueInput) string {
 	return fmt.Sprintf("任务：%s\n来源：%s\n\n%s\n\n本任务状态文件：%s\n每轮结束前，将任务实际结论写到该文件，格式见 AGENTS.md。不要把单轮回复结束当作任务完成。", input.Title, input.IssueURL, input.Prompt, h.resultPath(id))
+}
+
+func bridgeConversationPrompt(prompt, chat, root string) string {
+	return fmt.Sprintf("%s\n\n当前飞书群 chat_id：%s\n原话题锚点 message_id：%s（需要在原话题主动 @ 同事时，以此消息 reply-in-thread；最终回复由 bridge 自动发送）。", prompt, chat, root)
 }
 
 func (h *bridgeHost) writeWorkspace(dir string) error {
@@ -506,7 +513,13 @@ func (h *bridgeHost) writeWorkspace(dir string) error {
 小修复也先检查原因、调用方和影响面；复杂任务按需拆分、列计划或写技术设计，不强制每项写文档。
 在开始、关键发现、方案改变和交付时，用简短中文说明进展。先说结论，使用段落、列表和 Markdown，不贴长工具日志。工具细节由 bridge 折叠。
 只有需要人类判断时才等待。找谁由你判断，可查任务、参与者及同事信息；不清楚就问 Looper owner。选择题用编号选项，人在原话题 @bot 回复。
-需要邀请同事时，先以 bot 邀请、确认入群，再 @；不要求只允许 owner 回复。飞书读写、附件和表情全部使用 bot，禁止 --as user，权限不足不能切换用户身份。
+找同事参与的操作顺序：
+1. 自己判断应该请谁；不知道就问 owner，不要求只允许 owner 回复。
+2. 在当前群以 bot 邀请该同事（lark-cli 的 im.chat.members.create），再以 bot 查询当前群成员，确认对方已入群。
+3. 确认后才在原话题 @ 对方并提出编号问题。不要把消息发送成功当作已邀请成功，也不要到别的群寻找一个能 @ 的同名人。
+真正提醒同事用飞书原生 post：在 content 数组中使用 {"tag":"at","user_id":"目标 open_id"}，问题和每个选项各占一个内容行。不要把 <at> 标签写进 Markdown 或用字面量反斜杠 n 冒充换行，它们可能只显示文字而不提醒人。
+如果邀请失败，说明实际原因并问 owner 如何处理；不反复催问，不声称对方已入群。
+飞书读写、附件和表情全部显式使用 bot，禁止 --as user，权限不足不能切换用户身份。在已获任务授权范围内邀请和发问，不必为同一授权下的每次 API 操作重复请 owner 确认。
 交付要让验收人实际能访问。按任务选择预览、截图、录屏或包；本机路径和 localhost 不能当作共享链接。优先利用 bridge 的图片与本地文件交付能力。
 只读调查、解释和文档任务可以正常完成，不强求代码修改或 PR。开发任务创建所需各仓 PR，持续处理 review、CI、冲突和合并队列。未获授权不要代替人合并。
 
@@ -711,7 +724,7 @@ func (h *bridgeHost) pollPullRequests(ctx context.Context) {
 			continue
 		}
 		state.Signal = signal
-		err = h.patch(ctx, loop.ID, "running", state, "正在跟进 PR 变化")
+		err = h.patch(ctx, loop.ID, "queued", state, "等待跟进 PR 变化")
 		if err == nil {
 			h.active[loop.ID] = true
 		}
@@ -720,7 +733,7 @@ func (h *bridgeHost) pollPullRequests(ctx context.Context) {
 			continue
 		}
 		if err := h.client.Request(ctx, http.MethodPost, "/tasks", feishubridge.Task{ChatID: chat, ThreadID: state.ThreadID,
-			RootMessageID: state.RootID, CWD: filepath.Join(h.dir, "workspace"), Title: "跟进 PR", Prompt: prompt,
+			RootMessageID: state.RootID, CWD: filepath.Join(h.dir, "workspace"), Title: "跟进 PR", Prompt: bridgeConversationPrompt(prompt, chat, state.RootID),
 			RequesterOpenID: h.cfg.HITL.Feishu.OwnerOpenID}); err != nil {
 			h.mu.Lock()
 			delete(h.active, loop.ID)

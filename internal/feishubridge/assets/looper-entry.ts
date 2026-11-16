@@ -43,14 +43,14 @@ async function report(event: TurnEvent): Promise<void> {
 
 const projects = await listProjects();
 const cfg: AppConfig = { accounts: { app: {
-  id: init.appId, secret: { source: 'env', id: 'LOOPER_BRIDGE_APP_SECRET' }, tenant: init.tenant ?? 'feishu',
+  id: init.appId, secret: '', tenant: init.tenant ?? 'feishu',
 } }, preferences: {
   messageReply: 'card', showToolCalls: true, maxConcurrentRuns: init.concurrency ?? 4,
   pendingPolicy: 'steer', requireMentionInGroup: true,
   access: { ownerOpenId: init.ownerOpenId, allowedChats: projects.length ? projects.map((p) => p.chatId) : ['__no_tasks_yet__'] },
   cliBridge: { enabled: false },
 } };
-process.env.LOOPER_BRIDGE_APP_SECRET = init.appSecret;
+// startBridge receives the secret directly; agent children must not inherit it.
 const bridge = await startBridge({ cfg, appSecret: init.appSecret, fallbackCwd: init.cwd,
   externalHooks: { onTurn: report } });
 init.appSecret = '';

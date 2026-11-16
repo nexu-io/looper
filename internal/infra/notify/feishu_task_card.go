@@ -178,7 +178,7 @@ func (g *Gateway) feishuTaskUpdate(ctx context.Context, loop *storage.LoopRecord
 		}
 	}
 	if loop.Status == "awaiting_human" {
-		if ask, ok := loops.ReadHITLAsk(loop.MetadataJSON); ok && ask.Status == "awaiting" {
+		if ask, ok := loops.ReadHITLAsk(loop.MetadataJSON); ok && ask.Status == "awaiting" && strings.TrimSpace(ask.Question) != "" {
 			return ask.Question, elapsed
 		}
 	}
