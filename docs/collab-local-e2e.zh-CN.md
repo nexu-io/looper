@@ -223,6 +223,26 @@ looper_test collab stop --state-dir "$COLLAB_STATE"
 | @bot 没继续 | 是否在正确话题真实 @、任务是否正在等待人、读取话题权限与日志 |
 | 日志提示启动 daemon | 是否误用了旧 connect／doctor 流程；独立连接必须带 `--collab` |
 
+## 人员目录
+
+协作入口启动后自动读取当前 bot 可见的飞书通讯录和已连接的 Plane 项目成员，每 10 分钟刷新到 `<state-dir>/workspace/people.json`。Agent 的工作指引已包含这个位置；需要找人时读取，不需要为每项任务维护角色配置。
+
+也可以查看当前快照：
+
+```sh
+dist/looper collab people --config "$COLLAB_CONFIG" --state-dir "$COLLAB_STATE" --json
+```
+
+`feishu.users` 保存姓名、当前应用的 open_id，以及上游允许读取的其他基础字段；`plane` 按 connection 列出成员。没有姓名／字段权限、不可见的人员或同步失败会显示 `error`。每次刷新替换快照，不将旧成员静默保留为当前人员。文件仅本机用户可读，不入库、不贴到群里；它不含登录凭证，也不采集手机号或邮箱。
+
+应用需要 `contact:contact.base:readonly` 读取通讯录，另需 `contact:user.base:readonly` 读取姓名；按需开启 `contact:user.employee:readonly` 后才能取得任职状态等字段。字段不存在表示未知，不能当成“已确认在职”。应用通讯录数据范围建议按需要覆盖团队所在部门或全员，使新员工进入该范围后自动出现。仅配置若干个人不会自动覆盖后续新员工。当前支持可见部门（含子部门）和直接授权用户；只有用户组授权时会标记目录不完整，不能声称已同步全部人员。
+
+飞书 `open_id` 属于具体应用，CLI 应用与 bridge 应用不一致时会报告错误，不提供错误应用的人员 ID，但不阻塞任务执行。人员目录同步在后台运行，不阻塞派单、消息回执或 PR 跟进。
+
+当前按已确认方案**同步两份真实目录，不按邮箱／同名自动合并账号**。Agent 根据任务和对话查阅找人，不确定就问 owner；明确人选后仍需先邀请、确认入群，再 @。公司 SSO 保存飞书身份不代表当前 Plane 已暴露对应字段，本次不扩展 SSO 或 Plane 登录流程。
+
+验收时检查：目录中能按姓名找到已授权同事；在测试来源新增／移除成员后下一轮快照对应变化；禁用权限时出现错误而非旧数据冒充成功；普通任务不因目录缺失被拦住。真实邀请与 @ 沿用第 6 节，在已授权私测群验证，不向大群广播。
+
 ## 附录 在自己电脑启动 Plane
 
 已有可用测试 Plane 时跳过本节。要本地验证 Plane 改动，取得 `https://code.powerformer.net/core/plane` 的配套分支 `feat/looper-collab-standalone-main`，按该仓库的 `AGENTS.md` 和 `apps/api/LOCAL_DEVELOPMENT.md` 准备环境。该分支基于最新 main，collab migration 接在 `0156` 之后，不使用早期工作树的 `0137` 临时迁移。优先原生 Django／Web，不启动完整 Compose。

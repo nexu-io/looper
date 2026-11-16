@@ -24,10 +24,13 @@ import (
 func (r *commandRuntime) collabCommand() *cobra.Command {
 	command := newCommand(commandSpec{use: "collab", short: "Run the independent Feishu collaboration service", helpWhenNoArgs: true,
 		persistentFlags: []flagSpec{stringFlag("state-dir", "path", "Independent collaboration state directory")},
-		helpSubcommands: []helpSubcommand{{name: "start", description: "Start once; stay available across tasks"}, {name: "status", description: "Show service and task progress"}, {name: "run", description: "Dispatch a task; the agent determines its repositories"}, {name: "logs", description: "Show collaboration host logs"}, {name: "stop", description: "Drain executions and stop the service"}},
+		helpSubcommands: []helpSubcommand{{name: "start", description: "Start once; stay available across tasks"}, {name: "status", description: "Show service and task progress"}, {name: "people", description: "Read the automatically refreshed people directory"}, {name: "run", description: "Dispatch a task; the agent determines its repositories"}, {name: "logs", description: "Show collaboration host logs"}, {name: "stop", description: "Drain executions and stop the service"}},
 		subcommands: []*cobra.Command{
 			newCommand(commandSpec{use: "start", short: "Start once; stay available across tasks", args: cobra.NoArgs, runE: r.collabStart, localFlags: []flagSpec{boolFlag("foreground", "Run in the current terminal"), stringFlag("bridge-entry", "path", "Use a prebuilt bridge entry instead of preparing the pinned runtime")}}),
 			newCommand(commandSpec{use: "status", short: "Show service and task progress", args: cobra.NoArgs, runE: r.collabStatus}),
+			newCommand(commandSpec{use: "people", short: "Read the automatically refreshed people directory", args: cobra.NoArgs, runE: func(cmd *cobra.Command, _ []string) error {
+				return r.collabRequest(cmd, "GET", "/people", nil)
+			}}),
 			newCommand(commandSpec{use: "run", short: "Explicitly dispatch a task", args: cobra.NoArgs, runE: r.collabRun, localFlags: []flagSpec{stringFlag("project", "id", "Plane connection / local record namespace (does not bind a repository)"), stringFlag("module", "name", "Optional module collaboration scope"), stringFlag("title", "text", "Human-readable task title"), stringFlag("prompt-file", "path|-", "Task prompt file; - reads stdin"), stringFlag("issue", "number", "Source issue or Plane sequence number"), stringFlag("issue-url", "url", "Source task link")}}),
 			newCommand(commandSpec{use: "logs", short: "Show collaboration host logs", args: cobra.NoArgs, runE: r.collabLogs}),
 			newCommand(commandSpec{use: "stop", short: "Drain executions and stop the service", args: cobra.NoArgs, runE: r.collabStop}),

@@ -130,6 +130,7 @@ func serveBridge(parent context.Context, options Options) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /bridge/events", host.turnEvent)
 	mux.HandleFunc("GET /status", host.status)
+	mux.HandleFunc("GET /people", host.people)
 	mux.HandleFunc("POST /run", func(w http.ResponseWriter, r *http.Request) {
 		var input worker.EnqueueInput
 		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 2<<20)).Decode(&input); err != nil {
@@ -196,6 +197,12 @@ func serveBridge(parent context.Context, options Options) error {
 	if err != nil {
 		return err
 	}
+	peopleDone := make(chan struct{})
+	go func() {
+		defer close(peopleDone)
+		host.maintainPeople(ctx, appID)
+	}()
+	defer func() { cancel(); <-peopleDone }()
 	host.ready.Store(true)
 	// A bridge resume uses the native session recorded by upstream. No recovered
 	// OS PID is inspected or killed, and no synthetic human answer is generated.
@@ -513,6 +520,9 @@ func (h *bridgeHost) writeWorkspace(dir string) error {
 小修复也先检查原因、调用方和影响面；复杂任务按需拆分、列计划或写技术设计，不强制每项写文档。
 在开始、关键发现、方案改变和交付时，用简短中文说明进展。先说结论，使用段落、列表和 Markdown，不贴长工具日志。工具细节由 bridge 折叠。
 只有需要人类判断时才等待。找谁由你判断，可查任务、参与者及同事信息；不清楚就问 Looper owner。选择题用编号选项，人在原话题 @bot 回复。
+当前工作目录的 people.json 是后台自动维护的人员目录，启动后同步、每 10 分钟更新。飞书人员来自当前 bot 的可见通讯录，Plane 成员按 connection 区分。找人时按需读取，不需要把整份目录贴进聊天。
+它提供真实人员资料，不是固定角色表，也不证明同名账号一定是同一人；不要仅凭姓名或邮箱自动认定跨系统身份。结合任务参与者、已有身份关联及对话判断，不明确就问 owner。目录缺少人员、字段或出现 error 时说明缺失，不猜造 ID；未加入 Plane 的同学也可以参与飞书协作。
+open_id 只适用于目录 app_id 对应的应用，不能搬用别的 bot 的 open_id。status 显示离职、冻结或退出的人员不要作为当前可联系对象。目录刷新不成功或时间过旧时，按需查询确认。目录只是协作信息，不能作为登录或审批权限依据。
 找同事参与的操作顺序：
 1. 自己判断应该请谁；不知道就问 owner，不要求只允许 owner 回复。
 2. 在当前群以 bot 邀请该同事（lark-cli 的 im.chat.members.create），再以 bot 查询当前群成员，确认对方已入群。
