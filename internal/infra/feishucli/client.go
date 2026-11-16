@@ -86,8 +86,53 @@ func (c Client) CreateGroup(ctx context.Context, name, description string, users
 	return chatID, nil
 }
 
-func (c Client) SendGroupCard(ctx context.Context, chatID string, card []byte) error {
-	_, err := c.callData(ctx, nil, "im", "+messages-send", "--chat-id", chatID, "--msg-type", "interactive", "--content", string(card), "--as", "bot")
+// InitializeAnnouncement fills a new group's announcement. An existing
+// announcement belongs to its human editors and is left intact.
+func (c Client) InitializeAnnouncement(ctx context.Context, chatID, title, link, rule string) error {
+	path := "/open-apis/docx/v1/chats/" + chatID + "/announcement/blocks"
+	var blocks struct {
+		Items []struct {
+			ID       string   `json:"block_id"`
+			Type     int      `json:"block_type"`
+			Children []string `json:"children"`
+		} `json:"items"`
+	}
+	if err := c.call(ctx, &blocks, "api", "GET", path, "--as", "bot"); err != nil {
+		return err
+	}
+	root := ""
+	for _, block := range blocks.Items {
+		if block.Type == 1 {
+			if len(block.Children) > 0 {
+				return nil
+			}
+			root = block.ID
+		}
+	}
+	if root == "" {
+		return fmt.Errorf("Feishu announcement has no root block")
+	}
+	text := func(content string, style map[string]any) any {
+		return map[string]any{"block_type": 2, "text": map[string]any{"elements": []any{
+			map[string]any{"text_run": map[string]any{"content": content, "text_element_style": style}},
+		}}}
+	}
+	children := []any{text(title, map[string]any{"bold": true})}
+	if link != "" {
+		children = append(children, text("在 Plane 查看", map[string]any{"link": map[string]string{"url": link}}))
+	}
+	children = append(children, text(rule, map[string]any{}))
+	body, err := json.Marshal(map[string]any{"children": children})
+	if err != nil {
+		return err
+	}
+	_, err = c.callData(ctx, body, "api", "POST", path+"/"+root+"/children", "--data", "-", "--as", "bot")
+	if err != nil {
+		return err
+	}
+	// Writing the document alone does not display it above the conversation.
+	_, err = c.callData(ctx, nil, "api", "POST", "/open-apis/im/v1/chats/"+chatID+"/top_notice/put_top_notice",
+		"--data", `{"chat_top_notice":[{"action_type":"2"}]}`, "--as", "bot")
 	return err
 }
 

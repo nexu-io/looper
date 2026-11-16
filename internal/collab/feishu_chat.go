@@ -125,10 +125,7 @@ func (m *taskChatManager) prepare(ctx context.Context, loopID string) error {
 	}
 	inviteErr := m.client.InviteMembers(ctx, chatID, m.config.InviteOpenIDs)
 	if createdChat {
-		card, err := notify.BuildFeishuGroupCard(groupContext)
-		if err == nil {
-			err = m.client.SendGroupCard(ctx, chatID, card)
-		}
+		err := m.client.InitializeAnnouncement(ctx, chatID, groupContext.Kind+" · "+groupContext.Name, groupContext.URL, groupContext.Rule)
 		return errors.Join(inviteErr, err)
 	}
 	return inviteErr
@@ -136,7 +133,7 @@ func (m *taskChatManager) prepare(ctx context.Context, loopID string) error {
 
 func taskGroupContext(input worker.EnqueueInput, key string) notify.FeishuGroupContext {
 	if key == "" {
-		return notify.FeishuGroupContext{Kind: "默认群", Name: "零散任务", Rule: "没有 Module 或父需求的任务集中在这里；每项任务仍使用独立话题，Plane 链接见各任务卡片。"}
+		return notify.FeishuGroupContext{Kind: "默认群", Name: "零散任务", Rule: "未归入 Module 或父需求的任务在本群协作。每项任务单独开话题，进入话题 @bot 沟通；Plane 链接见任务卡片。"}
 	}
 	kind := "任务"
 	if input.Module != "" || strings.Contains(key, ":module:") || strings.HasPrefix(key, "module:") {

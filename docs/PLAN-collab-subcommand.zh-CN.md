@@ -173,7 +173,7 @@ Plane 派发携带实际分组关系：优先 Module，再是父需求树；单�
 
 ### 2026-11-16：飞书交互改为直接集成 feishu-codex-bridge
 
-根据最新体验反馈，停止继续在 Go 内逐项复刻卡片、文本流和排队交互。下一步优先让 [modelzen/feishu-codex-bridge](https://github.com/modelzen/feishu-codex-bridge) 整体承担飞书会话及 Agent 运行；Looper 保留 Plane 接单、设备连接、仓库与 worktree 准备、任务记录和 PR 持续跟进。此处是接入方案，**尚未替换当前运行链路**。
+根据最新体验反馈，停止继续在 Go 内逐项复刻卡片、文本流和排队交互。下一步优先让 [modelzen/feishu-codex-bridge](https://github.com/modelzen/feishu-codex-bridge) 整体承担飞书会话及 Agent 运行；Looper 保留 Plane 接单、设备连接、可用仓库上下文、任务记录和 PR 持续跟进。实际 worktree 由 Agent 按需准备。独立私测实例已启动固定版本的上游运行时，并完成不指定仓库的跨仓只读任务；原 Worker 的活跃任务仍归原宿主。Plane 和 PR 的完整新链路继续验证。
 
 已阅读参考源码版本 `0.6.15`（MIT）。它已有文字与工具事件分别呈现、执行过程折叠、排队占位卡、逐轮卡片、运行中追加输入，以及原生会话恢复。其本地 CLI hooks 通道主要面向 owner 私聊的审批、提问和结束续聊，并非这套完整的群话题运行界面，不能将接上 hooks 当作整体集成完成。
 

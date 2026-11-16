@@ -19,13 +19,14 @@ type Status struct {
 // Task is a presentation of existing loop records, not another task state.
 // Prompts, checkpoints and execution parameters stay out of status responses.
 type Task struct {
-	ID        string `json:"id"`
-	Seq       int64  `json:"seq"`
-	ProjectID string `json:"projectId"`
-	Title     string `json:"title"`
-	Repo      string `json:"repo"`
-	Status    string `json:"status"`
-	PRNumber  *int64 `json:"prNumber,omitempty"`
+	ID           string   `json:"id"`
+	Seq          int64    `json:"seq"`
+	ProjectID    string   `json:"projectId"`
+	Title        string   `json:"title"`
+	Repo         string   `json:"repo"`
+	Status       string   `json:"status"`
+	PRNumber     *int64   `json:"prNumber,omitempty"`
+	PullRequests []string `json:"pullRequests,omitempty"`
 }
 
 func taskStatus(record storage.LoopRecord) Task {
@@ -42,5 +43,6 @@ func taskStatus(record storage.LoopRecord) Task {
 	if record.Repo != nil {
 		repo = *record.Repo
 	}
-	return Task{ID: record.ID, Seq: record.Seq, ProjectID: record.ProjectID, Title: metadata.Worker.Title, Repo: repo, Status: record.Status, PRNumber: record.PRNumber}
+	_, bridge, _ := readBridgeTask(record)
+	return Task{ID: record.ID, Seq: record.Seq, ProjectID: record.ProjectID, Title: metadata.Worker.Title, Repo: repo, Status: record.Status, PRNumber: record.PRNumber, PullRequests: bridge.Outcome.PullRequests}
 }

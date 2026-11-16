@@ -15,6 +15,7 @@ import (
 	"github.com/nexu-io/looper/internal/collab"
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/executionhost"
+	"github.com/nexu-io/looper/internal/feishubridge"
 	networkclient "github.com/nexu-io/looper/internal/network/client"
 	"github.com/nexu-io/looper/internal/worker"
 	"github.com/spf13/cobra"
@@ -23,11 +24,11 @@ import (
 func (r *commandRuntime) collabCommand() *cobra.Command {
 	command := newCommand(commandSpec{use: "collab", short: "Run the independent Feishu collaboration service", helpWhenNoArgs: true,
 		persistentFlags: []flagSpec{stringFlag("state-dir", "path", "Independent collaboration state directory")},
-		helpSubcommands: []helpSubcommand{{name: "start", description: "Start once; stay available across tasks"}, {name: "status", description: "Show service and task progress"}, {name: "run", description: "Explicitly dispatch a task to a configured repository"}, {name: "logs", description: "Show collaboration host logs"}, {name: "stop", description: "Drain executions and stop the service"}},
+		helpSubcommands: []helpSubcommand{{name: "start", description: "Start once; stay available across tasks"}, {name: "status", description: "Show service and task progress"}, {name: "run", description: "Dispatch a task; the agent determines its repositories"}, {name: "logs", description: "Show collaboration host logs"}, {name: "stop", description: "Drain executions and stop the service"}},
 		subcommands: []*cobra.Command{
-			newCommand(commandSpec{use: "start", short: "Start once; stay available across tasks", args: cobra.NoArgs, runE: r.collabStart, localFlags: []flagSpec{boolFlag("foreground", "Run in the current terminal")}}),
+			newCommand(commandSpec{use: "start", short: "Start once; stay available across tasks", args: cobra.NoArgs, runE: r.collabStart, localFlags: []flagSpec{boolFlag("foreground", "Run in the current terminal"), stringFlag("bridge-entry", "path", "Use a prebuilt bridge entry instead of preparing the pinned runtime")}}),
 			newCommand(commandSpec{use: "status", short: "Show service and task progress", args: cobra.NoArgs, runE: r.collabStatus}),
-			newCommand(commandSpec{use: "run", short: "Explicitly dispatch a task", args: cobra.NoArgs, runE: r.collabRun, localFlags: []flagSpec{stringFlag("project", "id", "Configured local project ID"), stringFlag("repo", "owner/repo", "Explicit target code repository"), stringFlag("module", "name", "Optional module collaboration scope"), stringFlag("title", "text", "Human-readable task title"), stringFlag("prompt-file", "path|-", "Task prompt file; - reads stdin"), stringFlag("issue", "number", "Source issue or Plane sequence number"), stringFlag("issue-url", "url", "Source task link")}}),
+			newCommand(commandSpec{use: "run", short: "Explicitly dispatch a task", args: cobra.NoArgs, runE: r.collabRun, localFlags: []flagSpec{stringFlag("project", "id", "Plane connection / local record namespace (does not bind a repository)"), stringFlag("module", "name", "Optional module collaboration scope"), stringFlag("title", "text", "Human-readable task title"), stringFlag("prompt-file", "path|-", "Task prompt file; - reads stdin"), stringFlag("issue", "number", "Source issue or Plane sequence number"), stringFlag("issue-url", "url", "Source task link")}}),
 			newCommand(commandSpec{use: "logs", short: "Show collaboration host logs", args: cobra.NoArgs, runE: r.collabLogs}),
 			newCommand(commandSpec{use: "stop", short: "Drain executions and stop the service", args: cobra.NoArgs, runE: r.collabStop}),
 		},
@@ -49,12 +50,24 @@ func (r *commandRuntime) collabStart(cmd *cobra.Command, _ []string) error {
 	if err != nil {
 		return err
 	}
+	if !getBoolFlag(cmd, "foreground") {
+		if result, err := collab.Request(cmd.Context(), dir, "GET", "/status", nil); err == nil {
+			return writeCollabOutput(cmd, result)
+		}
+	}
+	entry := getStringFlag(cmd, "bridge-entry")
+	if entry == "" {
+		entry, err = feishubridge.Install(cmd.Context(), filepath.Join(dir, "bridge-runtime"), r.app.stderr())
+		if err != nil {
+			return err
+		}
+	}
 	if getBoolFlag(cmd, "foreground") {
 		home, err := r.homeDir()
 		if err != nil {
 			return err
 		}
-		return collab.Serve(cmd.Context(), collab.Options{Config: cfg, StateDir: dir, NetworkStatePath: networkclient.DefaultStatePath(home), Logger: collabLogger{out: r.app.stderr()}})
+		return collab.Serve(cmd.Context(), collab.Options{Config: cfg, StateDir: dir, BridgeEntry: entry, NetworkStatePath: networkclient.DefaultStatePath(home), Logger: collabLogger{out: r.app.stderr()}})
 	}
 	if result, err := collab.Request(cmd.Context(), dir, "GET", "/status", nil); err == nil {
 		return writeCollabOutput(cmd, result)
@@ -75,7 +88,7 @@ func (r *commandRuntime) collabStart(cmd *cobra.Command, _ []string) error {
 		}
 	}
 	args := append([]string{}, ExtractConfigArgs(r.argv)...)
-	args = append(args, "collab", "start", "--foreground", "--state-dir", dir)
+	args = append(args, "collab", "start", "--foreground", "--state-dir", dir, "--bridge-entry", entry)
 	child := exec.Command(executable, args...)
 	child.Stdout, child.Stderr = log, log
 	child.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
@@ -152,7 +165,7 @@ func (r *commandRuntime) collabRequest(cmd *cobra.Command, method, path string, 
 }
 
 func (r *commandRuntime) collabRun(cmd *cobra.Command, _ []string) error {
-	input := worker.EnqueueInput{ProjectID: getStringFlag(cmd, "project"), Repo: getStringFlag(cmd, "repo"), Module: getStringFlag(cmd, "module"), Title: getStringFlag(cmd, "title"), IssueURL: getStringFlag(cmd, "issue-url")}
+	input := worker.EnqueueInput{ProjectID: getStringFlag(cmd, "project"), Module: getStringFlag(cmd, "module"), Title: getStringFlag(cmd, "title"), IssueURL: getStringFlag(cmd, "issue-url")}
 	if text := getStringFlag(cmd, "issue"); text != "" {
 		number, err := strconv.ParseInt(text, 10, 64)
 		if err != nil || number <= 0 {

@@ -21,7 +21,7 @@ func TestFeishuCLIPreservesOriginalCardsAcrossProgressDecisionsAndRestart(t *tes
 	if err := repos.Projects.Upsert(ctx, storage.ProjectRecord{ID: "p", Name: "Test", RepoPath: t.TempDir(), CreatedAt: now, UpdatedAt: now}); err != nil {
 		t.Fatal(err)
 	}
-	loop := storage.LoopRecord{ID: "loop", Seq: 1, ProjectID: "p", Type: "worker", TargetType: "project", TargetID: stringPointer("project:p"), Status: "running", MetadataJSON: stringPointer(`{"title":"修复问候语"}`), CreatedAt: now, UpdatedAt: now}
+	loop := storage.LoopRecord{ID: "loop", Seq: 1, ProjectID: "p", Type: "worker", TargetType: "project", TargetID: stringPointer("project:p"), Status: "running", MetadataJSON: stringPointer(`{"title":"修复问候语","worker":{"issueUrl":"https://plane.example/workspace/browse/LOOP-42"}}`), CreatedAt: now, UpdatedAt: now}
 	if err := repos.Loops.Upsert(ctx, loop); err != nil {
 		t.Fatal(err)
 	}
@@ -83,7 +83,7 @@ func TestFeishuCLIPreservesOriginalCardsAcrossProgressDecisionsAndRestart(t *tes
 	if root == "" || feed == "" || root == feed || messages[root].kind != "interactive" || messages[feed].kind != "interactive" || messages[feed].parent != root {
 		t.Fatalf("missing original task/live cards: root=%q feed=%q messages=%+v", root, feed, messages)
 	}
-	if !strings.Contains(messages[root].content, "实现中") {
+	if !strings.Contains(messages[root].content, "实现中") || !strings.Contains(messages[root].content, "https://plane.example/workspace/browse/LOOP-42") {
 		t.Fatalf("root not running: %s", messages[root].content)
 	}
 	loadLoop := func() storage.LoopRecord {
@@ -141,7 +141,7 @@ func TestFeishuCLIPreservesOriginalCardsAcrossProgressDecisionsAndRestart(t *tes
 	if strings.Contains(messages[feed].content, "实时") || !strings.Contains(messages[feed].content, "执行记录") {
 		t.Fatalf("finished feed still promises live updates: %s", messages[feed].content)
 	}
-	if count != 3 || patches[feed] != 1 || patches[root] < 3 || !strings.Contains(messages[root].content, "已完成") {
+	if count != 3 || patches[feed] != 1 || patches[root] < 3 || !strings.Contains(messages[root].content, "已完成") || !strings.Contains(messages[root].content, "https://plane.example/workspace/browse/LOOP-42") {
 		t.Fatalf("cards were replaced or stale: count=%d patches=%v root=%s", count, patches, messages[root].content)
 	}
 }

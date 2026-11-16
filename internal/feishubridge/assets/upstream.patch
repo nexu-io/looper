@@ -1,0 +1,182 @@
+--- a/src/bot/bridge.ts
++++ b/src/bot/bridge.ts
+@@ -1,3 +1,4 @@
++import type { ExternalTask, ExternalHooks } from './external';
+ import { createLarkChannel, Domain, type LarkChannel } from '@larksuiteoapi/node-sdk';
+ import type { AdminWriteOp } from '../admin/ops';
+ import type { AppConfig } from '../config/schema';
+@@ -28,10 +29,13 @@
+   appSecret: string;
+   /** fallback cwd for groups that aren't registered projects. */
+   fallbackCwd: string;
++  externalHooks?: ExternalHooks;
+ }
+ 
+ export interface BridgeHandle {
+   channel: LarkChannel;
++  submitTask: (task: ExternalTask) => Promise<void>;
++  stopTask: (threadId: string) => boolean;
+   /** 管理面写操作（Web 控制台 / supervisor IPC）：进程内执行，与 DM 卡片回调
+    * 同一套共享逻辑（admin/ops.ts）；校验拒绝抛 AdminWriteError。 */
+   adminExecute: (op: AdminWriteOp) => Promise<void>;
+@@ -82,7 +86,7 @@
+     socketPath: paths.cliBridgeSocket,
+     isBoundProject: cwdIsBoundProject,
+   });
+-  const orchestrator = createOrchestrator(channel, opts.cfg, opts.fallbackCwd, cliBridge);
++  const orchestrator = createOrchestrator(channel, opts.cfg, opts.fallbackCwd, cliBridge, opts.externalHooks);
+   channel.on('message', orchestrator.onMessage);
+   channel.on('cardAction', orchestrator.dispatcher.handle);
+   // Cloud-doc comments: @bot in a doc comment (drive.notice.comment_add_v1) →
+@@ -158,5 +162,5 @@
+     await cliBridge.shutdown().catch((err) => log.fail('cli-bridge', err, { phase: 'shutdown' }));
+     await channel.disconnect().catch((err) => log.fail('ws', err, { phase: 'disconnect' }));
+   };
+-  return { channel, adminExecute: orchestrator.adminExecute, shutdown };
++  return { channel, submitTask: orchestrator.submitTask, stopTask: orchestrator.stopTask, adminExecute: orchestrator.adminExecute, shutdown };
+ }
+--- a/src/bot/handle-message.ts
++++ b/src/bot/handle-message.ts
+@@ -1,3 +1,4 @@
++import type { ExternalTask, ExternalHooks } from './external';
+ import { registerVoiceConsole } from './voice-console';
+ import { createVoiceService } from '../voice/service';
+ import { ingestVoice, createIntakeQueue, type IngestedContext } from '../voice/inbound';
+@@ -514,6 +515,8 @@
+ }
+ 
+ export interface Orchestrator {
++  submitTask: (task: ExternalTask) => Promise<void>;
++  stopTask: (threadId: string) => boolean;
+   onMessage: (msg: NormalizedMessage) => Promise<void>;
+   /** `comment` event handler: @bot in a cloud-doc comment → reply in-thread. */
+   onComment: (evt: CommentEvent) => Promise<void>;
+@@ -671,6 +674,7 @@
+   cfg: AppConfig,
+   fallbackCwd: string,
+   cliBridge?: CliBridgeRuntimeHooks,
++  externalHooks?: ExternalHooks,
+ ): Orchestrator {
+   /** Lazily-constructed backends by id — one instance per backend for the whole
+    * bridge (mirrors the old single-instance shape; codex stays the default). */
+@@ -4134,7 +4138,13 @@
+ 
+     // M-3: 池满先排队（占位卡可见可取消）；null = 等待期被 ⏹ 取消，预订已释放。
+     const slot = await acquireRunSlot(opts, state, activeKey, reaction);
+-    if (!slot) return;
++    if (!slot) {
++      await opts.thread.close();
++      await externalHooks?.onTurn?.({ phase: 'failed', rootMessageId: opts.replyTo, chatId: opts.chatId,
++        threadId: topicThreadId, sessionId: opts.thread.sessionId, cwd: runCwd,
++        terminal: 'interrupted', text: 'Queued task cancelled' });
++      return;
++    }
+     if (shuttingDown) {
+       slot.release();
+       active.delete(activeKey);
+@@ -4270,6 +4280,8 @@
+         const turnModel = rec?.model ?? opts.model;
+         const turnEffort = rec?.effort ?? opts.effort;
+         const modelDisp = getModelDisplay(cfg);
++        await externalHooks?.onTurn?.({ phase: 'started', rootMessageId: opts.replyTo, chatId: opts.chatId,
++          threadId: topicThreadId, sessionId: opts.thread.sessionId, cwd: runCwd });
+         const run = opts.thread.runStreamed(turnInput, { model: turnModel, effort: turnEffort });
+         titleTurnAttempted = true;
+         const turnStartAt = Date.now(); // turn/start 已在 runStreamed() 内发出（与下面的建卡并行）
+@@ -4310,6 +4322,8 @@
+               topicThreadId = key;
+               rc.threadId = key;
+               await persist(key);
++              await externalHooks?.onTurn?.({ phase: 'bound', rootMessageId: opts.replyTo, chatId: opts.chatId,
++                threadId: key, sessionId: opts.thread.sessionId, cwd: runCwd });
+             }
+           } else {
+             topicThreadId = activeKey;
+@@ -4678,6 +4692,9 @@
+         replyTo = finalMsgId;
+         replyInThread = !opts.flat; // stay in the topic for queued turns (single: stay flat)
+         log.info('card', 'final', { terminal: render.terminal() });
++        await externalHooks?.onTurn?.({ phase: 'finished', rootMessageId: opts.replyTo, chatId: opts.chatId,
++          threadId: topicThreadId, sessionId: opts.thread.sessionId, cwd: runCwd,
++          terminal: render.terminal(), text: finalMessageText(render.snapshot()) });
+ 
+         // A stop (⏹ graceful or forced / watchdog) or a dead process ends the
+         // whole run — drop any queued follow-ups, but tell the user instead of
+@@ -4715,6 +4732,9 @@
+       // client before the next message resumes the persisted session.
+       if (topicThreadId && sessions.get(topicThreadId) === opts.thread) sessions.delete(topicThreadId);
+       await opts.thread.close().catch(() => undefined);
++      await externalHooks?.onTurn?.({ phase: 'failed', rootMessageId: opts.replyTo, chatId: opts.chatId,
++        threadId: topicThreadId, sessionId: opts.thread.sessionId, cwd: runCwd,
++        terminal: 'error', text: err instanceof Error ? err.message : String(err) });
+       log.fail('intake', err);
+       await channel
+         .send(opts.chatId, { markdown: runFailureMessage(err, dropped) }, { replyTo: opts.replyTo, replyInThread: !opts.flat })
+@@ -5669,7 +5689,55 @@
+     if (op.kind === 'setCompletionReminder') refreshCompletionReminderCards();
+   };
+ 
+-  return { onMessage, onComment, onBotAddedToChat, onBotRemovedFromChat, onReaction, onBotMenu, dispatcher, adminExecute, shutdown };
++  async function submitTask(task: ExternalTask): Promise<void> {
++    if (shuttingDown) throw new Error('bridge is stopping');
++    const queued: QueuedTurn = { input: { text: task.prompt },
++      titleSource: { text: task.title, rawContentType: 'text' },
++      summary: task.title, requesterOpenId: task.requesterOpenId, requestedAt: Date.now() };
++    const key = task.threadId ?? `pending:${task.rootMessageId}`;
++    const prior = active.get(key);
++    if (prior) { prior.queue.push(queued); return; }
++    const reserved: ActiveState = { queue: [], requesterOpenId: task.requesterOpenId };
++    active.set(key, reserved);
++    try {
++      const be = backendFor(task.backendId);
++      const rec = task.threadId ? await getSession(task.threadId) : undefined;
++      const { model, effort } = pickDefault(await listModels(be), { model: rec?.model ?? task.model, effort: rec?.effort });
++      const resolved = task.threadId ? await resolveThread(task.threadId, task.chatId, { mode: 'full', network: true }) : { thread: undefined };
++      const thread = resolved.thread ?? await be.startThread({ cwd: task.cwd, model, effort, mode: 'full', network: true });
++      if (reserved.intakeCancelled || shuttingDown) {
++        await thread.close();
++        await externalHooks?.onTurn?.({ phase: 'failed', rootMessageId: task.rootMessageId, chatId: task.chatId,
++          threadId: task.threadId, sessionId: thread.sessionId, cwd: task.cwd,
++          terminal: 'interrupted', text: 'Task cancelled before starting' });
++        return;
++      }
++      if (task.threadId) await upsertSession({ threadId: task.threadId, chatId: task.chatId, cwd: task.cwd,
++        sessionId: thread.sessionId, backend: be.id, model, effort,
++        summary: task.title, createdAt: rec?.createdAt ?? Date.now(), updatedAt: Date.now() });
++      await trackRun(launchRun({ chatId: task.chatId, replyTo: task.rootMessageId,
++        knownThreadId: task.threadId, replyInThread: true, thread,
++        firstText: task.prompt, cwd: task.cwd, mode: 'full', model, effort,
++        backendId: be.id, summary: task.title, requesterOpenId: task.requesterOpenId,
++        titleSource: queued.titleSource }));
++    } catch (err) {
++      await externalHooks?.onTurn?.({ phase: 'failed', rootMessageId: task.rootMessageId, chatId: task.chatId,
++        threadId: task.threadId, cwd: task.cwd, terminal: 'error',
++        text: err instanceof Error ? err.message : String(err) });
++      throw err;
++    } finally {
++      if (active.get(key) === reserved) active.delete(key);
++    }
++  }
++  function stopTask(threadId: string): boolean {
++    const state = active.get(threadId);
++    if (!state) return false;
++    state.queue.splice(0);
++    state.intakeCancelled = true;
++    state.interrupt?.();
++    return true;
++  }
++  return { submitTask, stopTask, onMessage, onComment, onBotAddedToChat, onBotRemovedFromChat, onReaction, onBotMenu, dispatcher, adminExecute, shutdown };
+ }
+ 
+ /** Resolve a message's thread_id via raw API (reply response omits it). The
+--- a/src/config/paths.ts
++++ b/src/config/paths.ts
+@@ -2,7 +2,7 @@
+ import { homedir } from 'node:os';
+ import { join } from 'node:path';
+ 
+-const appDir = join(homedir(), '.feishu-codex-bridge');
++const appDir = process.env.LOOPER_BRIDGE_HOME ?? join(homedir(), '.feishu-codex-bridge');
+ const larkCliDir = join(appDir, 'lark-cli');
+ const codexCliDir = join(appDir, 'codex-cli');
+ 

@@ -480,6 +480,12 @@ func shepherdActionable(pr githubinfra.PullRequestDetail) bool {
 	return changesRequestedOnCurrentHead(pr)
 }
 
+// ShepherdNeedsPass reuses the existing review/CI/conflict wake policy for the
+// bridge executor. A task may track PRs in several repositories.
+func ShepherdNeedsPass(pr githubinfra.PullRequestDetail) bool {
+	return shepherdActionable(pr) || commentedOnCurrentHead(pr)
+}
+
 // shepherdPhaseFor maps PR state to the card phase. awaiting_merge keys on the
 // CURRENT head's review state (approved here + no outstanding change request
 // here), not the aggregate reviewDecision — a stale CHANGES_REQUESTED on an old

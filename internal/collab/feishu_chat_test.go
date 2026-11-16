@@ -58,8 +58,14 @@ func TestTaskChatManagerSharesScopeBeforeAnyThreadIsPosted(t *testing.T) {
 			}
 			return []byte(`{"ok":true,"data":{}}`), nil
 		}
-		if strings.Contains(strings.Join(args, " "), "+messages-send") {
-			return []byte(`{"ok":true,"data":{"message_id":"om_group_info"}}`), nil
+		if len(args) > 2 && args[0] == "api" && args[1] == "GET" {
+			return []byte(`{"ok":true,"data":{"items":[{"block_id":"oc_issue","block_type":1}]}}`), nil
+		}
+		if len(args) > 2 && args[0] == "api" && args[1] == "POST" {
+			if !strings.Contains(strings.Join(args, " "), "top_notice") && !strings.Contains(string(input), "独立话题") {
+				t.Fatalf("announcement lacks context: %s", input)
+			}
+			return []byte(`{"ok":true,"data":{}}`), nil
 		}
 		t.Fatalf("unexpected Feishu call: %v", args)
 		return nil, nil
@@ -78,7 +84,7 @@ func TestTaskChatManagerSharesScopeBeforeAnyThreadIsPosted(t *testing.T) {
 	if updated.Status != "terminated" || !strings.Contains(*updated.MetadataJSON, `"stopReason":"owner stopped"`) {
 		t.Fatalf("provisioning overwrote concurrent stop: %+v", updated)
 	}
-	if len(calls) != 3 || !strings.Contains(calls[0], "+chat-create") || !strings.Contains(calls[1], "chat.members create") || !strings.Contains(calls[2], "+messages-send") {
+	if len(calls) != 5 || !strings.Contains(calls[0], "+chat-create") || !strings.Contains(calls[1], "chat.members create") || !strings.Contains(calls[2], "api GET") || !strings.Contains(calls[3], "api POST") {
 		t.Fatalf("calls = %#v", calls)
 	}
 	// A sibling item joins the scope before the first worker creates its
@@ -95,7 +101,7 @@ func TestTaskChatManagerSharesScopeBeforeAnyThreadIsPosted(t *testing.T) {
 	if chatID, _, _ := readChat(second.MetadataJSON); chatID != "oc_issue" {
 		t.Fatalf("sibling chat=%s", chatID)
 	}
-	if len(calls) != 4 || strings.Contains(calls[3], "+chat-create") || strings.Contains(calls[3], "+messages-send") {
+	if len(calls) != 6 || !strings.Contains(calls[5], "chat.members create") {
 		t.Fatalf("duplicate group: %v", calls)
 	}
 }

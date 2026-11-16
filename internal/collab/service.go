@@ -37,6 +37,7 @@ type Options struct {
 	StateDir         string
 	Logger           bootstrap.Logger
 	NetworkStatePath string
+	BridgeEntry      string
 }
 
 func StateDir(cfg config.Config, override string) string {
@@ -52,6 +53,9 @@ func LogPath(dir string) string    { return filepath.Join(dir, "collab.log") }
 // Serve stays available across tasks. The local socket is private to this OS
 // user; it is not a remotely accessible, unauthenticated Plane endpoint.
 func Serve(parent context.Context, options Options) error {
+	if options.BridgeEntry != "" {
+		return serveBridge(parent, options)
+	}
 	cfg := privateChatConfig(options.Config)
 	dir, err := filepath.Abs(StateDir(cfg, options.StateDir))
 	if err != nil {
