@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -25,6 +26,7 @@ type Init struct {
 	AppSecret      string `json:"appSecret"`
 	OwnerOpenID    string `json:"ownerOpenId"`
 	Concurrency    int    `json:"concurrency,omitempty"`
+	ExternalEvents bool   `json:"externalEvents,omitempty"`
 }
 
 type Task struct {
@@ -59,7 +61,7 @@ type Client struct {
 	err    error
 }
 
-func Start(ctx context.Context, entry, home string, init Init, log io.Writer) (*Client, error) {
+func Start(ctx context.Context, entry, home string, init Init, log io.Writer, privateSecrets ...string) (*Client, error) {
 	if init.AppID == "" || init.AppSecret == "" {
 		return nil, fmt.Errorf("bridge needs the existing bot's app ID and secret via notifications.webhook.appIdEnv/appSecretEnv (or FEISHU_APP_ID/FEISHU_APP_SECRET)")
 	}
@@ -94,7 +96,7 @@ func Start(ctx context.Context, entry, home string, init Init, log io.Writer) (*
 	cmd := exec.Command("node", entry)
 	for _, variable := range os.Environ() {
 		key, value, _ := strings.Cut(variable, "=")
-		if value == init.AppSecret || key == "FEISHU_APP_SECRET" || key == "LOOPER_BRIDGE_APP_SECRET" {
+		if value == init.AppSecret || slices.Contains(privateSecrets, value) || key == "FEISHU_APP_SECRET" || key == "LOOPER_BRIDGE_APP_SECRET" {
 			continue
 		}
 		cmd.Env = append(cmd.Env, variable)

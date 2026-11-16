@@ -1,25 +1,36 @@
 --- a/src/bot/bridge.ts
 +++ b/src/bot/bridge.ts
-@@ -1,3 +1,4 @@
+@@ -1,3 +1,5 @@
 +import type { ExternalTask, ExternalHooks } from './external';
++import { getSession } from './session-store';
  import { createLarkChannel, Domain, type LarkChannel } from '@larksuiteoapi/node-sdk';
  import type { AdminWriteOp } from '../admin/ops';
  import type { AppConfig } from '../config/schema';
-@@ -28,10 +29,13 @@
+@@ -28,10 +30,15 @@
    appSecret: string;
    /** fallback cwd for groups that aren't registered projects. */
    fallbackCwd: string;
 +  externalHooks?: ExternalHooks;
++  transport?: 'websocket' | 'webhook';
  }
  
  export interface BridgeHandle {
    channel: LarkChannel;
++  dispatchEvent: (raw: unknown) => Promise<void>;
 +  submitTask: (task: ExternalTask) => Promise<void>;
 +  stopTask: (threadId: string) => boolean;
    /** 管理面写操作（Web 控制台 / supervisor IPC）：进程内执行，与 DM 卡片回调
     * 同一套共享逻辑（admin/ops.ts）；校验拒绝抛 AdminWriteError。 */
    adminExecute: (op: AdminWriteOp) => Promise<void>;
-@@ -82,7 +86,7 @@
+@@ -54,6 +61,7 @@
+     appSecret: opts.appSecret,
+     domain: app.tenant === 'lark' ? Domain.Lark : Domain.Feishu,
+     source: 'feishu-codex-bridge',
++    transport: opts.transport,
+     // surface raw events so card-action handlers can read form submissions
+     // (action.form_value) — used by the new-project form.
+     includeRawEvent: true,
+@@ -82,7 +90,7 @@
      socketPath: paths.cliBridgeSocket,
      isBoundProject: cwdIsBoundProject,
    });
@@ -28,12 +39,33 @@
    channel.on('message', orchestrator.onMessage);
    channel.on('cardAction', orchestrator.dispatcher.handle);
    // Cloud-doc comments: @bot in a doc comment (drive.notice.comment_add_v1) →
-@@ -158,5 +162,5 @@
+@@ -158,5 +166,26 @@
      await cliBridge.shutdown().catch((err) => log.fail('cli-bridge', err, { phase: 'shutdown' }));
      await channel.disconnect().catch((err) => log.fail('ws', err, { phase: 'disconnect' }));
    };
 -  return { channel, adminExecute: orchestrator.adminExecute, shutdown };
-+  return { channel, submitTask: orchestrator.submitTask, stopTask: orchestrator.stopTask, adminExecute: orchestrator.adminExecute, shutdown };
++  // Same SDK normalizer, dedup, mention policy and upstream conversation handler
++  // as WebSocket intake. Only reachable through Looper's private Unix socket;
++  // the shared inbox verifies Feishu's callback before an event gets here.
++  async function dispatchEvent(raw: unknown): Promise<void> {
++    const dispatcher = (channel as unknown as {
++      dispatcher: { invoke: (raw: unknown, options: { needCheck: boolean }) => Promise<unknown> };
++    }).dispatcher;
++    const envelope = raw as { header?: { event_type?: string }; event?: {
++      message_id?: string; context?: { open_message_id?: string };
++    } };
++    if (envelope.header?.event_type !== 'im.message.receive_v1') {
++      // Buttons and reactions point to a card, not its topic root. Resolve the
++      // real topic through Feishu and use the existing local session store.
++      const messageId = envelope.event?.message_id ?? envelope.event?.context?.open_message_id;
++      if (!messageId) return;
++      const response = await channel.rawClient.im.v1.message.get({ path: { message_id: messageId } });
++      const threadId = response.data?.items?.[0]?.thread_id;
++      if (!threadId || !(await getSession(threadId))) return;
++    }
++    await dispatcher.invoke(raw, { needCheck: false });
++  }
++  return { channel, dispatchEvent, submitTask: orchestrator.submitTask, stopTask: orchestrator.stopTask, adminExecute: orchestrator.adminExecute, shutdown };
  }
 --- a/src/bot/handle-message.ts
 +++ b/src/bot/handle-message.ts

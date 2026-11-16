@@ -1,0 +1,11 @@
+name = "looper-collab-inbox"
+main = "worker.ts"
+compatibility_date = "2026-11-01"
+workers_dev = true
+
+# Set account_id and the actual D1 ID in your deployment config.
+[[d1_databases]]
+binding = "DB"
+database_name = "looper-collab-inbox"
+database_id = "REPLACE_WITH_D1_ID"
+migrations_dir = "migrations"

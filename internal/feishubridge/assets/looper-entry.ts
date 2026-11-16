@@ -16,6 +16,7 @@ interface Init {
   ownerOpenId: string;
   tenant?: 'feishu' | 'lark';
   concurrency?: number;
+  externalEvents?: boolean;
 }
 
 // Credentials cross an inherited pipe, never argv, logs, or saved bridge config.
@@ -52,6 +53,7 @@ const cfg: AppConfig = { accounts: { app: {
 } };
 // startBridge receives the secret directly; agent children must not inherit it.
 const bridge = await startBridge({ cfg, appSecret: init.appSecret, fallbackCwd: init.cwd,
+  transport: init.externalEvents ? 'webhook' : 'websocket',
   externalHooks: { onTurn: report } });
 init.appSecret = '';
 
@@ -83,6 +85,11 @@ const server = createServer(async (req, res) => {
       const chats = cfg.preferences!.access!.allowedChats!;
       if (!chats.includes(task.chatId)) chats.push(task.chatId);
       void bridge.submitTask(task).catch((err) => console.error('dispatch failed:', err instanceof Error ? err.message : 'unknown error'));
+      res.end(JSON.stringify({ accepted: true }));
+      return;
+    }
+    if (req.method === 'POST' && req.url === '/inbound' && init.externalEvents) {
+      await bridge.dispatchEvent(await readBody(req));
       res.end(JSON.stringify({ accepted: true }));
       return;
     }

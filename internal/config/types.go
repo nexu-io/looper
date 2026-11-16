@@ -776,6 +776,10 @@ type HITLConfig struct {
 // open to the collaborators invited into the task group; ownerOpenId is only
 // attribution and the default reminder target.
 type HITLFeishuConfig struct {
+	// Optional shared-app event inbox. When configured, collab polls this URL
+	// instead of opening a competing Feishu WebSocket on every local instance.
+	EventInboxURLEnv   string `json:"eventInboxUrlEnv,omitempty"`
+	EventInboxTokenEnv string `json:"eventInboxTokenEnv,omitempty"`
 	// ChatID is the default/fallback collaboration group. It may be empty when
 	// autoCreateTaskChats is enabled; the collab host will create a default group
 	// on first use and keep its id in the host state directory.

@@ -361,6 +361,8 @@ func mergeConfig(config *Config, partial PartialConfig) {
 				}
 			}
 			copied.CLIPath = strings.TrimSpace(copied.CLIPath)
+			copied.EventInboxURLEnv = strings.TrimSpace(copied.EventInboxURLEnv)
+			copied.EventInboxTokenEnv = strings.TrimSpace(copied.EventInboxTokenEnv)
 			config.HITL.Feishu = &copied
 		}
 		if gh := partial.HITL.GitHub; gh != nil {

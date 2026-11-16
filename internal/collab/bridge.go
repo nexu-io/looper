@@ -113,6 +113,7 @@ func serveBridge(parent context.Context, options Options) error {
 	}
 	host.notify = notify.NewGateway(notify.Options{Config: cfg.Notifications, Repositories: repos,
 		FeishuCLI: workerhost.PrivateFeishuClient(&cfg), LogFilePath: LogPath(dir),
+		ResolveOwnerName:   host.ownerName,
 		ResolveOwnerOpenID: func(project string) string { return config.ProjectOwner(cfg, project) }})
 	workspace := filepath.Join(dir, "workspace")
 	if err := host.writeWorkspace(workspace); err != nil {
@@ -169,10 +170,15 @@ func serveBridge(parent context.Context, options Options) error {
 	if appSecret == "" {
 		appSecret = os.Getenv("FEISHU_APP_SECRET")
 	}
+	inboxURL, inboxToken, err := sharedFeishuInbox(cfg)
+	if err != nil {
+		return err
+	}
 	host.client, err = feishubridge.Start(ctx, options.BridgeEntry, filepath.Join(dir, "bridge-state"), feishubridge.Init{
 		Socket: filepath.Join(dir, "bridge.sock"), CallbackSocket: SocketPath(dir), CWD: workspace,
 		AppID: appID, AppSecret: appSecret, OwnerOpenID: cfg.HITL.Feishu.OwnerOpenID,
-	}, log)
+		ExternalEvents: inboxURL != "",
+	}, log, inboxToken)
 	if err != nil {
 		return err
 	}
@@ -208,6 +214,11 @@ func serveBridge(parent context.Context, options Options) error {
 	// OS PID is inspected or killed, and no synthetic human answer is generated.
 	if _, err := coordinator.DB().ExecContext(ctx, `UPDATE loops SET status='queued' WHERE status='running' AND json_extract(metadata_json,'$.bridge') IS NOT NULL`); err != nil {
 		return err
+	}
+	if inboxURL != "" {
+		inboxDone := make(chan struct{})
+		go func() { defer close(inboxDone); host.maintainFeishuInbox(ctx, inboxURL, inboxToken, appID) }()
+		defer func() { cancel(); <-inboxDone }()
 	}
 	tick := time.NewTicker(time.Second)
 	defer tick.Stop()
@@ -538,6 +549,7 @@ open_id 只适用于目录 app_id 对应的应用，不能搬用别的 bot 的 o
 任务提示会给出独立的状态文件路径。每轮回复前把实际结论写到该文件；它只同步任务状态，不是审批或新的决策规则。不要在飞书贴 JSON。
 格式：{"state":"needs_input","summary":"一句话进展","waitingFor":["负责人 open_id"],"pullRequests":["https://github.com/owner/repo/pull/123"]}
 summary 只写一句短进展（约 40 字），解释和证据放话题正文，不要复制整篇回复。
+waitingFor 中填写从当前应用目录查得的真实 open_id；不要把 owner、qa 或人名当作 open_id。不确定等谁时留空，在话题中问 owner。
 state 可为 needs_input（确实需要人回复）、monitoring_prs（PR 尚在推进或等待合并）、completed（任务已实际完成；有 PR 时应在收尾后）。pullRequests 记录任务涉及的全部仓库 PR，允许为空。
 继续原话题时沿用同一个任务文件。普通聊天只有 @bot 才触发你，不要自行轮询飞书抢另一条消息通道。
 `

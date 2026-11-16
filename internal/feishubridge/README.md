@@ -32,6 +32,22 @@ npx vitest run test/external-dispatch.test.ts test/message-queue-races.test.ts \
 `go test ./internal/feishubridge ./internal/collab` checks live sidecar replacement
 and durable task/conversation transitions without contacting Feishu or an LLM.
 
-One bot should have one active collaboration consumer. Colleagues using separate
-local instances should configure separate test bots; two independent processes
-using one bot do not share topic/session state.
+Without an inbox configured, one bot has one WebSocket consumer. For several
+local Loopers sharing one app, deploy [the shared inbox](../../deploy/feishu-inbox-worker/README.md)
+and set `LOOPER_FEISHU_INBOX_URL` and `LOOPER_FEISHU_INBOX_TOKEN` before starting
+each host. The sidecar uses the upstream webhook transport instead of opening
+competing WebSockets. Go forwards owned task topics to the same SDK dispatcher;
+upstream still owns mentions, deduplication, steering, queues and cards.
+
+Ownership uses existing chat/root/native-thread records. Each host persists its
+own cursor, so one reader cannot consume another reader's messages. Unknown
+topics and free-form DMs are not dispatched to an arbitrary device. Do not clone
+an active host's state directory onto a second online host: it would duplicate
+topic ownership. This is routing among trusted team instances, not per-device
+isolation: the shared bearer can read all inbox events.
+
+`node --test deploy/feishu-inbox-worker/worker.test.ts` (Node 24) verifies the
+receiver with SQLite. `TestSharedInbox` runs two SQLite hosts and real Node IPC
+sidecars to verify independent routing, retry, cursor persistence and secret
+filtering. The upstream test also dispatches webhook events through the actual
+SDK, with ordinary-chat silence, @bot steering and session resume.

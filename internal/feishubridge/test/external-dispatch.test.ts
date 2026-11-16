@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { NormalizedMessage } from '@larksuiteoapi/node-sdk';
+import { createLarkChannel, LoggerLevel, type NormalizedMessage } from '@larksuiteoapi/node-sdk';
 import type { AgentEvent, AgentInput, TurnOptions } from '../src/agent/types';
 
 const fake = vi.hoisted(() => ({
@@ -14,7 +14,7 @@ vi.mock('../src/core/logger', () => ({ log: fake.log, withTrace: (_ctx: unknown,
 vi.mock('../src/agent', async (original) => ({ ...await original<object>(), createBackend: () => fake.backend }));
 vi.mock('../src/project/registry', async (original) => ({
   ...await original<object>(),
-  getProjectByChatId: async () => ({ name: 'test', chatId: 'chat', cwd: '/test', defaultModel: 'chosen-model', defaultEffort: 'xhigh' }),
+  getProjectByChatId: async () => ({ name: 'test', chatId: 'chat', cwd: '/test', noMention: false, defaultModel: 'chosen-model', defaultEffort: 'xhigh' }),
 }));
 vi.mock('../src/bot/session-store', async (original) => ({
   ...await original<object>(),
@@ -82,7 +82,7 @@ function message(text: string): NormalizedMessage {
     content: text, senderId: 'owner', senderName: 'Owner', mentionedBot: true, createTime: Date.now(), rawContentType: 'text', resources: [], mentions: [], mentionAll: false };
 }
 function setup(showModel: 'off' | 'running' | 'always' = 'always') {
-  const cfg: AppConfig = { accounts: { app: { id: 'app', secret: 'test', tenant: 'feishu' } }, preferences: { showModel, access: { ownerOpenId: 'owner' }, completionReminder: { mode: 'manual' } } };
+  const cfg: AppConfig = { accounts: { app: { id: 'app', secret: 'test', tenant: 'feishu' } }, preferences: { showModel, pendingPolicy: 'steer', access: { ownerOpenId: 'owner' }, completionReminder: { mode: 'manual' } } };
   const channel = { send: fake.send, rawClient: { im: { v1: { message: { get: async () => ({ data: { items: [{ thread_id: 'topic' }] } }) }, messageReaction: {
     create: async () => ({ data: {} }), delete: async () => ({}),
   } } } } };
@@ -128,4 +128,47 @@ describe('Looper native dispatch seam', () => {
     await next;
     expect(fake.backend.startThread).toHaveBeenCalledTimes(1);
   });
+  it('takes shared inbox SDK events, keeps ordinary chat silent, steers and resumes the same session', async () => {
+    const run = thread();
+    fake.backend.startThread.mockResolvedValue(run.t);
+    const o = setup();
+    const channel = createLarkChannel({ appId: 'app', appSecret: 'unused', transport: 'webhook',
+      loggerLevel: LoggerLevel.error, safety: { batch: { text: { delayMs: 0 } } },
+      policy: { requireMention: false } });
+    // Real SDK normalizer/dispatcher with only the bot identity HTTP lookup stubbed.
+    vi.spyOn(channel as any, 'fetchBotIdentity').mockResolvedValue({ openId: 'bot', appId: 'app' });
+    await channel.connect();
+    expect(channel.rawWsClient).toBeUndefined();
+    channel.on('message', o.onMessage);
+    const receive = async (id: string, text: string, mention: boolean) => {
+      await (channel as any).dispatcher.invoke({ schema: '2.0', header: {
+        app_id: 'app', event_id: id, event_type: 'im.message.receive_v1',
+      }, event: { sender: { sender_id: { open_id: 'owner' }, sender_type: 'user' }, message: {
+        message_id: id, chat_id: 'chat', chat_type: 'group', thread_id: 'topic', root_id: 'root',
+        create_time: String(Date.now()), message_type: 'text', content: JSON.stringify({ text }),
+        mentions: mention ? [{ key: '@_user_1', id: { open_id: 'bot' }, name: 'Bot' }] : [],
+      } } }, { needCheck: false });
+    };
+    try {
+      const first = o.submitTask({chatId:'chat',rootMessageId:'root',cwd:'/neutral',title:'test',prompt:'Start'});
+      await until(() => expect(events).toHaveBeenCalledWith(expect.objectContaining({phase:'bound',threadId:'topic'})));
+      await receive('ordinary', 'Humans talking to each other', false);
+      expect(run.t.steer).not.toHaveBeenCalled();
+      await receive('reply', '@_user_1 Also check compatibility', true);
+      await until(() => expect(run.t.steer).toHaveBeenCalledTimes(1));
+      expect(run.t.steer.mock.calls[0]![0].text).toContain('Also check compatibility');
+      expect(run.t.abort).not.toHaveBeenCalled();
+      await receive('reply', '@_user_1 Also check compatibility', true);
+      expect(run.t.steer).toHaveBeenCalledTimes(1);
+      run.turns[0]!.resolve();
+      await first;
+      await receive('followup', '@_user_1 Continue following the PR', true);
+      await until(() => expect(run.consumed).toHaveLength(2));
+      run.turns[1]!.resolve();
+      await until(() => expect(events.mock.calls.filter(([e]) => (e as any).phase === 'finished')).toHaveLength(2));
+      expect(fake.backend.startThread).toHaveBeenCalledTimes(1);
+      expect(fake.createCard.mock.calls.length).toBeGreaterThanOrEqual(2);
+    } finally { await channel.disconnect(); }
+  });
+
 });

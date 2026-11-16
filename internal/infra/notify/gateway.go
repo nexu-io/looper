@@ -62,6 +62,8 @@ type Options struct {
 	FeishuAppHTTP      FeishuAppHTTPFunc
 	FeishuCLI          *feishucli.Client
 	ResolveOwnerOpenID ResolveOwnerOpenID
+	// ResolveOwnerName supplies attribution text without notifying the owner.
+	ResolveOwnerName func(openID string) string
 }
 
 // GatewayState retains transport continuity across immutable, config-specific
@@ -159,6 +161,7 @@ type Gateway struct {
 	feishuAppHTTP      FeishuAppHTTPFunc
 	feishuCLI          *feishucli.Client
 	resolveOwnerOpenID ResolveOwnerOpenID
+	resolveOwnerName   func(string) string
 	state              *GatewayState
 
 	rootMu    sync.Mutex
@@ -217,6 +220,7 @@ func NewGateway(options Options) *Gateway {
 		feishuAppHTTP:      feishuAppHTTP,
 		feishuCLI:          options.FeishuCLI,
 		resolveOwnerOpenID: options.ResolveOwnerOpenID,
+		resolveOwnerName:   options.ResolveOwnerName,
 		state:              state,
 	}
 }

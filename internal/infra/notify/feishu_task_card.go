@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"html"
 	"strings"
 	"time"
 
@@ -50,6 +51,11 @@ func (g *Gateway) feishuCollaborationCard(ctx context.Context, loop *storage.Loo
 	heading = append(heading, map[string]any{"tag": "column", "width": "weighted", "weight": 1, "vertical_align": "center", "elements": []any{
 		taskCardMarkdown("**"+title+"**", "normal"),
 	}})
+	if owner := g.looperAttribution(loop.ProjectID); owner != "" {
+		heading = append(heading, map[string]any{"tag": "column", "width": "auto", "vertical_align": "center", "elements": []any{
+			taskCardMarkdown(owner, "notation"),
+		}})
+	}
 	elements := []any{
 		map[string]any{"tag": "column_set", "flex_mode": "none", "horizontal_align": "left", "horizontal_spacing": "8px", "columns": heading},
 		map[string]any{"tag": "column_set", "flex_mode": "none", "columns": []any{
@@ -64,13 +70,13 @@ func (g *Gateway) feishuCollaborationCard(ctx context.Context, loop *storage.Loo
 		if ask, ok := loops.ReadHITLAsk(loop.MetadataJSON); ok {
 			for _, id := range ask.MentionOpenIDs {
 				if strings.TrimSpace(id) != "" {
-					mentions = append(mentions, "<at id="+id+"></at>")
+					mentions = append(mentions, taskCardPerson(id))
 				}
 			}
 		}
 		if len(mentions) == 0 {
 			if owner := g.ownerOpenID(loop.ProjectID); owner != "" {
-				mentions = append(mentions, "<at id="+owner+"></at>")
+				mentions = append(mentions, taskCardPerson(owner))
 			}
 		}
 		if len(mentions) > 0 {
@@ -117,6 +123,32 @@ func (g *Gateway) feishuCollaborationCard(ctx context.Context, loop *storage.Loo
 	}
 	raw, err := json.Marshal(map[string]any{"schema": "2.0", "config": map[string]any{"update_multi": true, "width_mode": "default", "summary": map[string]any{"content": label + " · " + title}}, "body": map[string]any{"direction": "vertical", "padding": "12px", "vertical_spacing": "8px", "elements": elements}})
 	return string(raw), err == nil
+}
+
+func (g *Gateway) looperAttribution(projectID string) string {
+	identity := ""
+	if id := g.ownerOpenID(projectID); id != "" {
+		identity = taskCardPerson(id)
+		if g.resolveOwnerName != nil {
+			if name := strings.TrimSpace(g.resolveOwnerName(id)); name != "" {
+				return "<text_tag color='neutral'>" + html.EscapeString(name) + "的 Looper</text_tag>"
+			}
+		}
+	}
+	if identity != "" {
+		return identity + "的 Looper"
+	}
+	return ""
+}
+
+// Names are display text. Encoding one as an @ resource makes Feishu reject
+// the entire card and leaves its previous status frozen.
+func taskCardPerson(person string) string {
+	person = strings.TrimSpace(person)
+	if strings.HasPrefix(person, "ou_") && !strings.ContainsAny(person, " <>\"'\t\r\n") {
+		return "<at id=" + person + "></at>"
+	}
+	return html.EscapeString(person)
 }
 
 func taskCardMarkdown(text, size string) map[string]any {

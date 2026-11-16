@@ -38,7 +38,14 @@ func TestCollaborationCardShowsOnlyCurrentExecution(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	gateway := NewGateway(Options{Repositories: repos, ResolveOwnerOpenID: func(string) string { return "ou_owner" }})
+	gateway := NewGateway(Options{Repositories: repos,
+		ResolveOwnerOpenID: func(string) string { return "ou_owner" },
+		ResolveOwnerName: func(id string) string {
+			if id == "ou_owner" {
+				return "杨瑾龙"
+			}
+			return ""
+		}})
 	raw, ok := gateway.feishuThreadHeaderCard(ctx, loop.ID)
 	if !ok {
 		t.Fatal("card not rendered")
@@ -73,15 +80,33 @@ func TestCollaborationCardShowsOnlyCurrentExecution(t *testing.T) {
 	if !strings.Contains(outside.String(), "43s") {
 		t.Fatal("elapsed time lost after restart")
 	}
+	if !strings.Contains(outside.String(), "杨瑾龙的 Looper") || strings.Contains(raw, "ou_owner") || strings.Contains(raw, "执行：") {
+		t.Fatalf("completed card must retain named attribution without an @ notification: %s", raw)
+	}
+	columns := elements[0].(map[string]any)["columns"].([]any)
+	owner := columns[len(columns)-1].(map[string]any)["elements"].([]any)[0].(map[string]any)
+	if owner["content"] != "<text_tag color='neutral'>杨瑾龙的 Looper</text_tag>" || owner["text_size"] != "notation" {
+		t.Fatalf("owner must be a compact tag at the right of the heading: %v", owner)
+	}
+	for _, status := range []string{"queued", "running", "awaiting_human", "completed", "failed"} {
+		loop.Status = status
+		if err := repos.Loops.Upsert(ctx, loop); err != nil {
+			t.Fatal(err)
+		}
+		updated, _ := gateway.feishuThreadHeaderCard(ctx, loop.ID)
+		if !strings.Contains(updated, "杨瑾龙的 Looper") {
+			t.Fatalf("%s card lost owner attribution: %s", status, updated)
+		}
+	}
 	// Current question takes precedence over every previous delivery.
 	loop.Status = "awaiting_human"
-	updated, _ := loops.WriteHITLAsk(loop.MetadataJSON, loops.HITLAsk{Status: "awaiting", Question: "是否接受当前交付？"})
+	updated, _ := loops.WriteHITLAsk(loop.MetadataJSON, loops.HITLAsk{Status: "awaiting", Question: "是否接受当前交付？", MentionOpenIDs: []string{"owner", "ou_qa"}})
 	loop.MetadataJSON = &updated
 	if err := repos.Loops.Upsert(ctx, loop); err != nil {
 		t.Fatal(err)
 	}
 	waiting, _ := gateway.feishuThreadHeaderCard(ctx, loop.ID)
-	if !strings.Contains(waiting, "等待 ") || !strings.Contains(waiting, "ou_owner") || strings.Contains(waiting, "等你") {
+	if !strings.Contains(waiting, "等待 owner") || !strings.Contains(waiting, "ou_qa") || strings.Contains(waiting, "id=owner") || strings.Contains(waiting, "等你") {
 		t.Fatalf("waiting person is not explicit: %s", waiting)
 	}
 	brief, _ := gateway.feishuTaskUpdate(ctx, &loop, nil)

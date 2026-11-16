@@ -37,6 +37,25 @@ func (h *bridgeHost) peoplePath() string {
 	return filepath.Join(h.dir, "workspace", "people.json")
 }
 
+// Use the existing directory snapshot; rendering a card must not wait on a
+// contacts API request or turn routine attribution into an @ notification.
+func (h *bridgeHost) ownerName(openID string) string {
+	data, err := os.ReadFile(h.peoplePath())
+	if err != nil {
+		return ""
+	}
+	var directory PeopleDirectory
+	if json.Unmarshal(data, &directory) != nil {
+		return ""
+	}
+	for _, user := range directory.Feishu.Users {
+		if user.OpenID == openID {
+			return user.Name
+		}
+	}
+	return ""
+}
+
 // Each refresh replaces the snapshot. Removed people and revoked visibility
 // cannot silently survive as successful mappings from an older refresh.
 func (h *bridgeHost) syncPeople(ctx context.Context, appID string, client feishucli.Client) error {
