@@ -14,15 +14,16 @@ const hitlMetadataKey = "hitl"
 // the answer is filled in by /respond or the configured answer transport. On resume the runner
 // reads Answer + SessionID to continue the same agent session.
 type HITLAsk struct {
-	Question    string   `json:"question,omitempty"`
-	Options     []string `json:"options,omitempty"`
-	SessionID   string   `json:"sessionId,omitempty"`
-	ExecutionID string   `json:"executionId,omitempty"`
-	Vendor      string   `json:"vendor,omitempty"`
-	Answer      string   `json:"answer,omitempty"`
-	Status      string   `json:"status,omitempty"` // "awaiting" | "answered" | "consumed"
-	AskedAt     string   `json:"askedAt,omitempty"`
-	AnsweredAt  string   `json:"answeredAt,omitempty"`
+	MentionOpenIDs []string `json:"mentionOpenIds,omitempty"`
+	Question       string   `json:"question,omitempty"`
+	Options        []string `json:"options,omitempty"`
+	SessionID      string   `json:"sessionId,omitempty"`
+	ExecutionID    string   `json:"executionId,omitempty"`
+	Vendor         string   `json:"vendor,omitempty"`
+	Answer         string   `json:"answer,omitempty"`
+	Status         string   `json:"status,omitempty"` // "awaiting" | "answered" | "consumed"
+	AskedAt        string   `json:"askedAt,omitempty"`
+	AnsweredAt     string   `json:"answeredAt,omitempty"`
 	// Transport records which source owns the answer ("github" | "plane" | "feishu").
 	// ActionURL points to the exact comment where the human must respond.
 	Transport    string `json:"transport,omitempty"`

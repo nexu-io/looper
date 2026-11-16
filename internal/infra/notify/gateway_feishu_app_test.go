@@ -70,13 +70,13 @@ func TestGatewayFeishuAppChannel(t *testing.T) {
 		Level:      "action_required",
 		Title:      "Looper Worker Needs Attention",
 		Subtitle:   "task_1",
-		Body:       "A worker paused for human input",
+		Body:       "A worker paused for human input\n\n1. [Review evidence](https://example.com/pr)\n2. Reply @bot",
 		EntityType: "task",
 		EntityID:   "task_1",
 		DedupeKey:  "worker.attention:task:task_1",
 	}
 
-	t.Run("app mode fetches token then posts text message", func(t *testing.T) {
+	t.Run("app mode fetches token then posts Markdown card", func(t *testing.T) {
 		t.Setenv("LOOPER_TEST_FEISHU_APP_ID", "cli_app_id")
 		t.Setenv("LOOPER_TEST_FEISHU_APP_SECRET", "app_secret_value")
 
@@ -121,16 +121,28 @@ func TestGatewayFeishuAppChannel(t *testing.T) {
 		if envelope.ReceiveID != "oc_group_chat_123" {
 			t.Fatalf("receive_id = %q, want oc_group_chat_123", envelope.ReceiveID)
 		}
-		// System updates are plain text now (only mid-run asks are cards).
-		if envelope.MsgType != "text" {
-			t.Fatalf("msg_type = %q, want text", envelope.MsgType)
+		if envelope.MsgType != "interactive" {
+			t.Fatalf("msg_type = %q, want interactive", envelope.MsgType)
 		}
-		// content is a JSON string {"text":"..."} with title + subtitle + body.
 		if !strings.Contains(envelope.Content, "Looper Worker Needs Attention") {
 			t.Fatalf("text content missing title: %s", envelope.Content)
 		}
 		if !strings.Contains(envelope.Content, "A worker paused for human input") {
 			t.Fatalf("text content missing body: %s", envelope.Content)
+		}
+
+		var card struct {
+			Body struct {
+				Elements []struct {
+					Content string `json:"content"`
+				} `json:"elements"`
+			} `json:"body"`
+		}
+		if err := json.Unmarshal([]byte(envelope.Content), &card); err != nil {
+			t.Fatal(err)
+		}
+		if len(card.Body.Elements) != 2 || card.Body.Elements[1].Content != actionRequired.Body {
+			t.Fatalf("Markdown body changed: %s", envelope.Content)
 		}
 
 		if got := notificationStatus(records, "feishu_app"); got != "success" {
@@ -141,7 +153,7 @@ func TestGatewayFeishuAppChannel(t *testing.T) {
 		}
 	})
 
-	t.Run("failure level posts plain text", func(t *testing.T) {
+	t.Run("failure level posts readable Markdown", func(t *testing.T) {
 		t.Setenv("LOOPER_TEST_FEISHU_APP_ID", "cli_app_id")
 		t.Setenv("LOOPER_TEST_FEISHU_APP_SECRET", "app_secret_value")
 
@@ -159,8 +171,8 @@ func TestGatewayFeishuAppChannel(t *testing.T) {
 		if err := json.Unmarshal(calls[1].body, &envelope); err != nil {
 			t.Fatalf("message body not JSON: %v", err)
 		}
-		if envelope.MsgType != "text" {
-			t.Fatalf("msg_type = %q, want text", envelope.MsgType)
+		if envelope.MsgType != "interactive" {
+			t.Fatalf("msg_type = %q, want interactive", envelope.MsgType)
 		}
 		if !strings.Contains(envelope.Content, "Run failed") || !strings.Contains(envelope.Content, "boom") {
 			t.Fatalf("text content missing title/body: %s", envelope.Content)
@@ -599,9 +611,19 @@ func TestLiveStatusHelpers(t *testing.T) {
 	if _, ok := feishuLiveFeedCard(nil, 0); ok {
 		t.Fatalf("feishuLiveFeedCard(empty) should not render")
 	}
-	// Header-less now — the body leads with 🔧 最近执行记录, so no separate title.
-	if card, ok := feishuLiveFeedCard([]string{"✅ git push"}, 90); !ok || strings.Contains(card, "\"header\"") || !strings.Contains(card, "🔧 最近执行记录") {
-		t.Fatalf("feishuLiveFeedCard: want header-less card with 🔧 最近执行记录 body, got %q", card)
+	raw, ok := feishuLiveFeedCard([]string{"✅ git push"}, 90)
+	var processCard map[string]any
+	if !ok || json.Unmarshal([]byte(raw), &processCard) != nil {
+		t.Fatalf("invalid execution card: %s", raw)
+	}
+	panel := processCard["body"].(map[string]any)["elements"].([]any)[0].(map[string]any)
+	if processCard["schema"] != "2.0" || processCard["header"] != nil || panel["tag"] != "collapsible_panel" || panel["expanded"] != false || !strings.Contains(raw, "用时 1m30s") || !strings.Contains(raw, "✅ git push") {
+		t.Fatalf("execution details must remain available, collapsed under elapsed time: %s", raw)
+	}
+	header := panel["header"].(map[string]any)
+	icon, hasIcon := header["icon"].(map[string]any)
+	if !hasIcon || icon["token"] != "down-small-ccm_outlined" || header["icon_position"] != "follow_text" || header["icon_expanded_angle"] != float64(-180) {
+		t.Fatalf("collapsed execution needs a visible rotating disclosure arrow: %s", raw)
 	}
 	// Terminal detection gates the takeover hint (shown only while live).
 	for _, s := range []string{"completed", "failed", "terminated", "stopped", "merged"} {
@@ -885,8 +907,32 @@ func TestFeishuThreadHeaderCardLinksCheckpointIssueURL(t *testing.T) {
 		t.Fatal("feishuThreadHeaderCard() did not render")
 	}
 	want := `https://plane.example/open-design/browse/OPEND-582`
-	if !strings.Contains(card, want) || !strings.Contains(card, "查看任务") || !strings.Contains(card, "open_url") {
+	if !strings.Contains(card, want) || !strings.Contains(card, "OPEND-582 ↗") || strings.Contains(card, "查看任务") {
 		t.Fatalf("checkpoint issue reference is not clickable; want %q in %s", want, card)
+	}
+	var rendered map[string]any
+	if err := json.Unmarshal([]byte(card), &rendered); err != nil {
+		t.Fatal(err)
+	}
+	tags := rendered["body"].(map[string]any)["elements"].([]any)[0].(map[string]any)
+	if tags["horizontal_align"] != "left" || tags["flex_mode"] != "none" {
+		t.Fatalf("tags must stay together on the left: %v", tags)
+	}
+	columns := tags["columns"].([]any)
+	if len(columns) != 3 {
+		t.Fatalf("want status, issue and title on the same row, got %v", columns)
+	}
+	statusTag := columns[0].(map[string]any)["elements"].([]any)[0].(map[string]any)
+	issueColumn := columns[1].(map[string]any)
+	link := issueColumn["elements"].([]any)[0].(map[string]any)
+	issueTag := link["elements"].([]any)[0].(map[string]any)
+	url := link["behaviors"].([]any)[0].(map[string]any)["default_url"]
+	if url != want || link["padding"] != "0px" || link["background_style"] != nil || issueTag["text_size"] != statusTag["text_size"] || !strings.HasPrefix(issueTag["content"].(string), "<text_tag ") {
+		t.Fatalf("issue must use the same native tag style with a Plane link: %v", issueColumn)
+	}
+	title := columns[2].(map[string]any)
+	if title["width"] != "weighted" || title["elements"].([]any)[0].(map[string]any)["content"] != "**High-fidelity export**" {
+		t.Fatalf("title must sit beside tags: %v", title)
 	}
 }
 
@@ -1047,5 +1093,20 @@ func TestFeishuLoopFlowchartStyleShepherding(t *testing.T) {
 	}
 	if !feishuLoopAwaitingMerge("shepherding") {
 		t.Fatal("feishuLoopAwaitingMerge(shepherding) = false, want true (card should mirror PR state)")
+	}
+}
+
+func TestPlaneThreadIdentityUsesSourceItemRatherThanRepositoryNumber(t *testing.T) {
+	repo := "acme/shared"
+	meta := `{"worker":{"strictDispatchId":"dispatch","issueNumber":6,"issueUrl":"https://plane.example/ws/browse/OD-6"}}`
+	loop := storage.LoopRecord{Repo: &repo, MetadataJSON: &meta}
+	first := loopTaskKeyFromRecord(&loop)
+	repo = "acme/other"
+	if second := loopTaskKeyFromRecord(&loop); second != first {
+		t.Fatal("one Plane item split across repositories")
+	}
+	meta = strings.ReplaceAll(meta, "OD-6", "MOTION-6")
+	if second := loopTaskKeyFromRecord(&loop); second == first {
+		t.Fatal("different Plane projects shared a thread")
 	}
 }

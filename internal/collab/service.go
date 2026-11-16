@@ -86,6 +86,7 @@ func Serve(parent context.Context, options Options) error {
 		return err
 	}
 	repos := storage.NewRepositories(coordinator.DB())
+	chatManager := newTaskChatManager(cfg, repos, dir)
 	git := gitinfra.New(gitinfra.Options{GitPath: value(cfg.Tools.GitPath), Repos: repos})
 	projectService := projects.Service{DB: coordinator.DB(), Repos: repos, Config: cfg, DetectRepo: func(ctx context.Context, path string) (projects.DetectedRepo, error) {
 		repo, err := git.DetectGitHubRepo(ctx, path)
@@ -139,7 +140,7 @@ func Serve(parent context.Context, options Options) error {
 		return fmt.Errorf("configure an agent for the worker role before starting collab")
 	}
 	executor := agent.New(agent.ExecutorOptions{Config: agent.ExecutorConfig{Vendor: resolved.Vendor, Model: resolved.Model, Params: cfg.Agent.Params, Env: cfg.Agent.Env, NativeResumeEnabled: cfg.Agent.NativeResume.Enabled, LiveToolEvents: true, ClaudeJSONEvents: true}, ParamsOwnerVendor: cfg.Agent.Vendor, Repos: repos, LogDir: cfg.Daemon.LogDir, Owner: owner, OnHardPersistFailure: func(error) { cancel() }, OnProgress: func(ctx context.Context, update agent.ProgressUpdate) {
-		gateway.RefreshThreadHeader(ctx, update.LoopID, nil, update.ElapsedSeconds)
+		gateway.RefreshThreadHeader(ctx, update.LoopID, update.TailLines, update.ElapsedSeconds)
 	}})
 	stamper := disclosure.FromConfig(cfg)
 	runner := worker.New(worker.Options{
@@ -178,7 +179,7 @@ func Serve(parent context.Context, options Options) error {
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		if err := work(ctx, runner, repos, owner, wake, options.Logger); err != nil {
+		if err := work(ctx, runner, repos, owner, chatManager, wake, options.Logger); err != nil {
 			workErr <- err
 			cancel()
 		}
@@ -267,9 +268,19 @@ func Serve(parent context.Context, options Options) error {
 		requestWake()
 		writeJSON(w, taskStatus(item))
 	})
+	stopped := make(chan struct{})
+	var stopErr error
 	mux.HandleFunc("POST /stop", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, map[string]string{"status": "stopping"})
 		cancel()
+		select {
+		case <-stopped:
+			if stopErr != nil {
+				http.Error(w, stopErr.Error(), http.StatusInternalServerError)
+				return
+			}
+			writeJSON(w, map[string]string{"status": "stopped"})
+		case <-r.Context().Done():
+		}
 	})
 	server := http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 	serveErr := make(chan error, 1)
@@ -279,9 +290,6 @@ func Serve(parent context.Context, options Options) error {
 	case err = <-serveErr:
 		cancel()
 	}
-	shutdownCtx, stop := context.WithTimeout(context.Background(), 5*time.Second)
-	_ = server.Shutdown(shutdownCtx)
-	stop()
 	drainErr := owner.BeginShutdown("collab stopped")
 	wg.Wait()
 	network.Stop()
@@ -293,6 +301,11 @@ func Serve(parent context.Context, options Options) error {
 		err = errors.Join(err, workerErr)
 	default:
 	}
+	stopErr = errors.Join(err, drainErr)
+	close(stopped)
+	shutdownCtx, stop := context.WithTimeout(context.Background(), 5*time.Second)
+	_ = server.Shutdown(shutdownCtx)
+	stop()
 	if drainErr != nil {
 		closed = true
 		return errors.Join(err, fmt.Errorf("execution drain failed; storage retained: %w", drainErr))
@@ -304,7 +317,7 @@ func Serve(parent context.Context, options Options) error {
 
 // The host only invokes the existing queue and worker. Operation leases cover
 // claim-through-finalization just as they do in the daemon scheduler.
-func work(ctx context.Context, runner *worker.Runner, repos *storage.Repositories, owner *executionhost.ActiveExecutionRegistry, wake <-chan struct{}, logger bootstrap.Logger) error {
+func work(ctx context.Context, runner *worker.Runner, repos *storage.Repositories, owner *executionhost.ActiveExecutionRegistry, chats *taskChatManager, wake <-chan struct{}, logger bootstrap.Logger) error {
 	tick := time.NewTicker(time.Second)
 	defer tick.Stop()
 	for ctx.Err() == nil {
@@ -333,6 +346,12 @@ func work(ctx context.Context, runner *worker.Runner, repos *storage.Repositorie
 			permit, bindErr := lease.BindClaim(*item)
 			var finalizeErr error
 			if bindErr == nil && permit.Valid() && lease.Context().Err() == nil {
+				// Prepare routing here, after claiming and before any worker
+				// notification. Intake and background polling must not race
+				// execution or move an active conversation to another group.
+				if chatErr := chats.prepare(lease.Context(), value(item.LoopID)); chatErr != nil && logger != nil {
+					logger.Warn("Feishu task chat preparation failed; using existing or fallback chat", map[string]any{"loopId": value(item.LoopID), "error": chatErr.Error()})
+				}
 				_, err = runner.ProcessClaimedQueueItem(lease.Context(), *item)
 				if lease.Context().Err() != nil {
 					finalizeErr = executionhost.FinalizeCancelledClaim(ctx, repos, *item, time.Now)

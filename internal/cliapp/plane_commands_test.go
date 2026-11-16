@@ -44,7 +44,7 @@ func TestPlaneLinkAndEnableCreateOwnerBoundStrictCredentials(t *testing.T) {
 			return
 		}
 		switch request.URL.Path {
-		case "/api/v1/users/me":
+		case "/api/v1/users/me/":
 			writePlaneCommandTestJSON(t, response, map[string]any{"id": memberID})
 		case "/api/v1/workspaces/open-design":
 			writePlaneCommandTestJSON(t, response, map[string]any{"id": planeprotocolUUIDString(workspaceID)})

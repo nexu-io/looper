@@ -458,6 +458,37 @@ func (r *FeishuThreadsRepository) RootByTask(ctx context.Context, taskKey string
 	return rootMessageID, nil
 }
 
+// ChatIDByTask returns the chat that owns the task's anchor thread. It lets a
+// restarted collab host route sibling loops back to the same task group before
+// it has emitted a new message.
+func (r *FeishuThreadsRepository) ChatIDByTask(ctx context.Context, taskKey string) (string, error) {
+	if strings.TrimSpace(taskKey) == "" {
+		return "", nil
+	}
+	var chatID string
+	err := r.q.QueryRowContext(ctx, `SELECT chat_id FROM feishu_threads WHERE task_key = ? AND chat_id != '' ORDER BY created_at DESC LIMIT 1`, taskKey).Scan(&chatID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", nil
+		}
+		return "", fmt.Errorf("feishu thread chat by task: %w", err)
+	}
+	return strings.TrimSpace(chatID), nil
+}
+
+// ChatIDByLoop returns the chat persisted for one loop's thread root.
+func (r *FeishuThreadsRepository) ChatIDByLoop(ctx context.Context, loopID string) (string, error) {
+	var chatID string
+	err := r.q.QueryRowContext(ctx, `SELECT chat_id FROM feishu_threads WHERE loop_id = ? AND chat_id != '' ORDER BY created_at DESC LIMIT 1`, loopID).Scan(&chatID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", nil
+		}
+		return "", fmt.Errorf("feishu thread chat by loop: %w", err)
+	}
+	return strings.TrimSpace(chatID), nil
+}
+
 // RootByLoop returns the most recent thread root for a loop, or "" when none.
 func (r *FeishuThreadsRepository) RootByLoop(ctx context.Context, loopID string) (string, error) {
 	var rootMessageID string
@@ -649,6 +680,34 @@ func (r *LoopsRepository) Upsert(ctx context.Context, record LoopRecord) error {
 	}
 
 	return nil
+}
+
+// AssignFeishuChat changes only routing metadata. A network call to create or
+// invite may overlap a stop request; never write back the old loop snapshot.
+func (r *LoopsRepository) AssignFeishuChat(ctx context.Context, id, chatID, scope string) error {
+	_, err := r.q.ExecContext(ctx, `UPDATE loops SET metadata_json = json_patch(
+ CASE WHEN json_valid(metadata_json) THEN metadata_json ELSE '{}' END,
+ json_object('feishuChatId', ?, 'feishuChatKey', NULLIF(?, ''))) WHERE id = ?`, strings.TrimSpace(chatID), strings.TrimSpace(scope), id)
+	if err != nil {
+		return fmt.Errorf("assign Feishu chat: %w", err)
+	}
+	return nil
+}
+
+// FeishuChatByScope reads the existing assignment before any thread is posted.
+// Group scope is shared across items; thread task keys remain per item.
+func (r *LoopsRepository) FeishuChatByScope(ctx context.Context, scope string) (string, error) {
+	var chatID string
+	err := r.q.QueryRowContext(ctx, `SELECT json_extract(metadata_json, '$.feishuChatId') FROM loops
+ WHERE CASE WHEN json_valid(metadata_json) THEN json_extract(metadata_json, '$.feishuChatKey') END = ?
+ AND json_extract(metadata_json, '$.feishuChatId') IS NOT NULL ORDER BY created_at, id LIMIT 1`, scope).Scan(&chatID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("Feishu chat by scope: %w", err)
+	}
+	return strings.TrimSpace(chatID), nil
 }
 
 func (r *LoopsRepository) GetByID(ctx context.Context, id string) (*LoopRecord, error) {

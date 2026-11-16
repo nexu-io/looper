@@ -20,9 +20,6 @@ func (c Client) AppHTTP(ctx context.Context, method, endpoint string, headers ma
 	if err != nil || u.Scheme != "https" || u.Host != "open.feishu.cn" {
 		return 0, nil, fmt.Errorf("unsupported Feishu endpoint")
 	}
-	if err := c.VerifyPrivateChat(ctx); err != nil {
-		return 0, nil, err
-	}
 	const messages = "/open-apis/im/v1/messages"
 	var args []string
 	var input []byte
@@ -65,16 +62,26 @@ func (c Client) AppHTTP(ctx context.Context, method, endpoint string, headers ma
 		suffix := strings.TrimPrefix(u.Path, messages)
 		switch {
 		case method == http.MethodPost && suffix == "" && payload.ReceiveID == c.Config.ChatID && u.Query().Get("receive_id_type") == "chat_id":
-			args = []string{"im", "+messages-send", "--chat-id", c.Config.ChatID}
+			args = []string{"im", "+messages-send", "--chat-id", payload.ReceiveID}
+		case method == http.MethodPost && suffix == "" && c.Config.AutoCreateTaskChats && strings.HasPrefix(payload.ReceiveID, "oc_") && u.Query().Get("receive_id_type") == "chat_id":
+			args = []string{"im", "+messages-send", "--chat-id", payload.ReceiveID}
 		case method == http.MethodPost && strings.HasSuffix(suffix, "/reply"):
 			id := strings.TrimSuffix(strings.TrimPrefix(suffix, "/"), "/reply")
-			if _, err := c.root(ctx, id); err != nil {
+			root, err := c.rootInChat(ctx, id, "")
+			if err != nil {
 				return 0, nil, err
+			}
+			if !c.Config.AutoCreateTaskChats && strings.TrimSpace(c.Config.ChatID) != "" && root.ChatID != strings.TrimSpace(c.Config.ChatID) {
+				return 0, nil, fmt.Errorf("Feishu message belongs to another chat")
 			}
 			args = []string{"im", "+messages-reply", "--message-id", id, "--reply-in-thread"}
 		case method == http.MethodPatch && strings.Count(suffix, "/") == 1:
-			if _, err := c.root(ctx, strings.TrimPrefix(suffix, "/")); err != nil {
+			root, err := c.rootInChat(ctx, strings.TrimPrefix(suffix, "/"), "")
+			if err != nil {
 				return 0, nil, err
+			}
+			if !c.Config.AutoCreateTaskChats && strings.TrimSpace(c.Config.ChatID) != "" && root.ChatID != strings.TrimSpace(c.Config.ChatID) {
+				return 0, nil, fmt.Errorf("Feishu message belongs to another chat")
 			}
 			// This CLI version has no typed PATCH command. Use its authenticated API.
 			args = []string{"api", "PATCH", u.Path, "--data", "-"}

@@ -113,3 +113,46 @@ func TestCollaborationCardExcerptPreservesChinese(t *testing.T) {
 		t.Fatal("excerpt split Chinese or exceeded its bound")
 	}
 }
+
+func TestThreadQuestionKeepsDecisionVisibleAndFoldsSupportingDetails(t *testing.T) {
+	raw, err := buildFeishuThreadQuestion(HITLAskCard{
+		Question:       "请看话题里的截图，页面是否符合预期？",
+		Options:        []string{"通过", "需要修改"},
+		Recommendation: strings.Repeat("浏览器测试和复现步骤。", 40),
+		Consequences:   map[string]string{"通过": "继续跟进当前 PR", "需要修改": "修改后请你复验"},
+		OwnerOpenID:    "ou_owner", MentionOpenIds: []string{"ou_qa", "ou_product"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var card map[string]any
+	if err := json.Unmarshal(raw, &card); err != nil {
+		t.Fatal(err)
+	}
+	var visible, folded strings.Builder
+	for _, item := range card["body"].(map[string]any)["elements"].([]any) {
+		element := item.(map[string]any)
+		encoded, _ := json.Marshal(element)
+		if element["tag"] == "collapsible_panel" {
+			if element["expanded"] != false {
+				t.Fatal("supporting details must start collapsed")
+			}
+			folded.Write(encoded)
+		} else {
+			visible.Write(encoded)
+		}
+	}
+	for _, want := range []string{"页面是否符合预期", "1. 通过", "2. 需要修改", "ou_qa", "ou_product", "@bot"} {
+		if !strings.Contains(visible.String(), want) {
+			t.Fatalf("decision or selected recipient hidden: %q", want)
+		}
+	}
+	for _, detail := range []string{"浏览器测试和复现步骤", "继续跟进当前 PR", "修改后请你复验"} {
+		if strings.Contains(visible.String(), detail) || !strings.Contains(folded.String(), detail) {
+			t.Fatalf("supporting detail should only appear when expanded: %q", detail)
+		}
+	}
+	if strings.Contains(visible.String(), "ou_owner") {
+		t.Fatal("owner must not replace agent-selected reviewers")
+	}
+}

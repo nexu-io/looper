@@ -15,8 +15,15 @@ import (
 // EnqueueInput is an explicit dispatch to an already configured checkout.
 // Project identity and code repository must agree; task titles never select a repo.
 type EnqueueInput struct {
-	ProjectID        string `json:"projectId"`
-	Repo             string `json:"repo"`
+	ProjectID string `json:"projectId"`
+	Repo      string `json:"repo"`
+	// Module is an optional stable collaboration scope. When present, all
+	// requirements dispatched under the module share one Feishu group while
+	// retaining separate task threads.
+	ChatScope        string `json:"chatScope,omitempty"`
+	ChatTitle        string `json:"chatTitle,omitempty"`
+	ChatURL          string `json:"chatUrl,omitempty"`
+	Module           string `json:"module,omitempty"`
 	Title            string `json:"title"`
 	Prompt           string `json:"prompt"`
 	IssueNumber      int64  `json:"issueNumber,omitempty"`
@@ -42,7 +49,7 @@ func (r *Runner) Enqueue(ctx context.Context, input EnqueueInput) (storage.LoopR
 	if strings.TrimSpace(input.Prompt) == "" && input.IssueNumber <= 0 {
 		return storage.LoopRecord{}, fmt.Errorf("prompt or issueNumber is required")
 	}
-	work := workerInput{Title: input.Title, Prompt: input.Prompt, Repo: configuredRepo, IssueNumber: input.IssueNumber, IssueURL: input.IssueURL, StrictDispatchID: input.StrictDispatchID, BaseBranch: derefString(project.BaseBranch), ExecutionMode: "create-pr"}
+	work := workerInput{Title: input.Title, Prompt: input.Prompt, Repo: configuredRepo, Module: input.Module, ChatScope: input.ChatScope, ChatTitle: input.ChatTitle, ChatURL: input.ChatURL, IssueNumber: input.IssueNumber, IssueURL: input.IssueURL, StrictDispatchID: input.StrictDispatchID, BaseBranch: derefString(project.BaseBranch), ExecutionMode: "create-pr"}
 	payload, err := json.Marshal(work)
 	if err != nil {
 		return storage.LoopRecord{}, err

@@ -33,6 +33,7 @@ func TestPlaneIngestionFiltersBeforeClaimAndReplaysOriginalTask(t *testing.T) {
 	broken := wrong
 	broken.ID, broken.IssueID, broken.CodeRepo = "22222222-2222-4222-8222-222222222222", "broken", "acme/local"
 	good := broken
+	good.CollaborationScope = &planestrict.CollaborationScope{Key: "plane:project:module:motion", Name: "Motion"}
 	good.ID, good.IssueID, good.Revision, good.StateVersion = "33333333-3333-4333-8333-333333333333", "good", 1, 1
 	claims := 0
 	var transitions []string
@@ -51,6 +52,8 @@ func TestPlaneIngestionFiltersBeforeClaimAndReplaysOriginalTask(t *testing.T) {
 			http.Error(w, "unavailable item", 503)
 		case strings.HasSuffix(r.URL.Path, "/work-items/good/"):
 			_ = json.NewEncoder(w).Encode(map[string]any{"id": "good", "name": "Fix local fixture", "sequence_id": 99, "description_html": "<p>Inspect impact before changing code</p>"})
+		case r.URL.Path == "/api/v1/workspaces/fixture/projects/44444444-4444-4444-8444-444444444444/":
+			_ = json.NewEncoder(w).Encode(map[string]any{"identifier": "FIX"})
 		case strings.HasSuffix(r.URL.Path, "/labels/"):
 			_ = json.NewEncoder(w).Encode(map[string]any{"results": []any{}})
 		case strings.HasSuffix(r.URL.Path, "/"+good.ID+"/claim/"):
@@ -124,6 +127,9 @@ func TestPlaneIngestionFiltersBeforeClaimAndReplaysOriginalTask(t *testing.T) {
 	queue, err := repos.Queue.List(ctx)
 	if err != nil || len(queue) != 1 || claims != 1 {
 		t.Fatalf("replay created another claim or queue item: %d %+v %v", claims, queue, err)
+	}
+	if queue[0].PayloadJSON == nil || !strings.Contains(*queue[0].PayloadJSON, good.CollaborationScope.Key) {
+		t.Fatal("Plane collaboration scope was lost before enqueue")
 	}
 	if queue[0].PayloadJSON == nil || !strings.Contains(*queue[0].PayloadJSON, good.ID) {
 		t.Fatal("dispatch identity missing from original queue")

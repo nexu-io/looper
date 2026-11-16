@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/nexu-io/looper/internal/collab"
 	"github.com/nexu-io/looper/internal/config"
 	networkclient "github.com/nexu-io/looper/internal/network/client"
 	"github.com/nexu-io/looper/internal/planestrict"
@@ -30,7 +31,7 @@ type planeDoctorResult struct {
 }
 
 func (r *commandRuntime) planeDoctor(cmd *cobra.Command, args []string) error {
-	result := r.runPlaneDoctor(cmd.Context(), args)
+	result := r.runPlaneDoctor(cmd.Context(), args, getBoolFlag(cmd, "collab"), getStringFlag(cmd, "state-dir"))
 	if getBoolFlag(cmd, "json") {
 		if err := writeJSON(cmd.OutOrStdout(), result); err != nil {
 			return err
@@ -44,7 +45,7 @@ func (r *commandRuntime) planeDoctor(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-func (r *commandRuntime) runPlaneDoctor(ctx context.Context, args []string) planeDoctorResult {
+func (r *commandRuntime) runPlaneDoctor(ctx context.Context, args []string, collaboration bool, stateDir string) planeDoctorResult {
 	result := planeDoctorResult{Ready: true}
 	add := func(name, status, detail, remediation string) {
 		result.Checks = append(result.Checks, planeDoctorCheck{Name: name, Status: status, Detail: detail, Remediation: remediation})
@@ -85,21 +86,21 @@ func (r *commandRuntime) runPlaneDoctor(ctx context.Context, args []string) plan
 		add("repository", "passed", fmt.Sprintf("%s · GitHub %s", project.RepoPath, project.Repo), "")
 	}
 
-	r.planeDoctorToolChecks(ctx, loaded.Config, add)
+	r.planeDoctorToolChecks(ctx, loaded.Config, collaboration, add)
 
 	tokenEnv := stringPointerValue(provider.TokenEnv)
 	token := strings.TrimSpace(os.Getenv(tokenEnv))
 	if tokenEnv == "" {
 		add("plane-api-key", "failed", "provider tokenEnv is not configured", "Reconnect the provider with --plane-token-env PLANE_API_KEY.")
 	} else if token == "" {
-		add("plane-api-key", "failed", tokenEnv+" is empty", "Export the Plane API key in the daemon environment, then restart looperd.")
+		add("plane-api-key", "failed", tokenEnv+" is empty", "Export the Plane API key in the receiving service environment, then restart that service.")
 	} else {
 		var identity planeLinkIdentity
 		apiCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		err := r.planeJSONRequest(apiCtx, provider.BaseURL, token, "GET", "users/me", "", nil, &identity)
+		err := r.planeJSONRequest(apiCtx, provider.BaseURL, token, "GET", "users/me/", "", nil, &identity)
 		cancel()
 		if err != nil {
-			add("plane-api-key", "failed", err.Error(), "Refresh the Plane API key and restart looperd.")
+			add("plane-api-key", "failed", err.Error(), "Refresh the Plane API key and restart the receiving service.")
 		} else {
 			add("plane-api-key", "passed", "authenticated as member "+identity.ID, "")
 		}
@@ -136,6 +137,16 @@ func (r *commandRuntime) runPlaneDoctor(ctx context.Context, args []string) plan
 				add("signed-inbox", "passed", fmt.Sprintf("reachable · %d queued dispatches", len(inbox.Dispatches)), "")
 			}
 		}
+	}
+
+	if collaboration {
+		dir := collab.StateDir(loaded.Config, stateDir)
+		if _, err := collab.Request(ctx, dir, "GET", "/status", nil); err != nil {
+			add("collab", "failed", err.Error(), "Run `looper collab start` with the same config and --state-dir, then rerun `looper plane doctor --collab`.")
+		} else {
+			add("collab", "passed", "independent collaboration host is reachable", "")
+		}
+		return result
 	}
 
 	daemonCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
@@ -181,7 +192,7 @@ func findPlaneDoctorProject(cfg config.Config, providerID string) *config.Projec
 	return nil
 }
 
-func (r *commandRuntime) planeDoctorToolChecks(ctx context.Context, cfg config.Config, add func(string, string, string, string)) {
+func (r *commandRuntime) planeDoctorToolChecks(ctx context.Context, cfg config.Config, collaboration bool, add func(string, string, string, string)) {
 	checkTool := func(name, configured, fallback, remediation string) string {
 		candidate := strings.TrimSpace(configured)
 		if candidate == "" {
@@ -207,7 +218,11 @@ func (r *commandRuntime) planeDoctorToolChecks(ctx context.Context, cfg config.C
 	}
 	checkTool("git", gitPath, "git", "Install Git, for example `brew install git`.")
 	ghPath = checkTool("github-cli", ghPath, "gh", "Install GitHub CLI and run `gh auth login`.")
-	planePath = checkTool("plane-cli", planePath, "plane", "Install and authenticate the Plane CLI; Looper currently uses it for spec pages and links.")
+	if !collaboration {
+		planePath = checkTool("plane-cli", planePath, "plane", "Install and authenticate the Plane CLI; Looper currently uses it for spec pages and links.")
+	} else {
+		planePath = ""
+	}
 	if ghPath != "" {
 		probe, err := r.runCommand(ctx, ghPath, []string{"auth", "status"}, 5*time.Second)
 		if err != nil || probe.ExitCode != 0 {

@@ -198,12 +198,13 @@ const (
 )
 
 type ProviderConfig struct {
-	ID       string           `json:"id"`
-	Kind     ProviderKind     `json:"kind"`
-	BaseURL  string           `json:"baseUrl,omitempty"`
-	GHPath   *string          `json:"ghPath,omitempty"`
-	Auth     ProviderAuthMode `json:"auth,omitempty"`
-	TokenEnv *string          `json:"tokenEnv,omitempty"`
+	ID         string           `json:"id"`
+	Kind       ProviderKind     `json:"kind"`
+	BaseURL    string           `json:"baseUrl,omitempty"`
+	WebBaseURL *string          `json:"webBaseUrl,omitempty"`
+	GHPath     *string          `json:"ghPath,omitempty"`
+	Auth       ProviderAuthMode `json:"auth,omitempty"`
+	TokenEnv   *string          `json:"tokenEnv,omitempty"`
 	// TeaLogin is the explicit tea CLI login name used when Auth is "tea".
 	// Required for tea-backed Forgejo providers; never inferred from tea's default.
 	TeaLogin *string `json:"teaLogin,omitempty"`
@@ -724,6 +725,7 @@ type PartialProviderConfig struct {
 	ID             string                     `json:"id"`
 	Kind           *ProviderKind              `json:"kind,omitempty"`
 	BaseURL        *string                    `json:"baseUrl,omitempty"`
+	WebBaseURL     *string                    `json:"webBaseUrl,omitempty"`
 	GHPath         *string                    `json:"ghPath,omitempty"`
 	Auth           *ProviderAuthMode          `json:"auth,omitempty"`
 	TokenEnv       *string                    `json:"tokenEnv,omitempty"`
@@ -770,12 +772,23 @@ type HITLConfig struct {
 	Feishu          *HITLFeishuConfig `json:"feishu,omitempty"`
 }
 
-// HITLFeishuConfig uses an already authenticated lark-cli. This initial bridge
-// is restricted to a private chat containing one owner and the CLI's bot.
+// HITLFeishuConfig uses an already authenticated lark-cli. Chat membership is
+// open to the collaborators invited into the task group; ownerOpenId is only
+// attribution and the default reminder target.
 type HITLFeishuConfig struct {
-	ChatID      string `json:"chatId"`
-	OwnerOpenID string `json:"ownerOpenId"`
-	CLIPath     string `json:"cliPath,omitempty"`
+	// ChatID is the default/fallback collaboration group. It may be empty when
+	// autoCreateTaskChats is enabled; the collab host will create a default group
+	// on first use and keep its id in the host state directory.
+	ChatID string `json:"chatId,omitempty"`
+	// OwnerOpenID is attribution only. It is optional and never limits who may
+	// participate in a task thread.
+	OwnerOpenID string `json:"ownerOpenId,omitempty"`
+	// AutoCreateTaskChats creates one private group for each issue/module key.
+	// Unscoped runs still use ChatID (or the persisted default group).
+	AutoCreateTaskChats bool     `json:"autoCreateTaskChats,omitempty"`
+	InviteOpenIDs       []string `json:"inviteOpenIds,omitempty"`
+	ChatNamePrefix      string   `json:"chatNamePrefix,omitempty"`
+	CLIPath             string   `json:"cliPath,omitempty"`
 }
 
 // HITLGitHubConfig tunes the GitHub PR-comment HITL transport.

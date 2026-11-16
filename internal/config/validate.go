@@ -108,8 +108,23 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 	}
 	if answerTransport == "feishu" {
 		fs := config.HITL.Feishu
-		if fs == nil || !strings.HasPrefix(fs.ChatID, "oc_") || !strings.HasPrefix(fs.OwnerOpenID, "ou_") {
-			issues = append(issues, ValidationIssue{Path: "hitl.answerTransport", Message: "feishu requires hitl.feishu.chatId and ownerOpenId for a private test chat"})
+		if fs == nil {
+			issues = append(issues, ValidationIssue{Path: "hitl.answerTransport", Message: "feishu requires hitl.feishu"})
+		} else {
+			if strings.TrimSpace(fs.ChatID) != "" && !strings.HasPrefix(fs.ChatID, "oc_") {
+				issues = append(issues, ValidationIssue{Path: "hitl.feishu.chatId", Message: "must be a Feishu chat id (oc_...) when set"})
+			}
+			if strings.TrimSpace(fs.OwnerOpenID) != "" && !strings.HasPrefix(fs.OwnerOpenID, "ou_") {
+				issues = append(issues, ValidationIssue{Path: "hitl.feishu.ownerOpenId", Message: "must be a Feishu open_id (ou_...) when set"})
+			}
+			if strings.TrimSpace(fs.ChatID) == "" && !fs.AutoCreateTaskChats {
+				issues = append(issues, ValidationIssue{Path: "hitl.feishu", Message: "set chatId or enable autoCreateTaskChats"})
+			}
+			for i, id := range fs.InviteOpenIDs {
+				if strings.TrimSpace(id) != "" && !strings.HasPrefix(id, "ou_") {
+					issues = append(issues, ValidationIssue{Path: fmt.Sprintf("hitl.feishu.inviteOpenIds[%d]", i), Message: "must be a Feishu open_id (ou_...)"})
+				}
+			}
 		}
 	}
 

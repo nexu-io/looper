@@ -761,10 +761,14 @@ type DiscoveryResult struct {
 }
 
 type workerInput struct {
-	Title    string `json:"title,omitempty"`
-	Prompt   string `json:"prompt,omitempty"`
-	SpecPath string `json:"specPath,omitempty"`
-	Repo     string `json:"repo,omitempty"`
+	Title     string `json:"title,omitempty"`
+	Prompt    string `json:"prompt,omitempty"`
+	SpecPath  string `json:"specPath,omitempty"`
+	Repo      string `json:"repo,omitempty"`
+	ChatScope string `json:"chatScope,omitempty"`
+	ChatTitle string `json:"chatTitle,omitempty"`
+	ChatURL   string `json:"chatUrl,omitempty"`
+	Module    string `json:"module,omitempty"`
 	// IssueRepo is the source issue repository, which may differ from Repo for cross-repo closing references.
 	IssueRepo        string `json:"issueRepo,omitempty"`
 	BaseBranch       string `json:"baseBranch,omitempty"`
@@ -2259,7 +2263,7 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 		if r.hitlEnabled {
 			prompt += hitlPromptInstruction
 			nativeResumePrompt, nativeSessionID = r.pendingHumanAnswer(ctx, &input.Loop, agentVendor)
-			if nativeResumePrompt == "" && strings.EqualFold(r.hitlAnswerTransport, "feishu") {
+			if strings.EqualFold(r.hitlAnswerTransport, "feishu") {
 				prompt += feishuCollaborationInstruction
 			}
 			if nativeResumePrompt != "" {
@@ -2274,6 +2278,9 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 				nativeSessionID = takeoverSession
 				prompt += "\n\n" + takeoverPrompt
 			}
+		}
+		if nativeResumePrompt != "" && strings.EqualFold(r.hitlAnswerTransport, "feishu") {
+			nativeResumePrompt += feishuCollaborationInstruction
 		}
 		executionID := eventlog.NewEventID("agent")
 		metadata := map[string]any{"loopType": "worker", "title": work.Title, "repo": work.Repo, "baseBranch": work.BaseBranch}
@@ -2860,7 +2867,7 @@ func (r *Runner) resolveWorkerInput(ctx context.Context, project storage.Project
 	projectMetadata := parseJSONObject(project.MetadataJSON)
 	repo := firstNonEmpty(stringFromAnyDefault(source["repo"]), derefString(loop.Repo), stringFromAnyDefault(projectMetadata["repo"]))
 	baseBranch := firstNonEmpty(stringFromAnyDefault(source["baseBranch"]), stringFromAnyDefault(metadata["baseBranch"]), derefString(project.BaseBranch), "main")
-	work := workerInput{Title: firstNonEmpty(stringFromAnyDefault(source["title"]), "Worker run"), Prompt: stringFromAnyDefault(source["prompt"]), SpecPath: stringFromAnyDefault(source["specPath"]), Repo: repo, IssueRepo: stringFromAnyDefault(source["issueRepo"]), BaseBranch: baseBranch, ExecutionMode: executionMode, IssueNumber: int64FromAny(source["issueNumber"]), IssueURL: stringFromAnyDefault(source["issueUrl"]), StrictDispatchID: stringFromAnyDefault(source["strictDispatchId"]), TriggerLogin: stringFromAnyDefault(source["triggerLogin"]), PRNumber: int64FromAny(source["prNumber"]), Branch: stringFromAnyDefault(source["branch"]), HeadSHA: stringFromAnyDefault(source["headSha"]), AutoDiscovered: boolFromAny(source["autoDiscovered"]), Labels: stringSliceFromAny(source["labels"]), Reviewers: stringSliceFromAny(source["reviewers"])}
+	work := workerInput{Title: firstNonEmpty(stringFromAnyDefault(source["title"]), "Worker run"), Prompt: stringFromAnyDefault(source["prompt"]), SpecPath: stringFromAnyDefault(source["specPath"]), Repo: repo, Module: stringFromAnyDefault(source["module"]), IssueRepo: stringFromAnyDefault(source["issueRepo"]), BaseBranch: baseBranch, ExecutionMode: executionMode, IssueNumber: int64FromAny(source["issueNumber"]), IssueURL: stringFromAnyDefault(source["issueUrl"]), StrictDispatchID: stringFromAnyDefault(source["strictDispatchId"]), TriggerLogin: stringFromAnyDefault(source["triggerLogin"]), PRNumber: int64FromAny(source["prNumber"]), Branch: stringFromAnyDefault(source["branch"]), HeadSHA: stringFromAnyDefault(source["headSha"]), AutoDiscovered: boolFromAny(source["autoDiscovered"]), Labels: stringSliceFromAny(source["labels"]), Reviewers: stringSliceFromAny(source["reviewers"])}
 	if work.IssueNumber == 0 && loop.TargetType == "issue" {
 		work.IssueNumber = parseIssueNumberFromTargetID(derefString(loop.TargetID))
 	}

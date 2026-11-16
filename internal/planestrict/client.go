@@ -42,22 +42,29 @@ type Client struct {
 	rand        io.Reader
 }
 
+type CollaborationScope struct {
+	Key  string `json:"key"`
+	Name string `json:"name"`
+	Path string `json:"path,omitempty"`
+}
+
 type Dispatch struct {
-	ID                  string     `json:"id"`
-	IssueID             string     `json:"issue_id"`
-	Revision            uint64     `json:"revision"`
-	StateVersion        uint64     `json:"state_version"`
-	State               string     `json:"state"`
-	Health              string     `json:"health"`
-	RequestedMode       string     `json:"requested_mode"`
-	CodeRepo            string     `json:"code_repo"`
-	ActiveRole          string     `json:"active_role"`
-	OwnerMemberID       string     `json:"owner_member_id"`
-	NodeID              string     `json:"node_id"`
-	NodeBindingID       string     `json:"node_binding_id"`
-	ExecutionAttemptID  *string    `json:"execution_attempt_id"`
-	FencingToken        uint64     `json:"fencing_token"`
-	ClaimLeaseExpiresAt *time.Time `json:"claim_lease_expires_at"`
+	CollaborationScope  *CollaborationScope `json:"collaboration_scope,omitempty"`
+	ID                  string              `json:"id"`
+	IssueID             string              `json:"issue_id"`
+	Revision            uint64              `json:"revision"`
+	StateVersion        uint64              `json:"state_version"`
+	State               string              `json:"state"`
+	Health              string              `json:"health"`
+	RequestedMode       string              `json:"requested_mode"`
+	CodeRepo            string              `json:"code_repo"`
+	ActiveRole          string              `json:"active_role"`
+	OwnerMemberID       string              `json:"owner_member_id"`
+	NodeID              string              `json:"node_id"`
+	NodeBindingID       string              `json:"node_binding_id"`
+	ExecutionAttemptID  *string             `json:"execution_attempt_id"`
+	FencingToken        uint64              `json:"fencing_token"`
+	ClaimLeaseExpiresAt *time.Time          `json:"claim_lease_expires_at"`
 }
 
 type InboxResponse struct {

@@ -124,6 +124,7 @@ func normalizeLayerPartial(partial PartialConfig) PartialConfig {
 				ID:             provider.ID,
 				Kind:           &provider.Kind,
 				BaseURL:        &provider.BaseURL,
+				WebBaseURL:     cloneStringPtr(provider.WebBaseURL),
 				GHPath:         provider.GHPath,
 				Auth:           providerAuthModePtr(provider.Auth),
 				TokenEnv:       provider.TokenEnv,
@@ -352,6 +353,13 @@ func mergeConfig(config *Config, partial PartialConfig) {
 			copied := *fs
 			copied.ChatID = strings.TrimSpace(copied.ChatID)
 			copied.OwnerOpenID = strings.TrimSpace(copied.OwnerOpenID)
+			copied.ChatNamePrefix = strings.TrimSpace(copied.ChatNamePrefix)
+			if copied.InviteOpenIDs != nil {
+				copied.InviteOpenIDs = append([]string(nil), copied.InviteOpenIDs...)
+				for i := range copied.InviteOpenIDs {
+					copied.InviteOpenIDs[i] = strings.TrimSpace(copied.InviteOpenIDs[i])
+				}
+			}
 			copied.CLIPath = strings.TrimSpace(copied.CLIPath)
 			config.HITL.Feishu = &copied
 		}
@@ -1675,6 +1683,7 @@ func clonePartialConfig(partial PartialConfig) PartialConfig {
 		for i := range providers {
 			providers[i].Kind = cloneProviderKindPtr(providers[i].Kind)
 			providers[i].BaseURL = cloneStringPtr(providers[i].BaseURL)
+			providers[i].WebBaseURL = cloneStringPtr(providers[i].WebBaseURL)
 			providers[i].GHPath = cloneStringPtr(providers[i].GHPath)
 			providers[i].Auth = cloneProviderAuthModePtr(providers[i].Auth)
 			providers[i].TokenEnv = cloneStringPtr(providers[i].TokenEnv)
@@ -1850,6 +1859,7 @@ func cloneProviderConfigs(providers []PartialProviderConfig) []ProviderConfig {
 			ID:             strings.TrimSpace(provider.ID),
 			Kind:           kind,
 			GHPath:         cloneStringPtr(provider.GHPath),
+			WebBaseURL:     cloneStringPtr(provider.WebBaseURL),
 			TokenEnv:       cloneStringPtr(provider.TokenEnv),
 			TeaLogin:       cloneStringPtr(provider.TeaLogin),
 			TeaPath:        cloneStringPtr(provider.TeaPath),

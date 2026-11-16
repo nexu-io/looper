@@ -2,6 +2,7 @@ package forge
 
 import (
 	"context"
+	"github.com/nexu-io/looper/internal/config"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -250,5 +251,18 @@ func TestPlaneCreateIssueCommentRejectsUnsafeContentBeforeRequest(t *testing.T) 
 	}
 	if requests != 0 {
 		t.Fatalf("CreateIssueComment() made %d HTTP requests after content safety failure", requests)
+	}
+}
+
+func TestPlaneConfiguredWebOriginAndPublicTaskKey(t *testing.T) {
+	t.Setenv("PLANE_TEST_TOKEN", "fixture-token")
+	server, _ := planeTestServer(t)
+	tokenEnv, workspace, projectID, web := "PLANE_TEST_TOKEN", "acme", "proj-123", "https://plane-web.example"
+	client, err := NewPlaneClientFromConfig(config.ProviderConfig{ID: "plane", Kind: config.ProviderKindPlane, BaseURL: server.URL + "/api/v1", WebBaseURL: &web, TokenEnv: &tokenEnv, Workspace: &workspace, ProjectID: &projectID}, "acme/code")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := client.workItemWebURL("wi-1"); got != "https://plane-web.example/acme/projects/proj-123/issues/wi-1" {
+		t.Fatalf("web link uses API origin: %s", got)
 	}
 }

@@ -2,6 +2,8 @@ package workerhost
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"strings"
 	"time"
 
@@ -37,7 +39,7 @@ func PostPrivateFeishuQuestion(ctx context.Context, cfg *config.Config, repos *s
 	}
 	return gateway.SendHITLAsk(ctx, notify.HITLAskCard{
 		AskedAt: ask.AskedAt, Transport: "feishu", ProjectID: loop.ProjectID, LoopID: loop.ID, LoopSeq: loop.Seq,
-		Question: ask.Question, Options: ask.Options,
+		Question: ask.Question, Options: ask.Options, MentionOpenIds: ask.MentionOpenIDs,
 		Recommendation: ask.Recommendation, RecommendedOption: ask.RecommendedOption,
 		Consequences: ask.Consequences, Confidence: ask.Confidence,
 	})
@@ -52,7 +54,6 @@ func PollPrivateFeishu(ctx context.Context, input FeishuPollInput) error {
 	if err != nil {
 		return err
 	}
-	verified := false
 	for _, loop := range records {
 		ask, ok := loops.ReadHITLAsk(loop.MetadataJSON)
 		if loop.Status != "awaiting_human" || !ok || ask.Transport != "feishu" || ask.Status != "awaiting" {
@@ -69,28 +70,39 @@ func PollPrivateFeishu(ctx context.Context, input FeishuPollInput) error {
 			}
 			continue
 		}
-		if !verified {
-			if err := client.VerifyPrivateChat(ctx); err != nil {
-				return err
-			}
-			verified = true
+		chatID := client.Config.ChatID
+		if assigned, _, ok := loops.ReadFeishuChat(loop.MetadataJSON); ok {
+			chatID = assigned
 		}
 		root, err := input.Repos.FeishuThreads.RootByLoop(ctx, loop.ID)
 		if err != nil {
 			return err
 		}
-		messages, err := client.ThreadMessages(ctx, root)
+		messages, err := client.ThreadMessagesInChat(ctx, root, chatID)
 		if err != nil {
 			return err
 		}
-		answer := feishucli.ReplyAfterQuestion(messages, client.Config, ask.QuestionMessageID)
-		if answer != "" {
+		replyConfig := client.Config
+		replyConfig.ChatID = chatID
+		reply := feishucli.ReplyAfterQuestion(messages, replyConfig, ask.QuestionMessageID)
+		if reply.Text != "" {
 			nowISO := eventlog.FormatJavaScriptISOString(input.Now().UTC())
-			if err := loops.DeliverHITLAnswerForQuestion(ctx, input.Repos, nowISO, loop.ID, answer, ask.QuestionMessageID); err != nil {
+			if err := loops.DeliverHITLAnswerForQuestion(ctx, input.Repos, nowISO, loop.ID, reply.Text, ask.QuestionMessageID); err != nil {
 				return err
 			}
+			// A reaction acknowledges receipt without interpreting the answer.
+			// Failure must not prevent the already-delivered reply from resuming.
+			ackCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+			var ackErr error
+			for _, id := range reply.MessageIDs {
+				ackErr = errors.Join(ackErr, client.MarkReplyProcessing(ackCtx, id))
+			}
+			cancel()
 			if input.OnHITLAnswerDelivered != nil {
-				input.OnHITLAnswerDelivered(ctx, loop.ID, answer)
+				input.OnHITLAnswerDelivered(ctx, loop.ID, reply.Text)
+			}
+			if ackErr != nil {
+				return fmt.Errorf("reply delivered; Feishu processing reaction failed: %w", ackErr)
 			}
 		}
 	}

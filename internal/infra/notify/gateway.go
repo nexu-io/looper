@@ -8,6 +8,7 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -515,7 +516,7 @@ func (g *Gateway) recordFeishuApp(ctx context.Context, payload SystemNotificatio
 		return persist(build("skipped", "disabled", nil))
 	}
 
-	chatID := strings.TrimSpace(cfg.ChatID)
+	chatID := g.chatIDForLoop(ctx, payload.LoopID)
 	if chatID == "" {
 		return persist(build("skipped", "no app config", nil))
 	}
@@ -545,46 +546,21 @@ func (g *Gateway) recordFeishuApp(ctx context.Context, payload SystemNotificatio
 		return persist(build("failed", err.Error(), nil))
 	}
 
-	// Non-interactive updates (PR opened, progress, completion) are plain text —
-	// only a mid-run question needs an interactive card with buttons. Thread the
-	// message under the loop's root so a task's updates aggregate into one Feishu
-	// thread instead of stacking as separate cards.
+	// Native Markdown keeps paragraphs, lists and links readable. Updates stay
+	// inside the existing task thread and require no action callbacks.
 	rootMessageID := g.ensureFeishuThreadRoot(ctx, token, chatID, payload.LoopID)
 	// Refresh the anchor card so its colour/label tracks the loop's status
 	// (processing → done/failed) as lifecycle updates arrive.
 	g.updateFeishuThreadHeader(ctx, token, payload.LoopID)
-	content, err := json.Marshal(map[string]string{"text": feishuNotificationText(payload)})
+	content, err := buildFeishuUpdateCard(payload)
 	if err != nil {
 		return persist(build("failed", err.Error(), nil))
 	}
-	if _, err := g.postFeishuAppMessage(ctx, token, chatID, rootMessageID, "text", string(content)); err != nil {
+	if _, err := g.postFeishuAppMessage(ctx, token, chatID, rootMessageID, "interactive", string(content)); err != nil {
 		return persist(build("failed", err.Error(), nil))
 	}
 
 	return persist(build("success", "", stringPointer(nowISO)))
-}
-
-// feishuNotificationText renders a system notification as a plain-text body for
-// the app bot. Feishu auto-links any URLs it contains (e.g. the PR link).
-func feishuNotificationText(payload SystemNotificationPayload) string {
-	lines := make([]string, 0, 3)
-	for _, part := range []string{payload.Title, payload.Subtitle, payload.Body} {
-		if trimmed := strings.TrimSpace(part); trimmed != "" {
-			lines = append(lines, trimmed)
-		}
-	}
-	if len(lines) == 0 {
-		return "Looper update"
-	}
-	body := strings.Join(lines, "\n")
-	// Feishu text @-mention: <at user_id="ou_..."></at> (distinct from the card form).
-	mention := ""
-	for _, id := range payload.MentionOpenIds {
-		if id = strings.TrimSpace(id); id != "" {
-			mention += `<at user_id="` + id + `"></at> `
-		}
-	}
-	return mention + body
 }
 
 // HITLAskCard renders the original decision brief. Feishu transport accepts
@@ -686,7 +662,7 @@ func (g *Gateway) deliverHITLAsk(ctx context.Context, card HITLAskCard) error {
 		card.ProjectID = loop.ProjectID
 	}
 	cfg := g.config.Webhook
-	chatID := strings.TrimSpace(cfg.ChatID)
+	chatID := g.chatIDForLoop(ctx, card.LoopID)
 	if !g.feishuAppConfigured() || chatID == "" {
 		return fmt.Errorf("feishu app-bot is not configured for HITL asks (need appIdEnv/appSecretEnv/chatId)")
 	}
@@ -694,11 +670,13 @@ func (g *Gateway) deliverHITLAsk(ctx context.Context, card HITLAskCard) error {
 	if err != nil {
 		return err
 	}
-	// The @-mention targets come from config (deployment-specific), not the caller.
+	// The agent selects collaborators; deployment defaults apply when none were selected.
 	if len(card.MentionOpenIds) == 0 {
 		card.MentionOpenIds = cfg.MentionOpenIds
 	}
-	card.MentionOpenIds = firstFeishuOwner(card.MentionOpenIds)
+	if card.Transport != "feishu" {
+		card.MentionOpenIds = firstFeishuOwner(card.MentionOpenIds)
+	}
 	if strings.TrimSpace(card.OwnerOpenID) == "" {
 		card.OwnerOpenID = g.ownerOpenID(card.ProjectID)
 	}
@@ -1264,12 +1242,12 @@ func (g *Gateway) PostThreadImage(ctx context.Context, loopID, pngPath, dedupeUU
 	if loopID == "" || strings.TrimSpace(pngPath) == "" || !strings.EqualFold(strings.TrimSpace(g.config.Webhook.Mode), "app") {
 		return "", nil
 	}
-	cfg := g.config.Webhook
 	if !g.feishuAppConfigured() {
 		return "", nil
 	}
 	root := g.threadRootForLoop(ctx, loopID)
-	if root == "" || strings.TrimSpace(cfg.ChatID) == "" {
+	chatID := g.chatIDForLoop(ctx, loopID)
+	if root == "" || chatID == "" {
 		return "", nil
 	}
 	token, err := g.feishuAppToken(ctx)
@@ -1284,7 +1262,7 @@ func (g *Gateway) PostThreadImage(ctx context.Context, loopID, pngPath, dedupeUU
 	if err != nil {
 		return "", err
 	}
-	return g.postFeishuAppMessageWithUUID(ctx, token, cfg.ChatID, root, "image", string(content), dedupeUUID)
+	return g.postFeishuAppMessageWithUUID(ctx, token, chatID, root, "image", string(content), dedupeUUID)
 }
 
 func (g *Gateway) uploadFeishuImage(ctx context.Context, token, pngPath string) (string, error) {
@@ -1422,6 +1400,19 @@ func (g *Gateway) loopTaskKey(ctx context.Context, loopID string) string {
 // loopTaskKeyFromRecord builds issue:repo:N from a loop, or "" when there's no
 // originating issue (or no repo) to anchor the task on.
 func loopTaskKeyFromRecord(loop *storage.LoopRecord) string {
+	// Plane numbers are project-local and independent of the code repository.
+	// Its explicit source URL identifies the item even across code repositories.
+	if loop != nil && loop.MetadataJSON != nil {
+		var metadata struct {
+			Worker struct {
+				StrictDispatchID string `json:"strictDispatchId"`
+				IssueURL         string `json:"issueUrl"`
+			} `json:"worker"`
+		}
+		if json.Unmarshal([]byte(*loop.MetadataJSON), &metadata) == nil && metadata.Worker.StrictDispatchID != "" && strings.TrimSpace(metadata.Worker.IssueURL) != "" {
+			return "plane:" + strings.TrimSpace(metadata.Worker.IssueURL)
+		}
+	}
 	if loop == nil || loop.Repo == nil {
 		return ""
 	}
@@ -1503,6 +1494,31 @@ func (g *Gateway) threadRootForLoop(ctx context.Context, loopID string) string {
 	return g.resolveThreadRoot(ctx, loopID, g.loopTaskKey(ctx, loopID))
 }
 
+// chatIDForLoop resolves the durable per-task group before falling back to the
+// configured default group. Child loops inherit the task group through the
+// Feishu thread table, so a restart never silently moves a conversation.
+func (g *Gateway) chatIDForLoop(ctx context.Context, loopID string) string {
+	loopID = strings.TrimSpace(loopID)
+	if g.repositories != nil && g.repositories.Loops != nil && loopID != "" {
+		if loop, err := g.repositories.Loops.GetByID(ctx, loopID); err == nil && loop != nil {
+			if chatID, _, ok := loops.ReadFeishuChat(loop.MetadataJSON); ok {
+				return chatID
+			}
+		}
+	}
+	if g.repositories != nil && g.repositories.FeishuThreads != nil && loopID != "" {
+		if chatID, err := g.repositories.FeishuThreads.ChatIDByLoop(ctx, loopID); err == nil && chatID != "" {
+			return chatID
+		}
+		if taskKey := g.loopTaskKey(ctx, loopID); taskKey != "" {
+			if chatID, err := g.repositories.FeishuThreads.ChatIDByTask(ctx, taskKey); err == nil && chatID != "" {
+				return chatID
+			}
+		}
+	}
+	return strings.TrimSpace(g.config.Webhook.ChatID)
+}
+
 // feishuThreadHeaderText builds a loop thread's plain-text root header, e.g.
 // "🔧 开始处理 #360 · owner/repo\n<title>". Best-effort; never exposes an
 // internal loop id when the record cannot be resolved.
@@ -1560,6 +1576,9 @@ func (g *Gateway) feishuThreadHeaderCard(ctx context.Context, loopID string) (st
 			sourceLabel = fmt.Sprintf("Issue #%d", n)
 		} else if n := urlTrailingNumber(issueURL); n != "" {
 			sourceLabel = "Issue #" + n
+		}
+		if key := planeItemKey(issueURL); key != "" {
+			sourceLabel = key
 		}
 		sourceURL = issueURL
 	} else {
@@ -2090,7 +2109,6 @@ func (g *Gateway) RefreshThreadHeader(ctx context.Context, loopID string, tail [
 		g.state.liveTails[loopID] = liveTailEntry{lines: tail, elapsedSec: elapsedSec}
 		g.state.liveMu.Unlock()
 	}
-	cfg := g.config.Webhook
 	if !g.feishuAppConfigured() {
 		return
 	}
@@ -2101,7 +2119,7 @@ func (g *Gateway) RefreshThreadHeader(ctx context.Context, loopID string, tail [
 	// Ensure the anchor exists NOW so live progress is visible DURING the run: the
 	// lifecycle Notify path that would otherwise create it is level-filtered (info
 	// updates are dropped) and only fires the anchor at completion. Idempotent.
-	if chatID := strings.TrimSpace(cfg.ChatID); chatID != "" {
+	if chatID := g.chatIDForLoop(ctx, loopID); chatID != "" {
 		g.ensureFeishuThreadRoot(ctx, token, chatID, loopID)
 	}
 	// Anchor (topic root) → human brief; live tool feed → its own reply in-thread.
@@ -2214,7 +2232,7 @@ func (g *Gateway) updateLiveFeedComment(ctx context.Context, token, loopID strin
 		_ = g.patchFeishuAppCard(ctx, token, msgID, cardJSON)
 		return
 	}
-	chatID := strings.TrimSpace(g.config.Webhook.ChatID)
+	chatID := g.chatIDForLoop(ctx, loopID)
 	if chatID == "" {
 		return
 	}
@@ -2285,7 +2303,6 @@ func (g *Gateway) postThreadNote(ctx context.Context, loopID, text string, menti
 	if loopID == "" || strings.TrimSpace(text) == "" || !strings.EqualFold(strings.TrimSpace(g.config.Webhook.Mode), "app") {
 		return nil
 	}
-	cfg := g.config.Webhook
 	if !g.feishuAppConfigured() {
 		return nil
 	}
@@ -2294,7 +2311,7 @@ func (g *Gateway) postThreadNote(ctx context.Context, loopID, text string, menti
 		return err
 	}
 	root := g.threadRootForLoop(ctx, loopID)
-	chatID := strings.TrimSpace(cfg.ChatID)
+	chatID := g.chatIDForLoop(ctx, loopID)
 	if strings.TrimSpace(root) == "" || chatID == "" {
 		return nil
 	}
@@ -2356,7 +2373,6 @@ func (g *Gateway) deliverThreadDecisionCard(ctx context.Context, intent feishuDe
 	loopID := strings.TrimSpace(intent.LoopID)
 	body := strings.TrimSpace(intent.Body)
 	actionURL := strings.TrimSpace(intent.ActionURL)
-	cfg := g.config.Webhook
 	if !g.feishuAppConfigured() {
 		return fmt.Errorf("feishu app credentials are not configured")
 	}
@@ -2364,7 +2380,7 @@ func (g *Gateway) deliverThreadDecisionCard(ctx context.Context, intent feishuDe
 	if err != nil {
 		return err
 	}
-	chatID := strings.TrimSpace(cfg.ChatID)
+	chatID := g.chatIDForLoop(ctx, loopID)
 	if chatID == "" {
 		return fmt.Errorf("feishu chat id is not configured")
 	}
@@ -2581,19 +2597,16 @@ func feishuLiveFeedCardWithOwner(tail []string, elapsedSec int64, ownerOpenID st
 	if len(tail) == 0 {
 		return "", false
 	}
-	elements := []any{larkDiv(feishuActivityTail(tail))}
-	note := "任务当前状态见主卡片"
+	title := "执行过程"
 	if elapsedSec > 0 {
-		note = "⏱ 本轮已执行 " + humanizeElapsedSeconds(elapsedSec) + " · " + note
+		title = "用时 " + humanizeElapsedSeconds(elapsedSec) + " · " + title
 	}
-	elements = append(elements, map[string]any{"tag": "note", "elements": []any{map[string]any{"tag": "lark_md", "content": note}}})
-	elements = append(elements, feishuLooperOwnerNote(ownerOpenID))
-	// No header — the body already leads with "🔧 最近执行记录"; a separate progress
-	// title just repeats it. Feishu renders a header-less card fine.
-	cardObj := map[string]any{
-		"config":   map[string]any{"wide_screen_mode": true},
-		"elements": elements,
+	details := []any{taskCardMarkdown(feishuActivityTail(tail), "notation")}
+	if ownerOpenID != "" {
+		details = append(details, taskCardMarkdown("来自 <at id="+ownerOpenID+"></at> 的 Looper", "notation"))
 	}
+	cardObj := map[string]any{"schema": "2.0", "config": map[string]any{"update_multi": true},
+		"body": map[string]any{"padding": "12px", "elements": []any{taskCardDetails(title, details)}}}
 	raw, err := json.Marshal(cardObj)
 	if err != nil {
 		return "", false
@@ -2935,4 +2948,17 @@ func ternaryTimePointer(condition bool, value string) *string {
 	}
 
 	return &value
+}
+
+// Plane browse URLs carry the public item identifier, unlike UUID detail URLs.
+func planeItemKey(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return ""
+	}
+	parts := strings.Split(strings.Trim(u.Path, "/"), "/")
+	if len(parts) >= 2 && parts[len(parts)-2] == "browse" {
+		return parts[len(parts)-1]
+	}
+	return ""
 }

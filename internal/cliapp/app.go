@@ -156,7 +156,7 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 						stringFlag("plane-token-env", "ENV", "Environment variable holding the Plane API key (default PLANE_API_KEY)"),
 						stringFlag("trigger-label", "label", "Work-item label used by Looper (default looper:plan)"),
 					}}),
-					newCommand(commandSpec{use: "doctor [provider-id]", short: "Check whether this computer can receive Plane work", args: cobra.MaximumNArgs(1), runE: runtime.planeDoctor}),
+					newCommand(commandSpec{use: "doctor [provider-id]", short: "Check whether this computer can receive Plane work", args: cobra.MaximumNArgs(1), runE: runtime.planeDoctor, localFlags: []flagSpec{boolFlag("collab", "Check the independent collaboration host instead of looperd"), stringFlag("state-dir", "path", "Independent collaboration state directory")}}),
 					newCommand(commandSpec{use: "link [provider-id]", short: "Link this Node to your Plane identity", args: cobra.MaximumNArgs(1), runE: runtime.planeLink, localFlags: []flagSpec{stringFlag("strict-base-url", "url", "Plane web origin for strict dispatch endpoints")}}),
 					newCommand(commandSpec{use: "approve <binding-id> [provider-id]", short: "Approve a binding on legacy Plane servers", args: cobra.RangeArgs(1, 2), runE: runtime.planeApprove, localFlags: []flagSpec{boolFlag("allow-offline-queue", "Allow this owner to queue work while their Node is offline")}}),
 					newCommand(commandSpec{use: "setup <product-member-id> <design-member-id> <qa-member-id> [provider-id]", short: "Configure role owners and activate strict dispatch", args: cobra.RangeArgs(3, 4), runE: runtime.planeSetup, localFlags: []flagSpec{stringFlag("checklist-revision", "revision", "Signed rollout checklist revision")}}),

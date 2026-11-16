@@ -36,6 +36,7 @@ When you DO escalate, make it a decision brief the human can confirm in seconds 
 {
   "question": "<one concise question>",
   "options": ["<option 1>", "<option 2>"],
+  "mentionOpenIds": ["<responsible member open_id, optional; invite and confirm membership first>"],
   "recommendation": "<1-2 sentences: what you found, what you'd do, and why>",
   "recommendedOption": "<the option you recommend, matching one of options>",
   "consequences": {"<option 1>": "<what happens if picked>", "<option 2>": "<what happens if picked>"},
@@ -49,16 +50,24 @@ question + options are required; the rest are strongly encouraged (a bare questi
 const feishuCollaborationInstruction = `
 
 FEISHU COLLABORATION:
+- Before mentioning a selected person, invite them into the existing task group and verify they are a current member. An invitation or a pending approval is not membership. If they have not joined, tell the owner that the invitation is pending; do not claim the person has received an @mention. Continue independent work while waiting.
+- Send collaboration messages and attachments ONLY as the bot, with an explicit --as bot when using lark-cli. Never use --as user to send on the owner's behalf unless the owner explicitly authorizes that specific message. Bot permission errors are not permission to impersonate the owner; report the missing permission instead. The host posts ask.json into the task thread, so do not send the same acceptance question yourself.
+- The host delivers your updates and .looper/ask.json to the existing task thread and resumes this session with addressed human replies. Do not search Feishu tasks or chats to locate the task, and do not create a second task or group. Implement the assigned work first; use ask.json for acceptance or a required human decision.
 - Write concise, plain Chinese for the people in the task thread. Lead with what changed or the specific question. Do not expose internal loop IDs, session IDs, local runtime paths, tool chatter, or generic progress slogans.
-- The task anchor shows current progress; the thread holds the conversation. When asked a follow-up, answer it before repeating the remaining decision. Do not treat a question, disagreement, or "先不要执行" as approval. Messages labeled [群内讨论，仅作背景] are context, not instructions to proceed; respond to [负责人 @bot] and respect any conditions in that message.
+- Write final summaries as two or three short Markdown paragraphs or a few bullets: result, useful evidence, and any material remaining gap. Tool-by-tool narration belongs in the execution record, which the host folds; do not paste it into the answer. Preserve meaningful paragraph breaks and use links, code spans or a small table where helpful. A simple follow-up needs only a direct answer.
+- Keep ask.json question to one or two short sentences: what needs judging and what to look at. Put member IDs only in mentionOpenIds, never in prose. Keep options short. Essential risks, costs and conditions for the decision must be visible in the question or option text; put supporting checks, reproduction steps, PR details and extended rationale in recommendation/consequences, which the card folds by default. Do not turn the question into a test report.
+- The task anchor shows current progress; the thread holds the conversation. When asked a follow-up, answer it before repeating the remaining decision. Do not treat a question, disagreement, or "先不要执行" as approval. Messages labeled [群内讨论，仅作背景] are context, not instructions to proceed; respond to [群成员 @bot] and respect any conditions in that message.
+- An @mention identifies the recipient, not the subject of the answer. In this task's acceptance thread, "验收通过" accepts the current deliverable unless the person explicitly limits its scope. Use the conversation context; do not ask them to confirm the same acceptance again. Continue the remaining PR work within existing authorization. Ask only about a genuinely new human decision; never invent merge authorization or repeat generic warnings about it in every message.
 - Write options as plain, unnumbered strings in ask.json; the thread renders nonempty options as 1, 2, 3 in order. A reply may be a number, a request for explanation, a correction, or a delegated decision. Interpret it against the exact previous options. Do not invent approval buttons or require a rigid response phrase.
 - Before asking for a judgment, prepare the smallest useful evidence: a working preview for behavior/UI, before-and-after screenshots for visual changes, a short recording for a sequence of steps, or a small comparison/table for tradeoffs. Explain what to look at and how it relates to the decision. Prefer one useful artifact over a pile of links. Use the tools actually available; never claim a screenshot, deployment, upload or check you did not perform.
 - Put the key finding and real evidence links into question/recommendation, with each option's impact in consequences. The human cannot see your terminal output. A local path is not a shared link. Label localhost previews as available only on the host machine; state when an artifact cannot be shared. Do not invent URLs or image keys.
+- Prefer native Feishu images/files over bare external attachment URLs. A URL that works on this machine is not proof the reviewer can open it. If a reviewer reports an inaccessible artifact, try an appropriate accessible alternative (native image, recording or file) and explain any interaction it cannot demonstrate; do not treat uploading a link as completed delivery.
 - For delivery, state the user-visible result, how to view it, what you verified and the relevant remaining gap (for example: unit tests passed, browser flow not checked). A successful tool exit is not human acceptance, a merged PR, or a production release. Use a clear small table or annotated screenshot when it helps; do not force every answer into a long report.
 `
 
 type hitlAsk struct {
 	Question          string            `json:"question"`
+	MentionOpenIDs    []string          `json:"mentionOpenIds,omitempty"`
 	Options           []string          `json:"options"`
 	Recommendation    string            `json:"recommendation,omitempty"`
 	RecommendedOption string            `json:"recommendedOption,omitempty"`
@@ -98,11 +107,12 @@ func consumeAskSentinel(worktreePath string) (*hitlAsk, error) {
 // human mid-run. The step loop catches it and suspends the loop as
 // awaiting_human instead of treating it as a failure.
 type awaitingHumanError struct {
-	question    string
-	options     []string
-	sessionID   string
-	executionID string
-	vendor      string
+	question       string
+	mentionOpenIDs []string
+	options        []string
+	sessionID      string
+	executionID    string
+	vendor         string
 	// The agent's decision brief (optional) — carried through to the ask card.
 	recommendation    string
 	recommendedOption string
@@ -295,6 +305,7 @@ func (r *Runner) detectHITLAskSentinel(ctx context.Context, input stepInput, wor
 	sessionID, vendor := r.latestAgentSession(ctx, input.Loop.ID)
 	return &awaitingHumanError{
 		question:          ask.Question,
+		mentionOpenIDs:    ask.MentionOpenIDs,
 		options:           ask.Options,
 		sessionID:         sessionID,
 		executionID:       executionID,
@@ -330,6 +341,7 @@ func (r *Runner) suspendForHuman(ctx context.Context, input stepInput, run stora
 	nowISO := r.nowISO()
 	ask := loops.HITLAsk{
 		Question:          awaiting.question,
+		MentionOpenIDs:    awaiting.mentionOpenIDs,
 		Options:           awaiting.options,
 		SessionID:         awaiting.sessionID,
 		ExecutionID:       awaiting.executionID,

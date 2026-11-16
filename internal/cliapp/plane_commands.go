@@ -499,7 +499,7 @@ func (r *commandRuntime) planeLink(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("inspect Plane private key: %w", readErr)
 	}
 	user := planeLinkIdentity{}
-	if err := r.planeJSONRequest(cmd.Context(), provider.BaseURL, token, http.MethodGet, "users/me", "", nil, &user); err != nil {
+	if err := r.planeJSONRequest(cmd.Context(), provider.BaseURL, token, http.MethodGet, "users/me/", "", nil, &user); err != nil {
 		return fmt.Errorf("read current Plane identity: %w", err)
 	}
 	workspace := planeLinkIdentity{}

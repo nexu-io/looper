@@ -15,6 +15,7 @@ import (
 	"github.com/nexu-io/looper/internal/collab"
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/executionhost"
+	networkclient "github.com/nexu-io/looper/internal/network/client"
 	"github.com/nexu-io/looper/internal/worker"
 	"github.com/spf13/cobra"
 )
@@ -26,7 +27,7 @@ func (r *commandRuntime) collabCommand() *cobra.Command {
 		subcommands: []*cobra.Command{
 			newCommand(commandSpec{use: "start", short: "Start once; stay available across tasks", args: cobra.NoArgs, runE: r.collabStart, localFlags: []flagSpec{boolFlag("foreground", "Run in the current terminal")}}),
 			newCommand(commandSpec{use: "status", short: "Show service and task progress", args: cobra.NoArgs, runE: r.collabStatus}),
-			newCommand(commandSpec{use: "run", short: "Explicitly dispatch a task", args: cobra.NoArgs, runE: r.collabRun, localFlags: []flagSpec{stringFlag("project", "id", "Configured local project ID"), stringFlag("repo", "owner/repo", "Explicit target code repository"), stringFlag("title", "text", "Human-readable task title"), stringFlag("prompt-file", "path|-", "Task prompt file; - reads stdin"), stringFlag("issue", "number", "Source issue or Plane sequence number"), stringFlag("issue-url", "url", "Source task link")}}),
+			newCommand(commandSpec{use: "run", short: "Explicitly dispatch a task", args: cobra.NoArgs, runE: r.collabRun, localFlags: []flagSpec{stringFlag("project", "id", "Configured local project ID"), stringFlag("repo", "owner/repo", "Explicit target code repository"), stringFlag("module", "name", "Optional module collaboration scope"), stringFlag("title", "text", "Human-readable task title"), stringFlag("prompt-file", "path|-", "Task prompt file; - reads stdin"), stringFlag("issue", "number", "Source issue or Plane sequence number"), stringFlag("issue-url", "url", "Source task link")}}),
 			newCommand(commandSpec{use: "logs", short: "Show collaboration host logs", args: cobra.NoArgs, runE: r.collabLogs}),
 			newCommand(commandSpec{use: "stop", short: "Drain executions and stop the service", args: cobra.NoArgs, runE: r.collabStop}),
 		},
@@ -49,7 +50,11 @@ func (r *commandRuntime) collabStart(cmd *cobra.Command, _ []string) error {
 		return err
 	}
 	if getBoolFlag(cmd, "foreground") {
-		return collab.Serve(cmd.Context(), collab.Options{Config: cfg, StateDir: dir, Logger: collabLogger{out: r.app.stderr()}})
+		home, err := r.homeDir()
+		if err != nil {
+			return err
+		}
+		return collab.Serve(cmd.Context(), collab.Options{Config: cfg, StateDir: dir, NetworkStatePath: networkclient.DefaultStatePath(home), Logger: collabLogger{out: r.app.stderr()}})
 	}
 	if result, err := collab.Request(cmd.Context(), dir, "GET", "/status", nil); err == nil {
 		return writeCollabOutput(cmd, result)
@@ -147,7 +152,7 @@ func (r *commandRuntime) collabRequest(cmd *cobra.Command, method, path string, 
 }
 
 func (r *commandRuntime) collabRun(cmd *cobra.Command, _ []string) error {
-	input := worker.EnqueueInput{ProjectID: getStringFlag(cmd, "project"), Repo: getStringFlag(cmd, "repo"), Title: getStringFlag(cmd, "title"), IssueURL: getStringFlag(cmd, "issue-url")}
+	input := worker.EnqueueInput{ProjectID: getStringFlag(cmd, "project"), Repo: getStringFlag(cmd, "repo"), Module: getStringFlag(cmd, "module"), Title: getStringFlag(cmd, "title"), IssueURL: getStringFlag(cmd, "issue-url")}
 	if text := getStringFlag(cmd, "issue"); text != "" {
 		number, err := strconv.ParseInt(text, 10, 64)
 		if err != nil || number <= 0 {

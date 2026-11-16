@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -137,8 +138,12 @@ func TestStopDuringExecutionFinalizesClaimBeforeReleasingHost(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	if _, err := Request(ctx, dir, "POST", "/stop", nil); err != nil {
+	result, err := Request(ctx, dir, "POST", "/stop", nil)
+	if err != nil {
 		t.Fatal(err)
+	}
+	if !strings.Contains(string(result), `"status":"stopped"`) {
+		t.Fatalf("stop returned before reporting the drained result: %s", result)
 	}
 	select {
 	case err := <-done:
@@ -160,6 +165,90 @@ func TestStopDuringExecutionFinalizesClaimBeforeReleasingHost(t *testing.T) {
 	}
 	if len(items) != 1 || items[0].Status == "running" || items[0].Status == "completed" {
 		t.Fatalf("stop must durably release the claim without claiming delivery: %+v", items)
+	}
+}
+
+func TestStandaloneHostPreparesChatBeforeStartingAgent(t *testing.T) {
+	cfg, dir := hostFixture(t, `#!/bin/sh
+printf started > "$COLLAB_TEST_STARTED"
+printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"__LOOPER_RESULT__={\"summary\":\"Verified routing fixture\"}"}}'
+`)
+	started := filepath.Join(dir, "model-started")
+	creating := filepath.Join(dir, "chat-creating")
+	release := filepath.Join(dir, "release-chat")
+	cfg.Agent.Env = map[string]string{"COLLAB_TEST_STARTED": started}
+	t.Setenv("COLLAB_TEST_CREATING", creating)
+	t.Setenv("COLLAB_TEST_RELEASE", release)
+	cli := filepath.Join(dir, "feishu.sh")
+	script := `#!/bin/sh
+case "$*" in
+  *+chat-create*)
+    touch "$COLLAB_TEST_CREATING"
+    while [ ! -f "$COLLAB_TEST_RELEASE" ]; do sleep 0.01; done
+    printf '%s\n' '{"ok":true,"data":{"chat_id":"oc_prepared"}}'
+    ;;
+  *) printf '%s\n' '{"ok":true,"data":{"message_id":"om_fixture"}}' ;;
+esac
+`
+	if err := os.WriteFile(cli, []byte(script), 0700); err != nil {
+		t.Fatal(err)
+	}
+	cfg.HITL = config.HITLConfig{Enabled: true, AnswerTransport: "feishu", Feishu: &config.HITLFeishuConfig{CLIPath: cli, ChatID: "oc_fallback", AutoCreateTaskChats: true, OwnerOpenID: "ou_owner"}}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	done := make(chan error, 1)
+	go func() {
+		done <- Serve(ctx, Options{Config: cfg, StateDir: dir, NetworkStatePath: filepath.Join(dir, "network.json")})
+	}()
+	defer func() {
+		cancel()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Error(err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Error("host did not drain")
+		}
+	}()
+	await := func(ready func() bool) {
+		t.Helper()
+		for !ready() {
+			if ctx.Err() != nil {
+				t.Fatal("fixture never became ready")
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	await(func() bool { _, err := Request(ctx, dir, "GET", "/status", nil); return err == nil })
+	runCtx, stop := context.WithTimeout(ctx, 2*time.Second)
+	defer stop()
+	created, err := Request(runCtx, dir, "POST", "/run", worker.EnqueueInput{ProjectID: "local", Repo: "acme/local", Module: "shared", Title: "Routing fixture", Prompt: "Verify fixture"})
+	if err != nil {
+		t.Fatalf("intake must not wait for chat provisioning: %v", err)
+	}
+	await(func() bool { _, err := os.Stat(creating); return err == nil })
+	if _, err := os.Stat(started); !os.IsNotExist(err) {
+		t.Fatal("agent started before chat preparation completed")
+	}
+	if err := os.WriteFile(release, nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	await(func() bool { _, err := os.Stat(started); return err == nil })
+	var task Task
+	if err := json.Unmarshal(created, &task); err != nil {
+		t.Fatal(err)
+	}
+	db, err := storage.OpenSQLiteCoordinator(ctx, filepath.Join(dir, "looper.sqlite"), storage.SQLiteCoordinatorOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	loop, err := storage.NewRepositories(db.DB()).Loops.GetByID(ctx, task.ID)
+	if err != nil || loop == nil {
+		t.Fatalf("loop missing: %v", err)
+	}
+	if chat, _, _ := readChat(loop.MetadataJSON); chat != "oc_prepared" {
+		t.Fatalf("agent started without prepared routing: %s", chat)
 	}
 }
 

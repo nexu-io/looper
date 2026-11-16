@@ -26,6 +26,9 @@ func Request(ctx context.Context, dir, method, path string, input any) (json.Raw
 	}}
 	defer transport.CloseIdleConnections()
 	client := http.Client{Transport: transport, Timeout: 10 * time.Second}
+	if path == "/stop" {
+		client.Timeout = 40 * time.Second // Wait for execution drain, not just signal delivery.
+	}
 	req, err := http.NewRequestWithContext(ctx, method, "http://collab"+path, body)
 	if err != nil {
 		return nil, err

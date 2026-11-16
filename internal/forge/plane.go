@@ -158,6 +158,9 @@ func NewPlaneClientFromConfig(provider config.ProviderConfig, codeRepo string, o
 	if err != nil {
 		return nil, err
 	}
+	if provider.WebBaseURL != nil && strings.TrimSpace(*provider.WebBaseURL) != "" {
+		client.webBaseURL = strings.TrimRight(strings.TrimSpace(*provider.WebBaseURL), "/")
+	}
 	if strict := provider.StrictDispatch; strict != nil && strict.Enabled {
 		credentials, err := planestrict.LoadCredentials(strict.BindingID, strict.KeyRevision, strict.NodeID, strict.PrivateKeyFile)
 		if err != nil {
@@ -252,6 +255,14 @@ func (plane *PlaneClient) ClaimStrictDispatch(ctx context.Context, dispatch plan
 	return err
 }
 
+// CollaborationURL uses the human web origin, never the signed API origin.
+func (plane *PlaneClient) CollaborationURL(scope *planestrict.CollaborationScope) string {
+	if scope == nil || scope.Path == "" {
+		return ""
+	}
+	return plane.webBaseURL + "/" + strings.TrimLeft(scope.Path, "/")
+}
+
 func (plane *PlaneClient) StrictDispatchIssue(ctx context.Context, dispatch planestrict.Dispatch) (Issue, error) {
 	item, err := plane.workItemByID(ctx, dispatch.IssueID)
 	if err != nil {
@@ -262,6 +273,16 @@ func (plane *PlaneClient) StrictDispatchIssue(ctx context.Context, dispatch plan
 		return Issue{}, err
 	}
 	issue := plane.convertWorkItem(item, labels)
+	// The project identifier is Plane's public task key, not a GitHub issue number.
+	var project struct {
+		Identifier string `json:"identifier"`
+	}
+	if err := plane.do(ctx, http.MethodGet, plane.projectPath(), nil, nil, &project); err != nil {
+		return Issue{}, err
+	}
+	if project.Identifier != "" {
+		issue.HTMLURL = fmt.Sprintf("%s/%s/browse/%s-%d", plane.webBaseURL, plane.workspace, project.Identifier, item.SequenceID)
+	}
 	issue.StrictDispatchID = dispatch.ID
 	return issue, nil
 }

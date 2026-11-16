@@ -78,10 +78,13 @@ func (s planeSource) processDispatch(ctx context.Context, runner *worker.Runner,
 				return err
 			}
 		}
-		if _, err := runner.Enqueue(ctx, worker.EnqueueInput{ProjectID: s.project.ID, Repo: dispatch.CodeRepo, Title: issue.Title, Prompt: issue.Body, IssueNumber: issue.Number, IssueURL: issue.HTMLURL, StrictDispatchID: dispatch.ID}); err != nil {
-			return err
+		input := worker.EnqueueInput{ProjectID: s.project.ID, Repo: dispatch.CodeRepo, Title: issue.Title, Prompt: issue.Body, IssueNumber: issue.Number, IssueURL: issue.HTMLURL, StrictDispatchID: dispatch.ID}
+		if scope := dispatch.CollaborationScope; scope != nil {
+			input.ChatScope, input.ChatTitle = scope.Key, scope.Name
+			input.ChatURL = s.client.CollaborationURL(scope)
 		}
-		return nil
+		_, err = runner.Enqueue(ctx, input)
+		return err
 	}
 	if loop.ProjectID != s.project.ID {
 		return fmt.Errorf("Plane dispatch %s already belongs to local project %s", dispatch.ID, loop.ProjectID)

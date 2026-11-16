@@ -21,19 +21,123 @@ type Client struct {
 }
 
 type Message struct {
-	ID       string `json:"message_id"`
-	ChatID   string `json:"chat_id"`
-	ThreadID string `json:"thread_id"`
-	Content  string `json:"content"`
-	Deleted  bool   `json:"deleted"`
-	Mentions []struct {
-		ID string `json:"id"`
-	} `json:"mentions"`
-	Sender struct {
+	ID       string    `json:"message_id"`
+	ChatID   string    `json:"chat_id"`
+	ThreadID string    `json:"thread_id"`
+	Content  string    `json:"content"`
+	Deleted  bool      `json:"deleted"`
+	Mentions []Mention `json:"mentions"`
+	Sender   struct {
 		ID        string `json:"id"`
 		Type      string `json:"sender_type"`
 		OpenBotID string `json:"open_bot_id"`
 	} `json:"sender"`
+}
+
+type Mention struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+	Key  string `json:"key"`
+}
+
+type Reply struct {
+	Text       string
+	MessageIDs []string
+}
+
+// MarkReplyProcessing is a receipt, not a decision or an acceptance result.
+func (c Client) MarkReplyProcessing(ctx context.Context, messageID string) error {
+	params, _ := json.Marshal(map[string]string{"message_id": messageID})
+	_, err := c.callData(ctx, nil, "im", "reactions", "create", "--params", string(params), "--data", `{"reaction_type":{"emoji_type":"OnIt"}}`, "--as", "bot")
+	return err
+}
+
+// CreateGroup creates a private Feishu group owned by the Looper bot. The
+// caller deliberately supplies the member list; role discovery stays with the
+// agent and is never hard-coded into the transport.
+func (c Client) CreateGroup(ctx context.Context, name, description string, users []string) (string, error) {
+	args := []string{"im", "+chat-create", "--name", strings.TrimSpace(name), "--chat-mode", "group", "--type", "private", "--as", "bot", "--set-bot-manager"}
+	if description = strings.TrimSpace(description); description != "" {
+		args = append(args, "--description", description)
+	}
+	if ids := cleanOpenIDs(users); len(ids) > 0 {
+		args = append(args, "--users", strings.Join(ids, ","))
+	}
+	data, err := c.callData(ctx, nil, args...)
+	if err != nil {
+		return "", err
+	}
+	var result struct {
+		ChatID string `json:"chat_id"`
+		Chat   struct {
+			ChatID string `json:"chat_id"`
+		} `json:"chat"`
+	}
+	if err := json.Unmarshal(data, &result); err != nil {
+		return "", fmt.Errorf("decode created Feishu chat: %w", err)
+	}
+	chatID := strings.TrimSpace(result.ChatID)
+	if chatID == "" {
+		chatID = strings.TrimSpace(result.Chat.ChatID)
+	}
+	if chatID == "" {
+		return "", fmt.Errorf("Feishu chat create returned no chat_id")
+	}
+	return chatID, nil
+}
+
+func (c Client) SendGroupCard(ctx context.Context, chatID string, card []byte) error {
+	_, err := c.callData(ctx, nil, "im", "+messages-send", "--chat-id", chatID, "--msg-type", "interactive", "--content", string(card), "--as", "bot")
+	return err
+}
+
+// InviteMembers is best-effort at the API level: succeed_type=1 lets Feishu
+// add visible members while reporting unavailable ids instead of rejecting the
+// entire group. The agent can still mention and invite additional people later.
+func (c Client) InviteMembers(ctx context.Context, chatID string, users []string) error {
+	chatID = strings.TrimSpace(chatID)
+	ids := cleanOpenIDs(users)
+	if chatID == "" || len(ids) == 0 {
+		return nil
+	}
+	body, err := json.Marshal(map[string]any{"id_list": ids})
+	if err != nil {
+		return err
+	}
+	data, err := c.callData(ctx, body, "im", "chat.members", "create", "--chat-id", chatID, "--member-id-type", "open_id", "--succeed-type", "1", "--data", "-", "--as", "bot")
+	if err != nil {
+		return err
+	}
+	var result struct {
+		Invalid []string `json:"invalid_id_list"`
+		Missing []string `json:"not_existed_id_list"`
+		Pending []string `json:"pending_approval_id_list"`
+	}
+	if err := json.Unmarshal(data, &result); err != nil {
+		return err
+	}
+	unavailable := append(append(result.Invalid, result.Missing...), result.Pending...)
+	if len(unavailable) > 0 {
+		return fmt.Errorf("Feishu members unavailable or pending approval: %s; invite them through an authorized group member", strings.Join(unavailable, ", "))
+	}
+	return nil
+}
+
+func cleanOpenIDs(ids []string) []string {
+	seen := map[string]struct{}{}
+	result := make([]string, 0, len(ids))
+	for _, id := range ids {
+		id = strings.TrimSpace(id)
+		if id == "" || !strings.HasPrefix(id, "ou_") {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		result = append(result, id)
+	}
+	return result
 }
 
 func (c Client) run(ctx context.Context, input []byte, args ...string) ([]byte, error) {
@@ -85,64 +189,19 @@ func (c Client) callData(ctx context.Context, input []byte, args ...string) (jso
 	return envelope.Data, nil
 }
 
-// VerifyPrivateChat enforces the configured-chat boundary before any write.
-// The chat may contain additional human collaborators; it only needs to retain
-// the configured Looper owner and the current bot. Reading membership uses the
-// authorized user; outbound messages always use the bot.
-func (c Client) VerifyPrivateChat(ctx context.Context) error {
-	var members struct {
-		Users []struct {
-			ID string `json:"member_id"`
-		} `json:"users"`
-		Bots []struct {
-			AppID string `json:"app_id"`
-		} `json:"bots"`
-		HasMore     bool              `json:"has_more"`
-		Truncations []json.RawMessage `json:"truncations"`
-	}
-	if err := c.call(ctx, &members, "im", "+chat-members-list", "--chat-id", c.Config.ChatID, "--as", "user", "--page-all"); err != nil {
-		return err
-	}
-	identity, err := c.run(ctx, nil, "whoami", "--as", "bot")
-	if err != nil {
-		return err
-	}
-	var bot struct {
-		AppID     string `json:"appId"`
-		Available bool   `json:"available"`
-	}
-	if err := json.Unmarshal(identity, &bot); err != nil {
-		return err
-	}
-	ownerPresent := false
-	for _, member := range members.Users {
-		if strings.TrimSpace(member.ID) == strings.TrimSpace(c.Config.OwnerOpenID) {
-			ownerPresent = true
-			break
-		}
-	}
-	botPresent := false
-	for _, member := range members.Bots {
-		if strings.TrimSpace(member.AppID) == strings.TrimSpace(bot.AppID) {
-			botPresent = true
-			break
-		}
-	}
-	if members.HasMore || len(members.Truncations) != 0 || !ownerPresent || !bot.Available || !botPresent {
-		return fmt.Errorf("Feishu chat must contain the configured owner and current bot")
-	}
-	return nil
+func (c Client) root(ctx context.Context, id string) (Message, error) {
+	return c.rootInChat(ctx, id, c.Config.ChatID)
 }
 
-func (c Client) root(ctx context.Context, id string) (Message, error) {
+func (c Client) rootInChat(ctx context.Context, id, expectedChatID string) (Message, error) {
 	var data struct {
 		Messages []Message `json:"messages"`
 	}
-	if err := c.call(ctx, &data, "im", "+messages-mget", "--message-ids", id, "--as", "user", "--no-reactions"); err != nil {
+	if err := c.call(ctx, &data, "im", "+messages-mget", "--message-ids", id, "--as", "bot", "--no-reactions"); err != nil {
 		return Message{}, err
 	}
 	for _, message := range data.Messages {
-		if message.ID == id && message.ChatID == c.Config.ChatID && !message.Deleted {
+		if message.ID == id && (strings.TrimSpace(expectedChatID) == "" || message.ChatID == strings.TrimSpace(expectedChatID)) && !message.Deleted {
 			return message, nil
 		}
 	}
@@ -150,7 +209,11 @@ func (c Client) root(ctx context.Context, id string) (Message, error) {
 }
 
 func (c Client) ThreadMessages(ctx context.Context, rootID string) ([]Message, error) {
-	root, err := c.root(ctx, rootID)
+	return c.ThreadMessagesInChat(ctx, rootID, c.Config.ChatID)
+}
+
+func (c Client) ThreadMessagesInChat(ctx context.Context, rootID, chatID string) ([]Message, error) {
+	root, err := c.rootInChat(ctx, rootID, chatID)
 	if err != nil {
 		return nil, err
 	}
@@ -161,7 +224,7 @@ func (c Client) ThreadMessages(ctx context.Context, rootID string) ([]Message, e
 		Messages []Message `json:"messages"`
 		HasMore  bool      `json:"has_more"`
 	}
-	err = c.call(ctx, &data, "im", "+threads-messages-list", "--thread", root.ThreadID, "--as", "user", "--no-reactions", "--order", "asc", "--page-all")
+	err = c.call(ctx, &data, "im", "+threads-messages-list", "--thread", root.ThreadID, "--as", "bot", "--no-reactions", "--order", "asc", "--page-all")
 	if err != nil {
 		return nil, err
 	}
@@ -174,7 +237,7 @@ func (c Client) ThreadMessages(ctx context.Context, rootID string) ([]Message, e
 // ReplyAfterQuestion returns conversation after this exact question. It never
 // treats ordinary discussion as a command. Only a real mention of the question's
 // bot wakes the task; other owner messages are supplied as labeled context.
-func ReplyAfterQuestion(messages []Message, cfg config.HITLFeishuConfig, questionID string) string {
+func ReplyAfterQuestion(messages []Message, cfg config.HITLFeishuConfig, questionID string) Reply {
 	botID := ""
 	for _, message := range messages {
 		if message.ID == questionID && message.ChatID == cfg.ChatID && message.Sender.Type == "app" && !message.Deleted {
@@ -183,11 +246,11 @@ func ReplyAfterQuestion(messages []Message, cfg config.HITLFeishuConfig, questio
 		}
 	}
 	if botID == "" {
-		return ""
+		return Reply{}
 	}
 	after := false
 	var replies []string
-	directed := false
+	var directedIDs []string
 	for _, message := range messages {
 		if message.ID == questionID {
 			after = true
@@ -195,18 +258,28 @@ func ReplyAfterQuestion(messages []Message, cfg config.HITLFeishuConfig, questio
 		}
 		if after && message.ChatID == cfg.ChatID && message.Sender.Type == "user" && !message.Deleted && strings.TrimSpace(message.Content) != "" {
 			label := "[群内讨论，仅作背景] "
+			content := message.Content
 			for _, mention := range message.Mentions {
 				if mention.ID == botID {
-					directed = true
+					directedIDs = append(directedIDs, message.ID)
 					label = "[群成员 @bot] "
+					// CLI renders a real mention as @display-name. Keep it visibly
+					// separate from the person's words so the bot name is not read
+					// as the subject of an approval (e.g. "飞书 CLI 验收通过").
+					if mention.Name != "" {
+						content = strings.ReplaceAll(content, "@"+mention.Name, "@bot")
+					}
+					if mention.Key != "" {
+						content = strings.ReplaceAll(content, mention.Key, "@bot")
+					}
 					break
 				}
 			}
-			replies = append(replies, label+message.Content)
+			replies = append(replies, label+content)
 		}
 	}
-	if !directed {
-		return ""
+	if len(directedIDs) == 0 {
+		return Reply{}
 	}
-	return strings.Join(replies, "\n\n")
+	return Reply{Text: strings.Join(replies, "\n\n"), MessageIDs: directedIDs}
 }

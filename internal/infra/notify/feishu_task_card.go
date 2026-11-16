@@ -37,11 +37,21 @@ func (g *Gateway) feishuCollaborationCard(ctx context.Context, loop *storage.Loo
 	} else if elapsed > 0 {
 		label += " · " + humanizeElapsedSeconds(elapsed)
 	}
+	heading := []any{map[string]any{"tag": "column", "width": "auto", "vertical_align": "center", "elements": []any{
+		taskCardMarkdown("<text_tag color='"+color+"'>"+label+"</text_tag>", "notation"),
+	}}}
+	if sourceURL != "" {
+		heading = append(heading, map[string]any{"tag": "column", "width": "auto", "vertical_align": "center", "elements": []any{
+			map[string]any{"tag": "interactive_container", "width": "auto", "padding": "0px",
+				"behaviors": []any{map[string]any{"type": "open_url", "default_url": sourceURL}},
+				"elements":  []any{taskCardMarkdown("<text_tag color='blue'>"+sourceLabel+" ↗</text_tag>", "notation")}},
+		}})
+	}
+	heading = append(heading, map[string]any{"tag": "column", "width": "weighted", "weight": 1, "vertical_align": "center", "elements": []any{
+		taskCardMarkdown("**"+title+"**", "normal"),
+	}})
 	elements := []any{
-		map[string]any{"tag": "column_set", "flex_mode": "none", "horizontal_spacing": "8px", "columns": []any{
-			map[string]any{"tag": "column", "width": "weighted", "weight": 3, "vertical_align": "center", "elements": []any{taskCardMarkdown("**"+title+"**", "normal")}},
-			map[string]any{"tag": "column", "width": "auto", "elements": []any{map[string]any{"tag": "markdown", "content": "<text_tag color='" + color + "'>" + label + "</text_tag>", "text_size": "notation", "text_align": "right"}}},
-		}},
+		map[string]any{"tag": "column_set", "flex_mode": "none", "horizontal_align": "left", "horizontal_spacing": "8px", "columns": heading},
 		map[string]any{"tag": "column_set", "flex_mode": "none", "columns": []any{
 			map[string]any{"tag": "column", "width": "weighted", "weight": 1, "background_style": "grey-50", "padding": "10px", "vertical_spacing": "4px", "elements": []any{
 				taskCardMarkdown(taskCardExcerpt(brief, 180), "normal"),
@@ -50,19 +60,32 @@ func (g *Gateway) feishuCollaborationCard(ctx context.Context, loop *storage.Loo
 	}
 	if loop.Status == "awaiting_human" {
 		waiting := "尚未指定回复负责人"
-		if owner := g.ownerOpenID(loop.ProjectID); owner != "" {
-			waiting = "等待 <at id=" + owner + "></at> 回复"
+		mentions := []string{}
+		if ask, ok := loops.ReadHITLAsk(loop.MetadataJSON); ok {
+			for _, id := range ask.MentionOpenIDs {
+				if strings.TrimSpace(id) != "" {
+					mentions = append(mentions, "<at id="+id+"></at>")
+				}
+			}
+		}
+		if len(mentions) == 0 {
+			if owner := g.ownerOpenID(loop.ProjectID); owner != "" {
+				mentions = append(mentions, "<at id="+owner+"></at>")
+			}
+		}
+		if len(mentions) > 0 {
+			waiting = "等待 " + strings.Join(mentions, "、") + " 回复"
 		}
 		elements = append(elements, taskCardMarkdown(waiting, "notation"))
 	}
 	if len([]rune(brief)) > 180 {
-		elements = append(elements, map[string]any{"tag": "collapsible_panel", "expanded": false, "padding": "0px", "header": map[string]any{"title": map[string]any{"tag": "plain_text", "content": "完整内容"}, "icon_position": "right"}, "elements": []any{taskCardMarkdown(brief, "normal")}})
+		elements = append(elements, taskCardDetails("完整内容", []any{taskCardMarkdown(brief, "normal")}))
 	}
 
 	// These are real source/delivery URLs. Replies use Feishu's native task thread;
 	// no callback or approval is implied by clicking a link.
 	columns := []any{}
-	for _, item := range [][2]string{{"查看交付", prURL}, {"查看任务", sourceURL}} {
+	for _, item := range [][2]string{{"查看交付", prURL}} {
 		if strings.TrimSpace(item[1]) == "" {
 			continue
 		}
@@ -82,6 +105,35 @@ func (g *Gateway) feishuCollaborationCard(ctx context.Context, loop *storage.Loo
 
 func taskCardMarkdown(text, size string) map[string]any {
 	return map[string]any{"tag": "markdown", "content": text, "text_size": size}
+}
+
+func taskCardDetails(title string, elements []any) map[string]any {
+	return map[string]any{
+		"tag": "collapsible_panel", "expanded": false, "padding": "0px",
+		"header": map[string]any{
+			"title":         taskCardMarkdown("<font color='grey'>"+title+"</font>", "notation"),
+			"icon":          map[string]any{"tag": "standard_icon", "token": "down-small-ccm_outlined", "color": "grey", "size": "16px 16px"},
+			"icon_position": "follow_text", "icon_expanded_angle": -180,
+		},
+		"elements": elements,
+	}
+}
+
+// Markdown is rendered by Feishu, not flattened into a plain-text message.
+// The agent writes the short answer; the transport does not infer which parts
+// of that answer are safe to hide.
+func buildFeishuUpdateCard(payload SystemNotificationPayload) ([]byte, error) {
+	elements := []any{}
+	if title := strings.TrimSpace(payload.Title); title != "" {
+		elements = append(elements, taskCardMarkdown("**"+title+"**", "normal"))
+	}
+	if body := strings.TrimSpace(payload.Body); body != "" {
+		elements = append(elements, taskCardMarkdown(body, "normal"))
+	}
+	if mentions := feishuMentionMarkup(payload.MentionOpenIds); mentions != "" {
+		elements = append(elements, taskCardMarkdown(mentions, "notation"))
+	}
+	return json.Marshal(map[string]any{"schema": "2.0", "config": map[string]any{"update_multi": true}, "body": map[string]any{"padding": "12px", "vertical_spacing": "8px", "elements": elements}})
 }
 
 func taskCardExcerpt(text string, limit int) string {
@@ -146,8 +198,9 @@ func (g *Gateway) feishuTaskUpdate(ctx context.Context, loop *storage.LoopRecord
 func buildFeishuThreadQuestion(card HITLAskCard) ([]byte, error) {
 	question := strings.TrimSpace(card.Question)
 	elements := []any{taskCardMarkdown("**"+question+"**", "normal")}
+	details := []any{}
 	if rec := strings.TrimSpace(card.Recommendation); rec != "" {
-		elements = append(elements, taskCardMarkdown(rec, "normal"))
+		details = append(details, taskCardMarkdown(rec, "normal"))
 	}
 	options := []string{}
 	for _, option := range card.Options {
@@ -160,7 +213,7 @@ func buildFeishuThreadQuestion(card HITLAskCard) ([]byte, error) {
 			line += "（推荐）"
 		}
 		if consequence := strings.TrimSpace(card.Consequences[option]); consequence != "" {
-			line += " — " + consequence
+			details = append(details, taskCardMarkdown("**"+option+"**\n"+consequence, "normal"))
 		}
 		options = append(options, line)
 	}
@@ -169,12 +222,15 @@ func buildFeishuThreadQuestion(card HITLAskCard) ([]byte, error) {
 			map[string]any{"tag": "column", "width": "weighted", "weight": 1, "background_style": "grey-50", "padding": "8px", "elements": []any{taskCardMarkdown(strings.Join(options, "\n"), "normal")}},
 		}})
 	}
-	owner := strings.TrimSpace(card.OwnerOpenID)
-	if owner == "" && len(card.MentionOpenIds) > 0 {
-		owner = card.MentionOpenIds[0]
+	if len(details) > 0 {
+		elements = append(elements, taskCardDetails("判断依据与验证详情", details))
 	}
-	if owner != "" {
-		elements = append(elements, taskCardMarkdown("<at id="+owner+"></at> 请在话题里 @bot 回复，可选编号，也可以追问或补充。", "notation"))
+	mentions := feishuMentionMarkup(card.MentionOpenIds)
+	if mentions == "" && strings.TrimSpace(card.OwnerOpenID) != "" {
+		mentions = feishuMentionMarkup([]string{card.OwnerOpenID})
+	}
+	if mentions != "" {
+		elements = append(elements, taskCardMarkdown(mentions+" 在话题里 @bot 回复即可，也可以追问。", "notation"))
 	}
 	return json.Marshal(map[string]any{"schema": "2.0", "config": map[string]any{"update_multi": true, "width_mode": "default", "summary": map[string]any{"content": question}}, "body": map[string]any{"padding": "12px", "vertical_spacing": "8px", "elements": elements}})
 }
