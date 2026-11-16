@@ -663,9 +663,32 @@ func (forgejo *ForgejoClient) AddIssueReaction(ctx context.Context, issueNumber 
 	if content == "" {
 		return nil
 	}
-	err := forgejo.do(ctx, http.MethodPost, forgejo.repoPath("issues", strconv.FormatInt(issueNumber, 10), "reactions"), nil, map[string]string{"content": content}, nil)
+	path := forgejo.repoPath("issues", strconv.FormatInt(issueNumber, 10), "reactions")
+	err := forgejo.do(ctx, http.MethodPost, path, nil, map[string]string{"content": content}, nil)
 	if forgejoReactionAlreadyPresent(err) {
 		return nil
+	}
+	var httpErr *ForgejoHTTPError
+	if !errors.As(err, &httpErr) || httpErr.StatusCode < 500 || httpErr.StatusCode >= 600 {
+		return err
+	}
+	// Some Forgejo servers return 500 for duplicate reactions. Reconcile the
+	// desired state without hiding failures when this account's reaction is absent.
+	user, userErr := forgejo.CurrentUser(ctx)
+	if userErr != nil || user.ID <= 0 {
+		return err
+	}
+	var reactions []struct {
+		Content string      `json:"content"`
+		User    forgejoUser `json:"user"`
+	}
+	if listErr := forgejo.getPaged(ctx, path, nil, 0, &reactions); listErr != nil {
+		return err
+	}
+	for _, reaction := range reactions {
+		if reaction.User.ID == user.ID && reaction.Content == content {
+			return nil
+		}
 	}
 	return err
 }
