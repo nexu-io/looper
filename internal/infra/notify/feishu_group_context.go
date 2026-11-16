@@ -11,9 +11,7 @@ type FeishuGroupContext struct {
 }
 
 func (c FeishuGroupContext) Description() string {
-	parts := []string{c.Kind + " · " + c.Name}
-	if c.URL != "" {
-		parts = append(parts, c.URL)
-	}
-	return strings.Join(append(parts, c.Rule), "\n")
+	// Links and usage instructions belong in the announcement; Feishu limits
+	// the chat description to 100 characters.
+	return strings.TrimSpace(c.Kind + " · " + c.Name)
 }

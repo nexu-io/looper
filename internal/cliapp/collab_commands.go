@@ -99,7 +99,7 @@ func (r *commandRuntime) collabStart(cmd *cobra.Command, _ []string) error {
 	go func() { done <- child.Wait() }()
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
-	deadline := time.NewTimer(10 * time.Second)
+	deadline := time.NewTimer(60 * time.Second)
 	defer deadline.Stop()
 	for {
 		select {
@@ -113,7 +113,8 @@ func (r *commandRuntime) collabStart(cmd *cobra.Command, _ []string) error {
 			ctx, cancel := context.WithTimeout(cmd.Context(), 250*time.Millisecond)
 			result, err := collab.Request(ctx, dir, "GET", "/status", nil)
 			cancel()
-			if err == nil {
+			var status collab.Status
+			if err == nil && json.Unmarshal(result, &status) == nil && status.State == "running" {
 				return writeCollabOutput(cmd, result)
 			}
 		}

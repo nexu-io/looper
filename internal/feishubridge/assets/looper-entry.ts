@@ -125,3 +125,6 @@ async function shutdown(): Promise<void> {
 process.stdin.once('end', () => void shutdown());
 process.once('SIGTERM', () => void shutdown());
 process.once('SIGINT', () => void shutdown());
+
+// EOF may have arrived while startBridge was still connecting.
+if (process.stdin.readableEnded) void shutdown();

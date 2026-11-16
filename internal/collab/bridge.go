@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -279,64 +280,72 @@ func (h *bridgeHost) dispatchQueued(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	var failures []error
 	for _, loop := range items {
-		input, state, ok := readBridgeTask(loop)
-		if !ok {
-			continue // Legacy tasks stay owned by their original executor.
+		if err := h.dispatchTask(ctx, loop); err != nil {
+			failures = append(failures, fmt.Errorf("task %s: %w", loop.ID, err))
 		}
-		h.mu.Lock()
-		busy := h.active[loop.ID]
-		h.mu.Unlock()
-		if busy {
-			continue
-		}
-		if err := h.chats.prepare(ctx, loop.ID); err != nil {
-			// Optional invites/announcement edits must not block a task whose
-			// group was already created and durably assigned.
-			h.warn("Feishu group setup incomplete", err)
-		}
-		h.notify.RefreshThreadHeader(ctx, loop.ID, nil, 0)
-		root, err := h.repos.FeishuThreads.RootByLoop(ctx, loop.ID)
-		if err != nil || root == "" {
-			return fmt.Errorf("task %s has no Feishu anchor: %v", loop.ID, err)
-		}
-		chat, err := h.repos.FeishuThreads.ChatIDByLoop(ctx, loop.ID)
-		if err != nil {
-			return err
-		}
-		h.mu.Lock()
-		fresh, err := h.repos.Loops.GetByID(ctx, loop.ID)
-		if err != nil || fresh == nil || fresh.Status != "queued" || h.active[loop.ID] {
-			h.mu.Unlock()
-			if err != nil {
-				return err
-			}
-			continue
-		}
-		_, state, _ = readBridgeTask(*fresh)
-		state.RootID = root
-		err = h.patch(ctx, loop.ID, "running", state, "正在了解任务和影响面")
-		if err == nil {
-			h.active[loop.ID] = true
-		}
+	}
+	return errors.Join(failures...)
+}
+
+func (h *bridgeHost) dispatchTask(ctx context.Context, loop storage.LoopRecord) error {
+	input, state, ok := readBridgeTask(loop)
+	if !ok {
+		return nil // Legacy tasks stay owned by their original executor.
+	}
+	h.mu.Lock()
+	busy := h.active[loop.ID]
+	h.mu.Unlock()
+	if busy {
+		return nil
+	}
+	if err := h.chats.prepare(ctx, loop.ID); err != nil {
+		// Optional invites/announcement edits must not block a task whose
+		// group was already created and durably assigned.
+		h.warn("Feishu group setup incomplete", err)
+	}
+	h.notify.RefreshThreadHeader(ctx, loop.ID, nil, 0)
+	root, err := h.repos.FeishuThreads.RootByLoop(ctx, loop.ID)
+	if err != nil || root == "" {
+		return fmt.Errorf("task %s has no Feishu anchor: %v", loop.ID, err)
+	}
+	chat, err := h.repos.FeishuThreads.ChatIDByLoop(ctx, loop.ID)
+	if err != nil {
+		return err
+	}
+	h.mu.Lock()
+	fresh, err := h.repos.Loops.GetByID(ctx, loop.ID)
+	if err != nil || fresh == nil || fresh.Status != "queued" || h.active[loop.ID] {
 		h.mu.Unlock()
 		if err != nil {
 			return err
 		}
-		prompt := h.taskPrompt(loop.ID, input)
-		if state.SessionID != "" {
-			prompt = "继续原任务；先结合会话和实际文件确认已做过的工作，避免重复操作。\n\n" + prompt
-		}
-		if err := h.client.Request(ctx, http.MethodPost, "/tasks", feishubridge.Task{ChatID: chat,
-			ThreadID: state.ThreadID, RootMessageID: root, CWD: filepath.Join(h.dir, "workspace"),
-			Title: input.Title, Prompt: prompt, RequesterOpenID: h.cfg.HITL.Feishu.OwnerOpenID,
-			Model: value(h.cfg.Agent.Model)}); err != nil {
-			h.mu.Lock()
-			delete(h.active, loop.ID)
-			_ = h.patch(ctx, loop.ID, "queued", state, "等待重新派发")
-			h.mu.Unlock()
-			return err
-		}
+		return nil
+	}
+	_, state, _ = readBridgeTask(*fresh)
+	state.RootID = root
+	err = h.patch(ctx, loop.ID, "running", state, "正在了解任务和影响面")
+	if err == nil {
+		h.active[loop.ID] = true
+	}
+	h.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	prompt := h.taskPrompt(loop.ID, input)
+	if state.SessionID != "" {
+		prompt = "继续原任务；先结合会话和实际文件确认已做过的工作，避免重复操作。\n\n" + prompt
+	}
+	if err := h.client.Request(ctx, http.MethodPost, "/tasks", feishubridge.Task{ChatID: chat,
+		ThreadID: state.ThreadID, RootMessageID: root, CWD: filepath.Join(h.dir, "workspace"),
+		Title: input.Title, Prompt: prompt, RequesterOpenID: h.cfg.HITL.Feishu.OwnerOpenID,
+		Model: value(h.cfg.Agent.Model)}); err != nil {
+		h.mu.Lock()
+		delete(h.active, loop.ID)
+		_ = h.patch(ctx, loop.ID, "queued", state, "等待重新派发")
+		h.mu.Unlock()
+		return err
 	}
 	return nil
 }
@@ -669,7 +678,14 @@ func (h *bridgeHost) pollPullRequests(ctx context.Context) {
 			if workerhost.ShepherdNeedsPass(pr) {
 				actionable = true
 			}
-			notes = append(notes, link+"\n"+signal)
+			// Pass the fetched evidence, not only a wake marker. An agent's
+			// managed PR CLI may expose metadata without reviews or CI logs.
+			evidence, err := json.Marshal(pr)
+			if err != nil {
+				h.warn("PR evidence serialization failed", err)
+				continue
+			}
+			notes = append(notes, link+"\n"+string(evidence))
 		}
 		sort.Strings(signals)
 		signal := strings.Join(signals, "\n")
@@ -678,7 +694,7 @@ func (h *bridgeHost) pollPullRequests(ctx context.Context) {
 		}
 		// Wake the same agent even when every PR closes: the agent reconciles
 		// the task outcome, rather than treating any closed PR as a business pass.
-		prompt := "原任务的 PR 状态有变化。检查 review 评论、CI、冲突及合并队列，处理可推进事项；若全部 PR 已结束，核实实际交付结论。不要替人合并。\n\n" + strings.Join(notes, "\n\n") + "\n\n本任务状态文件：" + h.resultPath(loop.ID)
+		prompt := "原任务的 PR 状态有变化。以下是已读取的 PR 现场，包含 Reviews／Comments 原文及 Checks；逐项核对和处理，不因其他 CLI 摘要缺少字段而忽略这些内容。检查冲突及合并队列；若全部 PR 已结束，核实实际交付结论。不要替人合并。用简短中文说明进展，不贴原始快照。\n\n" + strings.Join(notes, "\n\n") + "\n\n本任务状态文件：" + h.resultPath(loop.ID)
 		chat, err := h.repos.FeishuThreads.ChatIDByLoop(ctx, loop.ID)
 		if err != nil {
 			continue
@@ -690,7 +706,7 @@ func (h *bridgeHost) pollPullRequests(ctx context.Context) {
 			continue
 		}
 		_, current, _ := readBridgeTask(*fresh)
-		if current.SessionID != state.SessionID || current.Signal != state.Signal {
+		if !reflect.DeepEqual(current, state) {
 			h.mu.Unlock()
 			continue
 		}

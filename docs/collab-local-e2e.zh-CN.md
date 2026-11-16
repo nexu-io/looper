@@ -1,8 +1,8 @@
 # 同事本地运行 Looper 协作端到端测试
 
-本文面向运行本地 Agent 的研发同学。跑完后，应能在 Plane 派发一个明确仓库的任务，在飞书原话题沟通和验收，让原 Agent 继续修改同一个 PR，并观察 PR 最终结果。产品、设计和 QA 只需参与飞书沟通，不用安装本地服务。
+本文面向运行本地 Agent 的研发同学。跑完后，应能在 Plane 派发一个任务，由 Agent 判断涉及哪些仓库，在飞书原话题沟通和验收，让原 Agent 继续修改同一个 PR，并观察 PR 最终结果。产品、设计和 QA 只需参与飞书沟通，不用安装本地服务。
 
-**当前为联调指南，尚非已发布的一键安装流程。** Looper 代码位于 [PR #696](https://github.com/nexu-io/looper/pull/696) 的 `feat/looper-collab-standalone`；Plane 需要 `core/plane` 的配套 collab 改动及 migration `0137_looper_collaboration_dispatch`。截至 2026-11-16，两边最新联调修复仍有未提交部分。开始前由维护者提供包含这些修复的具体提交或代码副本，仅下载 main 或旧版 Looper 不够。本次实际结果和未修问题见[端到端测试记录](E2E-collab-2026-11-16.zh-CN.md)。
+**当前为联调指南，尚非已发布的一键安装流程。** Looper 使用 [PR #696](https://github.com/nexu-io/looper/pull/696) 的 `feat/looper-collab-standalone`；Plane 使用 [配套分支](https://code.powerformer.net/core/plane/src/branch/feat/looper-collab-standalone-main)（提交 `6733d80`），迁移为 `0157_looper_collaboration_dispatch`，接在最新 main 的 `0156` 之后。仅下载 main 或旧版 Looper 不够。任务无需绑定单一代码仓库，Agent 根据任务和本机可用仓库判断，必要时问人。早期联调工作树的 `0137` 是临时迁移，不能复制进最新 main 的数据库迁移链。本次实际结果和未修问题见[端到端测试记录](E2E-collab-2026-11-16.zh-CN.md)。
 
 ## 先理解要启动哪些东西
 
@@ -31,7 +31,7 @@ loopernet 是设备连接基础设施，**当前 Plane 派发依赖它**；客�
 | 飞书测试应用、私测群 ID、本人 open_id | bot 已加入私测群，owner 是实际运行本地 Agent 的同学 |
 | 允许修改的 sandbox GitHub 仓库 | 创建真实分支和 PR；需要测试账号具备读写权限 |
 
-本地需要 Git、Go 1.22 或更新版本及 C 编译工具链（SQLite 使用 CGO）、已登录的 `gh`、可正常执行的 Codex 或团队 Agent、Node 和 `lark-cli`。当前独立入口在 macOS 验证，使用 Unix socket；不要据此认为 Windows 原生已经支持。
+本地需要 Git、Go 1.22 或更新版本及 C 编译工具链（SQLite 使用 CGO）、已登录的 `gh`、可正常执行的 Codex 或团队 Agent、Node.js 20+、npm 和 `lark-cli`。当前独立入口在 macOS 验证，使用 Unix socket；不要据此认为 Windows 原生已经支持。
 
 ```sh
 git --version
@@ -45,7 +45,7 @@ lark-cli auth status --json --verify
 
 未安装 `lark-cli` 时，可运行 `npm install -g @larksuite/cli`，按团队的飞书应用配置方式执行 `lark-cli config init`。适配器的消息读取、发送、图片及回复回执统一使用同一个应用的 bot 身份。bot 缺 scope 要在应用后台开通，重新做用户登录不能代替开通 bot 权限。
 
-先使用“本人 + bot”的私测群；需要 QA 时先邀请、确认已经入群，再 @。所有协作消息、图片和文件以 **bot** 发送。测试自动邀请时，应用还需有建群、邀请成员权限且目标同学在应用可见范围内。本次现场先遇到权限与可用范围失败；开通发布后，产品自动建群与邀请片段已实测通过。人工加人仍不能冒充自动邀请验证。
+每个独立运行实例使用自己的测试 bot；同一 bot 只保留一个协作消息消费者，不要让多个同事的本机同时连接同一 bot。先使用“本人 + bot”的私测群；需要 QA 时先邀请、确认已经入群，再 @。所有协作消息、图片和文件以 **bot** 发送。测试自动邀请时，应用还需有建群、邀请成员权限且目标同学在应用可见范围内。本次现场先遇到权限与可用范围失败；开通发布后，产品自动建群与邀请片段已实测通过。人工加人仍不能冒充自动邀请验证。
 
 ## 2 编译并隔离本次运行
 
@@ -76,7 +76,7 @@ looper_test collab --help
 
 以下配置先不写 project，下一步 Plane 连接命令会生成 provider 和本地仓库映射，避免把同一 checkout 先注册成 GitHub 项目再绑定 Plane。
 
-Agent 参数使用团队认可的运行策略；示例沿用 Codex 的 `workspace-write` 和允许网络访问配置。若团队使用其他 Agent，沿用已有可工作的 Agent 配置。不要照搬现场的临时设备 ID、消息 ID 或密钥。
+当前 `collab start` 直接运行固定版本的 feishu-codex-bridge，使用本机 Codex 的登录与 app-server；旧 Worker 的 `agent.params` 不控制该运行时。Agent 从中立的协作目录启动，通过仓库清单自行选择涉及的代码，按需创建 worktree。不要照搬现场的临时设备 ID、消息 ID 或密钥。
 
 ```sh
 python3 - <<'PY'
@@ -85,10 +85,6 @@ root = pathlib.Path(os.environ['COLLAB_CONFIG']).parent
 cfg = {
     'agent': {
         'vendor': 'codex',
-        'params': {'command': shutil.which('codex') or 'codex', 'args': [
-            '-c', 'approval_policy="never"', '-s', 'workspace-write',
-            '-c', 'sandbox_workspace_write.network_access=true'
-        ]},
         'nativeResume': {'enabled': True}
     },
     'hitl': {'enabled': True, 'answerTransport': 'feishu', 'feishu': {
@@ -158,6 +154,12 @@ looper_test plane connect '替换为弹窗给出的Plane地址' \
 
 ## 5 启动并确认可以接单
 
+在启动终端中配置同一个飞书测试应用的 `FEISHU_APP_ID` 和 `FEISHU_APP_SECRET`。不要将 secret 写入配置、文档或 Git；后台启动会继承此环境。已有配置也可通过 `notifications.webhook.appIdEnv/appSecretEnv` 指定环境变量名。
+
+首次启动会下载固定版本的上游源码并执行 npm 安装、构建，之后使用缓存；升级本分支后应在空闲时 stop/start 装载新代码。无需另开一个 bridge 服务。
+
+新建群自动写入并置顶群公告，需要 bot 的 `im:chat.announcement:read`、`im:chat.announcement:write_only` 以及 `im:chat` 或 `im:chat.top_notice:write_only`。公告或可选邀请失败会记录日志，不因此拦住已经建好群的任务。
+
 ```sh
 looper_test collab start --state-dir "$COLLAB_STATE"
 looper_test collab status --state-dir "$COLLAB_STATE"
@@ -168,23 +170,23 @@ looper_test collab status --state-dir "$COLLAB_STATE" --json
 
 独立入口使用 `looper plane doctor --collab --state-dir "$COLLAB_STATE"`（按实际目录替换），检查协作宿主，不要求启动完整 `looperd` 或安装旧规划流程使用的 Plane CLI。未传 `--collab` 时仍检查旧 daemon 流程。诊断结果还要结合 Plane 本人设备在线和真实派发核对。
 
-Plane 项目管理员在项目设置的 Looper 页面激活 collab 集成；无需强制填齐所有人的角色配置。item 里应能看到本人的在线设备及明确的可用代码仓库。看不到仓库时先核对 provider 的 workspace／project、checkout 和设备心跳，不根据任务标题猜仓库。
+Plane 项目管理员在项目设置的 Looper 页面激活 collab 集成；无需强制填齐所有人的角色配置。item 里应能看到本人的在线设备。仓库是提供给 Agent 的上下文清单，不是必选派发字段；跨仓任务无需拆成多个话题或绑定仓库。配置缺失时补充仓库目录及用途，范围不清时由 Agent 问人。
 
 ## 6 创建任务并走完人工交接
 
 在测试 project 创建一个小 item，例如“增加单文件中文验收页面”。任务描述可以使用下面的内容，并把验收人姓名替换为实际同学：
 
-> 在本次明确选择的 sandbox 仓库增加一个无外部依赖的中文 HTML 页面，展示一个简单交互。先检查影响范围，再实现并验证。创建真实 PR，提供能让验收人直接查看的截图或可用预览，并说明交互体验方式。
+> 在任务描述明确允许的 sandbox 仓库增加一个无外部依赖的中文 HTML 页面，展示一个简单交互。先检查影响范围，再实现并验证。创建真实 PR，提供能让验收人直接查看的截图或可用预览，并说明交互体验方式。
 >
 > 请实际验收人在当前飞书话题验收；先邀请并确认入群，再 @。问题保持一两句，编号选项为“通过”“需要修改 + 原因”，技术验证放在折叠详情。消息和附件只用 bot 身份。回复后继续同一个任务和 PR；需要合并授权时再找有权同学。不要声称尚未发生的通过或合并。
 
-分配给本人后，确认 item Looper 面板里的**设备和目标仓库**，再点派发／交给我的 Looper。仅创建 item 或分配负责人不代表已经启动。
+分配给本人后，确认 item Looper 面板里的**本人设备**，再点派发／交给我的 Looper。仅创建 item 或分配负责人不代表已经启动。
 
 依次验证：
 
 1. 本机出现一个对应任务，Agent 在正确仓库的独立工作树执行；飞书出现一张有可点击 Plane 编号的主卡。
 2. 状态更新原主卡，标签同字号、标题在右侧；问题在同一话题。工具过程及技术验证默认折叠，最终回复保留 Markdown。验收证据能由目标同学打开；外链失败时可尝试原生图片、文件或视频，并说明不能覆盖的交互。
-3. 先在话题发一句普通人与人讨论，观察不要触发 Agent 的自动答复。随后**真实 @bot** 追问“为什么这样做”；宿主读到定向回复后会由 bot 添加 OnIt 处理表情，再由原任务解释，不能当作验收通过。表情失败只记录错误，不阻止续跑；轮询与 API 请求仍可能带来延迟。
+3. 先在话题发一句普通人与人讨论，观察不要触发 Agent 的自动答复。随后**真实 @bot** 追问“为什么这样做”；bridge 收到定向回复后显示接收／执行回执，再由原会话解释，不能当作验收通过。消息走 bot 长连接，不再另跑 Worker 回复轮询。
 4. @bot 给出一次明确修改要求，确认改的是原任务、原仓库、原 PR。不能重新开一个无关联任务。
 5. 实际体验交付后，由验收人 @bot 回复结论。编号和自然语言都可以，不需要点击决策按钮。
 
@@ -223,7 +225,7 @@ looper_test collab stop --state-dir "$COLLAB_STATE"
 
 ## 附录 在自己电脑启动 Plane
 
-已有可用测试 Plane 时跳过本节。要本地验证 Plane 改动，取得 `https://code.powerformer.net/core/plane` 的配套 collab 代码，按该仓库的 `AGENTS.md` 和 `apps/api/LOCAL_DEVELOPMENT.md` 准备环境。优先原生 Django／Web，不启动完整 Compose。
+已有可用测试 Plane 时跳过本节。要本地验证 Plane 改动，取得 `https://code.powerformer.net/core/plane` 的配套分支 `feat/looper-collab-standalone-main`，按该仓库的 `AGENTS.md` 和 `apps/api/LOCAL_DEVELOPMENT.md` 准备环境。该分支基于最新 main，collab migration 接在 `0156` 之后，不使用早期工作树的 `0137` 临时迁移。优先原生 Django／Web，不启动完整 Compose。
 
 在 Plane 工作树内：
 

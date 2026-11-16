@@ -21,7 +21,7 @@ func TestFeishuCLIPreservesOriginalCardsAcrossProgressDecisionsAndRestart(t *tes
 	if err := repos.Projects.Upsert(ctx, storage.ProjectRecord{ID: "p", Name: "Test", RepoPath: t.TempDir(), CreatedAt: now, UpdatedAt: now}); err != nil {
 		t.Fatal(err)
 	}
-	loop := storage.LoopRecord{ID: "loop", Seq: 1, ProjectID: "p", Type: "worker", TargetType: "project", TargetID: stringPointer("project:p"), Status: "running", MetadataJSON: stringPointer(`{"title":"修复问候语","worker":{"issueUrl":"https://plane.example/workspace/browse/LOOP-42"}}`), CreatedAt: now, UpdatedAt: now}
+	loop := storage.LoopRecord{ID: "loop", Seq: 1, ProjectID: "p", Type: "worker", TargetType: "project", TargetID: stringPointer("project:p"), Status: "running", MetadataJSON: stringPointer(`{"title":"修复问候语","worker":{"issueUrl":"https://plane.example/workspace/browse/LOOP-42"},"bridge":{"outcome":{"pullRequests":["https://github.com/acme/frontend/pull/1","https://github.com/acme/backend/pull/2"]}}}`), CreatedAt: now, UpdatedAt: now}
 	if err := repos.Loops.Upsert(ctx, loop); err != nil {
 		t.Fatal(err)
 	}
@@ -138,6 +138,11 @@ func TestFeishuCLIPreservesOriginalCardsAcrossProgressDecisionsAndRestart(t *tes
 		t.Fatal(err)
 	}
 	gateway.RefreshThreadHeader(ctx, loop.ID, nil, 0)
+	for _, link := range []string{"https://github.com/acme/frontend/pull/1", "https://github.com/acme/backend/pull/2"} {
+		if !strings.Contains(messages[root].content, link) {
+			t.Fatalf("completed card lost PR %s", link)
+		}
+	}
 	if strings.Contains(messages[feed].content, "实时") || !strings.Contains(messages[feed].content, "执行记录") {
 		t.Fatalf("finished feed still promises live updates: %s", messages[feed].content)
 	}

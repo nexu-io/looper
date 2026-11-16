@@ -58,6 +58,9 @@ func (c Client) MarkReplyProcessing(ctx context.Context, messageID string) error
 func (c Client) CreateGroup(ctx context.Context, name, description string, users []string) (string, error) {
 	args := []string{"im", "+chat-create", "--name", strings.TrimSpace(name), "--chat-mode", "group", "--type", "private", "--as", "bot", "--set-bot-manager"}
 	if description = strings.TrimSpace(description); description != "" {
+		if runes := []rune(description); len(runes) > 100 {
+			description = string(runes[:100])
+		}
 		args = append(args, "--description", description)
 	}
 	if ids := cleanOpenIDs(users); len(ids) > 0 {

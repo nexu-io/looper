@@ -99,6 +99,22 @@ func (g *Gateway) feishuCollaborationCard(ctx context.Context, loop *storage.Loo
 	if len(columns) > 0 {
 		elements = append(elements, map[string]any{"tag": "column_set", "flex_mode": "none", "horizontal_spacing": "8px", "columns": columns})
 	}
+	// The bridge can deliver one task across several repositories. Read its
+	// actual PR references without forcing them into the legacy single PR slot.
+	var metadata struct {
+		Bridge struct {
+			Outcome struct {
+				PullRequests []string `json:"pullRequests"`
+			} `json:"outcome"`
+		} `json:"bridge"`
+	}
+	if loop.MetadataJSON != nil {
+		_ = json.Unmarshal([]byte(*loop.MetadataJSON), &metadata)
+	}
+	for _, link := range metadata.Bridge.Outcome.PullRequests {
+		label := strings.Replace(strings.TrimPrefix(link, "https://github.com/"), "/pull/", " #", 1)
+		elements = append(elements, taskCardMarkdown("["+label+" ↗]("+link+")", "normal"))
+	}
 	raw, err := json.Marshal(map[string]any{"schema": "2.0", "config": map[string]any{"update_multi": true, "width_mode": "default", "summary": map[string]any{"content": label + " · " + title}}, "body": map[string]any{"direction": "vertical", "padding": "12px", "vertical_spacing": "8px", "elements": elements}})
 	return string(raw), err == nil
 }
