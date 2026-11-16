@@ -44,6 +44,19 @@ When you DO escalate, make it a decision brief the human can confirm in seconds 
 question + options are required; the rest are strongly encouraged (a bare question with no homework is a poor ask). Then STOP immediately without making further changes. A human will answer and you will be resumed in this same session with their decision.
 ---`
 
+// Presentation and conversational judgment belong to the agent. The bridge
+// only transports the existing ask fields and the next addressed reply.
+const feishuCollaborationInstruction = `
+
+FEISHU COLLABORATION:
+- Write concise, plain Chinese for the people in the task thread. Lead with what changed or the specific question. Do not expose internal loop IDs, session IDs, local runtime paths, tool chatter, or generic progress slogans.
+- The task anchor shows current progress; the thread holds the conversation. When asked a follow-up, answer it before repeating the remaining decision. Do not treat a question, disagreement, or "先不要执行" as approval. Messages labeled [群内讨论，仅作背景] are context, not instructions to proceed; respond to [负责人 @bot] and respect any conditions in that message.
+- Write options as plain, unnumbered strings in ask.json; the thread renders nonempty options as 1, 2, 3 in order. A reply may be a number, a request for explanation, a correction, or a delegated decision. Interpret it against the exact previous options. Do not invent approval buttons or require a rigid response phrase.
+- Before asking for a judgment, prepare the smallest useful evidence: a working preview for behavior/UI, before-and-after screenshots for visual changes, a short recording for a sequence of steps, or a small comparison/table for tradeoffs. Explain what to look at and how it relates to the decision. Prefer one useful artifact over a pile of links. Use the tools actually available; never claim a screenshot, deployment, upload or check you did not perform.
+- Put the key finding and real evidence links into question/recommendation, with each option's impact in consequences. The human cannot see your terminal output. A local path is not a shared link. Label localhost previews as available only on the host machine; state when an artifact cannot be shared. Do not invent URLs or image keys.
+- For delivery, state the user-visible result, how to view it, what you verified and the relevant remaining gap (for example: unit tests passed, browser flow not checked). A successful tool exit is not human acceptance, a merged PR, or a production release. Use a clear small table or annotated screenshot when it helps; do not force every answer into a long report.
+`
+
 type hitlAsk struct {
 	Question          string            `json:"question"`
 	Options           []string          `json:"options"`
@@ -196,6 +209,23 @@ func (r *Runner) pendingHumanAnswer(ctx context.Context, loop *storage.LoopRecor
 		agentVendor = r.agentRuntime
 	}
 	resumePrompt := fmt.Sprintf("A human answered the question you asked earlier (%q). Their decision: %s\nContinue the task using this decision; do not ask the same question again.", ask.Question, ask.Answer)
+	if ask.Transport == "feishu" {
+		var previous strings.Builder
+		number := 0
+		for _, option := range ask.Options {
+			if option = strings.TrimSpace(option); option != "" {
+				number++
+				fmt.Fprintf(&previous, "\n%d. %s", number, option)
+				if consequence := strings.TrimSpace(ask.Consequences[option]); consequence != "" {
+					fmt.Fprintf(&previous, " — %s", consequence)
+				}
+			}
+		}
+		resumePrompt = fmt.Sprintf("The responsible human replied in the task thread. Your previous question: %q\nPrevious options:%s\nPrevious recommendation: %s\nTheir message: %s\nRead this as conversation, not automatic approval. Answer follow-up questions in plain Chinese. If the decision is still unclear, explain and write .looper/ask.json again, then stop. The human sees only the question, options, recommendation and consequences from ask.json, so include your explanation and evidence there. Proceed with the blocked choice only when their addressed reply gives a clear decision or explicitly delegates it to you. A concrete requested correction authorizes that scoped revision: implement and verify it, then ask again for any remaining acceptance decision. Continue from the existing task and worktree; do not restart unrelated work.", ask.Question, previous.String(), ask.Recommendation, ask.Answer)
+	}
+	if ask.Transport == "feishu" {
+		resumePrompt += feishuCollaborationInstruction
+	}
 	if strings.TrimSpace(ask.Vendor) != strings.TrimSpace(agentVendor) {
 		return resumePrompt + "\nThe configured agent vendor changed after the question was asked, so continue in a fresh session rather than trying to attach to the prior vendor's session.", ""
 	}
@@ -311,6 +341,9 @@ func (r *Runner) suspendForHuman(ctx context.Context, input stepInput, run stora
 		Consequences:      awaiting.consequences,
 		Confidence:        awaiting.confidence,
 	}
+	if strings.EqualFold(strings.TrimSpace(r.hitlAnswerTransport), "feishu") {
+		ask.Transport = "feishu"
+	}
 	// GitHub transport (default): post the question on a (draft) PR before parking,
 	// so the ask metadata carries the PR + comment id the answer-poll lane needs.
 	// Best-effort — the loop still parks awaiting_human if delivery fails.
@@ -342,7 +375,7 @@ func (r *Runner) suspendForHuman(ctx context.Context, input stepInput, run stora
 	if _, err := r.completeRun(ctx, run, "interrupted", summary, "", checkpoint); err != nil {
 		return ProcessResult{}, err
 	}
-	if r.hitlNotify != nil && strings.TrimSpace(ask.ActionURL) != "" {
+	if r.hitlNotify != nil && (strings.TrimSpace(ask.ActionURL) != "" || ask.Transport == "feishu") {
 		notif := HITLAskNotification{
 			ProjectID:         input.Project.ID,
 			LoopID:            input.Loop.ID,

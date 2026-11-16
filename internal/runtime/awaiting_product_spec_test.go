@@ -1,6 +1,9 @@
 package runtime
 
-import "testing"
+import (
+	"github.com/nexu-io/looper/internal/workerhost"
+	"testing"
+)
 
 func TestShouldResumeForProductSpec(t *testing.T) {
 	cases := []struct {
@@ -23,15 +26,15 @@ func TestShouldResumeForProductSpec(t *testing.T) {
 
 func TestLoopIssueURLAndSpecPR(t *testing.T) {
 	meta := `{"loopType":"planner","issueUrl":"https://plane.x/w/projects/pp/issues/wi-9","prUrl":"https://github.com/o/r/pull/3"}`
-	url, hasPR := loopIssueURLAndSpecPR(&meta)
+	url, hasPR := workerhost.LoopIssueURLAndSpecPR(&meta)
 	if url != "https://plane.x/w/projects/pp/issues/wi-9" || !hasPR {
 		t.Fatalf("got %q, %v; want the issue url + hasSpecPR=true", url, hasPR)
 	}
 	meta2 := `{"issueUrl":"https://plane.x/w/projects/pp/issues/wi-9"}`
-	if url, hasPR := loopIssueURLAndSpecPR(&meta2); url == "" || hasPR {
+	if url, hasPR := workerhost.LoopIssueURLAndSpecPR(&meta2); url == "" || hasPR {
 		t.Fatalf("got %q, %v; want url + hasSpecPR=false (no prUrl)", url, hasPR)
 	}
-	if url, hasPR := loopIssueURLAndSpecPR(nil); url != "" || hasPR {
+	if url, hasPR := workerhost.LoopIssueURLAndSpecPR(nil); url != "" || hasPR {
 		t.Fatalf("nil metadata = %q, %v; want empty", url, hasPR)
 	}
 }

@@ -17,7 +17,7 @@ type Shepherd struct {
 	// Phase drives the card title: reviewing | fixing | awaiting_validation |
 	// awaiting_merge.
 	Phase string `json:"phase,omitempty"`
-	// PassCount is the global stop-ask cap counter (only agent-waking passes).
+	// PassCount records agent-waking passes for diagnostics. It does not end a task.
 	PassCount int `json:"passCount,omitempty"`
 	// LastSignal is the folded PR signal tuple last acted on, for wake dedupe.
 	LastSignal string `json:"lastSignal,omitempty"`

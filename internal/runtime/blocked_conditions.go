@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/nexu-io/looper/internal/workerhost"
 	"sort"
 	"strings"
 	"time"
@@ -83,11 +84,11 @@ func (r *Runtime) reconcileBlockedConditions(ctx context.Context) {
 func (r *Runtime) blockedConditionRegistry(cfg *config.Config, repositories *storage.Repositories, gateway *githubinfra.Gateway) map[loopcondition.Kind]blockedConditionReconciler {
 	return map[loopcondition.Kind]blockedConditionReconciler{
 		loopcondition.ProductSpec: func(ctx context.Context, loop storage.LoopRecord, condition loopcondition.Record) (bool, error) {
-			planeGateway, planeProjectID, ok := planeDocForProject(cfg, loop.ProjectID)
+			planeGateway, planeProjectID, ok := workerhost.PlaneDocForProject(cfg, loop.ProjectID)
 			if !ok || planeGateway == nil {
 				return false, nil
 			}
-			issueURL, hasSpecPR := loopIssueURLAndSpecPR(loop.MetadataJSON)
+			issueURL, hasSpecPR := workerhost.LoopIssueURLAndSpecPR(loop.MetadataJSON)
 			if issueURL == "" {
 				var err error
 				issueURL, err = latestRunIssueURL(ctx, repositories, loop.ID)
@@ -138,7 +139,7 @@ func (r *Runtime) blockedConditionRegistry(cfg *config.Config, repositories *sto
 			if !strings.EqualFold(ask.Transport, "plane") || !strings.EqualFold(ask.Status, "awaiting") {
 				return false, nil
 			}
-			planeGateway, planeProjectID, configured := planeDocForProject(cfg, loop.ProjectID)
+			planeGateway, planeProjectID, configured := workerhost.PlaneDocForProject(cfg, loop.ProjectID)
 			if !configured || planeGateway == nil {
 				return false, nil
 			}

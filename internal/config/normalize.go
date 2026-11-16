@@ -348,6 +348,13 @@ func mergeConfig(config *Config, partial PartialConfig) {
 		if partial.HITL.AnswerTransport != nil {
 			config.HITL.AnswerTransport = strings.TrimSpace(*partial.HITL.AnswerTransport)
 		}
+		if fs := partial.HITL.Feishu; fs != nil {
+			copied := *fs
+			copied.ChatID = strings.TrimSpace(copied.ChatID)
+			copied.OwnerOpenID = strings.TrimSpace(copied.OwnerOpenID)
+			copied.CLIPath = strings.TrimSpace(copied.CLIPath)
+			config.HITL.Feishu = &copied
+		}
 		if gh := partial.HITL.GitHub; gh != nil {
 			if config.HITL.GitHub == nil {
 				config.HITL.GitHub = &HITLGitHubConfig{}

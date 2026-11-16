@@ -1,0 +1,180 @@
+package notify
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/nexu-io/looper/internal/loops"
+	"github.com/nexu-io/looper/internal/storage"
+)
+
+// feishuCollaborationCard is the task anchor. Activity stays in the thread;
+// only the current update belongs on the main card.
+func (g *Gateway) feishuCollaborationCard(ctx context.Context, loop *storage.LoopRecord, color, label, sourceLabel, sourceURL, prURL string, tail []string, elapsed int64) (string, bool) {
+	title := loopTitleFromMetadata(loop.MetadataJSON)
+	if title == "" {
+		title = sourceLabel
+	}
+	if title == "" {
+		title = "协作任务"
+	}
+	brief, persistedElapsed := g.feishuTaskUpdate(ctx, loop, tail)
+	if elapsed == 0 || feishuLoopStatusTerminal(loop.Status) {
+		elapsed = persistedElapsed
+	}
+	if brief == "" {
+		brief = strings.ReplaceAll(label, "Looper ", "")
+	}
+	if color == "grey" {
+		color = "neutral"
+	}
+	label = strings.ReplaceAll(label, "Looper ", "")
+	if loop.Status == "awaiting_human" {
+		label = "待回复"
+	} else if elapsed > 0 {
+		label += " · " + humanizeElapsedSeconds(elapsed)
+	}
+	elements := []any{
+		map[string]any{"tag": "column_set", "flex_mode": "none", "horizontal_spacing": "8px", "columns": []any{
+			map[string]any{"tag": "column", "width": "weighted", "weight": 3, "vertical_align": "center", "elements": []any{taskCardMarkdown("**"+title+"**", "normal")}},
+			map[string]any{"tag": "column", "width": "auto", "elements": []any{map[string]any{"tag": "markdown", "content": "<text_tag color='" + color + "'>" + label + "</text_tag>", "text_size": "notation", "text_align": "right"}}},
+		}},
+		map[string]any{"tag": "column_set", "flex_mode": "none", "columns": []any{
+			map[string]any{"tag": "column", "width": "weighted", "weight": 1, "background_style": "grey-50", "padding": "10px", "vertical_spacing": "4px", "elements": []any{
+				taskCardMarkdown(taskCardExcerpt(brief, 180), "normal"),
+			}},
+		}},
+	}
+	if loop.Status == "awaiting_human" {
+		waiting := "尚未指定回复负责人"
+		if owner := g.ownerOpenID(loop.ProjectID); owner != "" {
+			waiting = "等待 <at id=" + owner + "></at> 回复"
+		}
+		elements = append(elements, taskCardMarkdown(waiting, "notation"))
+	}
+	if len([]rune(brief)) > 180 {
+		elements = append(elements, map[string]any{"tag": "collapsible_panel", "expanded": false, "padding": "0px", "header": map[string]any{"title": map[string]any{"tag": "plain_text", "content": "完整内容"}, "icon_position": "right"}, "elements": []any{taskCardMarkdown(brief, "normal")}})
+	}
+
+	// These are real source/delivery URLs. Replies use Feishu's native task thread;
+	// no callback or approval is implied by clicking a link.
+	columns := []any{}
+	for _, item := range [][2]string{{"查看交付", prURL}, {"查看任务", sourceURL}} {
+		if strings.TrimSpace(item[1]) == "" {
+			continue
+		}
+		buttonType := "default"
+		if len(columns) == 0 {
+			buttonType = "primary_filled"
+		}
+		button := map[string]any{"tag": "button", "text": map[string]any{"tag": "plain_text", "content": item[0]}, "type": buttonType, "size": "small", "behaviors": []any{map[string]any{"type": "open_url", "default_url": item[1]}}}
+		columns = append(columns, map[string]any{"tag": "column", "width": "auto", "elements": []any{button}})
+	}
+	if len(columns) > 0 {
+		elements = append(elements, map[string]any{"tag": "column_set", "flex_mode": "none", "horizontal_spacing": "8px", "columns": columns})
+	}
+	raw, err := json.Marshal(map[string]any{"schema": "2.0", "config": map[string]any{"update_multi": true, "width_mode": "default", "summary": map[string]any{"content": label + " · " + title}}, "body": map[string]any{"direction": "vertical", "padding": "12px", "vertical_spacing": "8px", "elements": elements}})
+	return string(raw), err == nil
+}
+
+func taskCardMarkdown(text, size string) map[string]any {
+	return map[string]any{"tag": "markdown", "content": text, "text_size": size}
+}
+
+func taskCardExcerpt(text string, limit int) string {
+	text = strings.TrimSpace(text)
+	runes := []rune(text)
+	if len(runes) <= limit {
+		return text
+	}
+	return string(runes[:limit]) + "…"
+}
+
+// Read existing execution records instead of copying delivery summaries into
+// another field. The latest run bounds the summary, so earlier runs cannot leak
+// into the current task phase after a restart.
+func (g *Gateway) feishuTaskUpdate(ctx context.Context, loop *storage.LoopRecord, tail []string) (string, int64) {
+	var run *storage.RunRecord
+	if g.repositories.Runs != nil {
+		run, _ = g.repositories.Runs.GetLatestByLoopID(ctx, loop.ID)
+	}
+	elapsed := int64(0)
+	if run != nil && run.EndedAt != nil {
+		started, e1 := time.Parse(time.RFC3339Nano, run.StartedAt)
+		ended, e2 := time.Parse(time.RFC3339Nano, *run.EndedAt)
+		if e1 == nil && e2 == nil && ended.After(started) {
+			elapsed = int64(ended.Sub(started).Seconds())
+		}
+	}
+	if loop.Status == "awaiting_human" {
+		if ask, ok := loops.ReadHITLAsk(loop.MetadataJSON); ok && ask.Status == "awaiting" {
+			return ask.Question, elapsed
+		}
+	}
+	if feishuLoopStatusTerminal(loop.Status) && run != nil {
+		if loop.Status == "completed" && g.repositories.AgentExecutions != nil {
+			execution, _ := g.repositories.AgentExecutions.GetLatestByRunID(ctx, run.ID)
+			if execution != nil && execution.Summary != nil && strings.TrimSpace(*execution.Summary) != "" {
+				return strings.TrimSpace(*execution.Summary), elapsed
+			}
+		}
+		for _, text := range []*string{run.ErrorMessage, run.Summary} {
+			if text != nil && strings.TrimSpace(*text) != "" {
+				return strings.TrimSpace(*text), elapsed
+			}
+		}
+	}
+	if loop.Status == "running" {
+		if phase := feishuPhaseFromTail(tail); phase != "" {
+			return phase, 0
+		}
+		return "", 0
+	}
+	for _, key := range []string{"summary", "changeSummary", "resultSummary", "outcome"} {
+		if brief := loopWorkerString(loop.MetadataJSON, key); brief != "" {
+			return brief, elapsed
+		}
+	}
+	return "", elapsed
+}
+
+// The question remains part of the conversation, unchanged after a reply.
+// Numbering is presentation only; the agent interprets the human's words.
+func buildFeishuThreadQuestion(card HITLAskCard) ([]byte, error) {
+	question := strings.TrimSpace(card.Question)
+	elements := []any{taskCardMarkdown("**"+question+"**", "normal")}
+	if rec := strings.TrimSpace(card.Recommendation); rec != "" {
+		elements = append(elements, taskCardMarkdown(rec, "normal"))
+	}
+	options := []string{}
+	for _, option := range card.Options {
+		option = strings.TrimSpace(option)
+		if option == "" {
+			continue
+		}
+		line := fmt.Sprintf("%d. %s", len(options)+1, option)
+		if strings.EqualFold(option, strings.TrimSpace(card.RecommendedOption)) {
+			line += "（推荐）"
+		}
+		if consequence := strings.TrimSpace(card.Consequences[option]); consequence != "" {
+			line += " — " + consequence
+		}
+		options = append(options, line)
+	}
+	if len(options) > 0 {
+		elements = append(elements, map[string]any{"tag": "column_set", "columns": []any{
+			map[string]any{"tag": "column", "width": "weighted", "weight": 1, "background_style": "grey-50", "padding": "8px", "elements": []any{taskCardMarkdown(strings.Join(options, "\n"), "normal")}},
+		}})
+	}
+	owner := strings.TrimSpace(card.OwnerOpenID)
+	if owner == "" && len(card.MentionOpenIds) > 0 {
+		owner = card.MentionOpenIds[0]
+	}
+	if owner != "" {
+		elements = append(elements, taskCardMarkdown("<at id="+owner+"></at> 请在话题里 @bot 回复，可选编号，也可以追问或补充。", "notation"))
+	}
+	return json.Marshal(map[string]any{"schema": "2.0", "config": map[string]any{"update_multi": true, "width_mode": "default", "summary": map[string]any{"content": question}}, "body": map[string]any{"padding": "12px", "vertical_spacing": "8px", "elements": elements}})
+}

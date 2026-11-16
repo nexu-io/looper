@@ -1,4 +1,4 @@
-package runtime
+package workerhost
 
 import (
 	"testing"
@@ -49,13 +49,13 @@ func TestShepherdTerminalOutcome(t *testing.T) {
 }
 
 func TestShepherdCIPhase(t *testing.T) {
-	if got := shepherdCIPhase(githubinfra.PullRequestDetail{Checks: []map[string]any{check("IN_PROGRESS", "")}}); got != "pending" {
+	if got := ShepherdCIPhase(githubinfra.PullRequestDetail{Checks: []map[string]any{check("IN_PROGRESS", "")}}); got != "pending" {
 		t.Fatalf("pending CI = %q", got)
 	}
-	if got := shepherdCIPhase(githubinfra.PullRequestDetail{Checks: []map[string]any{check("COMPLETED", "SUCCESS"), check("COMPLETED", "FAILURE")}}); got != "failed" {
+	if got := ShepherdCIPhase(githubinfra.PullRequestDetail{Checks: []map[string]any{check("COMPLETED", "SUCCESS"), check("COMPLETED", "FAILURE")}}); got != "failed" {
 		t.Fatalf("failed CI = %q", got)
 	}
-	if got := shepherdCIPhase(githubinfra.PullRequestDetail{Checks: []map[string]any{check("COMPLETED", "SUCCESS"), check("COMPLETED", "SKIPPED")}}); got != "passed" {
+	if got := ShepherdCIPhase(githubinfra.PullRequestDetail{Checks: []map[string]any{check("COMPLETED", "SUCCESS"), check("COMPLETED", "SKIPPED")}}); got != "passed" {
 		t.Fatalf("passed CI = %q", got)
 	}
 }
@@ -128,7 +128,7 @@ func TestShepherdValidationGate(t *testing.T) {
 	}
 	// the QA-gate labels are in the wake signal, so a `validated` landing at the same
 	// head/decision still wakes the reconcile to re-evaluate + re-report.
-	if foldShepherdSignal(needsVal) == foldShepherdSignal(validated) {
+	if FoldShepherdSignal(needsVal) == FoldShepherdSignal(validated) {
 		t.Fatal("adding `validated` must change the folded signal (else QA sign-off is missed)")
 	}
 }
@@ -140,7 +140,7 @@ func TestSyncShepherdPhaseRepairsFixingDriftWithoutSignalChange(t *testing.T) {
 		Reviews: []map[string]any{{"state": "APPROVED", "commit": map[string]any{"oid": "ready-head"}}},
 		Labels:  []string{"needs-validation"},
 	}
-	marker := loops.Shepherd{Active: true, Phase: "fixing", LastSignal: foldShepherdSignal(pr)}
+	marker := loops.Shepherd{Active: true, Phase: "fixing", LastSignal: FoldShepherdSignal(pr)}
 
 	if !syncShepherdPhase(&marker, pr) {
 		t.Fatal("syncShepherdPhase() = false, want phase drift repaired")
@@ -164,12 +164,12 @@ func TestFoldShepherdSignalIgnoresUpdatedAt(t *testing.T) {
 	green := []map[string]any{check("COMPLETED", "SUCCESS")}
 	a := githubinfra.PullRequestDetail{State: "OPEN", ReviewDecision: "APPROVED", HeadSHA: "sha1", Checks: green, UpdatedAt: "2026-07-08T00:00:00Z"}
 	b := githubinfra.PullRequestDetail{State: "OPEN", ReviewDecision: "APPROVED", HeadSHA: "sha1", Checks: green, UpdatedAt: "2026-07-08T09:99:99Z"}
-	if foldShepherdSignal(a) != foldShepherdSignal(b) {
-		t.Fatalf("signal must ignore updatedAt: %q vs %q", foldShepherdSignal(a), foldShepherdSignal(b))
+	if FoldShepherdSignal(a) != FoldShepherdSignal(b) {
+		t.Fatalf("signal must ignore updatedAt: %q vs %q", FoldShepherdSignal(a), FoldShepherdSignal(b))
 	}
 	// a new head IS a real change
 	c := githubinfra.PullRequestDetail{State: "OPEN", ReviewDecision: "APPROVED", HeadSHA: "sha2", Checks: green}
-	if foldShepherdSignal(a) == foldShepherdSignal(c) {
+	if FoldShepherdSignal(a) == FoldShepherdSignal(c) {
 		t.Fatal("a new head must change the signal")
 	}
 }
@@ -188,7 +188,7 @@ func TestSignalCatchesNewReviewRound(t *testing.T) {
 		{"state": "CHANGES_REQUESTED", "submittedAt": "2026-07-08T00:00:00Z", "commit": map[string]any{"oid": "sha1"}},
 		{"state": "CHANGES_REQUESTED", "submittedAt": "2026-07-08T09:00:00Z", "commit": map[string]any{"oid": "sha1"}}, // nettee re-reviewed at the SAME head
 	}
-	if foldShepherdSignal(base) == foldShepherdSignal(round2) {
+	if FoldShepherdSignal(base) == FoldShepherdSignal(round2) {
 		t.Fatal("a new review round at the same head/decision must change the signal (else re-review is missed)")
 	}
 	if !shepherdActionable(round2) {

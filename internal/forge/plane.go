@@ -237,14 +237,49 @@ func (plane *PlaneClient) ListOpenIssues(ctx context.Context, input ListIssuesIn
 	return issues, nil
 }
 
+func (plane *PlaneClient) StrictDispatchInbox(ctx context.Context) (planestrict.InboxResponse, error) {
+	if plane.strictClient == nil {
+		return planestrict.InboxResponse{}, errors.New("Plane strict dispatch is not configured")
+	}
+	return plane.strictClient.Inbox(ctx, "")
+}
+
+func (plane *PlaneClient) ClaimStrictDispatch(ctx context.Context, dispatch planestrict.Dispatch) error {
+	if plane.strictClient == nil {
+		return errors.New("Plane strict dispatch is not configured")
+	}
+	_, err := plane.strictClient.Claim(ctx, dispatch, dispatch.ID)
+	return err
+}
+
+func (plane *PlaneClient) StrictDispatchIssue(ctx context.Context, dispatch planestrict.Dispatch) (Issue, error) {
+	item, err := plane.workItemByID(ctx, dispatch.IssueID)
+	if err != nil {
+		return Issue{}, err
+	}
+	labels, err := plane.labelNamesByID(ctx)
+	if err != nil {
+		return Issue{}, err
+	}
+	issue := plane.convertWorkItem(item, labels)
+	issue.StrictDispatchID = dispatch.ID
+	return issue, nil
+}
+
 func (plane *PlaneClient) ListStrictDispatchIssues(ctx context.Context, input ListIssuesInput, activeRole string) ([]Issue, error) {
-	inbox, err := plane.strictClient.Inbox(ctx, "")
+	if plane.strictClient == nil {
+		return nil, errors.New("Plane strict dispatch is not configured")
+	}
+	inbox, err := plane.StrictDispatchInbox(ctx)
 	if err != nil {
 		return nil, err
 	}
 	issues := make([]Issue, 0, len(inbox.Dispatches))
 	for _, dispatch := range inbox.Dispatches {
 		if dispatch.ActiveRole != activeRole || dispatch.Health != "ok" {
+			continue
+		}
+		if dispatch.RequestedMode == "collab" {
 			continue
 		}
 		if dispatch.State == "queued" {
@@ -257,16 +292,10 @@ func (plane *PlaneClient) ListStrictDispatchIssues(ctx context.Context, input Li
 		if dispatch.State != "claimed" && dispatch.State != "running" && dispatch.State != "awaiting_human" {
 			continue
 		}
-		item, err := plane.workItemByID(ctx, dispatch.IssueID)
+		issue, err := plane.StrictDispatchIssue(ctx, dispatch)
 		if err != nil {
 			return nil, err
 		}
-		labelNames, err := plane.labelNamesByID(ctx)
-		if err != nil {
-			return nil, err
-		}
-		issue := plane.convertWorkItem(item, labelNames)
-		issue.StrictDispatchID = dispatch.ID
 		for _, label := range input.Labels {
 			if strings.TrimSpace(label) != "" {
 				issue.Labels = append(issue.Labels, Label{Name: label})

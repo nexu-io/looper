@@ -208,6 +208,14 @@ func TestPlaneLinkAndEnableCreateOwnerBoundStrictCredentials(t *testing.T) {
 }
 
 func TestPlaneConnectSelfActivatesAndWaitsForSignedInbox(t *testing.T) {
+	testPlaneConnectSelfActivates(t, false)
+}
+
+func TestPlaneCollaborationConnectVerifiesBindingWithoutDaemon(t *testing.T) {
+	testPlaneConnectSelfActivates(t, true)
+}
+
+func testPlaneConnectSelfActivates(t *testing.T, collaboration bool) {
 	homeDir := t.TempDir()
 	workspaceIDText := "22222222-3333-4444-8555-666666666666"
 	workspaceID := mustCLIProtocolUUID(t, workspaceIDText)
@@ -320,7 +328,19 @@ func TestPlaneConnectSelfActivatesAndWaitsForSignedInbox(t *testing.T) {
 				return
 			}
 			writePlaneCommandTestJSON(t, response, map[string]any{"connection_id": connectionID, "status": "completed"})
+		case "/api/workspaces/open-design/projects/" + projectID + "/looper/nodes/session/":
+			if request.Header.Get("Looper-Signature") == "" {
+				t.Error("unsigned binding verification")
+			}
+			var body map[string]any
+			_ = json.NewDecoder(request.Body).Decode(&body)
+			writePlaneCommandTestJSON(t, response, map[string]any{"session_id": body["session_id"], "state": "active"})
+		case "/api/workspaces/open-design/projects/" + projectID + "/looper/dispatch/inbox/":
+			writePlaneCommandTestJSON(t, response, map[string]any{"dispatches": []any{}, "integration_state": "inactive"})
 		case "/api/v1/status":
+			if collaboration {
+				t.Error("collaboration connection probed the daemon")
+			}
 			writePlaneCommandTestJSON(t, response, map[string]any{
 				"ok": true, "data": map[string]any{"service": map[string]any{"binary": map[string]any{"name": "looperd"}}},
 			})
@@ -349,9 +369,11 @@ func TestPlaneConnectSelfActivatesAndWaitsForSignedInbox(t *testing.T) {
 		HomeDir: homeDir, HTTPClient: server.Client(), LookPath: configLookPathForTests(),
 		Sleep: func(time.Duration) {},
 	})
-	exitCode, stdout, stderr := runAppWithDeps(t, app, []string{
-		"plane", "connect", server.URL, "--code", connectCode, "--config", configPath,
-	})
+	args := []string{"plane", "connect", server.URL, "--code", connectCode, "--config", configPath}
+	if collaboration {
+		args = append(args, "--collab")
+	}
+	exitCode, stdout, stderr := runAppWithDeps(t, app, args)
 	if exitCode != 0 {
 		t.Fatalf("plane connect exit=%d stdout=%s stderr=%s", exitCode, stdout, stderr)
 	}

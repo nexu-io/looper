@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/nexu-io/looper/internal/workerhost"
 	"html"
 	"os"
 	"strings"
@@ -174,11 +175,11 @@ func autoIntakeProjectEnabled(cfg config.Config, projectID string) bool {
 }
 
 func (r *Runtime) reconcileAutoIntakeProject(ctx context.Context, cfg *config.Config, project config.ProjectRefConfig, llm triage.LLM, logger bootstrap.Logger, now func() time.Time) {
-	gateway, planeProjectID, ok := planeDocForProject(cfg, project.ID)
+	gateway, planeProjectID, ok := workerhost.PlaneDocForProject(cfg, project.ID)
 	if !ok || gateway == nil {
 		return
 	}
-	provider, found := forgejoProviderByID(*cfg, project.Provider)
+	provider, found := workerhost.ForgejoProviderByID(*cfg, project.Provider)
 	if !found {
 		return
 	}

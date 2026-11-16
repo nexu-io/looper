@@ -26,6 +26,7 @@ import (
 	networkclient "github.com/nexu-io/looper/internal/network/client"
 	"github.com/nexu-io/looper/internal/network/protocol"
 	"github.com/nexu-io/looper/internal/planeprotocol"
+	"github.com/nexu-io/looper/internal/planestrict"
 	"github.com/spf13/cobra"
 )
 
@@ -297,7 +298,31 @@ func (r *commandRuntime) preparePlaneConnectProvider(cmd *cobra.Command, planeOr
 }
 
 func (r *commandRuntime) finishPlaneConnection(cmd *cobra.Command, planeOrigin, connectCode, providerID string, exchange planeConnectExchange, nodeName string) error {
-	if err := r.daemonRestartForBootstrap(cmd); err != nil {
+	if getBoolFlag(cmd, "collab") {
+		loaded, err := r.loadConfig()
+		if err != nil {
+			return err
+		}
+		provider, err := selectPlaneDoctorProvider(loaded.Config, providerID)
+		if err != nil {
+			return err
+		}
+		strict := provider.StrictDispatch
+		if strict == nil {
+			return errors.New("Plane provider has no device binding")
+		}
+		credentials, err := planestrict.LoadCredentials(strict.BindingID, strict.KeyRevision, strict.NodeID, strict.PrivateKeyFile)
+		if err != nil {
+			return err
+		}
+		client, err := planestrict.NewClient(strict.BaseURL, stringPointerValue(provider.Workspace), stringPointerValue(provider.ProjectID), credentials, planestrict.WithHTTPClient(r.httpClient()))
+		if err != nil {
+			return err
+		}
+		if _, err := client.Inbox(cmd.Context(), ""); err != nil {
+			return fmt.Errorf("verify collaboration binding through the signed Plane inbox: %w", err)
+		}
+	} else if err := r.daemonRestartForBootstrap(cmd); err != nil {
 		if strings.Contains(err.Error(), `unknown field "strictDispatch"`) {
 			return fmt.Errorf("binding and local configuration are ready, but the installed looperd is too old for Plane dispatch: %w; run `looper upgrade --daemon`, then rerun the same Plane command", err)
 		}
@@ -319,12 +344,19 @@ func (r *commandRuntime) finishPlaneConnection(cmd *cobra.Command, planeOrigin, 
 		}
 	}
 	if completeErr != nil {
-		return fmt.Errorf("Looper daemon restarted, but its signed Plane inbox did not become ready within 60 seconds: %w; rerun the same Plane command to continue checking", completeErr)
+		return fmt.Errorf("The signed Plane inbox did not become ready within 60 seconds: %w; rerun the same Plane command to continue checking", completeErr)
 	}
 	return r.writePlaneConnectResult(cmd, providerID, exchange, nodeName)
 }
 
 func (r *commandRuntime) writePlaneConnectResult(cmd *cobra.Command, providerID string, exchange planeConnectExchange, nodeName string) error {
+	if getBoolFlag(cmd, "collab") {
+		if getBoolFlag(cmd, "json") {
+			return writeJSON(cmd.OutOrStdout(), map[string]any{"providerId": providerID, "connectionId": exchange.ConnectionID, "bindingId": exchange.BindingID, "connected": true, "daemonReloaded": false, "next": "looper collab start"})
+		}
+		printSection(cmd.OutOrStdout(), "Plane collaboration binding connected", [][2]any{{"providerId", providerID}, {"node", nodeName}, {"bindingId", exchange.BindingID}, {"next", "Run looper collab start. If it is already running, stop and start it to load this binding, then return to Plane."}})
+		return nil
+	}
 	if getBoolFlag(cmd, "json") {
 		return writeJSON(cmd.OutOrStdout(), map[string]any{"providerId": providerID, "connectionId": exchange.ConnectionID, "bindingId": exchange.BindingID, "connected": true})
 	}

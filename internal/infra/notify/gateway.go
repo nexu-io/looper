@@ -17,6 +17,7 @@ import (
 
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/eventlog"
+	"github.com/nexu-io/looper/internal/infra/feishucli"
 	"github.com/nexu-io/looper/internal/infra/shell"
 	"github.com/nexu-io/looper/internal/loops"
 	"github.com/nexu-io/looper/internal/storage"
@@ -58,6 +59,7 @@ type Options struct {
 	RunCommand         RunCommandFunc
 	HTTPPost           HTTPPostFunc
 	FeishuAppHTTP      FeishuAppHTTPFunc
+	FeishuCLI          *feishucli.Client
 	ResolveOwnerOpenID ResolveOwnerOpenID
 }
 
@@ -154,6 +156,7 @@ type Gateway struct {
 	runCommand         RunCommandFunc
 	httpPost           HTTPPostFunc
 	feishuAppHTTP      FeishuAppHTTPFunc
+	feishuCLI          *feishucli.Client
 	resolveOwnerOpenID ResolveOwnerOpenID
 	state              *GatewayState
 
@@ -192,7 +195,9 @@ func NewGateway(options Options) *Gateway {
 	}
 
 	feishuAppHTTP := options.FeishuAppHTTP
-	if feishuAppHTTP == nil {
+	if options.FeishuCLI != nil {
+		feishuAppHTTP = options.FeishuCLI.AppHTTP
+	} else if feishuAppHTTP == nil {
 		feishuAppHTTP = defaultFeishuAppHTTP
 	}
 	state := options.State
@@ -209,6 +214,7 @@ func NewGateway(options Options) *Gateway {
 		runCommand:         runCommand,
 		httpPost:           httpPost,
 		feishuAppHTTP:      feishuAppHTTP,
+		feishuCLI:          options.FeishuCLI,
 		resolveOwnerOpenID: options.ResolveOwnerOpenID,
 		state:              state,
 	}
@@ -509,13 +515,11 @@ func (g *Gateway) recordFeishuApp(ctx context.Context, payload SystemNotificatio
 		return persist(build("skipped", "disabled", nil))
 	}
 
-	appID := strings.TrimSpace(os.Getenv(strings.TrimSpace(cfg.AppIDEnv)))
-	appSecret := strings.TrimSpace(os.Getenv(strings.TrimSpace(cfg.AppSecretEnv)))
 	chatID := strings.TrimSpace(cfg.ChatID)
-	if strings.TrimSpace(cfg.AppIDEnv) == "" || strings.TrimSpace(cfg.AppSecretEnv) == "" || chatID == "" {
+	if chatID == "" {
 		return persist(build("skipped", "no app config", nil))
 	}
-	if appID == "" || appSecret == "" {
+	if !g.feishuAppConfigured() {
 		return persist(build("skipped", "no app credentials", nil))
 	}
 
@@ -536,7 +540,7 @@ func (g *Gateway) recordFeishuApp(ctx context.Context, payload SystemNotificatio
 		}
 	}
 
-	token, err := g.feishuTenantToken(ctx, appID, appSecret)
+	token, err := g.feishuAppToken(ctx)
 	if err != nil {
 		return persist(build("failed", err.Error(), nil))
 	}
@@ -583,9 +587,11 @@ func feishuNotificationText(payload SystemNotificationPayload) string {
 	return mention + body
 }
 
-// HITLAskCard is a one-way Feishu notification for a decision that lives in
-// Plane or GitHub. The only card action opens the exact source-of-truth comment.
+// HITLAskCard renders the original decision brief. Feishu transport accepts
+// thread replies; other transports link to their source-of-truth comment.
 type HITLAskCard struct {
+	AskedAt        string
+	Transport      string
 	ProjectID      string
 	LoopID         string
 	LoopSeq        int64
@@ -621,8 +627,7 @@ type HITLAskCard struct {
 	Consequences map[string]string
 	// Confidence is the agent's self-assessed certainty ("high"/"medium"/"low").
 	Confidence string
-	// AnsweredWith renders the notification as resolved after the authoritative
-	// Plane/GitHub answer is accepted. Feishu itself never supplies this value.
+	// AnsweredWith acknowledges the answer received from the configured transport.
 	AnsweredWith string
 }
 
@@ -657,21 +662,35 @@ func feishuMentionMarkup(openIDs []string) string {
 // the app-bot credentials in notifications.webhook (appIdEnv/appSecretEnv/chatId)
 // and is a no-op error when they are not configured. Best-effort; caller logs.
 func (g *Gateway) SendHITLAsk(ctx context.Context, card HITLAskCard) error {
-	if strings.TrimSpace(card.SourceURL) == "" {
+	if card.Transport != "feishu" && strings.TrimSpace(card.SourceURL) == "" {
 		return fmt.Errorf("decision notification requires an exact source-of-truth URL")
 	}
 	return g.enqueueFeishuCard(ctx, "Decision needed", card.Question, card.LoopID, feishuCardIntent{Kind: "hitl", HITL: &card})
 }
 
 func (g *Gateway) deliverHITLAsk(ctx context.Context, card HITLAskCard) error {
+	// Discard a delayed outbox intent when its original question is no longer current.
+	if card.Transport == "feishu" {
+		loop, err := g.repositories.Loops.GetByID(ctx, card.LoopID)
+		if err != nil {
+			return err
+		}
+		if loop == nil {
+			return nil
+		}
+		ask, ok := loops.ReadHITLAsk(loop.MetadataJSON)
+		if !ok || loop.Status != "awaiting_human" || ask.Status != "awaiting" || ask.Transport != "feishu" || ask.Question != card.Question || ask.AskedAt != card.AskedAt || ask.QuestionMessageID != "" {
+			return nil
+		}
+		card.Title = loopTitleFromMetadata(loop.MetadataJSON)
+		card.ProjectID = loop.ProjectID
+	}
 	cfg := g.config.Webhook
-	appID := strings.TrimSpace(os.Getenv(strings.TrimSpace(cfg.AppIDEnv)))
-	appSecret := strings.TrimSpace(os.Getenv(strings.TrimSpace(cfg.AppSecretEnv)))
 	chatID := strings.TrimSpace(cfg.ChatID)
-	if appID == "" || appSecret == "" || chatID == "" {
+	if !g.feishuAppConfigured() || chatID == "" {
 		return fmt.Errorf("feishu app-bot is not configured for HITL asks (need appIdEnv/appSecretEnv/chatId)")
 	}
-	token, err := g.feishuTenantToken(ctx, appID, appSecret)
+	token, err := g.feishuAppToken(ctx)
 	if err != nil {
 		return err
 	}
@@ -687,16 +706,38 @@ func (g *Gateway) deliverHITLAsk(ctx context.Context, card HITLAskCard) error {
 	if err != nil {
 		return err
 	}
-	// Thread the notification under the loop's root; its sole button is an outbound
-	// deep link and never sends a decision back to Looper.
+	// Keep decisions and replies under the original task card.
 	rootMessageID := g.ensureFeishuThreadRoot(ctx, token, chatID, card.LoopID)
-	// The loop is awaiting_human now — turn the anchor card orange "等你定夺".
+	// Refresh the task anchor while keeping the question in its thread.
 	g.updateFeishuThreadHeader(ctx, token, card.LoopID)
 	msgID, err := g.postFeishuAppMessage(ctx, token, chatID, rootMessageID, "interactive", string(cardJSON))
 	if err != nil {
 		return err
 	}
 	if strings.TrimSpace(msgID) != "" && strings.TrimSpace(card.LoopID) != "" {
+		if card.Transport == "feishu" {
+			loop, err := g.repositories.Loops.GetByID(ctx, card.LoopID)
+			if err != nil {
+				return err
+			}
+			if loop != nil {
+				ask, ok := loops.ReadHITLAsk(loop.MetadataJSON)
+				if ok && ask.Status == "awaiting" && ask.Transport == "feishu" && ask.Question == card.Question && ask.AskedAt == card.AskedAt {
+					ask.QuestionMessageID = msgID
+					meta, err := loops.WriteHITLAsk(loop.MetadataJSON, ask)
+					if err != nil {
+						return err
+					}
+					loop.MetadataJSON = &meta
+					if err := g.repositories.Loops.Upsert(ctx, *loop); err != nil {
+						return err
+					}
+				}
+			}
+		}
+		if card.Transport == "feishu" {
+			return nil
+		}
 		g.state.liveMu.Lock()
 		if g.state.askCards == nil {
 			g.state.askCards = map[string]askCardState{}
@@ -718,20 +759,33 @@ func firstFeishuOwner(openIDs []string) []string {
 }
 
 // MarkAskAnswered updates the outbound Feishu notification after an answer was
-// accepted from its authoritative source. Feishu itself remains notification-only.
+// accepted from its configured source. Private-thread replies only refresh the
+// anchor; the conversation itself remains unchanged.
 func (g *Gateway) MarkAskAnswered(ctx context.Context, loopID, answer string) {
 	loopID = strings.TrimSpace(loopID)
 	answer = strings.TrimSpace(answer)
 	if loopID == "" || answer == "" {
 		return
 	}
-	g.RecordMilestone(ctx, loopID, "🧑‍⚖️ 已定夺:"+answer)
 	g.state.liveMu.Lock()
 	st, ok := g.state.askCards[loopID]
 	if ok {
 		g.state.touchLoopLocked(loopID)
 	}
 	g.state.liveMu.Unlock()
+	// A thread reply is already visible. Do not quote it back in an ACK card
+	// or a milestone; the resumed agent supplies the meaningful response.
+	if g.repositories != nil && g.repositories.Loops != nil {
+		if loop, err := g.repositories.Loops.GetByID(ctx, loopID); err == nil && loop != nil {
+			if ask, exists := loops.ReadHITLAsk(loop.MetadataJSON); exists && ask.Transport == "feishu" {
+				if token, err := g.feishuAppToken(ctx); err == nil {
+					g.updateFeishuThreadHeader(ctx, token, loopID)
+				}
+				return
+			}
+		}
+	}
+	g.RecordMilestone(ctx, loopID, "🧑‍⚖️ 已定夺:"+answer)
 	if !ok || strings.TrimSpace(st.msgID) == "" {
 		return
 	}
@@ -740,13 +794,10 @@ func (g *Gateway) MarkAskAnswered(ctx context.Context, loopID, answer string) {
 	if err != nil {
 		return
 	}
-	cfg := g.config.Webhook
-	appID := strings.TrimSpace(os.Getenv(strings.TrimSpace(cfg.AppIDEnv)))
-	appSecret := strings.TrimSpace(os.Getenv(strings.TrimSpace(cfg.AppSecretEnv)))
-	if appID == "" || appSecret == "" {
+	if !g.feishuAppConfigured() {
 		return
 	}
-	token, err := g.feishuTenantToken(ctx, appID, appSecret)
+	token, err := g.feishuAppToken(ctx)
 	if err != nil {
 		return
 	}
@@ -913,53 +964,18 @@ func (g *Gateway) RecordMilestone(ctx context.Context, loopID, text string) {
 	if err := g.repositories.Loops.Upsert(ctx, *loop); err != nil {
 		return
 	}
-	cfg := g.config.Webhook
-	appID := strings.TrimSpace(os.Getenv(strings.TrimSpace(cfg.AppIDEnv)))
-	appSecret := strings.TrimSpace(os.Getenv(strings.TrimSpace(cfg.AppSecretEnv)))
-	if appID == "" || appSecret == "" {
+	if !g.feishuAppConfigured() {
 		return
 	}
-	if token, err := g.feishuTenantToken(ctx, appID, appSecret); err == nil {
+	if token, err := g.feishuAppToken(ctx); err == nil {
 		g.updateFeishuThreadHeader(ctx, token, loopID)
 	}
 }
 
-// feishuMilestoneList renders a loop's milestone log as a compact, timestamped
-// narrative for the anchor: "HH:MM · <text>", most recent last, capped.
-func feishuMilestoneList(milestones []loops.Milestone) string {
-	const show = 6
-	start := 0
-	if len(milestones) > show {
-		start = len(milestones) - show
-	}
-	lines := make([]string, 0, len(milestones)-start+1)
-	lines = append(lines, "📋 进展")
-	for _, m := range milestones[start:] {
-		if strings.TrimSpace(m.Text) == "" {
-			continue
-		}
-		lines = append(lines, "· "+feishuShortTime(m.At)+" "+m.Text)
-	}
-	return strings.Join(lines, "\n")
-}
-
-// feishuShortTime turns an ISO timestamp into a local "HH:MM"; empty on parse
-// failure so the caller can omit it.
-func feishuShortTime(iso string) string {
-	iso = strings.TrimSpace(iso)
-	if iso == "" {
-		return ""
-	}
-	t, err := time.Parse(time.RFC3339Nano, iso)
-	if err != nil {
-		if t, err = time.Parse("2006-01-02T15:04:05.000Z", iso); err != nil {
-			return ""
-		}
-	}
-	return t.Local().Format("15:04")
-}
-
 func buildFeishuAskCard(card HITLAskCard) ([]byte, error) {
+	if card.Transport == "feishu" {
+		return buildFeishuThreadQuestion(card)
+	}
 	title := strings.TrimSpace(card.Title)
 	if title == "" {
 		title = "Looper needs a decision"
@@ -992,7 +1008,11 @@ func buildFeishuAskCard(card HITLAskCard) ([]byte, error) {
 		elements = append(elements, map[string]any{"tag": "hr"})
 	}
 	// The question itself.
-	elements = append(elements, larkDiv("**"+title+"**\n"+body))
+	questionText := "**" + title + "**"
+	if body != title {
+		questionText += "\n" + body
+	}
+	elements = append(elements, larkDiv(questionText))
 	// The agent's decision brief — research + recommendation.
 	if rec := strings.TrimSpace(card.Recommendation); rec != "" {
 		elements = append(elements, larkDiv("🔎 "+rec))
@@ -1104,6 +1124,24 @@ func feishuConfidenceLabel(confidence string) string {
 		return "置信度 低"
 	}
 	return ""
+}
+
+// CLI mode authenticates inside lark-cli; normal app mode retains the original
+// environment credentials and tenant-token cache. Neither renderer needs tokens.
+func (g *Gateway) feishuAppConfigured() bool {
+	if g.feishuCLI != nil {
+		return true
+	}
+	cfg := g.config.Webhook
+	return strings.TrimSpace(os.Getenv(cfg.AppIDEnv)) != "" && strings.TrimSpace(os.Getenv(cfg.AppSecretEnv)) != ""
+}
+
+func (g *Gateway) feishuAppToken(ctx context.Context) (string, error) {
+	if g.feishuCLI != nil {
+		return "", nil
+	}
+	cfg := g.config.Webhook
+	return g.feishuTenantToken(ctx, strings.TrimSpace(os.Getenv(cfg.AppIDEnv)), strings.TrimSpace(os.Getenv(cfg.AppSecretEnv)))
 }
 
 // feishuTenantToken returns a cached tenant_access_token when still valid, else
@@ -1227,16 +1265,14 @@ func (g *Gateway) PostThreadImage(ctx context.Context, loopID, pngPath, dedupeUU
 		return "", nil
 	}
 	cfg := g.config.Webhook
-	appID := strings.TrimSpace(os.Getenv(strings.TrimSpace(cfg.AppIDEnv)))
-	appSecret := strings.TrimSpace(os.Getenv(strings.TrimSpace(cfg.AppSecretEnv)))
-	if appID == "" || appSecret == "" {
+	if !g.feishuAppConfigured() {
 		return "", nil
 	}
 	root := g.threadRootForLoop(ctx, loopID)
 	if root == "" || strings.TrimSpace(cfg.ChatID) == "" {
 		return "", nil
 	}
-	token, err := g.feishuTenantToken(ctx, appID, appSecret)
+	token, err := g.feishuAppToken(ctx)
 	if err != nil {
 		return "", err
 	}
@@ -1497,8 +1533,8 @@ func (g *Gateway) feishuThreadHeaderText(ctx context.Context, loopID string) str
 	return head
 }
 
-// feishuThreadHeaderCard renders the thread anchor as a compact task-header card:
-// a linked source (Issue #N → url) · repo · who triggered it, plus the title.
+// feishuThreadHeaderCard resolves the task status and source links, then renders
+// its collaboration card with the latest update and folded history.
 // Returns ("", false) when the loop can't be loaded, so the caller falls back to
 // the plain-text header.
 func (g *Gateway) feishuThreadHeaderCard(ctx context.Context, loopID string) (string, bool) {
@@ -1530,7 +1566,6 @@ func (g *Gateway) feishuThreadHeaderCard(ctx context.Context, loopID string) (st
 		sourceLabel = humanizeLoopTarget(target) // PR-triggered loop: no originating issue
 	}
 	prURL := loopWorkerString(loop.MetadataJSON, "prUrl")
-	trigger := loopWorkerString(loop.MetadataJSON, "triggerLogin")
 	repo := ""
 	if loop.Repo != nil {
 		repo = strings.TrimSpace(*loop.Repo)
@@ -1543,69 +1578,7 @@ func (g *Gateway) feishuThreadHeaderCard(ctx context.Context, loopID string) (st
 	if prURL == "" && loop.PRNumber != nil && *loop.PRNumber > 0 && repo != "" {
 		prURL = fmt.Sprintf("https://github.com/%s/pull/%d", repo, *loop.PRNumber)
 	}
-	title := loopTitleFromMetadata(loop.MetadataJSON)
-
-	parts := make([]string, 0, 3)
-	if sourceLabel != "" {
-		if sourceURL != "" {
-			parts = append(parts, "📋 ["+sourceLabel+"]("+sourceURL+")")
-		} else {
-			parts = append(parts, "📋 "+sourceLabel)
-		}
-	}
-	if repo != "" {
-		parts = append(parts, repo)
-	}
-	if label := loopTriggerLabelHint(loop.Type); label != "" {
-		parts = append(parts, "🏷 "+label)
-	}
-	if trigger != "" {
-		parts = append(parts, "由 @"+strings.TrimPrefix(trigger, "@")+" 提出")
-	}
-	if len(parts) == 0 && title == "" {
-		return "", false
-	}
-	elements := make([]any, 0, 6)
-	if len(parts) > 0 {
-		elements = append(elements, larkDiv(strings.Join(parts, " · ")))
-	}
-	if title != "" {
-		elements = append(elements, larkDiv("**"+title+"**"))
-	}
-	// Key milestone, surfaced on the OUTER card: the PR this task opened, linked —
-	// so a human sees the deliverable without opening the thread and scrolling to
-	// the bottom for the "Opened a PR" reply.
-	if prURL != "" {
-		prLabel := "PR"
-		if n := urlTrailingNumber(prURL); n != "" {
-			prLabel = "PR #" + n
-		}
-		elements = append(elements, larkDiv("🔀 已开 ["+prLabel+"]("+prURL+") →"))
-	}
-	// The narrative — NOT the raw tool feed (that lives inside the thread, see
-	// updateLiveFeedComment). A timestamped milestone log (decisions · phases · PR)
-	// when we have one, else a single current-phase brief while nothing notable has
-	// landed yet.
 	tail, elapsed := g.liveTailFor(loopID)
-	if milestones := loops.ReadMilestones(loop.MetadataJSON); len(milestones) > 0 {
-		elements = append(elements, map[string]any{"tag": "hr"})
-		elements = append(elements, larkDiv(feishuMilestoneList(milestones)))
-	} else if brief := feishuAnchorBrief(loop, tail); brief != "" {
-		elements = append(elements, map[string]any{"tag": "hr"})
-		elements = append(elements, larkDiv(brief))
-	}
-	noteParts := make([]string, 0, 2)
-	if elapsed > 0 {
-		noteParts = append(noteParts, "⏱ "+humanizeElapsedSeconds(elapsed))
-	}
-	noteParts = append(noteParts, "展开话题看实时进度 →")
-	elements = append(elements, map[string]any{"tag": "note", "elements": []any{map[string]any{"tag": "lark_md", "content": strings.Join(noteParts, " · ")}}})
-	elements = append(elements, feishuLooperOwnerNote(g.ownerOpenID(loop.ProjectID)))
-	// One-command local takeover of the agent session (runs on the daemon host).
-	// Offered only while the loop is live; dropped once it reaches a terminal state.
-	if !feishuLoopStatusTerminal(loop.Status) {
-		elements = append(elements, map[string]any{"tag": "note", "elements": []any{map[string]any{"tag": "lark_md", "content": "💻 本地接管:`looper resume " + strconv.FormatInt(loop.Seq, 10) + "`"}}})
-	}
 	// hasPR drives the "已交付 · 待合并" vs "已完成" wording. Derive it from a
 	// reliable signal: a completed worker loop's target flips to its PR
 	// (pr:repo:N), and/or the metadata carries a prUrl. (loopWorkerString only
@@ -1634,16 +1607,7 @@ func (g *Gateway) feishuThreadHeaderCard(ctx context.Context, loopID string) (st
 	if style, ok := g.anchorOutcomeOverride(loopID); ok {
 		template, label = style.template, style.label
 	}
-	cardObj := map[string]any{
-		"config":   map[string]any{"wide_screen_mode": true},
-		"header":   map[string]any{"template": template, "title": map[string]any{"tag": "plain_text", "content": label}},
-		"elements": elements,
-	}
-	raw, err := json.Marshal(cardObj)
-	if err != nil {
-		return "", false
-	}
-	return string(raw), true
+	return g.feishuCollaborationCard(ctx, loop, template, label, sourceLabel, sourceURL, prURL, tail, elapsed)
 }
 
 // loopIssueURL resolves the originating issue URL for an anchor card. Current
@@ -1683,22 +1647,6 @@ func feishuLoopStatusTerminal(status string) bool {
 		return true
 	default:
 		return false
-	}
-}
-
-// loopTriggerLabelHint names the label that started a loop, by role — so the card
-// shows WHY this task is running: planner=looper:plan, worker=looper:worker-ready,
-// coordinator=looper:auto. Reviewer/fixer are PR-driven (no source label) → "".
-func loopTriggerLabelHint(loopType string) string {
-	switch strings.ToLower(strings.TrimSpace(loopType)) {
-	case "planner":
-		return "looper:plan"
-	case "worker":
-		return "looper:worker-ready"
-	case "coordinator":
-		return "looper:auto"
-	default:
-		return ""
 	}
 }
 
@@ -2143,12 +2091,10 @@ func (g *Gateway) RefreshThreadHeader(ctx context.Context, loopID string, tail [
 		g.state.liveMu.Unlock()
 	}
 	cfg := g.config.Webhook
-	appID := strings.TrimSpace(os.Getenv(strings.TrimSpace(cfg.AppIDEnv)))
-	appSecret := strings.TrimSpace(os.Getenv(strings.TrimSpace(cfg.AppSecretEnv)))
-	if appID == "" || appSecret == "" {
+	if !g.feishuAppConfigured() {
 		return
 	}
-	token, err := g.feishuTenantToken(ctx, appID, appSecret)
+	token, err := g.feishuAppToken(ctx)
 	if err != nil {
 		return
 	}
@@ -2340,12 +2286,10 @@ func (g *Gateway) postThreadNote(ctx context.Context, loopID, text string, menti
 		return nil
 	}
 	cfg := g.config.Webhook
-	appID := strings.TrimSpace(os.Getenv(strings.TrimSpace(cfg.AppIDEnv)))
-	appSecret := strings.TrimSpace(os.Getenv(strings.TrimSpace(cfg.AppSecretEnv)))
-	if appID == "" || appSecret == "" {
+	if !g.feishuAppConfigured() {
 		return nil
 	}
-	token, err := g.feishuTenantToken(ctx, appID, appSecret)
+	token, err := g.feishuAppToken(ctx)
 	if err != nil {
 		return err
 	}
@@ -2413,12 +2357,10 @@ func (g *Gateway) deliverThreadDecisionCard(ctx context.Context, intent feishuDe
 	body := strings.TrimSpace(intent.Body)
 	actionURL := strings.TrimSpace(intent.ActionURL)
 	cfg := g.config.Webhook
-	appID := strings.TrimSpace(os.Getenv(strings.TrimSpace(cfg.AppIDEnv)))
-	appSecret := strings.TrimSpace(os.Getenv(strings.TrimSpace(cfg.AppSecretEnv)))
-	if appID == "" || appSecret == "" {
+	if !g.feishuAppConfigured() {
 		return fmt.Errorf("feishu app credentials are not configured")
 	}
-	token, err := g.feishuTenantToken(ctx, appID, appSecret)
+	token, err := g.feishuAppToken(ctx)
 	if err != nil {
 		return err
 	}
@@ -2580,7 +2522,7 @@ func loopWorkerString(metadataJSON *string, key string) string {
 // feishuActivityTail renders the last few agent output lines as a compact log.
 func feishuActivityTail(lines []string) string {
 	rendered := make([]string, 0, len(lines)+1)
-	rendered = append(rendered, "🔧 实时进度")
+	rendered = append(rendered, "🔧 最近执行记录")
 	for _, line := range lines {
 		if len(line) > 90 {
 			line = line[:90] + "…"
@@ -2588,36 +2530,6 @@ func feishuActivityTail(lines []string) string {
 		rendered = append(rendered, "· "+line)
 	}
 	return strings.Join(rendered, "\n")
-}
-
-// feishuAnchorBrief returns the one-line, human-scannable status for the anchor
-// card — NOT the raw tool feed. It prefers the agent's own summary (genuinely
-// AI-written, present once the loop reaches a terminal/awaiting state) and falls
-// back to a natural-language phase inferred from the latest activity while the
-// agent is still running. Returns "" when there is nothing meaningful to say yet.
-func feishuAnchorBrief(loop *storage.LoopRecord, tail []string) string {
-	if loop != nil {
-		for _, key := range []string{"summary", "changeSummary", "resultSummary", "outcome"} {
-			if s := loopWorkerString(loop.MetadataJSON, key); s != "" {
-				if len(s) > 160 {
-					s = s[:160] + "…"
-				}
-				return "📝 " + s
-			}
-		}
-		// A terminal loop is no longer "正在…"; without a summary the green/orange/red
-		// header + title already say enough — don't contradict it with a stale phase.
-		if loop.Status != "" {
-			switch strings.ToLower(strings.TrimSpace(loop.Status)) {
-			case "completed", "done", "merged", "failed", "abandoned", "error", "awaiting_human", "terminated", "stopped":
-				return ""
-			}
-		}
-	}
-	if phase := feishuPhaseFromTail(tail); phase != "" {
-		return "🔧 " + phase
-	}
-	return ""
 }
 
 // feishuPhaseFromTail maps the most recent tool command to a short natural-language
@@ -2670,13 +2582,13 @@ func feishuLiveFeedCardWithOwner(tail []string, elapsedSec int64, ownerOpenID st
 		return "", false
 	}
 	elements := []any{larkDiv(feishuActivityTail(tail))}
-	note := "实时更新中"
+	note := "任务当前状态见主卡片"
 	if elapsedSec > 0 {
-		note = "⏱ " + humanizeElapsedSeconds(elapsedSec) + " · 实时更新中"
+		note = "⏱ 本轮已执行 " + humanizeElapsedSeconds(elapsedSec) + " · " + note
 	}
 	elements = append(elements, map[string]any{"tag": "note", "elements": []any{map[string]any{"tag": "lark_md", "content": note}}})
 	elements = append(elements, feishuLooperOwnerNote(ownerOpenID))
-	// No header — the body already leads with "🔧 实时进度"; a separate "实时进度同步"
+	// No header — the body already leads with "🔧 最近执行记录"; a separate progress
 	// title just repeats it. Feishu renders a header-less card fine.
 	cardObj := map[string]any{
 		"config":   map[string]any{"wide_screen_mode": true},

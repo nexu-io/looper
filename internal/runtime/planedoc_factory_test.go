@@ -1,6 +1,7 @@
 package runtime
 
 import (
+	"github.com/nexu-io/looper/internal/workerhost"
 	"testing"
 
 	"github.com/nexu-io/looper/internal/config"
@@ -24,25 +25,25 @@ func TestPlaneDocForProject(t *testing.T) {
 	}
 
 	// A plane project → gateway + the Plane project UUID.
-	gw, planeProjectID, ok := planeDocForProject(cfg, "plane-proj")
+	gw, planeProjectID, ok := workerhost.PlaneDocForProject(cfg, "plane-proj")
 	if !ok || gw == nil || planeProjectID != "plane-uuid-1" {
-		t.Fatalf("planeDocForProject(plane) = %v, %q, %v; want a gateway + plane-uuid-1", gw, planeProjectID, ok)
+		t.Fatalf("workerhost.PlaneDocForProject(plane) = %v, %q, %v; want a gateway + plane-uuid-1", gw, planeProjectID, ok)
 	}
 
 	// A github project → no plane gateway (keeps the repo-file spec path).
-	if _, _, ok := planeDocForProject(cfg, "gh-proj"); ok {
-		t.Fatal("planeDocForProject(github) ok = true, want false")
+	if _, _, ok := workerhost.PlaneDocForProject(cfg, "gh-proj"); ok {
+		t.Fatal("workerhost.PlaneDocForProject(github) ok = true, want false")
 	}
 	// A project with no provider (github default) → no plane gateway.
-	if _, _, ok := planeDocForProject(cfg, "default-proj"); ok {
-		t.Fatal("planeDocForProject(default) ok = true, want false")
+	if _, _, ok := workerhost.PlaneDocForProject(cfg, "default-proj"); ok {
+		t.Fatal("workerhost.PlaneDocForProject(default) ok = true, want false")
 	}
 	// Unknown project → false.
-	if _, _, ok := planeDocForProject(cfg, "nope"); ok {
-		t.Fatal("planeDocForProject(unknown) ok = true, want false")
+	if _, _, ok := workerhost.PlaneDocForProject(cfg, "nope"); ok {
+		t.Fatal("workerhost.PlaneDocForProject(unknown) ok = true, want false")
 	}
 	// nil cfg → false.
-	if _, _, ok := planeDocForProject(nil, "plane-proj"); ok {
-		t.Fatal("planeDocForProject(nil cfg) ok = true, want false")
+	if _, _, ok := workerhost.PlaneDocForProject(nil, "plane-proj"); ok {
+		t.Fatal("workerhost.PlaneDocForProject(nil cfg) ok = true, want false")
 	}
 }

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/nexu-io/looper/internal/config"
+	"github.com/nexu-io/looper/internal/executionhost"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/network/protocol"
 	"github.com/nexu-io/looper/internal/storage"
@@ -40,21 +41,31 @@ type Status struct {
 }
 
 type Manager struct {
-	statePath string
-	config    config.Config
-	repos     *storage.Repositories
-	gh        *githubinfra.Gateway
-	client    *http.Client
-	now       func() time.Time
-	mu        sync.RWMutex
-	status    Status
-	cancel    context.CancelFunc
-	done      chan struct{}
-	started   bool
+	statePath     string
+	config        config.Config
+	repos         *storage.Repositories
+	gh            *githubinfra.Gateway
+	client        *http.Client
+	now           func() time.Time
+	mu            sync.RWMutex
+	status        Status
+	cancel        context.CancelFunc
+	done          chan struct{}
+	started       bool
+	collaboration bool
+	identityLock  *executionhost.ServiceLock
 }
 
 func NewManager(statePath string, cfg config.Config, repos *storage.Repositories, gh *githubinfra.Gateway) *Manager {
 	return &Manager{statePath: statePath, config: cfg, repos: repos, gh: gh, client: &http.Client{Timeout: 10 * time.Second}, now: time.Now, done: make(chan struct{})}
+}
+
+// NewCollaborationManager reuses node credentials, authentication and heartbeat
+// transport while advertising only the executor actually hosted by collab.
+func NewCollaborationManager(statePath string, cfg config.Config, repos *storage.Repositories, gh *githubinfra.Gateway) *Manager {
+	m := NewManager(statePath, cfg, repos, gh)
+	m.collaboration = true
+	return m
 }
 
 func (m *Manager) UpdateConfig(cfg config.Config) {
@@ -107,6 +118,15 @@ func (m *Manager) Start(parent context.Context) error {
 		close(m.done)
 		return nil
 	}
+	// Two hosts heartbeating as one node would overwrite its capabilities and
+	// make Plane dispatch to the wrong executor. Reuse the existing OS lock,
+	// scoped to the credential file; it disappears automatically on a crash.
+	lock, err := executionhost.AcquireServiceLock(m.statePath+".lock", "loopernet-client", m.now())
+	if err != nil {
+		m.started = false
+		return err
+	}
+	m.identityLock = lock
 	ctx, cancel := context.WithCancel(parent)
 	m.cancel = cancel
 	go func() {
@@ -134,6 +154,7 @@ func (m *Manager) Stop() {
 		m.cancel()
 	}
 	<-m.done
+	_ = m.identityLock.Release()
 }
 
 func (m *Manager) Status() Status {
@@ -147,6 +168,14 @@ func (m *Manager) tick(ctx context.Context, state LocalState) {
 	cfg := m.configSnapshot()
 	routed, local := countProjectModes(cfg)
 	capabilities := protocol.NodeCapabilities{Roles: supportedRoles(cfg), CoordinatorEligible: routed > 0 && cfg.Roles.Coordinator.Enabled, RoutedProjects: routed, RoutedProjectIDs: routedProjectIDs(cfg), ReviewerProjects: reviewerProjectCapabilities(cfg), LocalProjects: local, DynamicLoad: m.dynamicLoad(ctx), StrictDispatchV1: hasStrictDispatchProvider(cfg)}
+	if m.collaboration {
+		capabilities.Roles = []string{"worker"}
+		capabilities.CoordinatorEligible = false
+		capabilities.RoutedProjectIDs = nil
+		capabilities.ReviewerProjects = nil
+		capabilities.CollaborationV1 = true
+		capabilities.CollaborationProjects = collaborationProjects(cfg)
+	}
 	drift, reason := identityDrift(state.GitHub, current)
 	capabilities.IdentityDrift = drift
 	capabilities.DriftReason = reason
@@ -207,6 +236,19 @@ func hasStrictDispatchProvider(cfg config.Config) bool {
 		}
 	}
 	return false
+}
+
+func collaborationProjects(cfg config.Config) []protocol.CollaborationProject {
+	var result []protocol.CollaborationProject
+	for _, project := range cfg.Projects {
+		for _, provider := range cfg.Providers {
+			if provider.ID != project.Provider || provider.Kind != config.ProviderKindPlane || provider.StrictDispatch == nil || !provider.StrictDispatch.Enabled || provider.ProjectID == nil || provider.Workspace == nil || strings.TrimSpace(project.Repo) == "" {
+				continue
+			}
+			result = append(result, protocol.CollaborationProject{Repo: project.Repo, Workspace: *provider.Workspace, PlaneProjectID: *provider.ProjectID})
+		}
+	}
+	return result
 }
 
 func (m *Manager) reconcileLease(ctx context.Context, api *Client, state LocalState, current protocol.GitHubIdentity, capabilities protocol.NodeCapabilities, status protocol.NodeStatusResponse) (string, string) {

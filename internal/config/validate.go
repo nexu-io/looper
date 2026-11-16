@@ -103,8 +103,14 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 	}
 
 	answerTransport := strings.ToLower(strings.TrimSpace(config.HITL.AnswerTransport))
-	if answerTransport != "" && answerTransport != "github" && answerTransport != "respond" {
-		issues = append(issues, ValidationIssue{Path: "hitl.answerTransport", Message: "must be github or respond; Feishu is notification-only"})
+	if answerTransport != "" && answerTransport != "github" && answerTransport != "respond" && answerTransport != "feishu" {
+		issues = append(issues, ValidationIssue{Path: "hitl.answerTransport", Message: "must be github, respond, or feishu"})
+	}
+	if answerTransport == "feishu" {
+		fs := config.HITL.Feishu
+		if fs == nil || !strings.HasPrefix(fs.ChatID, "oc_") || !strings.HasPrefix(fs.OwnerOpenID, "ou_") {
+			issues = append(issues, ValidationIssue{Path: "hitl.answerTransport", Message: "feishu requires hitl.feishu.chatId and ownerOpenId for a private test chat"})
+		}
 	}
 
 	if config.Webhook.FallbackPollIntervalSeconds < 60 {

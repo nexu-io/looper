@@ -758,14 +758,24 @@ type Config struct {
 // HITLConfig gates the mid-run human-in-the-loop feature: when Enabled, agents
 // may pause mid-run to ask a human (by writing .looper/ask.json), the loop
 // suspends as awaiting_human, and the question is posted to the configured source
-// of truth. Feishu may notify the owner, but never accepts answers.
+// of truth, or to an explicitly scoped private Feishu test chat.
 type HITLConfig struct {
 	Enabled bool `json:"enabled"`
 	// AnswerTransport selects how a mid-run question is delivered and how the
-	// human's answer comes back: "github" (PR comment, the default) or "respond"
-	// (only the authenticated /respond API). Empty defaults to "github".
+	// human's answer comes back: "github" (PR comment, the default), "respond"
+	// (authenticated /respond API), or "feishu" (private test-chat dialogue).
+	// Empty defaults to "github".
 	AnswerTransport string            `json:"answerTransport,omitempty"`
 	GitHub          *HITLGitHubConfig `json:"github,omitempty"`
+	Feishu          *HITLFeishuConfig `json:"feishu,omitempty"`
+}
+
+// HITLFeishuConfig uses an already authenticated lark-cli. This initial bridge
+// is restricted to a private chat containing one owner and the CLI's bot.
+type HITLFeishuConfig struct {
+	ChatID      string `json:"chatId"`
+	OwnerOpenID string `json:"ownerOpenId"`
+	CLIPath     string `json:"cliPath,omitempty"`
 }
 
 // HITLGitHubConfig tunes the GitHub PR-comment HITL transport.
@@ -1026,6 +1036,7 @@ type PartialHITLConfig struct {
 	Enabled         *bool                    `json:"enabled,omitempty"`
 	AnswerTransport *string                  `json:"answerTransport,omitempty"`
 	GitHub          *PartialHITLGitHubConfig `json:"github,omitempty"`
+	Feishu          *HITLFeishuConfig        `json:"feishu,omitempty"`
 }
 
 type PartialHITLGitHubConfig struct {

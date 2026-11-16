@@ -600,8 +600,7 @@ type Options struct {
 	AllowAutoCommit    bool
 	AllowAutoPush      bool
 	// ShepherdEnabled opts a worker into shepherding its own impl PR to merge
-	// after open-pr (looper:auto flow). Off by default; the loop still needs the
-	// looper:auto label on its issue to actually enter shepherding.
+	// after open-pr. This applies to every PR opened by that runner.
 	ShepherdEnabled         bool
 	OpenPRStrategy          config.OpenPRStrategy
 	Disclosure              *config.DisclosureConfig
@@ -767,11 +766,12 @@ type workerInput struct {
 	SpecPath string `json:"specPath,omitempty"`
 	Repo     string `json:"repo,omitempty"`
 	// IssueRepo is the source issue repository, which may differ from Repo for cross-repo closing references.
-	IssueRepo     string `json:"issueRepo,omitempty"`
-	BaseBranch    string `json:"baseBranch,omitempty"`
-	ExecutionMode string `json:"executionMode,omitempty"`
-	IssueNumber   int64  `json:"issueNumber,omitempty"`
-	IssueURL      string `json:"issueUrl,omitempty"`
+	IssueRepo        string `json:"issueRepo,omitempty"`
+	BaseBranch       string `json:"baseBranch,omitempty"`
+	ExecutionMode    string `json:"executionMode,omitempty"`
+	IssueNumber      int64  `json:"issueNumber,omitempty"`
+	IssueURL         string `json:"issueUrl,omitempty"`
+	StrictDispatchID string `json:"strictDispatchId,omitempty"`
 	// TriggerLogin is who created/assigned the source issue (GitHub login), shown
 	// as attribution on the HITL ask card so a human knows whose task this is.
 	TriggerLogin         string   `json:"triggerLogin,omitempty"`
@@ -2259,6 +2259,9 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 		if r.hitlEnabled {
 			prompt += hitlPromptInstruction
 			nativeResumePrompt, nativeSessionID = r.pendingHumanAnswer(ctx, &input.Loop, agentVendor)
+			if nativeResumePrompt == "" && strings.EqualFold(r.hitlAnswerTransport, "feishu") {
+				prompt += feishuCollaborationInstruction
+			}
 			if nativeResumePrompt != "" {
 				prompt += "\n\n" + nativeResumePrompt
 			}
@@ -2609,7 +2612,6 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 		return checkpoint, nil
 	}
 	if r.openPRStrategy == config.OpenPRStrategyManual {
-		checkpoint.SkipReason = fmt.Sprintf("Worker completed; PR opening is manual for %s", input.Loop.ID)
 		checkpoint.ResumePolicy = loops.ResumePolicyAdvanceFromCheckpoint
 		return checkpoint, nil
 	}
@@ -2858,7 +2860,7 @@ func (r *Runner) resolveWorkerInput(ctx context.Context, project storage.Project
 	projectMetadata := parseJSONObject(project.MetadataJSON)
 	repo := firstNonEmpty(stringFromAnyDefault(source["repo"]), derefString(loop.Repo), stringFromAnyDefault(projectMetadata["repo"]))
 	baseBranch := firstNonEmpty(stringFromAnyDefault(source["baseBranch"]), stringFromAnyDefault(metadata["baseBranch"]), derefString(project.BaseBranch), "main")
-	work := workerInput{Title: firstNonEmpty(stringFromAnyDefault(source["title"]), "Worker run"), Prompt: stringFromAnyDefault(source["prompt"]), SpecPath: stringFromAnyDefault(source["specPath"]), Repo: repo, IssueRepo: stringFromAnyDefault(source["issueRepo"]), BaseBranch: baseBranch, ExecutionMode: executionMode, IssueNumber: int64FromAny(source["issueNumber"]), IssueURL: stringFromAnyDefault(source["issueUrl"]), TriggerLogin: stringFromAnyDefault(source["triggerLogin"]), PRNumber: int64FromAny(source["prNumber"]), Branch: stringFromAnyDefault(source["branch"]), HeadSHA: stringFromAnyDefault(source["headSha"]), AutoDiscovered: boolFromAny(source["autoDiscovered"]), Labels: stringSliceFromAny(source["labels"]), Reviewers: stringSliceFromAny(source["reviewers"])}
+	work := workerInput{Title: firstNonEmpty(stringFromAnyDefault(source["title"]), "Worker run"), Prompt: stringFromAnyDefault(source["prompt"]), SpecPath: stringFromAnyDefault(source["specPath"]), Repo: repo, IssueRepo: stringFromAnyDefault(source["issueRepo"]), BaseBranch: baseBranch, ExecutionMode: executionMode, IssueNumber: int64FromAny(source["issueNumber"]), IssueURL: stringFromAnyDefault(source["issueUrl"]), StrictDispatchID: stringFromAnyDefault(source["strictDispatchId"]), TriggerLogin: stringFromAnyDefault(source["triggerLogin"]), PRNumber: int64FromAny(source["prNumber"]), Branch: stringFromAnyDefault(source["branch"]), HeadSHA: stringFromAnyDefault(source["headSha"]), AutoDiscovered: boolFromAny(source["autoDiscovered"]), Labels: stringSliceFromAny(source["labels"]), Reviewers: stringSliceFromAny(source["reviewers"])}
 	if work.IssueNumber == 0 && loop.TargetType == "issue" {
 		work.IssueNumber = parseIssueNumberFromTargetID(derefString(loop.TargetID))
 	}
@@ -3486,7 +3488,14 @@ func (r *Runner) buildSuccessSummary(loop storage.LoopRecord, checkpoint workerC
 	if checkpoint.PullRequest != nil && checkpoint.PullRequest.URL != "" {
 		return fmt.Sprintf("Opened pull request for worker %s: %s", loop.ID, checkpoint.PullRequest.URL)
 	}
-	return fmt.Sprintf("Completed worker %s", loop.ID)
+	summary := fmt.Sprintf("Completed worker %s", loop.ID)
+	if r.openPRStrategy == config.OpenPRStrategyManual {
+		if checkpoint.Execution != nil && strings.TrimSpace(checkpoint.Execution.Summary) != "" {
+			summary = strings.TrimSpace(checkpoint.Execution.Summary)
+		}
+		summary += "\n\n按配置，本轮不自动创建 PR。"
+	}
+	return summary
 }
 
 const (
@@ -4136,6 +4145,10 @@ func providerKindForProject(cfg config.Config, projectID string) config.Provider
 	return config.ProviderKindGitHub
 }
 
+const taskAssessmentInstruction = `Before editing, inspect the repository guidance and relevant code, establish the cause or intended behavior, and assess the impact even for a small fix. Check callers, shared modules and repositories, compatibility, data and security implications, and how to verify the change and regressions. Briefly explain the scope, risks and validation approach using evidence from that inspection; do not classify a task as small from its title alone.
+Scale planning to what you find: for a narrow, understood change, proceed after that assessment without requiring a separate design document; for coordinated changes, make a plan and split into independently verifiable steps where useful; for architectural changes, migrations, compatibility changes or consequential tradeoffs, prepare a technical design before implementation. Reassess if the scope grows. Follow repository requirements for plans, design documents and approvals.
+Continue autonomously when the decision is within the task's authority. When a human decision is needed, explain the issue, evidence and numbered alternatives to the appropriate product, design, engineering or QA owner in the existing task conversation. Writing a plan or design is not by itself a reason to stop for approval. Do not invent extra agent roles or require a fixed multi-role pipeline.`
+
 func buildWorkerPromptWithInstructions(repoRootPath string, projectID string, instructionConfig config.Config, work workerInput, plan *checkpointPlan, allowAgentPRCreation bool, disclosureCfg config.DisclosureConfig, agentRuntime string, agentModel string) (string, config.CustomInstructionBlock, error) {
 	providerKind := providerKindForProject(instructionConfig, projectID)
 	parts := []string{}
@@ -4153,6 +4166,7 @@ func buildWorkerPromptWithInstructions(repoRootPath string, projectID string, in
 		parts = append(parts, "This is a BUG. Work it in this order: (1) REPRODUCE it — write or run a failing test / concrete steps that show the wrong behaviour; (2) locate the ROOT CAUSE, not just the symptom; (3) fix the root cause and prove the reproduction now passes. Do not patch symptoms or skip the reproduction step.")
 	}
 	parts = append(parts, fmt.Sprintf("Repository: %s", work.Repo), fmt.Sprintf("Base branch: %s", work.BaseBranch))
+	parts = append(parts, taskAssessmentInstruction)
 	if work.ExecutionMode == "push-existing" && work.SpecPath != "" {
 		parts = append(parts, fmt.Sprintf("Do not modify the spec file at %s.", work.SpecPath))
 	}

@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/nexu-io/looper/internal/config"
-	"github.com/nexu-io/looper/internal/loops"
 	"github.com/nexu-io/looper/internal/storage"
 )
 
@@ -523,8 +522,8 @@ func TestFeishuCardsAttributeTheLocalLooperOwner(t *testing.T) {
 		return "ou_coworker_owner"
 	}})
 	anchor, ok := gateway.feishuThreadHeaderCard(context.Background(), "loop-owner")
-	if !ok || !strings.Contains(anchor, "ou_coworker_owner") || !strings.Contains(anchor, "来自 ") {
-		t.Fatalf("task anchor missing deployment owner attribution: %q", anchor)
+	if !ok || strings.Contains(anchor, "来自 ") {
+		t.Fatalf("task anchor contains redundant owner attribution: %q", anchor)
 	}
 }
 
@@ -582,7 +581,7 @@ func TestLiveStatusHelpers(t *testing.T) {
 		t.Fatalf("humanizeElapsedSeconds(45) = %q; want 45s", got)
 	}
 	tail := feishuActivityTail([]string{"read greet.js", "npm test → 12 pass"})
-	if !strings.Contains(tail, "实时进度") || !strings.Contains(tail, "· read greet.js") {
+	if !strings.Contains(tail, "最近执行记录") || !strings.Contains(tail, "· read greet.js") {
 		t.Fatalf("feishuActivityTail unexpected: %q", tail)
 	}
 	// Anchor brief: a human phrase from the latest tool line, not the raw command.
@@ -597,22 +596,12 @@ func TestLiveStatusHelpers(t *testing.T) {
 	if got := feishuPhaseFromTail([]string{"✅ tmpdir=$(mktemp -d /private/tmp/looper.XXXX)"}); got != "正在处理…" || strings.Contains(got, "mktemp") {
 		t.Fatalf("feishuPhaseFromTail(unknown) = %q; want generic phase, no raw command", got)
 	}
-	// feishuAnchorBrief falls back to the phase when no summary is in metadata, and
-	// the live feed card carries the raw feed for the in-thread surface.
-	if brief := feishuAnchorBrief(nil, []string{"✅ gh pr create --fill"}); brief != "🔧 正在开 PR" {
-		t.Fatalf("feishuAnchorBrief = %q; want 🔧 正在开 PR", brief)
-	}
 	if _, ok := feishuLiveFeedCard(nil, 0); ok {
 		t.Fatalf("feishuLiveFeedCard(empty) should not render")
 	}
-	// Header-less now — the body leads with 🔧 实时进度, so no separate title.
-	if card, ok := feishuLiveFeedCard([]string{"✅ git push"}, 90); !ok || strings.Contains(card, "\"header\"") || !strings.Contains(card, "🔧 实时进度") {
-		t.Fatalf("feishuLiveFeedCard: want header-less card with 🔧 实时进度 body, got %q", card)
-	}
-	// Milestone narrative renders "HH:MM · text".
-	ml := feishuMilestoneList([]loops.Milestone{{At: "2026-07-05T10:30:00.000Z", Text: "已定夺:中文"}, {At: "2026-07-05T10:50:00.000Z", Text: "🔀 已开 PR #9"}})
-	if !strings.Contains(ml, "进展") || !strings.Contains(ml, "已定夺:中文") || !strings.Contains(ml, "已开 PR #9") {
-		t.Fatalf("feishuMilestoneList unexpected: %q", ml)
+	// Header-less now — the body leads with 🔧 最近执行记录, so no separate title.
+	if card, ok := feishuLiveFeedCard([]string{"✅ git push"}, 90); !ok || strings.Contains(card, "\"header\"") || !strings.Contains(card, "🔧 最近执行记录") {
+		t.Fatalf("feishuLiveFeedCard: want header-less card with 🔧 最近执行记录 body, got %q", card)
 	}
 	// Terminal detection gates the takeover hint (shown only while live).
 	for _, s := range []string{"completed", "failed", "terminated", "stopped", "merged"} {
@@ -895,8 +884,8 @@ func TestFeishuThreadHeaderCardLinksCheckpointIssueURL(t *testing.T) {
 	if !ok {
 		t.Fatal("feishuThreadHeaderCard() did not render")
 	}
-	want := `[Issue #582](https://plane.example/open-design/browse/OPEND-582)`
-	if !strings.Contains(card, want) {
+	want := `https://plane.example/open-design/browse/OPEND-582`
+	if !strings.Contains(card, want) || !strings.Contains(card, "查看任务") || !strings.Contains(card, "open_url") {
 		t.Fatalf("checkpoint issue reference is not clickable; want %q in %s", want, card)
 	}
 }

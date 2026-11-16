@@ -2007,8 +2007,8 @@ func TestProcessClaimedItemUsesIssueLockForIssueTargetedWorker(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ProcessClaimedItem() error = %v", err)
 	}
-	if result.Status != "skipped" {
-		t.Fatalf("result = %#v, want skipped", result)
+	if result.Status != "success" {
+		t.Fatalf("result = %#v, want success", result)
 	}
 	lock, err := fixture.repos.Locks.Get(context.Background(), "issue:acme/looper:28")
 	if err != nil {
@@ -4983,4 +4983,38 @@ func TestCreatePullRequestInputCarriesDisclosureIdentity(t *testing.T) {
 		t.Fatalf("Disclosure fields = %#v", gh.createPRCalls[0])
 	}
 	_ = disclosureCfg
+}
+
+func TestProcessClaimedItemManualPRCompletesLocalDelivery(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	git := &fakeGitGateway{}
+	github := &fakeGitHubGateway{}
+	var completed []RunCompletedInput
+	runner := New(Options{
+		DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git,
+		AgentExecutor: &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "已修复并验证问候语", ParseStatus: "parsed"}}},
+		Logger:        fixture.logger, Now: fixture.now, OpenPRStrategy: config.OpenPRStrategyManual, AllowAutoCommit: true,
+		OnRunCompleted: func(_ context.Context, input RunCompletedInput) error {
+			completed = append(completed, input)
+			return nil
+		},
+	})
+	claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "manual-pr", "worker")
+	if err != nil || claim == nil {
+		t.Fatalf("claim = %#v, error = %v", claim, err)
+	}
+	result, err := runner.ProcessClaimedItem(context.Background(), *claim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != "success" || !strings.Contains(result.Summary, "已修复并验证问候语") || !strings.Contains(result.Summary, "不自动创建 PR") {
+		t.Fatalf("result = %#v, want local delivery summary with manual PR note", result)
+	}
+	if len(completed) != 1 || completed[0].Status != "success" || completed[0].Summary != result.Summary {
+		t.Fatalf("completion notification = %#v, want successful local delivery", completed)
+	}
+	if len(git.pushCalls) != 0 || len(github.createPRCalls) != 0 || result.PullRequestNumber != 0 {
+		t.Fatal("manual PR delivery pushed or opened a PR")
+	}
 }

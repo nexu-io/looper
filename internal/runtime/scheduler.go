@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/nexu-io/looper/internal/executionhost"
+	"github.com/nexu-io/looper/internal/workerhost"
 	"math"
 	"net/http"
 	"net/url"
@@ -114,6 +116,7 @@ type defaultSchedulerTickInput struct {
 	Worker                   workerScheduler
 	Snapshotter              snapshotScheduler
 	Config                   *config.Config
+	NotificationGateway      *notify.Gateway
 	PlannerDiscoveryEnabled  *bool
 	CoordinatorEnabled       func(string) bool
 	ReviewerDiscoveryEnabled *bool
@@ -349,362 +352,6 @@ func mintTrustedReviewProxyForPR(realLooper string, trustedEnv map[string]string
 	return forge.StartTrustedReviewProxy(resolvedLooper, trustedEnv, allowedPRRef, allowedCwd, configSnapshot, policy, tracker)
 }
 
-func forgejoClientForRepo(cfg *config.Config, repo string) (*forge.ForgejoClient, bool, error) {
-	provider, ok, err := forgejoProviderForRepo(cfg, repo)
-	if !ok || err != nil {
-		return nil, ok, err
-	}
-	client, err := forge.NewForgejoClientFromConfig(provider, strings.TrimSpace(repo))
-	if err != nil {
-		return nil, true, err
-	}
-	return client, true, nil
-}
-
-// forgejoReviewerDiscoveryLabelsForRepo returns configured reviewer trigger
-// labels for a Forgejo project. Used as a discovery fallback when native
-// requested_reviewers alone is insufficient (label-triggered discovery or
-// instances without requested_reviewers support).
-func forgejoReviewerDiscoveryLabelsForRepo(cfg *config.Config, repo, cwd string) []string {
-	if cfg == nil {
-		return nil
-	}
-	repo = strings.TrimSpace(repo)
-	if strings.TrimSpace(cwd) != "" {
-		for _, project := range cfg.Projects {
-			if cwdBelongsToProject(project, cwd) {
-				return forgejoReviewerDiscoveryLabelsForProject(*cfg, project)
-			}
-		}
-	}
-	var matched *config.ProjectRefConfig
-	for _, project := range cfg.Projects {
-		if !strings.EqualFold(strings.TrimSpace(project.Repo), repo) {
-			continue
-		}
-		if matched != nil {
-			return nil
-		}
-		projectCopy := project
-		matched = &projectCopy
-	}
-	if matched != nil {
-		return forgejoReviewerDiscoveryLabelsForProject(*cfg, *matched)
-	}
-	return nil
-}
-
-func forgejoReviewerDiscoveryLabelsForProject(cfg config.Config, project config.ProjectRefConfig) []string {
-	if config.ResolvedProjectProviderKind(cfg, project) != config.ProviderKindForgejo {
-		return nil
-	}
-	labels := config.ProjectRoleConfigs(cfg, project.ID).Reviewer.Discovery.Triggers.Labels
-	result := make([]string, 0, len(labels))
-	for _, label := range labels {
-		label = strings.TrimSpace(label)
-		if label != "" {
-			result = append(result, label)
-		}
-	}
-	return result
-}
-
-// addForgejoPullRequestReviewers requests native reviewers and, when the project
-// is label-triggered, also applies discovery trigger labels so reviewer
-// auto-discovery still matches. If native request fails but labels are
-// configured, labels alone keep compatibility instances working.
-// When native request succeeds on a native-request-triggered project
-// (requireReviewRequest=true), label application is best-effort because
-// requested_reviewers already makes the PR discoverable. Label failure remains
-// fatal for label-triggered projects (requireReviewRequest=false with trigger
-// labels): discovery still filters by labels, so a missing label would leave
-// the handoff permanently undiscoverable if publish marked it done.
-func addForgejoPullRequestReviewers(ctx context.Context, client *forge.ForgejoClient, cfg *config.Config, repo string, prNumber int64, reviewers []string, cwd string) error {
-	labels := forgejoReviewerDiscoveryLabelsForRepo(cfg, repo, cwd)
-	nativeErr := client.AddPullRequestReviewers(ctx, prNumber, reviewers)
-	if nativeErr != nil && len(labels) == 0 {
-		return nativeErr
-	}
-	if len(labels) > 0 {
-		if _, err := client.AddIssueLabels(ctx, prNumber, labels); err != nil {
-			if nativeErr != nil {
-				return fmt.Errorf("forgejo native review request failed (%v); label fallback also failed: %w", nativeErr, err)
-			}
-			// Native request already succeeded. Only native-request-triggered
-			// discovery can treat labels as best-effort; label-triggered
-			// projects must keep the handoff retryable until labels land.
-			if forgejoReviewerRequireReviewRequestForRepo(cfg, repo, cwd) {
-				return nil
-			}
-			return err
-		}
-	}
-	return nil
-}
-
-// forgejoReviewerRequireReviewRequestForRepo reports whether reviewer discovery
-// for the matched Forgejo project requires a native review request. Defaults to
-// true when no unique project match exists (labels are also empty in that case).
-func forgejoReviewerRequireReviewRequestForRepo(cfg *config.Config, repo, cwd string) bool {
-	if cfg == nil {
-		return true
-	}
-	repo = strings.TrimSpace(repo)
-	if strings.TrimSpace(cwd) != "" {
-		for _, project := range cfg.Projects {
-			if cwdBelongsToProject(project, cwd) {
-				return forgejoReviewerRequireReviewRequestForProject(*cfg, project)
-			}
-		}
-	}
-	var matched *config.ProjectRefConfig
-	for _, project := range cfg.Projects {
-		if !strings.EqualFold(strings.TrimSpace(project.Repo), repo) {
-			continue
-		}
-		if matched != nil {
-			return true
-		}
-		projectCopy := project
-		matched = &projectCopy
-	}
-	if matched != nil {
-		return forgejoReviewerRequireReviewRequestForProject(*cfg, *matched)
-	}
-	return true
-}
-
-func forgejoReviewerRequireReviewRequestForProject(cfg config.Config, project config.ProjectRefConfig) bool {
-	if config.ResolvedProjectProviderKind(cfg, project) != config.ProviderKindForgejo {
-		return true
-	}
-	return config.ProjectRoleConfigs(cfg, project.ID).Reviewer.Discovery.Triggers.RequireReviewRequest
-}
-
-func forgejoClientForCWD(cfg *config.Config, cwd string) (*forge.ForgejoClient, bool, error) {
-	project, provider, ok, err := forgejoProjectProviderForCWD(cfg, cwd)
-	if !ok || err != nil {
-		return nil, ok, err
-	}
-	client, err := forge.NewForgejoClientFromConfig(provider, strings.TrimSpace(project.Repo))
-	if err != nil {
-		return nil, true, err
-	}
-	return client, true, nil
-}
-
-func forgejoProviderForRepo(cfg *config.Config, repo string) (config.ProviderConfig, bool, error) {
-	if cfg == nil {
-		return config.ProviderConfig{}, false, nil
-	}
-	repo = strings.TrimSpace(repo)
-	var matched *config.ProjectRefConfig
-	for _, project := range cfg.Projects {
-		if !strings.EqualFold(strings.TrimSpace(project.Repo), repo) {
-			continue
-		}
-		if matched != nil {
-			return config.ProviderConfig{}, false, fmt.Errorf("repository %s is bound to multiple projects; project path or id is required", repo)
-		}
-		projectCopy := project
-		matched = &projectCopy
-	}
-	if matched != nil {
-		if config.ResolvedProjectProviderKind(*cfg, *matched) != config.ProviderKindForgejo {
-			return config.ProviderConfig{}, false, nil
-		}
-		provider, ok := forgejoProviderByID(*cfg, matched.Provider)
-		if !ok {
-			return config.ProviderConfig{}, false, fmt.Errorf("forgejo provider %q not configured for repo %s", matched.Provider, repo)
-		}
-		return provider, true, nil
-	}
-	return config.ProviderConfig{}, false, nil
-}
-
-func forgejoProjectProviderForCWD(cfg *config.Config, cwd string) (config.ProjectRefConfig, config.ProviderConfig, bool, error) {
-	if cfg == nil {
-		return config.ProjectRefConfig{}, config.ProviderConfig{}, false, nil
-	}
-	project, matched, err := projectForCWD(*cfg, cwd)
-	if err != nil || !matched {
-		return config.ProjectRefConfig{}, config.ProviderConfig{}, false, err
-	}
-	if config.ResolvedProjectProviderKind(*cfg, project) != config.ProviderKindForgejo {
-		return config.ProjectRefConfig{}, config.ProviderConfig{}, false, nil
-	}
-	provider, ok := forgejoProviderByID(*cfg, project.Provider)
-	if !ok {
-		return config.ProjectRefConfig{}, config.ProviderConfig{}, false, fmt.Errorf("forgejo provider %q not configured for project %s", project.Provider, project.ID)
-	}
-	if strings.TrimSpace(project.Repo) == "" {
-		return config.ProjectRefConfig{}, config.ProviderConfig{}, false, fmt.Errorf("forgejo project %s is missing repo", project.ID)
-	}
-	return project, provider, true, nil
-}
-
-func projectForCWD(cfg config.Config, cwd string) (config.ProjectRefConfig, bool, error) {
-	matches := make([]config.ProjectRefConfig, 0, 1)
-	for _, project := range cfg.Projects {
-		if cwdBelongsToProject(project, cwd) {
-			matches = append(matches, project)
-		}
-	}
-	if len(matches) == 0 {
-		return config.ProjectRefConfig{}, false, nil
-	}
-	if len(matches) > 1 {
-		ids := make([]string, 0, len(matches))
-		for _, project := range matches {
-			ids = append(ids, project.ID)
-		}
-		return config.ProjectRefConfig{}, false, fmt.Errorf("working directory %s matches multiple projects: %s", strings.TrimSpace(cwd), strings.Join(ids, ", "))
-	}
-	return matches[0], true, nil
-}
-
-func cwdBelongsToProject(project config.ProjectRefConfig, cwd string) bool {
-	cwd = filepath.Clean(strings.TrimSpace(cwd))
-	if cwd == "." || cwd == "" {
-		return false
-	}
-	repoPath := filepath.Clean(strings.TrimSpace(project.RepoPath))
-	if repoPath != "." && cwd == repoPath {
-		return true
-	}
-	worktreeRoot := ""
-	if project.WorktreeRoot != nil {
-		worktreeRoot = strings.TrimSpace(*project.WorktreeRoot)
-	}
-	if worktreeRoot == "" {
-		resolved, err := config.DefaultProjectWorktreeRoot(project.ID, project.RepoPath)
-		if err != nil {
-			return false
-		}
-		worktreeRoot = resolved
-	}
-	worktreeRoot = filepath.Clean(worktreeRoot)
-	relative, err := filepath.Rel(worktreeRoot, cwd)
-	return err == nil && relative != "." && relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator))
-}
-
-func forgejoProviderByID(cfg config.Config, providerID string) (config.ProviderConfig, bool) {
-	providerID = strings.TrimSpace(providerID)
-	if providerID == "" {
-		return config.ProviderConfig{}, false
-	}
-	for _, provider := range cfg.Providers {
-		if provider.ID == providerID {
-			return provider, true
-		}
-	}
-	return config.ProviderConfig{}, false
-}
-
-// planeClientForRepo returns a Plane task-source client for a project whose
-// provider kind is "plane" and whose code repo (project.Repo, a GitHub repo)
-// matches repo. The second return is false when repo is not a plane project, in
-// which case callers fall through to the GitHub/forgejo path.
-func planeClientForRepo(cfg *config.Config, repo string) (*forge.PlaneClient, bool, error) {
-	provider, codeRepo, ok, err := planeProviderForRepo(cfg, repo)
-	if !ok || err != nil {
-		return nil, ok, err
-	}
-	client, err := forge.NewPlaneClientFromConfig(provider, codeRepo)
-	if err != nil {
-		return nil, true, err
-	}
-	return client, true, nil
-}
-
-func planeClientForCWD(cfg *config.Config, cwd string) (*forge.PlaneClient, bool, error) {
-	project, provider, ok, err := planeProjectProviderForCWD(cfg, cwd)
-	if !ok || err != nil {
-		return nil, ok, err
-	}
-	client, err := forge.NewPlaneClientFromConfig(provider, strings.TrimSpace(project.Repo))
-	if err != nil {
-		return nil, true, err
-	}
-	return client, true, nil
-}
-
-func planeProviderForRepo(cfg *config.Config, repo string) (config.ProviderConfig, string, bool, error) {
-	if cfg == nil {
-		return config.ProviderConfig{}, "", false, nil
-	}
-	repo = strings.TrimSpace(repo)
-	var matched *config.ProjectRefConfig
-	for _, project := range cfg.Projects {
-		if !strings.EqualFold(strings.TrimSpace(project.Repo), repo) {
-			continue
-		}
-		if matched != nil {
-			return config.ProviderConfig{}, "", false, fmt.Errorf("repository %s is bound to multiple projects; project path or id is required", repo)
-		}
-		projectCopy := project
-		matched = &projectCopy
-	}
-	if matched != nil {
-		if config.ResolvedProjectProviderKind(*cfg, *matched) != config.ProviderKindPlane {
-			return config.ProviderConfig{}, "", false, nil
-		}
-		provider, ok := forgejoProviderByID(*cfg, matched.Provider)
-		if !ok {
-			return config.ProviderConfig{}, "", false, fmt.Errorf("plane provider %q not configured for repo %s", matched.Provider, repo)
-		}
-		return provider, strings.TrimSpace(matched.Repo), true, nil
-	}
-	return config.ProviderConfig{}, "", false, nil
-}
-
-func planeProjectProviderForCWD(cfg *config.Config, cwd string) (config.ProjectRefConfig, config.ProviderConfig, bool, error) {
-	if cfg == nil {
-		return config.ProjectRefConfig{}, config.ProviderConfig{}, false, nil
-	}
-	project, matched, err := projectForCWD(*cfg, cwd)
-	if err != nil || !matched {
-		return config.ProjectRefConfig{}, config.ProviderConfig{}, false, err
-	}
-	if config.ResolvedProjectProviderKind(*cfg, project) != config.ProviderKindPlane {
-		return config.ProjectRefConfig{}, config.ProviderConfig{}, false, nil
-	}
-	provider, ok := forgejoProviderByID(*cfg, project.Provider)
-	if !ok {
-		return config.ProjectRefConfig{}, config.ProviderConfig{}, false, fmt.Errorf("plane provider %q not configured for project %s", project.Provider, project.ID)
-	}
-	if strings.TrimSpace(project.Repo) == "" {
-		return config.ProjectRefConfig{}, config.ProviderConfig{}, false, fmt.Errorf("plane project %s is missing repo", project.ID)
-	}
-	return project, provider, true, nil
-}
-
-func forgeIdentityLogins(identities []forge.Identity) []string {
-	if identities == nil {
-		return nil
-	}
-	logins := make([]string, 0, len(identities))
-	for _, identity := range identities {
-		if login := strings.TrimSpace(identity.Login); login != "" {
-			logins = append(logins, login)
-		}
-	}
-	return logins
-}
-
-func forgeLabelNames(labels []forge.Label) []string {
-	if labels == nil {
-		return nil
-	}
-	names := make([]string, 0, len(labels))
-	for _, label := range labels {
-		if name := strings.TrimSpace(label.Name); name != "" {
-			names = append(names, name)
-		}
-	}
-	return names
-}
-
 func forgeReviewContext(ctx context.Context, client *forge.ForgejoClient, pr forge.PullRequest, compatibilityFallback bool) ([]string, []networkpolicy.GitHubUser, []map[string]any, string, error) {
 	requested := pr.Reviewers
 	reviews, err := client.ListPullRequestReviews(ctx, pr.Number)
@@ -739,14 +386,14 @@ func forgeReviewContext(ctx context.Context, client *forge.ForgejoClient, pr for
 			decision = "APPROVED"
 		}
 	}
-	return forgeIdentityLogins(requested), forgeNetworkPolicyUsers(requested), objects, decision, nil
+	return workerhost.ForgeIdentityLogins(requested), workerhost.ForgeNetworkPolicyUsers(requested), objects, decision, nil
 }
 
 func forgejoSummaryCommentMode(cfg *config.Config, repo, cwd string) bool {
 	if cfg == nil {
 		return false
 	}
-	project, matched, err := projectForCWD(*cfg, cwd)
+	project, matched, err := workerhost.ProjectForCWD(*cfg, cwd)
 	if err != nil {
 		return false
 	}
@@ -775,19 +422,8 @@ func appendLabels(label string, labels []string) []string {
 	return result
 }
 
-func forgeNetworkPolicyUsers(users []forge.Identity) []networkpolicy.GitHubUser {
-	if users == nil {
-		return nil
-	}
-	converted := make([]networkpolicy.GitHubUser, 0, len(users))
-	for _, user := range users {
-		converted = append(converted, networkpolicy.GitHubUser{Login: user.Login, ID: user.ID})
-	}
-	return converted
-}
-
 func (a plannerGitHubAdapter) forgejo(ctx context.Context, repo string, cwd ...string) (*forge.ForgejoClient, bool, error) {
-	client, ok, err := forgeClientForLocation(a.config, repo, cwd, forgejoClientForCWD, forgejoClientForRepo)
+	client, ok, err := workerhost.ForgeClientForLocation(a.config, repo, cwd, workerhost.ForgejoClientForCWD, workerhost.ForgejoClientForRepo)
 	return client, ok, err
 }
 
@@ -795,27 +431,8 @@ func (a plannerGitHubAdapter) forgejo(ctx context.Context, repo string, cwd ...s
 // project. Issue-side reads/mutations for such projects are served by Plane;
 // pull-request operations are left to the GitHub path (repo is the code repo).
 func (a plannerGitHubAdapter) plane(ctx context.Context, repo string, cwd ...string) (*forge.PlaneClient, bool, error) {
-	client, ok, err := forgeClientForLocation(a.config, repo, cwd, planeClientForCWD, planeClientForRepo)
+	client, ok, err := workerhost.ForgeClientForLocation(a.config, repo, cwd, workerhost.PlaneClientForCWD, workerhost.PlaneClientForRepo)
 	return client, ok, err
-}
-
-func forgeClientForLocation[T any](cfg *config.Config, repo string, cwd []string, byCWD func(*config.Config, string) (*T, bool, error), byRepo func(*config.Config, string) (*T, bool, error)) (*T, bool, error) {
-	if len(cwd) > 0 && strings.TrimSpace(cwd[0]) != "" {
-		client, ok, err := byCWD(cfg, cwd[0])
-		if ok || err != nil {
-			return client, ok, err
-		}
-		// A configured project path is authoritative even when it belongs to
-		// GitHub; do not fall through and select a same-slug Forgejo project.
-		if cfg != nil {
-			for _, project := range cfg.Projects {
-				if cwdBelongsToProject(project, cwd[0]) {
-					return nil, false, nil
-				}
-			}
-		}
-	}
-	return byRepo(cfg, repo)
 }
 
 func (a plannerGitHubAdapter) ListOpenIssues(ctx context.Context, input planner.ListOpenIssuesInput) ([]planner.IssueSummary, error) {
@@ -829,7 +446,7 @@ func (a plannerGitHubAdapter) ListOpenIssues(ctx context.Context, input planner.
 		}
 		result := make([]planner.IssueSummary, 0, len(issues))
 		for _, issue := range issues {
-			result = append(result, planner.IssueSummary{Number: issue.Number, Title: issue.Title, Body: issue.Body, URL: issue.HTMLURL, Assignees: forgeIdentityLogins(issue.Assignees), Labels: forgeLabelNames(issue.Labels), StrictDispatchID: issue.StrictDispatchID})
+			result = append(result, planner.IssueSummary{Number: issue.Number, Title: issue.Title, Body: issue.Body, URL: issue.HTMLURL, Assignees: workerhost.ForgeIdentityLogins(issue.Assignees), Labels: workerhost.ForgeLabelNames(issue.Labels), StrictDispatchID: issue.StrictDispatchID})
 		}
 		return result, nil
 	}
@@ -843,7 +460,7 @@ func (a plannerGitHubAdapter) ListOpenIssues(ctx context.Context, input planner.
 		}
 		result := make([]planner.IssueSummary, 0, len(issues))
 		for _, issue := range issues {
-			result = append(result, planner.IssueSummary{Number: issue.Number, Title: issue.Title, Body: issue.Body, URL: issue.HTMLURL, Assignees: forgeIdentityLogins(issue.Assignees), Labels: forgeLabelNames(issue.Labels)})
+			result = append(result, planner.IssueSummary{Number: issue.Number, Title: issue.Title, Body: issue.Body, URL: issue.HTMLURL, Assignees: workerhost.ForgeIdentityLogins(issue.Assignees), Labels: workerhost.ForgeLabelNames(issue.Labels)})
 		}
 		return result, nil
 	}
@@ -916,7 +533,7 @@ func (a plannerGitHubAdapter) ViewIssue(ctx context.Context, input planner.ViewI
 		if err != nil {
 			return planner.IssueDetail{}, err
 		}
-		return planner.IssueDetail{Number: issue.Number, Title: issue.Title, Body: issue.Body, URL: issue.HTMLURL, Assignees: forgeIdentityLogins(issue.Assignees), Labels: forgeLabelNames(issue.Labels)}, nil
+		return planner.IssueDetail{Number: issue.Number, Title: issue.Title, Body: issue.Body, URL: issue.HTMLURL, Assignees: workerhost.ForgeIdentityLogins(issue.Assignees), Labels: workerhost.ForgeLabelNames(issue.Labels)}, nil
 	}
 	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
@@ -926,7 +543,7 @@ func (a plannerGitHubAdapter) ViewIssue(ctx context.Context, input planner.ViewI
 		if err != nil {
 			return planner.IssueDetail{}, err
 		}
-		return planner.IssueDetail{Number: issue.Number, Title: issue.Title, Body: issue.Body, URL: issue.HTMLURL, Assignees: forgeIdentityLogins(issue.Assignees), Labels: forgeLabelNames(issue.Labels)}, nil
+		return planner.IssueDetail{Number: issue.Number, Title: issue.Title, Body: issue.Body, URL: issue.HTMLURL, Assignees: workerhost.ForgeIdentityLogins(issue.Assignees), Labels: workerhost.ForgeLabelNames(issue.Labels)}, nil
 	}
 	if a.gateway == nil {
 		return planner.IssueDetail{}, fmt.Errorf("github gateway is not configured")
@@ -939,14 +556,14 @@ func (a plannerGitHubAdapter) ViewIssue(ctx context.Context, input planner.ViewI
 }
 
 func (a plannerGitHubAdapter) GetCurrentUserLogin(ctx context.Context, cwd string) (string, error) {
-	if client, ok, err := planeClientForCWD(a.config, cwd); ok || err != nil {
+	if client, ok, err := workerhost.PlaneClientForCWD(a.config, cwd); ok || err != nil {
 		if err != nil {
 			return "", err
 		}
 		identity, err := client.CurrentUser(ctx)
 		return identity.Login, err
 	}
-	if client, ok, err := forgejoClientForCWD(a.config, cwd); ok || err != nil {
+	if client, ok, err := workerhost.ForgejoClientForCWD(a.config, cwd); ok || err != nil {
 		if err != nil {
 			return "", err
 		}
@@ -976,17 +593,6 @@ func (a plannerGitHubAdapter) AddIssueAssignees(ctx context.Context, input plann
 		return fmt.Errorf("github gateway is not configured")
 	}
 	return a.gateway.AddIssueAssignees(ctx, githubinfra.IssueAssigneesInput{Repo: input.Repo, IssueNumber: input.IssueNumber, Assignees: input.Assignees, CWD: input.CWD})
-}
-
-func networkPolicyUsers(users []githubinfra.GitHubUser) []networkpolicy.GitHubUser {
-	if users == nil {
-		return nil
-	}
-	converted := make([]networkpolicy.GitHubUser, 0, len(users))
-	for _, user := range users {
-		converted = append(converted, networkpolicy.GitHubUser{Login: user.Login, ID: user.ID})
-	}
-	return converted
 }
 
 func (a plannerGitHubAdapter) ListOpenPullRequests(ctx context.Context, input planner.ListOpenPullRequestsInput) ([]planner.PullRequestSummary, error) {
@@ -1027,7 +633,7 @@ func (a plannerGitHubAdapter) ViewPullRequest(ctx context.Context, input planner
 		if err != nil {
 			return planner.PullRequestDetail{}, err
 		}
-		return planner.PullRequestDetail{Number: pr.Number, Title: pr.Title, Body: pr.Body, URL: pr.HTMLURL, State: pr.State, Labels: forgeLabelNames(pr.Labels), HeadRefName: pr.Head.Name, BaseRefName: pr.Base.Name}, nil
+		return planner.PullRequestDetail{Number: pr.Number, Title: pr.Title, Body: pr.Body, URL: pr.HTMLURL, State: pr.State, Labels: workerhost.ForgeLabelNames(pr.Labels), HeadRefName: pr.Head.Name, BaseRefName: pr.Base.Name}, nil
 	}
 	if a.gateway == nil {
 		return planner.PullRequestDetail{}, fmt.Errorf("github gateway is not configured")
@@ -1095,7 +701,7 @@ func (a plannerGitHubAdapter) AddPullRequestReviewers(ctx context.Context, input
 		if err != nil {
 			return err
 		}
-		return addForgejoPullRequestReviewers(ctx, client, a.config, input.Repo, input.PRNumber, input.Reviewers, input.CWD)
+		return workerhost.AddForgejoPullRequestReviewers(ctx, client, a.config, input.Repo, input.PRNumber, input.Reviewers, input.CWD)
 	}
 	if a.gateway == nil {
 		return fmt.Errorf("github gateway is not configured")
@@ -1190,7 +796,7 @@ type reviewerGitHubAdapter struct {
 }
 
 func (a reviewerGitHubAdapter) forgejo(ctx context.Context, repo string, cwd ...string) (*forge.ForgejoClient, bool, error) {
-	client, ok, err := forgeClientForLocation(a.config, repo, cwd, forgejoClientForCWD, forgejoClientForRepo)
+	client, ok, err := workerhost.ForgeClientForLocation(a.config, repo, cwd, workerhost.ForgejoClientForCWD, workerhost.ForgejoClientForRepo)
 	return client, ok, err
 }
 
@@ -1213,7 +819,7 @@ func (a reviewerGitHubAdapter) ListOpenPullRequests(ctx context.Context, input r
 			if err != nil {
 				return nil, err
 			}
-			result = append(result, reviewer.PullRequestSummary{Number: pr.Number, Title: pr.Title, State: pr.State, IsDraft: pr.IsDraft, ReviewDecision: decision, Labels: forgeLabelNames(pr.Labels), HeadSHA: pr.Head.SHA, BaseSHA: pr.Base.SHA, Author: pr.User.Login, ReviewRequests: requests, ReviewRequestUsers: requestUsers, Reviews: reviews})
+			result = append(result, reviewer.PullRequestSummary{Number: pr.Number, Title: pr.Title, State: pr.State, IsDraft: pr.IsDraft, ReviewDecision: decision, Labels: workerhost.ForgeLabelNames(pr.Labels), HeadSHA: pr.Head.SHA, BaseSHA: pr.Base.SHA, Author: pr.User.Login, ReviewRequests: requests, ReviewRequestUsers: requestUsers, Reviews: reviews})
 		}
 		return result, nil
 	}
@@ -1226,7 +832,7 @@ func (a reviewerGitHubAdapter) ListOpenPullRequests(ctx context.Context, input r
 	}
 	result := make([]reviewer.PullRequestSummary, 0, len(pullRequests))
 	for _, pr := range pullRequests {
-		result = append(result, reviewer.PullRequestSummary{Number: pr.Number, Title: pr.Title, State: pr.State, IsDraft: pr.IsDraft, ReviewDecision: pr.ReviewDecision, Labels: pr.Labels, HeadSHA: pr.HeadSHA, BaseSHA: pr.BaseSHA, HasConflicts: pr.HasConflicts, Author: pr.Author, ReviewRequests: pr.ReviewRequests, ReviewRequestUsers: networkPolicyUsers(pr.ReviewRequestUsers), Reviews: pr.Reviews})
+		result = append(result, reviewer.PullRequestSummary{Number: pr.Number, Title: pr.Title, State: pr.State, IsDraft: pr.IsDraft, ReviewDecision: pr.ReviewDecision, Labels: pr.Labels, HeadSHA: pr.HeadSHA, BaseSHA: pr.BaseSHA, HasConflicts: pr.HasConflicts, Author: pr.Author, ReviewRequests: pr.ReviewRequests, ReviewRequestUsers: workerhost.NetworkPolicyUsers(pr.ReviewRequestUsers), Reviews: pr.Reviews})
 	}
 	return result, nil
 }
@@ -1246,7 +852,7 @@ func (a reviewerGitHubAdapter) ListReviewRequestedPullRequests(ctx context.Conte
 			if err != nil {
 				return nil, err
 			}
-			result = append(result, reviewer.PullRequestSummary{Number: pr.Number, Title: pr.Title, State: pr.State, IsDraft: pr.IsDraft, ReviewDecision: decision, Labels: forgeLabelNames(pr.Labels), HeadSHA: pr.Head.SHA, BaseSHA: pr.Base.SHA, Author: pr.User.Login, ReviewRequests: requests, ReviewRequestUsers: requestUsers, Reviews: reviews})
+			result = append(result, reviewer.PullRequestSummary{Number: pr.Number, Title: pr.Title, State: pr.State, IsDraft: pr.IsDraft, ReviewDecision: decision, Labels: workerhost.ForgeLabelNames(pr.Labels), HeadSHA: pr.Head.SHA, BaseSHA: pr.Base.SHA, Author: pr.User.Login, ReviewRequests: requests, ReviewRequestUsers: requestUsers, Reviews: reviews})
 		}
 		return result, nil
 	}
@@ -1259,13 +865,13 @@ func (a reviewerGitHubAdapter) ListReviewRequestedPullRequests(ctx context.Conte
 	}
 	result := make([]reviewer.PullRequestSummary, 0, len(pullRequests))
 	for _, pr := range pullRequests {
-		result = append(result, reviewer.PullRequestSummary{Number: pr.Number, Title: pr.Title, State: pr.State, IsDraft: pr.IsDraft, ReviewDecision: pr.ReviewDecision, Labels: pr.Labels, HeadSHA: pr.HeadSHA, BaseSHA: pr.BaseSHA, HasConflicts: pr.HasConflicts, Author: pr.Author, ReviewRequests: pr.ReviewRequests, ReviewRequestUsers: networkPolicyUsers(pr.ReviewRequestUsers), Reviews: pr.Reviews})
+		result = append(result, reviewer.PullRequestSummary{Number: pr.Number, Title: pr.Title, State: pr.State, IsDraft: pr.IsDraft, ReviewDecision: pr.ReviewDecision, Labels: pr.Labels, HeadSHA: pr.HeadSHA, BaseSHA: pr.BaseSHA, HasConflicts: pr.HasConflicts, Author: pr.Author, ReviewRequests: pr.ReviewRequests, ReviewRequestUsers: workerhost.NetworkPolicyUsers(pr.ReviewRequestUsers), Reviews: pr.Reviews})
 	}
 	return result, nil
 }
 
 func (a reviewerGitHubAdapter) GetCurrentUserLogin(ctx context.Context, cwd string) (string, error) {
-	if client, ok, err := forgejoClientForCWD(a.config, cwd); ok || err != nil {
+	if client, ok, err := workerhost.ForgejoClientForCWD(a.config, cwd); ok || err != nil {
 		if err != nil {
 			return "", err
 		}
@@ -1299,7 +905,7 @@ func (a reviewerGitHubAdapter) ViewPullRequest(ctx context.Context, input review
 		if err != nil {
 			return reviewer.PullRequestDetail{}, err
 		}
-		return reviewer.PullRequestDetail{Number: pr.Number, Title: pr.Title, Body: pr.Body, State: pr.State, IsDraft: pr.IsDraft, ReviewDecision: decision, Labels: forgeLabelNames(pr.Labels), HeadSHA: pr.Head.SHA, BaseSHA: pr.Base.SHA, HeadRefName: pr.Head.Name, BaseRefName: pr.Base.Name, Author: pr.User.Login, ReviewRequests: requests, ReviewRequestUsers: requestUsers, Diff: diff, IssueComments: forgeCommentsToObjects(comments), Reviews: reviews}, nil
+		return reviewer.PullRequestDetail{Number: pr.Number, Title: pr.Title, Body: pr.Body, State: pr.State, IsDraft: pr.IsDraft, ReviewDecision: decision, Labels: workerhost.ForgeLabelNames(pr.Labels), HeadSHA: pr.Head.SHA, BaseSHA: pr.Base.SHA, HeadRefName: pr.Head.Name, BaseRefName: pr.Base.Name, Author: pr.User.Login, ReviewRequests: requests, ReviewRequestUsers: requestUsers, Diff: diff, IssueComments: forgeCommentsToObjects(comments), Reviews: reviews}, nil
 	}
 	if a.gateway == nil {
 		return reviewer.PullRequestDetail{}, fmt.Errorf("github gateway is not configured")
@@ -1308,7 +914,7 @@ func (a reviewerGitHubAdapter) ViewPullRequest(ctx context.Context, input review
 	if err != nil {
 		return reviewer.PullRequestDetail{}, err
 	}
-	return reviewer.PullRequestDetail{Number: detail.Number, Title: detail.Title, Body: detail.Body, State: detail.State, IsDraft: detail.IsDraft, ReviewDecision: detail.ReviewDecision, Labels: detail.Labels, HeadSHA: detail.HeadSHA, BaseSHA: detail.BaseSHA, HeadRefName: detail.HeadRefName, BaseRefName: detail.BaseRefName, Author: detail.Author, ReviewRequests: detail.ReviewRequests, ReviewRequestUsers: networkPolicyUsers(detail.ReviewRequestUsers), HasConflicts: detail.HasConflicts, ChecksSummary: summarizeCheckStates(detail.Checks), Comments: detail.Comments, IssueComments: commentInfosToObjects(detail.IssueComments), Reviews: detail.Reviews}, nil
+	return reviewer.PullRequestDetail{Number: detail.Number, Title: detail.Title, Body: detail.Body, State: detail.State, IsDraft: detail.IsDraft, ReviewDecision: detail.ReviewDecision, Labels: detail.Labels, HeadSHA: detail.HeadSHA, BaseSHA: detail.BaseSHA, HeadRefName: detail.HeadRefName, BaseRefName: detail.BaseRefName, Author: detail.Author, ReviewRequests: detail.ReviewRequests, ReviewRequestUsers: workerhost.NetworkPolicyUsers(detail.ReviewRequestUsers), HasConflicts: detail.HasConflicts, ChecksSummary: summarizeCheckStates(detail.Checks), Comments: detail.Comments, IssueComments: commentInfosToObjects(detail.IssueComments), Reviews: detail.Reviews}, nil
 }
 
 func (a reviewerGitHubAdapter) ViewIssue(ctx context.Context, input githubinfra.ViewIssueInput) (githubinfra.IssueDetail, error) {
@@ -1320,7 +926,7 @@ func (a reviewerGitHubAdapter) ViewIssue(ctx context.Context, input githubinfra.
 		if err != nil {
 			return githubinfra.IssueDetail{}, err
 		}
-		return githubinfra.IssueDetail{Number: issue.Number, Title: issue.Title, Body: issue.Body, URL: issue.HTMLURL, State: issue.State, Labels: forgeLabelNames(issue.Labels), Assignees: forgeIdentityLogins(issue.Assignees), Author: issue.User.Login}, nil
+		return githubinfra.IssueDetail{Number: issue.Number, Title: issue.Title, Body: issue.Body, URL: issue.HTMLURL, State: issue.State, Labels: workerhost.ForgeLabelNames(issue.Labels), Assignees: workerhost.ForgeIdentityLogins(issue.Assignees), Author: issue.User.Login}, nil
 	}
 	if a.gateway == nil {
 		return githubinfra.IssueDetail{}, fmt.Errorf("github gateway is not configured")
@@ -2110,12 +1716,12 @@ type fixerGitHubAdapter struct {
 }
 
 func (a fixerGitHubAdapter) forgejo(ctx context.Context, repo string, cwd ...string) (*forge.ForgejoClient, bool, error) {
-	client, ok, err := forgeClientForLocation(a.config, repo, cwd, forgejoClientForCWD, forgejoClientForRepo)
+	client, ok, err := workerhost.ForgeClientForLocation(a.config, repo, cwd, workerhost.ForgejoClientForCWD, workerhost.ForgejoClientForRepo)
 	return client, ok, err
 }
 
 func (a fixerGitHubAdapter) forgejoForCWD(ctx context.Context, cwd string) (*forge.ForgejoClient, bool, error) {
-	client, ok, err := forgejoClientForCWD(a.config, cwd)
+	client, ok, err := workerhost.ForgejoClientForCWD(a.config, cwd)
 	return client, ok, err
 }
 
@@ -2147,7 +1753,7 @@ func (a fixerGitHubAdapter) ListOpenPullRequests(ctx context.Context, input fixe
 			if input.BaseRefName != "" && pr.Base.Name != input.BaseRefName {
 				continue
 			}
-			result = append(result, fixer.PullRequestSummary{Number: pr.Number, State: pr.State, IsDraft: pr.IsDraft, Labels: forgeLabelNames(pr.Labels), BaseRefName: pr.Base.Name, HeadSHA: pr.Head.SHA, Author: pr.User.Login})
+			result = append(result, fixer.PullRequestSummary{Number: pr.Number, State: pr.State, IsDraft: pr.IsDraft, Labels: workerhost.ForgeLabelNames(pr.Labels), BaseRefName: pr.Base.Name, HeadSHA: pr.Head.SHA, Author: pr.User.Login})
 			if len(result) >= effectiveLimit {
 				break
 			}
@@ -2203,7 +1809,7 @@ func (a fixerGitHubAdapter) ViewPullRequest(ctx context.Context, input fixer.Vie
 		if err != nil {
 			return fixer.PullRequestDetail{}, err
 		}
-		return fixer.PullRequestDetail{Number: pr.Number, State: pr.State, IsDraft: pr.IsDraft, Labels: forgeLabelNames(pr.Labels), HeadSHA: pr.Head.SHA, HeadRefName: pr.Head.Name, BaseRefName: pr.Base.Name, BaseSHA: pr.Base.SHA, IssueComments: forgeCommentsToObjects(comments), Author: pr.User.Login}, nil
+		return fixer.PullRequestDetail{Number: pr.Number, State: pr.State, IsDraft: pr.IsDraft, Labels: workerhost.ForgeLabelNames(pr.Labels), HeadSHA: pr.Head.SHA, HeadRefName: pr.Head.Name, BaseRefName: pr.Base.Name, BaseSHA: pr.Base.SHA, IssueComments: forgeCommentsToObjects(comments), Author: pr.User.Login}, nil
 	}
 	detail, err := a.gateway.ViewPullRequestForFixer(ctx, githubinfra.ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD})
 	if err != nil {
@@ -2322,7 +1928,7 @@ func (a fixerGitHubAdapter) ListNativeReviewComments(ctx context.Context, input 
 }
 
 func (a fixerGitHubAdapter) ProbeNativeReviewCommentResolution(ctx context.Context, input fixer.ListNativeReviewCommentsInput) (forge.ProbeState, error) {
-	_, provider, ok, err := forgejoProjectProviderForCWD(a.config, input.CWD)
+	_, provider, ok, err := workerhost.ForgejoProjectProviderForCWD(a.config, input.CWD)
 	if err != nil {
 		return forge.ProbeStateUnknown, err
 	}
@@ -2527,302 +2133,6 @@ func (a fixerAgentExecutorAdapter) Start(ctx context.Context, input fixer.AgentR
 	}}, nil
 }
 
-type workerGitHubAdapter struct {
-	gateway *githubinfra.Gateway
-	stamper disclosure.Stamper
-	config  *config.Config
-}
-
-func (a workerGitHubAdapter) forgejo(ctx context.Context, repo string, cwd ...string) (*forge.ForgejoClient, bool, error) {
-	client, ok, err := forgeClientForLocation(a.config, repo, cwd, forgejoClientForCWD, forgejoClientForRepo)
-	return client, ok, err
-}
-
-// plane returns a Plane task-source client when repo belongs to a plane-kind
-// project. The worker reads issues and posts issue-side comments/labels through
-// Plane; pull-request creation stays on the GitHub code repo.
-func (a workerGitHubAdapter) plane(ctx context.Context, repo string, cwd ...string) (*forge.PlaneClient, bool, error) {
-	client, ok, err := forgeClientForLocation(a.config, repo, cwd, planeClientForCWD, planeClientForRepo)
-	return client, ok, err
-}
-
-func (a workerGitHubAdapter) ListOpenPullRequests(ctx context.Context, input worker.ListOpenPullRequestsInput) ([]worker.PullRequestSummary, error) {
-	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
-		if err != nil {
-			return nil, err
-		}
-		pullRequests, err := client.ListOpenPullRequests(ctx, forge.ListPullRequestsInput{Limit: input.Limit})
-		if err != nil {
-			return nil, err
-		}
-		result := make([]worker.PullRequestSummary, 0, len(pullRequests))
-		for _, pr := range pullRequests {
-			result = append(result, worker.PullRequestSummary{Number: pr.Number, URL: pr.HTMLURL, State: pr.State, HeadRefName: pr.Head.Name, BaseRefName: pr.Base.Name})
-		}
-		return result, nil
-	}
-	if a.gateway == nil {
-		return nil, fmt.Errorf("github gateway is not configured")
-	}
-	pullRequests, err := a.gateway.ListOpenPullRequests(ctx, githubinfra.ListOpenPullRequestsInput{
-		Repo:       input.Repo,
-		CWD:        input.CWD,
-		Limit:      input.Limit,
-		Label:      input.Label,
-		PreferREST: true,
-	})
-	if err != nil {
-		return nil, err
-	}
-	result := make([]worker.PullRequestSummary, 0, len(pullRequests))
-	for _, pr := range pullRequests {
-		result = append(result, worker.PullRequestSummary{Number: pr.Number, URL: pr.URL, State: pr.State, HeadRefName: pr.HeadRefName, BaseRefName: pr.BaseRefName})
-	}
-	return result, nil
-}
-
-func (a workerGitHubAdapter) ListOpenIssues(ctx context.Context, input worker.ListOpenIssuesInput) ([]worker.IssueSummary, error) {
-	if client, ok, err := a.plane(ctx, input.Repo, input.CWD); ok || err != nil {
-		if err != nil {
-			return nil, err
-		}
-		issues, err := client.ListStrictDispatchIssues(ctx, forge.ListIssuesInput{Labels: input.Labels, Assignee: input.Assignee, Limit: input.Limit}, "worker")
-		if err != nil {
-			return nil, err
-		}
-		result := make([]worker.IssueSummary, 0, len(issues))
-		for _, issue := range issues {
-			result = append(result, worker.IssueSummary{Number: issue.Number, Title: issue.Title, Body: issue.Body, URL: issue.HTMLURL, Assignees: forgeIdentityLogins(issue.Assignees), AssigneeUsers: forgeNetworkPolicyUsers(issue.Assignees), Labels: forgeLabelNames(issue.Labels), StrictDispatchID: issue.StrictDispatchID})
-		}
-		return result, nil
-	}
-	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
-		if err != nil {
-			return nil, err
-		}
-		issues, err := client.ListOpenIssues(ctx, forge.ListIssuesInput{Labels: input.Labels, Assignee: input.Assignee, Limit: input.Limit})
-		if err != nil {
-			return nil, err
-		}
-		result := make([]worker.IssueSummary, 0, len(issues))
-		for _, issue := range issues {
-			result = append(result, worker.IssueSummary{Number: issue.Number, Title: issue.Title, Body: issue.Body, URL: issue.HTMLURL, Assignees: forgeIdentityLogins(issue.Assignees), AssigneeUsers: forgeNetworkPolicyUsers(issue.Assignees), Labels: forgeLabelNames(issue.Labels)})
-		}
-		return result, nil
-	}
-	if a.gateway == nil {
-		return nil, fmt.Errorf("github gateway is not configured")
-	}
-	issues, err := a.gateway.ListOpenIssues(ctx, githubinfra.ListOpenIssuesInput{Repo: input.Repo, CWD: input.CWD, Limit: input.Limit, Assignee: input.Assignee, Label: input.Label, Labels: input.Labels})
-	if err != nil {
-		return nil, err
-	}
-	result := make([]worker.IssueSummary, 0, len(issues))
-	for _, issue := range issues {
-		result = append(result, worker.IssueSummary{Number: issue.Number, Title: issue.Title, Body: issue.Body, URL: issue.URL, Author: issue.Author, Assignees: issue.Assignees, AssigneeUsers: networkPolicyUsers(issue.AssigneeUsers), Labels: issue.Labels})
-	}
-	return result, nil
-}
-
-func (a workerGitHubAdapter) TransitionStrictDispatch(ctx context.Context, input worker.StrictDispatchTransitionInput) error {
-	client, ok, err := a.plane(ctx, input.Repo, input.CWD)
-	if err != nil {
-		return err
-	}
-	if !ok {
-		return fmt.Errorf("strict dispatch requires a Plane provider")
-	}
-	return client.TransitionStrictDispatch(ctx, input.DispatchID, input.State, input.WaitKind)
-}
-
-func (a workerGitHubAdapter) GetCurrentUserLogin(ctx context.Context, cwd string) (string, error) {
-	if client, ok, err := planeClientForCWD(a.config, cwd); ok || err != nil {
-		if err != nil {
-			return "", err
-		}
-		identity, err := client.CurrentUser(ctx)
-		return identity.Login, err
-	}
-	if client, ok, err := forgejoClientForCWD(a.config, cwd); ok || err != nil {
-		if err != nil {
-			return "", err
-		}
-		identity, err := client.CurrentUser(ctx)
-		return identity.Login, err
-	}
-	if a.gateway == nil {
-		return "", fmt.Errorf("github gateway is not configured")
-	}
-	return a.gateway.GetCurrentUserLogin(ctx, cwd)
-}
-
-func (a workerGitHubAdapter) AddIssueAssignees(ctx context.Context, input worker.IssueAssigneesInput) error {
-	if client, ok, err := a.plane(ctx, input.Repo, input.CWD); ok || err != nil {
-		if err != nil {
-			return err
-		}
-		return client.AddIssueAssignees(ctx, input.IssueNumber, input.Assignees)
-	}
-	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
-		if err != nil {
-			return err
-		}
-		return client.AddIssueAssignees(ctx, input.IssueNumber, input.Assignees)
-	}
-	if a.gateway == nil {
-		return fmt.Errorf("github gateway is not configured")
-	}
-	return a.gateway.AddIssueAssignees(ctx, githubinfra.IssueAssigneesInput{Repo: input.Repo, IssueNumber: input.IssueNumber, Assignees: input.Assignees, CWD: input.CWD})
-}
-
-func (a workerGitHubAdapter) ViewPullRequest(ctx context.Context, input worker.ViewPullRequestInput) (worker.PullRequestDetail, error) {
-	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
-		if err != nil {
-			return worker.PullRequestDetail{}, err
-		}
-		pr, err := client.ViewPullRequest(ctx, input.PRNumber)
-		if err != nil {
-			return worker.PullRequestDetail{}, err
-		}
-		return worker.PullRequestDetail{Number: pr.Number, Title: pr.Title, Body: pr.Body, URL: pr.HTMLURL, State: pr.State, HeadRefName: pr.Head.Name, BaseRefName: pr.Base.Name, HeadSHA: pr.Head.SHA, Labels: forgeLabelNames(pr.Labels)}, nil
-	}
-	if a.gateway == nil {
-		return worker.PullRequestDetail{}, fmt.Errorf("github gateway is not configured")
-	}
-	detail, err := a.gateway.ViewPullRequest(ctx, githubinfra.ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD})
-	if err != nil {
-		return worker.PullRequestDetail{}, err
-	}
-	return worker.PullRequestDetail{Number: detail.Number, Title: detail.Title, Body: detail.Body, URL: detail.URL, State: detail.State, HeadRefName: detail.HeadRefName, BaseRefName: detail.BaseRefName, HeadSHA: detail.HeadSHA, Labels: append([]string(nil), detail.Labels...), ReviewRequests: detail.ReviewRequests, ReviewRequestUsers: networkPolicyUsers(detail.ReviewRequestUsers)}, nil
-}
-
-func (a workerGitHubAdapter) ViewIssue(ctx context.Context, input worker.ViewIssueInput) (worker.IssueDetail, error) {
-	if client, ok, err := a.plane(ctx, input.Repo, input.CWD); ok || err != nil {
-		if err != nil {
-			return worker.IssueDetail{}, err
-		}
-		issue, err := client.ViewIssue(ctx, input.IssueNumber)
-		if err != nil {
-			return worker.IssueDetail{}, err
-		}
-		return worker.IssueDetail{Number: issue.Number, Title: issue.Title, Body: issue.Body, URL: issue.HTMLURL, State: issue.State, AssigneeUsers: forgeNetworkPolicyUsers(issue.Assignees), Labels: forgeLabelNames(issue.Labels)}, nil
-	}
-	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
-		if err != nil {
-			return worker.IssueDetail{}, err
-		}
-		issue, err := client.ViewIssue(ctx, input.IssueNumber)
-		if err != nil {
-			return worker.IssueDetail{}, err
-		}
-		return worker.IssueDetail{Number: issue.Number, Title: issue.Title, Body: issue.Body, URL: issue.HTMLURL, State: issue.State, AssigneeUsers: forgeNetworkPolicyUsers(issue.Assignees), Labels: forgeLabelNames(issue.Labels)}, nil
-	}
-	if a.gateway == nil {
-		return worker.IssueDetail{}, fmt.Errorf("github gateway is not configured")
-	}
-	issue, err := a.gateway.ViewIssue(ctx, githubinfra.ViewIssueInput{Repo: input.Repo, IssueNumber: input.IssueNumber, CWD: input.CWD})
-	if err != nil {
-		return worker.IssueDetail{}, err
-	}
-	return worker.IssueDetail{Number: issue.Number, Title: issue.Title, Body: issue.Body, URL: issue.URL, State: issue.State, IsPullRequest: issue.IsPullRequest, AssigneeUsers: networkPolicyUsers(issue.AssigneeUsers), Labels: issue.Labels}, nil
-}
-
-func (a workerGitHubAdapter) CreateIssueComment(ctx context.Context, input worker.IssueCommentInput) (worker.IssueCommentResult, error) {
-	body := a.stamper.WithIdentity(input.DisclosureAgent, input.DisclosureModel).Markdown(input.Body, "worker", disclosure.ChannelIssueComment)
-	if client, ok, err := a.plane(ctx, input.Repo, input.CWD); ok || err != nil {
-		if err != nil {
-			return worker.IssueCommentResult{}, err
-		}
-		comment, err := client.CreateIssueComment(ctx, forge.CreateCommentInput{IssueNumber: input.IssueNumber, Body: body})
-		if err != nil {
-			return worker.IssueCommentResult{}, err
-		}
-		// Plane comment ids are UUIDs and do not fit looper's int64 comment id, so
-		// ID stays 0; the URL points at the work-item web page.
-		return worker.IssueCommentResult{ID: comment.ID, URL: comment.HTMLURL}, nil
-	}
-	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
-		if err != nil {
-			return worker.IssueCommentResult{}, err
-		}
-		comment, err := client.CreateIssueComment(ctx, forge.CreateCommentInput{IssueNumber: input.IssueNumber, Body: body})
-		if err != nil {
-			return worker.IssueCommentResult{}, err
-		}
-		return worker.IssueCommentResult{ID: comment.ID, URL: comment.HTMLURL}, nil
-	}
-	if a.gateway == nil {
-		return worker.IssueCommentResult{}, fmt.Errorf("github gateway is not configured")
-	}
-	comment, err := a.gateway.CreateIssueComment(ctx, githubinfra.IssueCommentInput{Repo: input.Repo, IssueNumber: input.IssueNumber, Body: body, CWD: input.CWD})
-	if err != nil {
-		return worker.IssueCommentResult{}, err
-	}
-	return worker.IssueCommentResult{ID: comment.ID, URL: comment.URL}, nil
-}
-
-func (a workerGitHubAdapter) UpdateIssueComment(ctx context.Context, input worker.UpdateIssueCommentInput) error {
-	body := a.stamper.WithIdentity(input.DisclosureAgent, input.DisclosureModel).Markdown(input.Body, "worker", disclosure.ChannelIssueComment)
-	if _, ok, err := a.plane(ctx, input.Repo, input.CWD); ok || err != nil {
-		if err != nil {
-			return err
-		}
-		// Plane comment ids are UUIDs, which do not round-trip through looper's
-		// int64 comment id, so in-place updates are not supported. This is a
-		// no-op: the worker's CreateIssueComment path (which returns id 0) posts a
-		// fresh progress comment on each status transition instead.
-		// TODO(plane): track the Plane comment UUID to enable true updates.
-		return nil
-	}
-	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
-		if err != nil {
-			return err
-		}
-		_, err = client.UpdateIssueComment(ctx, forge.UpdateCommentInput{CommentID: input.CommentID, Body: body})
-		return err
-	}
-	if a.gateway == nil {
-		return fmt.Errorf("github gateway is not configured")
-	}
-	return a.gateway.UpdateIssueComment(ctx, githubinfra.UpdateIssueCommentInput{Repo: input.Repo, CommentID: input.CommentID, Body: body, CWD: input.CWD})
-}
-
-func (a workerGitHubAdapter) CreatePullRequest(ctx context.Context, input worker.CreatePullRequestInput) (worker.CreatePullRequestResult, error) {
-	body := a.stamper.WithIdentity(input.DisclosureAgent, input.DisclosureModel).Markdown(input.Body, "worker", disclosure.ChannelPullRequest)
-	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
-		if err != nil {
-			return worker.CreatePullRequestResult{}, err
-		}
-		pr, err := client.CreatePullRequest(ctx, forge.CreatePullRequestInput{Title: input.Title, Body: body, Head: input.HeadBranch, Base: input.BaseBranch})
-		if err != nil {
-			return worker.CreatePullRequestResult{}, err
-		}
-		return worker.CreatePullRequestResult{Number: pr.Number, URL: pr.HTMLURL}, nil
-	}
-	if a.gateway == nil {
-		return worker.CreatePullRequestResult{}, fmt.Errorf("github gateway is not configured")
-	}
-	pr, err := a.gateway.CreatePullRequest(ctx, githubinfra.CreatePullRequestInput{Repo: input.Repo, HeadBranch: input.HeadBranch, BaseBranch: input.BaseBranch, Title: input.Title, Body: body, Draft: input.Draft, CWD: input.CWD})
-	if err != nil {
-		return worker.CreatePullRequestResult{}, err
-	}
-	return worker.CreatePullRequestResult{Number: pr.Number, URL: pr.URL}, nil
-}
-
-func (a workerGitHubAdapter) AddPullRequestLabels(ctx context.Context, input worker.PullRequestLabelsInput) error {
-	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
-		if err != nil {
-			return err
-		}
-		_, err := client.AddIssueLabels(ctx, input.PRNumber, input.Labels)
-		return err
-	}
-	if a.gateway == nil {
-		return fmt.Errorf("github gateway is not configured")
-	}
-	return a.gateway.AddPullRequestLabels(ctx, githubinfra.PullRequestLabelsInput{Repo: input.Repo, PRNumber: input.PRNumber, Labels: input.Labels, CWD: input.CWD})
-}
-
 // providerHasGitHubPullRequests reports whether a project of this provider kind
 // has its pull requests on GitHub — so the coordinator/fixer PR-follow-up lanes
 // apply. GitHub projects obviously do; Plane projects too (Plane is the task
@@ -2844,173 +2154,6 @@ func hitlGitHubSettings(cfg *config.HITLGitHubConfig) worker.HITLGitHubSettings 
 		AwaitingLabel: cfg.AwaitingLabel,
 		MentionLogins: append([]string(nil), cfg.MentionLogins...),
 	}
-}
-
-func (a workerGitHubAdapter) CompareBranches(ctx context.Context, input worker.CompareBranchesInput) (worker.CompareBranchesResult, error) {
-	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
-		if err != nil {
-			return worker.CompareBranchesResult{}, err
-		}
-		comparison, err := client.CompareBranches(ctx, forge.CompareBranchesInput{Base: input.BaseBranch, Head: input.HeadBranch})
-		if err != nil {
-			return worker.CompareBranchesResult{}, err
-		}
-		return worker.CompareBranchesResult{AheadBy: comparison.AheadBy, BehindBy: comparison.BehindBy, Status: comparison.Status, TotalCommits: comparison.TotalCommits}, nil
-	}
-	if a.gateway == nil {
-		return worker.CompareBranchesResult{}, fmt.Errorf("github gateway is not configured")
-	}
-	comparison, err := a.gateway.CompareBranches(ctx, githubinfra.CompareBranchesInput{Repo: input.Repo, BaseBranch: input.BaseBranch, HeadBranch: input.HeadBranch, CWD: input.CWD})
-	if err != nil {
-		return worker.CompareBranchesResult{}, err
-	}
-	return worker.CompareBranchesResult{AheadBy: comparison.AheadBy, BehindBy: comparison.BehindBy, Status: comparison.Status, TotalCommits: comparison.TotalCommits}, nil
-}
-
-func (a workerGitHubAdapter) UpdatePullRequestBody(ctx context.Context, input worker.UpdatePullRequestBodyInput) error {
-	body := a.stamper.WithIdentity(input.DisclosureAgent, input.DisclosureModel).Markdown(input.Body, "worker", disclosure.ChannelPullRequest)
-	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
-		if err != nil {
-			return err
-		}
-		_, err = client.UpdatePullRequest(ctx, forge.UpdatePullRequestInput{Number: input.PRNumber, Body: &body})
-		return err
-	}
-	if a.gateway == nil {
-		return fmt.Errorf("github gateway is not configured")
-	}
-	return a.gateway.UpdatePullRequestBody(ctx, githubinfra.UpdatePullRequestBodyInput{Repo: input.Repo, PRNumber: input.PRNumber, Body: body, CWD: input.CWD})
-}
-
-func (a workerGitHubAdapter) UpdatePullRequestTitle(ctx context.Context, input worker.UpdatePullRequestTitleInput) error {
-	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
-		if err != nil {
-			return err
-		}
-		_, err = client.UpdatePullRequest(ctx, forge.UpdatePullRequestInput{Number: input.PRNumber, Title: &input.Title})
-		return err
-	}
-	if a.gateway == nil {
-		return fmt.Errorf("github gateway is not configured")
-	}
-	return a.gateway.UpdatePullRequestTitle(ctx, githubinfra.UpdatePullRequestTitleInput{Repo: input.Repo, PRNumber: input.PRNumber, Title: input.Title, CWD: input.CWD})
-}
-
-func (a workerGitHubAdapter) RemovePullRequestLabels(ctx context.Context, input worker.PullRequestLabelsInput) error {
-	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
-		if err != nil {
-			return err
-		}
-		for _, label := range input.Labels {
-			if err := client.RemoveIssueLabel(ctx, input.PRNumber, label); err != nil {
-				return err
-			}
-		}
-		return nil
-	}
-	if a.gateway == nil {
-		return fmt.Errorf("github gateway is not configured")
-	}
-	return a.gateway.RemovePullRequestLabels(ctx, githubinfra.PullRequestLabelsInput{Repo: input.Repo, PRNumber: input.PRNumber, Labels: input.Labels, CWD: input.CWD})
-}
-
-func (a workerGitHubAdapter) AddPullRequestReviewers(ctx context.Context, input worker.PullRequestReviewersInput) error {
-	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
-		if err != nil {
-			return err
-		}
-		return addForgejoPullRequestReviewers(ctx, client, a.config, input.Repo, input.PRNumber, input.Reviewers, input.CWD)
-	}
-	if a.gateway == nil {
-		return fmt.Errorf("github gateway is not configured")
-	}
-	return a.gateway.AddPullRequestReviewers(ctx, githubinfra.PullRequestReviewersInput{Repo: input.Repo, PRNumber: input.PRNumber, Reviewers: input.Reviewers, CWD: input.CWD})
-}
-
-type workerGitAdapter struct {
-	gateway *gitinfra.Gateway
-	stamper disclosure.Stamper
-}
-
-func (a workerGitAdapter) CreateWorktree(ctx context.Context, input worker.CreateWorktreeInput) (worker.CreateWorktreeResult, error) {
-	worktree, err := a.gateway.CreateWorktree(ctx, gitinfra.CreateWorktreeInput{ProjectID: input.ProjectID, RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot, Branch: input.Branch, BaseBranch: input.BaseBranch, PRNumber: input.PRNumber, ProtectedBranches: input.ProtectedBranches, CheckoutMode: gitinfra.CheckoutMode(input.CheckoutMode)})
-	if err != nil {
-		return worker.CreateWorktreeResult{}, err
-	}
-	return worker.CreateWorktreeResult{WorktreePath: worktree.WorktreePath, Branch: worktree.Branch, BaseBranch: derefString(worktree.BaseBranch), HeadSHA: derefString(worktree.HeadSHA), WorktreeID: worktree.ID}, nil
-}
-
-func (a workerGitAdapter) RestoreWorktree(ctx context.Context, input worker.RestoreWorktreeInput) (*worker.RestoreWorktreeResult, error) {
-	worktree, err := a.gateway.RestoreWorktree(ctx, gitinfra.RestoreWorktreeInput{ProjectID: input.ProjectID, RepoPath: input.RepoPath, Branch: input.Branch, WorktreeRoot: input.WorktreeRoot, CheckoutMode: gitinfra.CheckoutMode(input.CheckoutMode), ExpectedWorktreePath: input.ExpectedWorktreePath})
-	if err != nil || worktree == nil {
-		return nil, err
-	}
-	return &worker.RestoreWorktreeResult{WorktreePath: worktree.WorktreePath, Branch: worktree.Branch, BaseBranch: derefString(worktree.BaseBranch), HeadSHA: derefString(worktree.HeadSHA), WorktreeID: worktree.ID}, nil
-}
-
-func (a workerGitAdapter) PrepareWorktree(ctx context.Context, input worker.PrepareWorktreeInput) (worker.PrepareWorktreeResult, error) {
-	result, err := a.gateway.PrepareWorktree(ctx, gitinfra.PrepareWorktreeInput{RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot, WorktreePath: input.WorktreePath, Branch: input.Branch, ExpectedHeadSHA: input.ExpectedHeadSHA, Remote: input.Remote})
-	if err != nil {
-		return worker.PrepareWorktreeResult{}, err
-	}
-	return worker.PrepareWorktreeResult{HeadSHA: result.HeadSHA, Clean: result.Clean}, nil
-}
-
-func (a workerGitAdapter) InspectHead(ctx context.Context, input worker.InspectHeadInput) (worker.InspectHeadResult, error) {
-	result, err := a.gateway.InspectHead(ctx, gitinfra.InspectHeadInput{RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot, WorktreePath: input.WorktreePath, BaseRef: input.BaseRef})
-	if err != nil {
-		return worker.InspectHeadResult{}, err
-	}
-	return worker.InspectHeadResult{HeadSHA: result.HeadSHA, NewCommitSHAs: result.NewCommitSHAs, HasUncommittedChanges: result.HasUncommittedChanges, ChangedFiles: result.ChangedFiles}, nil
-}
-
-func (a workerGitAdapter) Commit(ctx context.Context, input worker.CommitInput) (worker.CommitResult, error) {
-	message := a.stamper.WithIdentity(input.DisclosureAgent, input.DisclosureModel).CommitMessage(input.Message, "worker")
-	result, err := a.gateway.Commit(ctx, gitinfra.CommitInput{RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot, WorktreePath: input.WorktreePath, Message: message})
-	if err != nil {
-		return worker.CommitResult{}, err
-	}
-	return worker.CommitResult{CommitSHA: result.CommitSHA}, nil
-}
-
-func (a workerGitAdapter) Push(ctx context.Context, input worker.PushInput) error {
-	return a.gateway.Push(ctx, gitinfra.PushInput{RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot, WorktreePath: input.WorktreePath, Branch: input.Branch, Remote: input.Remote, ProtectedBranches: input.ProtectedBranches})
-}
-
-type workerAgentExecutorAdapter struct {
-	executor *agent.ConfiguredExecutor
-}
-
-type workerAgentExecutionAdapter struct {
-	execution agent.Execution
-}
-
-func (a workerAgentExecutorAdapter) Start(ctx context.Context, input worker.AgentRunInput) (worker.AgentExecution, error) {
-	// Ownership is acquired at the common executor boundary (AdmitSpawn +
-	// BindHandle), not via post-spawn role-adapter registration (#576 / not #572).
-	execution, err := a.executor.Start(ctx, agent.RunInput{
-		ExecutionID: input.ExecutionID, ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID,
-		Prompt: input.Prompt, NativeResumePrompt: input.NativeResumePrompt, NativeSessionID: input.NativeSessionID,
-		WorkingDirectory: input.WorkingDirectory, Timeout: input.Timeout, HeartbeatTimeout: input.HeartbeatTimeout,
-		Metadata: input.Metadata, IdempotencyKey: input.IdempotencyKey,
-		UseSnapshot: input.UseSnapshot, SnapshotVendor: input.SnapshotVendor, SnapshotModel: input.SnapshotModel,
-	})
-	if err != nil {
-		return nil, err
-	}
-	return workerAgentExecutionAdapter{execution: execution}, nil
-}
-
-func (a workerAgentExecutionAdapter) Wait(ctx context.Context) (worker.AgentResult, error) {
-	result, err := a.execution.Wait(ctx)
-	if err != nil {
-		return worker.AgentResult{}, err
-	}
-	return worker.AgentResult{Status: result.Status, Summary: result.Summary, Stdout: result.Stdout, Stderr: result.Stderr, ParseStatus: result.ParseStatus, ChangedFiles: result.ChangedFiles, Commits: result.Commits, Lifecycle: result.Lifecycle, TimeoutType: result.TimeoutType, ConfiguredIdleTimeoutSeconds: result.ConfiguredIdleTimeoutSeconds, ConfiguredMaxRuntimeSeconds: result.ConfiguredMaxRuntimeSeconds, ElapsedRuntimeSeconds: result.ElapsedRuntimeSeconds, LastProgressAt: result.LastProgressAt}, nil
-}
-
-func (a workerAgentExecutionAdapter) Kill(reason string) error {
-	return a.execution.Kill(reason)
 }
 
 type schedulerNotificationGatewayFactory struct {
@@ -3155,13 +2298,25 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 	// loops with a valid predecessor snapshot are eligible. New discovery stays
 	// gated on CodingRoleAgentConfigured via *DiscoveryEnabled flags and
 	// webhook nil-runner checks.
+	privateClient := privateFeishuClient(&cfg)
+	if privateClient != nil {
+		// Reuse the existing card gateway; the CLI only supplies authentication.
+		cfg.Notifications.Webhook.Enabled = true
+		cfg.Notifications.Webhook.Mode = "app"
+		cfg.Notifications.Webhook.ChatID = privateClient.Config.ChatID
+		cfg.Notifications.Webhook.MentionOpenIds = []string{privateClient.Config.OwnerOpenID}
+	}
 	notificationGateway := notificationGateways.New(notify.Options{
 		Config:        cfg.Notifications,
+		FeishuCLI:     privateClient,
 		OsascriptPath: derefString(cfg.Tools.OsascriptPath),
 		LogFilePath:   filepath.Join(cfg.Daemon.LogDir, "looperd.log"),
 		Repositories:  repos,
 		Now:           now,
 		ResolveOwnerOpenID: func(projectID string) string {
+			if privateClient != nil {
+				return privateClient.Config.OwnerOpenID
+			}
 			return config.ProjectOwner(cfg, projectID)
 		},
 	})
@@ -3213,69 +2368,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 		return nil
 	}
 	notifyWorkerRunCompleted := func(ctx context.Context, input workerRunCompletedNotificationInput) error {
-		workerNotificationKeyID := runtimeFirstNonEmpty(input.RunID, input.LoopID)
-		payload := notify.SystemNotificationPayload{
-			ProjectID:  input.ProjectID,
-			LoopID:     input.LoopID,
-			RunID:      input.RunID,
-			Subtitle:   input.Subtitle,
-			EntityType: "run",
-			EntityID:   input.RunID,
-		}
-		switch {
-		case input.Status == "failed" && input.FailureKind == worker.FailureManualIntervention:
-			payload.Level = "action_required"
-			payload.Title = "Looper Worker Needs Attention"
-			payload.Body = input.Summary
-			payload.DedupeKey = fmt.Sprintf("runtime.worker.action_required:%s", workerNotificationKeyID)
-		case input.Status == "failed":
-			payload.Level = "failure"
-			payload.Title = "Looper Worker Failed"
-			payload.Body = input.Summary
-			payload.DedupeKey = fmt.Sprintf("runtime.worker.failed:%s", workerNotificationKeyID)
-		case input.Status == "skipped":
-			payload.Level = "action_required"
-			payload.Title = "Looper Worker Needs Attention"
-			payload.Body = input.Summary
-			payload.DedupeKey = fmt.Sprintf("runtime.worker.action_required:%s", workerNotificationKeyID)
-		case input.PullRequestNumber > 0:
-			payload.Level = "action_required"
-			payload.Title = "Looper Worker Opened a PR"
-			payload.Body = fmt.Sprintf("PR #%d is ready: %s", input.PullRequestNumber, runtimeFirstNonEmpty(input.PullRequestURL, input.Summary))
-			payload.DedupeKey = fmt.Sprintf("runtime.worker.pr_ready:%s", input.RunID)
-			// The requested work is delivered — @-mention the owner so it isn't missed.
-			payload.MentionOpenIds = projectOwnerMentionOpenIDs(cfg, input.ProjectID)
-			// Reflect the PR in Plane's own state column: In Progress → In Review. Plane
-			// projects only; best-effort (a failure must never disturb the notification).
-			setPlaneWorkItemState(ctx, &cfg, repos, logger, input.ProjectID, input.LoopID, "In Review")
-		default:
-			payload.Level = "success"
-			payload.Title = "Looper Worker Completed"
-			payload.Body = runtimeFirstNonEmpty(input.Summary, "Worker completed successfully")
-			payload.DedupeKey = fmt.Sprintf("runtime.worker.completed:%s", input.RunID)
-		}
-		notificationGateway.Notify(ctx, payload)
-		// Log the outcome to the loop's story so the anchor reads as a narrative.
-		if strings.TrimSpace(input.LoopID) != "" && strings.EqualFold(strings.TrimSpace(cfg.Notifications.Webhook.Mode), "app") {
-			switch {
-			case input.PullRequestNumber > 0:
-				link := runtimeFirstNonEmpty(input.PullRequestURL, "")
-				if link != "" {
-					notificationGateway.RecordMilestone(ctx, input.LoopID, fmt.Sprintf("🔀 已开 [PR #%d](%s)", input.PullRequestNumber, link))
-				} else {
-					notificationGateway.RecordMilestone(ctx, input.LoopID, fmt.Sprintf("🔀 已开 PR #%d", input.PullRequestNumber))
-				}
-			case input.Status == "failed" && input.FailureKind == worker.FailureManualIntervention:
-				notificationGateway.RecordMilestone(ctx, input.LoopID, "⏸ 需要人处理")
-			case input.Status == "failed":
-				notificationGateway.RecordMilestone(ctx, input.LoopID, "⚠️ 本轮失败,重试中")
-			case input.Status != "skipped":
-				notificationGateway.RecordMilestone(ctx, input.LoopID, "✅ 完成")
-			}
-		} else {
-			refreshFeishuAnchor(ctx, input.LoopID)
-		}
-		return nil
+		return workerhost.NotifyWorkerCompleted(ctx, cfg, repos, notificationGateway, logger, worker.RunCompletedInput(input))
 	}
 
 	var plannerRunner plannerScheduler
@@ -3380,7 +2473,9 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			AgentModel:         agentModel,
 			AgentTimeout:       time.Duration(cfg.Agent.Timeouts.PlannerMaxRuntimeSeconds) * time.Second,
 			AgentIdleTimeout:   time.Duration(cfg.Agent.Timeouts.PlannerIdleTimeoutSeconds) * time.Second,
-			PlaneDoc:           func(projectID string) (*planedoc.Gateway, string, bool) { return planeDocForProject(&cfg, projectID) },
+			PlaneDoc: func(projectID string) (*planedoc.Gateway, string, bool) {
+				return workerhost.PlaneDocForProject(&cfg, projectID)
+			},
 			DiscoveryPolicy: planner.DiscoveryPolicy{
 				AutoDiscovery:              plannerAutoDiscovery,
 				Labels:                     append([]string(nil), cfg.Roles.Planner.Triggers.Labels...),
@@ -3562,6 +2657,9 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 		})
 	}
 	notifyHITLAsk := func(ctx context.Context, ask worker.HITLAskNotification) error {
+		if privateFeishuClient(&cfg) != nil {
+			return postPrivateFeishuQuestion(ctx, &cfg, repos, notificationGateway, ask.LoopID)
+		}
 		return notificationGateway.SendHITLAsk(ctx, notify.HITLAskCard{
 			ProjectID: ask.ProjectID, LoopID: ask.LoopID, LoopSeq: ask.LoopSeq,
 			Repo: ask.Repo, Title: ask.Title, Question: ask.Question, Options: ask.Options,
@@ -3588,15 +2686,17 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			workerAutoDiscovery = false
 		}
 		workerRunner = worker.New(worker.Options{
-			DB:       coordinator.DB(),
-			Repos:    repos,
-			PlaneDoc: func(projectID string) (*planedoc.Gateway, string, bool) { return planeDocForProject(&cfg, projectID) },
-			GitHub:   workerGitHubAdapter{gateway: githubGateway, stamper: workerStamper, config: &cfg},
+			DB:    coordinator.DB(),
+			Repos: repos,
+			PlaneDoc: func(projectID string) (*planedoc.Gateway, string, bool) {
+				return workerhost.PlaneDocForProject(&cfg, projectID)
+			},
+			GitHub: workerhost.GitHub{Gateway: githubGateway, Stamper: workerStamper, Config: &cfg},
 			GitHubCLIAutoPROpeningAvailable: func(ctx context.Context, repo, cwd string) bool {
 				return githubCLIAutoPROpeningAvailable(ctx, cfg, githubGateway, logger, repo, cwd)
 			},
-			Git:             workerGitAdapter{gateway: gitGateway, stamper: workerStamper},
-			AgentExecutor:   workerAgentExecutorAdapter{executor: workerExecutor},
+			Git:             workerhost.Git{Gateway: gitGateway, Stamper: workerStamper},
+			AgentExecutor:   workerhost.Executor{Executor: workerExecutor},
 			Logger:          logger,
 			Now:             now,
 			AllowAutoCommit: cfg.Defaults.AllowAutoCommit,
@@ -3664,6 +2764,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			Worker:               workerRunner,
 			Snapshotter:          snapshotter,
 			Config:               &cfg,
+			NotificationGateway:  notificationGateway,
 			// Live discovery requires a currently resolvable agent; sticky retries
 			// still claim via always-present runners when vendor was removed
 			// (claimTypeSetsFromInput restricts unconfigured roles to snapshot items).
@@ -3824,6 +2925,7 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 	if !catalogCurrent {
 		return nil
 	}
+	appendErr(runPrivateFeishuHITLPoll(ctx, input))
 
 	claimedCount, availableSlots, err := executeClaimPhase(ctx, "pre_discovery", input, discoveredRunnableIDs, true)
 	recordClaim(claimedCount, availableSlots, err)
@@ -4603,56 +3705,6 @@ func newAmbiguousClaimRecoveryContext(parent context.Context) (context.Context, 
 	return context.WithTimeout(base, ambiguousClaimRecoveryTimeout)
 }
 
-// recoverAmbiguousCancelledClaim looks up running claims made by the scheduler
-// at nowISO that are not already owned by this tick or by any live registry
-// operation lease. Zero matches means the cancel happened before any durable
-// claim (safe to release). One match is the recovered item. Multiple unowned
-// matches cannot be bound to a single lease.
-//
-// Filtering only the current batch's owned slice is insufficient: two claim
-// batches can share the same formatted nowISO (back-to-back wakeups within one
-// millisecond) and both use claimed_by="scheduler", so ListRunningClaimedBy
-// also returns earlier still-running claims. Those must be excluded via
-// OperationOwner.OwnsQueueClaim so recovery never adopts a registry-owned row
-// or degrades on a multi-match that includes live ownership.
-func recoverAmbiguousCancelledClaim(ctx context.Context, input defaultSchedulerTickInput, nowISO string, owned []ownedQueueClaim) (*storage.QueueItemRecord, error) {
-	if input.Repos == nil || input.Repos.Queue == nil {
-		return nil, errors.New("queue repository is not configured for ambiguous claim recovery")
-	}
-	// Bound recovery: WithoutCancel alone would wait indefinitely on blocked
-	// SQLite while the lease stays pending and shutdown times out retaining storage.
-	recoverCtx, cancel := newAmbiguousClaimRecoveryContext(ctx)
-	defer cancel()
-	items, err := input.Repos.Queue.ListRunningClaimedBy(recoverCtx, "scheduler", nowISO)
-	if err != nil {
-		return nil, err
-	}
-	ownedIDs := make(map[string]struct{}, len(owned))
-	for _, o := range owned {
-		if o.item.ID != "" {
-			ownedIDs[o.item.ID] = struct{}{}
-		}
-	}
-	var found *storage.QueueItemRecord
-	for i := range items {
-		id := items[i].ID
-		if _, ok := ownedIDs[id]; ok {
-			continue
-		}
-		// Prior-batch claims with the same claimed_at share this query result;
-		// skip any still bound to a live operation lease in the registry.
-		if input.OperationOwner != nil && input.OperationOwner.OwnsQueueClaim(id) {
-			continue
-		}
-		if found != nil {
-			return nil, fmt.Errorf("%w: multiple unowned running claims after cancelled ClaimNext", ErrOperationFinalizeFailed)
-		}
-		item := items[i]
-		found = &item
-	}
-	return found, nil
-}
-
 // cancelledClaimFinalizeTimeout bounds MarkRetryIfRunning/GetByID after a
 // stop/bind refuse. Finalize must detach the caller cancel/deadline (shutdown
 // or a timed tick can still require durable requeue) without hanging forever if
@@ -4668,62 +3720,6 @@ func newCancelledClaimFinalizeContext(parent context.Context) (context.Context, 
 		base = context.WithoutCancel(parent)
 	}
 	return context.WithTimeout(base, cancelledClaimFinalizeTimeout)
-}
-
-// finalizeCancelledClaim durable-requeues a claim that cannot start because the
-// operation lease was cancelled (stop/bind race). Keeps the claim out of the
-// stranded running state without starting a processor.
-//
-// Uses a cancellation-detached, time-bounded context: Runtime.BeginShutdown
-// cancels the scheduler context before the registry drain, so a bind refused
-// after ClaimNext* must still requeue under retained ownership (same pattern as
-// dispatchOwnedQueueClaims / ambiguous-claim recovery). Passing the cancelled
-// scheduler ctx would make MarkRetry fail immediately, report hard persist
-// failure, and strand the claim. WithoutCancel alone would drop a caller
-// deadline and wait indefinitely on blocked SQLite while the lease stays pending.
-//
-// Pause/terminal stop may CancelByLoop the claim to cancelled after ClaimNext*
-// and before BindClaim refuses. Use MarkRetryIfRunning so concurrent
-// terminalization yields a zero-row no-op treated as durable success (stop must
-// not resurrect cancelled work). Unrestricted MarkRetry is reserved for runner
-// finalize after processing, which may requeue after mid-run pause cancel.
-func finalizeCancelledClaim(ctx context.Context, item storage.QueueItemRecord, input defaultSchedulerTickInput, now func() time.Time) error {
-	if input.Repos == nil || input.Repos.Queue == nil {
-		return errors.New("queue repository is not configured for cancelled-claim finalize")
-	}
-	// Bound finalization: detach cancel/deadline then apply a fresh timeout so
-	// shutdown/timed ticks still requeue without unbounded DB waits under a
-	// retained operation lease.
-	ctx, cancel := newCancelledClaimFinalizeContext(ctx)
-	defer cancel()
-	if now == nil {
-		now = time.Now
-	}
-	nowISO := formatJavaScriptISOString(now().UTC())
-	msg := "operation lease cancelled before queue processor start"
-	// Atomic status-guarded requeue: only updates while still running. Zero rows
-	// (already cancelled/completed/failed) is success — do not resurrect.
-	if err := input.Repos.Queue.MarkRetryIfRunning(ctx, storage.QueueMarkRetryInput{
-		ID:           item.ID,
-		AvailableAt:  nowISO,
-		Attempts:     item.Attempts,
-		ErrorMessage: &msg,
-		ErrorKind:    "retryable_transient",
-		UpdatedAt:    nowISO,
-	}); err != nil {
-		return err
-	}
-	// Verify durable observation: still-running after guarded requeue means
-	// the write did not take effect (e.g. archived project) and ownership must
-	// not pretend finalize succeeded.
-	got, err := input.Repos.Queue.GetByID(ctx, item.ID)
-	if err != nil {
-		return err
-	}
-	if got == nil || got.Status == "running" {
-		return fmt.Errorf("%w: claim %s still running after requeue", ErrOperationFinalizeFailed, item.ID)
-	}
-	return nil
 }
 
 // dispatchOwnedQueueClaims launches processors for items already durable as
@@ -5094,57 +4090,6 @@ func durableCompleteClaim(ctx context.Context, item storage.QueueItemRecord, inp
 	return nil
 }
 
-// ensureClaimFinalized guarantees typed durable finalization after a runner
-// returns. Happy-path runners already Complete/Fail; this closes the gap where
-// a runner error leaves status=running under a about-to-be-released lease.
-// Returns nil when the claim is no longer running (already finalized).
-func ensureClaimFinalized(ctx context.Context, item storage.QueueItemRecord, runErr error, input defaultSchedulerTickInput, now func() time.Time) error {
-	if input.Repos == nil || input.Repos.Queue == nil {
-		if runErr != nil {
-			return errors.New("queue repository is not configured for finalize")
-		}
-		return nil
-	}
-	got, err := input.Repos.Queue.GetByID(ctx, item.ID)
-	if err != nil {
-		return err
-	}
-	if got == nil || got.Status != "running" {
-		return nil
-	}
-	// Still running after processor return: typed durable finalization.
-	if now == nil {
-		now = time.Now
-	}
-	nowISO := formatJavaScriptISOString(now().UTC())
-	msg := "queue processor returned without durable finalize"
-	if runErr != nil {
-		msg = runErr.Error()
-	}
-	kind := "retryable_transient"
-	if runErr == nil {
-		kind = "non_retryable"
-	}
-	if err := input.Repos.Queue.Fail(ctx, storage.QueueFailInput{
-		ID:           item.ID,
-		Attempts:     got.Attempts,
-		FinishedAt:   nowISO,
-		ErrorMessage: &msg,
-		ErrorKind:    kind,
-		UpdatedAt:    nowISO,
-	}); err != nil {
-		return err
-	}
-	after, err := input.Repos.Queue.GetByID(ctx, item.ID)
-	if err != nil {
-		return err
-	}
-	if after == nil || after.Status == "running" {
-		return fmt.Errorf("%w: claim %s still running after fail", ErrOperationFinalizeFailed, item.ID)
-	}
-	return nil
-}
-
 func schedulerQueueProcessor(item storage.QueueItemRecord, input defaultSchedulerTickInput) (func(context.Context) error, error) {
 	switch item.Type {
 	case "planner":
@@ -5328,4 +4273,22 @@ func summarizeCheckStates(checks []map[string]any) string {
 		states = append(states, state)
 	}
 	return strings.Join(states, ", ")
+}
+
+// Compatibility wrappers keep scheduler queue ownership on the shared host primitives.
+func recoverAmbiguousCancelledClaim(ctx context.Context, input defaultSchedulerTickInput, nowISO string, owned []ownedQueueClaim) (*storage.QueueItemRecord, error) {
+	return executionhost.RecoverCancelledClaim(ctx, input.Repos, "scheduler", nowISO, func(id string) bool {
+		for _, claim := range owned {
+			if claim.item.ID == id {
+				return true
+			}
+		}
+		return input.OperationOwner != nil && input.OperationOwner.OwnsQueueClaim(id)
+	})
+}
+func finalizeCancelledClaim(ctx context.Context, item storage.QueueItemRecord, input defaultSchedulerTickInput, now func() time.Time) error {
+	return executionhost.FinalizeCancelledClaim(ctx, input.Repos, item, now)
+}
+func ensureClaimFinalized(ctx context.Context, item storage.QueueItemRecord, runErr error, input defaultSchedulerTickInput, now func() time.Time) error {
+	return executionhost.EnsureClaimFinalized(ctx, input.Repos, item, runErr, now)
 }

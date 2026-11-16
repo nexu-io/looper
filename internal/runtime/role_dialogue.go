@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"github.com/nexu-io/looper/internal/workerhost"
 	"strings"
 
 	"github.com/nexu-io/looper/internal/config"
@@ -205,7 +206,7 @@ func processPendingStrictRoleMessage(ctx context.Context, cfg config.Config, loo
 	if !ok {
 		return false, fmt.Errorf("role dialogue: project %s is not configured", loop.ProjectID)
 	}
-	client, ok, err := planeClientForRepo(&cfg, project.Repo)
+	client, ok, err := workerhost.PlaneClientForRepo(&cfg, project.Repo)
 	if err != nil || !ok {
 		if err == nil {
 			err = fmt.Errorf("Plane strict client is unavailable")

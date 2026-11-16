@@ -3,6 +3,7 @@ package runtime
 import (
 	"context"
 	"encoding/json"
+	"github.com/nexu-io/looper/internal/workerhost"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,7 +15,7 @@ import (
 )
 
 // TestForgejoTeaAuthSchedulerClaimPath covers:
-// tea login selection → config/db-registered Forgejo project → forgejoClientForRepo
+// tea login selection → config/db-registered Forgejo project → workerhost.ForgejoClientForRepo
 // (scheduler provider path) → successful provider operation via tea api.
 func TestForgejoTeaAuthSchedulerClaimPath(t *testing.T) {
 	teaBin := writeFakeTeaBinary(t, "https://code.example.com", "powerformer-code", map[string]fakeTeaAPIRoute{
@@ -72,9 +73,9 @@ func TestForgejoTeaAuthSchedulerClaimPath(t *testing.T) {
 	}
 
 	// Scheduler path: resolve client for the registered bare repo.
-	client, ok, err := forgejoClientForRepo(&cfg, "core/odcrew")
+	client, ok, err := workerhost.ForgejoClientForRepo(&cfg, "core/odcrew")
 	if err != nil || !ok || client == nil {
-		t.Fatalf("forgejoClientForRepo() = ok=%v err=%v client=%v", ok, err, client)
+		t.Fatalf("workerhost.ForgejoClientForRepo() = ok=%v err=%v client=%v", ok, err, client)
 	}
 	identity, err := client.CurrentUser(ctx)
 	if err != nil || identity.Login != "mrcfps" {
@@ -86,14 +87,14 @@ func TestForgejoTeaAuthSchedulerClaimPath(t *testing.T) {
 	}
 
 	// Ensure token-env absence is not required and never falls through to GitHub for this repo.
-	if _, ok, err := forgejoClientForRepo(&cfg, "core/odcrew"); err != nil || !ok {
-		t.Fatalf("second forgejoClientForRepo() failed: ok=%v err=%v", ok, err)
+	if _, ok, err := workerhost.ForgejoClientForRepo(&cfg, "core/odcrew"); err != nil || !ok {
+		t.Fatalf("second workerhost.ForgejoClientForRepo() failed: ok=%v err=%v", ok, err)
 	}
 
 	// Missing login must surface tea_login_missing, not a GitHub client.
-	// forgejoClientForRepo returns ok=true with err when the provider matches but auth fails.
+	// workerhost.ForgejoClientForRepo returns ok=true with err when the provider matches but auth fails.
 	cfg.Providers[0].TeaLogin = stringPtr("does-not-exist")
-	_, matched, err := forgejoClientForRepo(&cfg, "core/odcrew")
+	_, matched, err := workerhost.ForgejoClientForRepo(&cfg, "core/odcrew")
 	if !matched {
 		t.Fatal("expected forgejo provider match so routing does not fall through to GitHub")
 	}

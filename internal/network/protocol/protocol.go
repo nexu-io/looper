@@ -33,17 +33,27 @@ type ReviewerProjectCapability struct {
 	LabelMode            string   `json:"labelMode,omitempty"`
 }
 
+// CollaborationProject names an explicitly configured task source and code
+// repository. Local paths and credentials never leave the device.
+type CollaborationProject struct {
+	Repo           string `json:"repo"`
+	Workspace      string `json:"workspace"`
+	PlaneProjectID string `json:"planeProjectId"`
+}
+
 type NodeCapabilities struct {
-	Roles               []string                    `json:"roles,omitempty"`
-	CoordinatorEligible bool                        `json:"coordinatorEligible"`
-	RoutedProjects      int                         `json:"routedProjects"`
-	RoutedProjectIDs    []string                    `json:"routedProjectIds,omitempty"`
-	ReviewerProjects    []ReviewerProjectCapability `json:"reviewerProjects,omitempty"`
-	LocalProjects       int                         `json:"localProjects"`
-	DynamicLoad         int                         `json:"dynamicLoad"`
-	IdentityDrift       bool                        `json:"identityDrift"`
-	DriftReason         string                      `json:"driftReason,omitempty"`
-	StrictDispatchV1    bool                        `json:"strictDispatchV1,omitempty"`
+	Roles                 []string                    `json:"roles,omitempty"`
+	CoordinatorEligible   bool                        `json:"coordinatorEligible"`
+	RoutedProjects        int                         `json:"routedProjects"`
+	RoutedProjectIDs      []string                    `json:"routedProjectIds,omitempty"`
+	ReviewerProjects      []ReviewerProjectCapability `json:"reviewerProjects,omitempty"`
+	LocalProjects         int                         `json:"localProjects"`
+	DynamicLoad           int                         `json:"dynamicLoad"`
+	IdentityDrift         bool                        `json:"identityDrift"`
+	DriftReason           string                      `json:"driftReason,omitempty"`
+	StrictDispatchV1      bool                        `json:"strictDispatchV1,omitempty"`
+	CollaborationV1       bool                        `json:"collaborationV1,omitempty"`
+	CollaborationProjects []CollaborationProject      `json:"collaborationProjects,omitempty"`
 }
 
 type AuditEnvelope struct {

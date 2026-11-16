@@ -50,6 +50,7 @@ type Dispatch struct {
 	State               string     `json:"state"`
 	Health              string     `json:"health"`
 	RequestedMode       string     `json:"requested_mode"`
+	CodeRepo            string     `json:"code_repo"`
 	ActiveRole          string     `json:"active_role"`
 	OwnerMemberID       string     `json:"owner_member_id"`
 	NodeID              string     `json:"node_id"`

@@ -7,7 +7,7 @@ import (
 	"github.com/nexu-io/looper/internal/eventlog"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/loops"
-	loopcondition "github.com/nexu-io/looper/internal/loops/condition"
+
 	"github.com/nexu-io/looper/internal/storage"
 )
 
@@ -181,47 +181,10 @@ func enqueueHumanMessageToLoop(ctx context.Context, repos *storage.Repositories,
 	return err
 }
 
-// deliverHITLAnswerToLoop stores a GitHub source-of-truth answer on an
+// deliverHITLAnswerToLoop stores a configured source-of-truth answer on an
 // awaiting_human loop and requeues the suspended worker session.
 func deliverHITLAnswerToLoop(ctx context.Context, repos *storage.Repositories, nowISO, loopID, answer string) error {
-	// Same requeue + target exclusion as free-text enqueue / API discard+retry.
-	unlock := LockLoopRequeue(loopID)
-	defer unlock()
-
-	loop, err := repos.Loops.GetByID(ctx, loopID)
-	if err != nil || loop == nil {
-		return err
-	}
-	if loop.Status != "awaiting_human" {
-		return nil
-	}
-	unlockTarget := LockLoopTarget(LoopTargetGuardKeyFromRecord(*loop))
-	defer unlockTarget()
-	ask, ok := loops.ReadHITLAsk(loop.MetadataJSON)
-	if !ok {
-		return nil
-	}
-	ask.Answer = answer
-	ask.Status = "answered"
-	ask.AnsweredAt = nowISO
-	meta, werr := loops.WriteHITLAsk(loop.MetadataJSON, ask)
-	if werr != nil {
-		return werr
-	}
-	meta, werr = loopcondition.Clear(&meta)
-	if werr != nil {
-		return werr
-	}
-	updated := *loop
-	updated.MetadataJSON = &meta
-	updated.Status = "running"
-	updated.NextRunAt = &nowISO
-	updated.UpdatedAt = nowISO
-	if err := repos.Loops.Upsert(ctx, updated); err != nil {
-		return err
-	}
-	_, err = repos.Queue.RequeueLatestCancelledByLoop(ctx, loopID, nowISO)
-	return err
+	return deliverHITLAnswerToLoopForQuestion(ctx, repos, nowISO, loopID, answer, "")
 }
 
 // runGitHubHITLPoll runs one answer-poll pass for a project's awaiting_human
@@ -301,4 +264,8 @@ func runGitHubHITLPoll(ctx context.Context, input defaultSchedulerTickInput, pro
 	if n := pollGitHubHITLAnswersOnce(ctx, awaiting, deps); n > 0 && input.Logger != nil {
 		input.Logger.Info("hitl github: delivered human answers", map[string]any{"projectId": project.ID, "count": n})
 	}
+}
+
+func deliverHITLAnswerToLoopForQuestion(ctx context.Context, repos *storage.Repositories, nowISO, loopID, answer, expectedQuestionID string) error {
+	return loops.DeliverHITLAnswerForQuestion(ctx, repos, nowISO, loopID, answer, expectedQuestionID)
 }

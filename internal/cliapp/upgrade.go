@@ -257,6 +257,11 @@ func (r *commandRuntime) maybeRunAutoUpgrade(cmd *cobra.Command, args []string) 
 }
 
 func shouldSkipAutoUpgrade(cmd *cobra.Command) bool {
+	for parent := cmd; parent != nil; parent = parent.Parent() {
+		if parent.Name() == "collab" {
+			return true
+		}
+	}
 	if cmd == nil {
 		return true
 	}

@@ -816,11 +816,14 @@ func TestClaimAndRunScheduledQueueItemsSkipsUnconfiguredRoles(t *testing.T) {
 		}
 	}
 
+	tracker := &schedulerTaskTracker{}
+	defer tracker.Wait()
 	workerRunner := &stubWorkerScheduler{}
 	claimed, err := claimAndRunScheduledQueueItems(context.Background(), 2, defaultSchedulerTickInput{
-		Repos:  repos,
-		Now:    func() time.Time { return now },
-		Worker: workerRunner,
+		Repos:       repos,
+		AsyncRunner: tracker,
+		Now:         func() time.Time { return now },
+		Worker:      workerRunner,
 		// Reviewer intentionally nil — unconfigured role must not be claimed.
 	})
 	if err != nil {
@@ -897,13 +900,17 @@ func TestClaimAndRunScheduledQueueItemsClaimsStickySnapshotWithoutLiveRole(t *te
 		}
 	}
 
+	tracker := &schedulerTaskTracker{}
+	defer tracker.Wait()
+
 	// Simulate always-on runners with live config: worker live, reviewer sticky-only.
 	claimed, err := claimAndRunScheduledQueueItems(context.Background(), 3, defaultSchedulerTickInput{
-		Repos:    repos,
-		Now:      func() time.Time { return now },
-		Config:   &cfg,
-		Worker:   &stubWorkerScheduler{},
-		Reviewer: &stubReviewerScheduler{},
+		Repos:       repos,
+		AsyncRunner: tracker,
+		Now:         func() time.Time { return now },
+		Config:      &cfg,
+		Worker:      &stubWorkerScheduler{},
+		Reviewer:    &stubReviewerScheduler{},
 	})
 	if err != nil {
 		t.Fatalf("claimAndRunScheduledQueueItems() error = %v", err)

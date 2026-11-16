@@ -198,10 +198,9 @@ func TestShutdownRetainsStorageWhenNonAgentDrainFailureReported(t *testing.T) {
 func TestBeginShutdownCancelsProducersBeforeNonAgentDrain(t *testing.T) {
 	t.Parallel()
 
-	reg := NewActiveExecutionRegistry()
+	reg := NewActiveExecutionRegistry(3 * time.Second)
 	// Long budget makes reverse-order bugs obvious: without producer cancel
 	// first, drainNonAgentHandles waits this long before force-kill.
-	reg.killTimeout = 3 * time.Second
 
 	producerCtx, producerCancel := context.WithCancel(context.Background())
 	rt := &Runtime{
@@ -233,9 +232,7 @@ func TestBeginShutdownCancelsProducersBeforeNonAgentDrain(t *testing.T) {
 	// Wait until the shell handle is tracked (or fail fast).
 	deadline := time.Now().Add(3 * time.Second)
 	for {
-		reg.mu.Lock()
-		n := len(reg.nonAgentHandles)
-		reg.mu.Unlock()
+		n := reg.NonAgentCount()
 		if n > 0 {
 			break
 		}
@@ -251,8 +248,8 @@ func TestBeginShutdownCancelsProducersBeforeNonAgentDrain(t *testing.T) {
 	elapsed := time.Since(start)
 
 	// Prompt path must finish well under kill budget (cancel → shell Kill → release).
-	if elapsed >= reg.killTimeout {
-		t.Fatalf("BeginShutdown took %v (>= killTimeout %v); producer cancel likely ran after non-agent wait", elapsed, reg.killTimeout)
+	if elapsed >= 3*time.Second {
+		t.Fatalf("BeginShutdown took %v (>= killTimeout %v); producer cancel likely ran after non-agent wait", elapsed, 3*time.Second)
 	}
 	if elapsed > time.Second {
 		t.Fatalf("BeginShutdown took %v, want prompt cancel/drain well under 1s", elapsed)
@@ -273,9 +270,7 @@ func TestBeginShutdownCancelsProducersBeforeNonAgentDrain(t *testing.T) {
 		t.Fatal("shell.Run did not return after BeginShutdown")
 	}
 
-	reg.mu.Lock()
-	remaining := len(reg.nonAgentHandles)
-	reg.mu.Unlock()
+	remaining := reg.NonAgentCount()
 	if remaining != 0 {
 		t.Fatalf("nonAgentHandles remaining = %d, want 0 after prompt drain", remaining)
 	}
@@ -284,8 +279,7 @@ func TestBeginShutdownCancelsProducersBeforeNonAgentDrain(t *testing.T) {
 // Registry contract: BeginShutdown surfaces kill/drain failures (#577).
 func TestActiveExecutionRegistryBeginShutdownReturnsDrainFailure(t *testing.T) {
 	t.Parallel()
-	reg := NewActiveExecutionRegistry()
-	reg.killTimeout = 2 * time.Second
+	reg := NewActiveExecutionRegistry(2 * time.Second)
 
 	lease, err := reg.AdmitSpawn(context.Background(), agent.SpawnMeta{
 		LoopID: "loop-sd", RunID: "run-sd", ExecutionID: "exec-sd",

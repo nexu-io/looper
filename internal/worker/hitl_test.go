@@ -108,94 +108,105 @@ func TestWorkerDoesNotAttachOldVendorSessionsAfterVendorChange(t *testing.T) {
 }
 
 func TestSuspendForHumanTransitionsAndNotifies(t *testing.T) {
-	fixture := newRunnerFixture(t)
-	ctx := context.Background()
-	nowISO := fixture.nowISO()
+	for _, transport := range []string{"respond", "feishu"} {
+		t.Run(transport, func(t *testing.T) {
+			fixture := newRunnerFixture(t)
+			ctx := context.Background()
+			nowISO := fixture.nowISO()
 
-	// Move the seeded loop + queue item into an in-flight state.
-	loop, err := fixture.repos.Loops.GetByID(ctx, "loop_worker_1")
-	if err != nil || loop == nil {
-		t.Fatalf("Loops.GetByID error = %v", err)
-	}
-	loop.Status = "running"
-	if err := fixture.repos.Loops.Upsert(ctx, *loop); err != nil {
-		t.Fatalf("Loops.Upsert error = %v", err)
-	}
-	queueItem, err := fixture.repos.Queue.GetByID(ctx, "queue_worker_1")
-	if err != nil || queueItem == nil {
-		t.Fatalf("Queue.GetByID error = %v", err)
-	}
-	queueItem.Status = "running"
-	if err := fixture.repos.Queue.Upsert(ctx, *queueItem); err != nil {
-		t.Fatalf("Queue.Upsert error = %v", err)
-	}
-	run := storage.RunRecord{ID: "run_worker_1", LoopID: "loop_worker_1", Status: "running", CurrentStep: stringPtr("execute"), LastCompletedStep: stringPtr("plan"), StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}
-	if err := fixture.repos.Runs.Upsert(ctx, run); err != nil {
-		t.Fatalf("Runs.Upsert error = %v", err)
-	}
-	project, err := fixture.repos.Projects.GetByID(ctx, "project_1")
-	if err != nil || project == nil {
-		t.Fatalf("Projects.GetByID error = %v", err)
-	}
+			// Move the seeded loop + queue item into an in-flight state.
+			loop, err := fixture.repos.Loops.GetByID(ctx, "loop_worker_1")
+			if err != nil || loop == nil {
+				t.Fatalf("Loops.GetByID error = %v", err)
+			}
+			loop.Status = "running"
+			if err := fixture.repos.Loops.Upsert(ctx, *loop); err != nil {
+				t.Fatalf("Loops.Upsert error = %v", err)
+			}
+			queueItem, err := fixture.repos.Queue.GetByID(ctx, "queue_worker_1")
+			if err != nil || queueItem == nil {
+				t.Fatalf("Queue.GetByID error = %v", err)
+			}
+			queueItem.Status = "running"
+			if err := fixture.repos.Queue.Upsert(ctx, *queueItem); err != nil {
+				t.Fatalf("Queue.Upsert error = %v", err)
+			}
+			run := storage.RunRecord{ID: "run_worker_1", LoopID: "loop_worker_1", Status: "running", CurrentStep: stringPtr("execute"), LastCompletedStep: stringPtr("plan"), StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}
+			if err := fixture.repos.Runs.Upsert(ctx, run); err != nil {
+				t.Fatalf("Runs.Upsert error = %v", err)
+			}
+			project, err := fixture.repos.Projects.GetByID(ctx, "project_1")
+			if err != nil || project == nil {
+				t.Fatalf("Projects.GetByID error = %v", err)
+			}
 
-	var sent []HITLAskNotification
-	runner := New(Options{
-		DB:          fixture.coordinator.DB(),
-		Repos:       fixture.repos,
-		Logger:      fixture.logger,
-		Now:         fixture.now,
-		HITLEnabled: true,
-		// The operator fallback has no source-of-truth deep link, so it must not emit a
-		// misleading Feishu decision card.
-		HITLAnswerTransport: "respond",
-		HITLNotify: func(_ context.Context, n HITLAskNotification) error {
-			sent = append(sent, n)
-			return nil
-		},
-	})
+			var sent []HITLAskNotification
+			runner := New(Options{
+				DB:          fixture.coordinator.DB(),
+				Repos:       fixture.repos,
+				Logger:      fixture.logger,
+				Now:         fixture.now,
+				HITLEnabled: true,
+				// The operator fallback has no source-of-truth deep link, so it must not emit a
+				// misleading Feishu decision card.
+				HITLAnswerTransport: transport,
+				HITLNotify: func(_ context.Context, n HITLAskNotification) error {
+					sent = append(sent, n)
+					return nil
+				},
+			})
 
-	awaiting := &awaitingHumanError{question: "Which datastore?", options: []string{"redis", "postgres"}, sessionID: "sess-xyz", executionID: "agent-1", vendor: "codex"}
-	result, err := runner.suspendForHuman(ctx, stepInput{Project: *project, Loop: *loop, Run: run, QueueItem: *queueItem}, run, workerCheckpoint{}, awaiting)
-	if err != nil {
-		t.Fatalf("suspendForHuman error = %v", err)
-	}
-	if result.Status != "awaiting_human" {
-		t.Fatalf("result.Status = %q, want awaiting_human", result.Status)
-	}
+			awaiting := &awaitingHumanError{question: "Which datastore?", options: []string{"redis", "postgres"}, sessionID: "sess-xyz", executionID: "agent-1", vendor: "codex"}
+			result, err := runner.suspendForHuman(ctx, stepInput{Project: *project, Loop: *loop, Run: run, QueueItem: *queueItem}, run, workerCheckpoint{}, awaiting)
+			if err != nil {
+				t.Fatalf("suspendForHuman error = %v", err)
+			}
+			if result.Status != "awaiting_human" {
+				t.Fatalf("result.Status = %q, want awaiting_human", result.Status)
+			}
 
-	// Loop suspended + ask persisted.
-	got, err := fixture.repos.Loops.GetByID(ctx, "loop_worker_1")
-	if err != nil || got == nil {
-		t.Fatalf("Loops.GetByID error = %v", err)
-	}
-	if got.Status != "awaiting_human" {
-		t.Fatalf("loop status = %q, want awaiting_human", got.Status)
-	}
-	ask, ok := loops.ReadHITLAsk(got.MetadataJSON)
-	if !ok || ask.Question != "Which datastore?" || ask.SessionID != "sess-xyz" || ask.Status != "awaiting" {
-		t.Fatalf("persisted ask = %#v (ok=%v), want the question + session + awaiting", ask, ok)
-	}
+			// Loop suspended + ask persisted.
+			got, err := fixture.repos.Loops.GetByID(ctx, "loop_worker_1")
+			if err != nil || got == nil {
+				t.Fatalf("Loops.GetByID error = %v", err)
+			}
+			if got.Status != "awaiting_human" {
+				t.Fatalf("loop status = %q, want awaiting_human", got.Status)
+			}
+			ask, ok := loops.ReadHITLAsk(got.MetadataJSON)
+			if !ok || ask.Question != "Which datastore?" || ask.SessionID != "sess-xyz" || ask.Status != "awaiting" {
+				t.Fatalf("persisted ask = %#v (ok=%v), want the question + session + awaiting", ask, ok)
+			}
 
-	// Queue item cancelled so the scheduler stops retrying (resume requeues it).
-	q, err := fixture.repos.Queue.GetByID(ctx, "queue_worker_1")
-	if err != nil || q == nil {
-		t.Fatalf("Queue.GetByID error = %v", err)
-	}
-	if q.Status != "cancelled" {
-		t.Fatalf("queue status = %q, want cancelled", q.Status)
-	}
+			// Queue item cancelled so the scheduler stops retrying (resume requeues it).
+			q, err := fixture.repos.Queue.GetByID(ctx, "queue_worker_1")
+			if err != nil || q == nil {
+				t.Fatalf("Queue.GetByID error = %v", err)
+			}
+			if q.Status != "cancelled" {
+				t.Fatalf("queue status = %q, want cancelled", q.Status)
+			}
 
-	// Run ended as interrupted (resumable from checkpoint).
-	finishedRun, err := fixture.repos.Runs.GetByID(ctx, "run_worker_1")
-	if err != nil || finishedRun == nil {
-		t.Fatalf("Runs.GetByID error = %v", err)
-	}
-	if finishedRun.Status != "interrupted" {
-		t.Fatalf("run status = %q, want interrupted", finishedRun.Status)
-	}
+			// Run ended as interrupted (resumable from checkpoint).
+			finishedRun, err := fixture.repos.Runs.GetByID(ctx, "run_worker_1")
+			if err != nil || finishedRun == nil {
+				t.Fatalf("Runs.GetByID error = %v", err)
+			}
+			if finishedRun.Status != "interrupted" {
+				t.Fatalf("run status = %q, want interrupted", finishedRun.Status)
+			}
 
-	if len(sent) != 0 {
-		t.Fatalf("HITLNotify calls = %d, want 0 without an exact action URL", len(sent))
+			wantSent := 0
+			if transport == "feishu" {
+				wantSent = 1
+				if ask.Transport != "feishu" {
+					t.Fatalf("transport = %q", ask.Transport)
+				}
+			}
+			if len(sent) != wantSent {
+				t.Fatalf("HITLNotify calls = %d, want %d", len(sent), wantSent)
+			}
+		})
 	}
 }
 
@@ -294,4 +305,41 @@ func containsAll(s string, subs ...string) bool {
 		}
 	}
 	return true
+}
+
+func TestFeishuResumePreservesNumberedOptionsAndConversationInFreshSession(t *testing.T) {
+	fixture := newRunnerFixture(t)
+	ctx := context.Background()
+	loop, err := fixture.repos.Loops.GetByID(ctx, "loop_worker_1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	meta, err := loops.WriteHITLAsk(loop.MetadataJSON, loops.HITLAsk{
+		Transport: "feishu", Status: "answered", Question: "选择哪个方案？",
+		Options: []string{" 小杨 ", " ", "杨工"}, Recommendation: "更正式",
+		Consequences: map[string]string{"杨工": "修改问候语"},
+		Answer:       "[负责人 @bot] 选 2，但先解释，不要修改", Vendor: "codex", SessionID: "original-session",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	loop.MetadataJSON = &meta
+	if err := fixture.repos.Loops.Upsert(ctx, *loop); err != nil {
+		t.Fatal(err)
+	}
+	runner := New(Options{Repos: fixture.repos, AgentRuntime: "codex"})
+	for _, vendor := range []string{"codex", "claude-code"} {
+		prompt, session := runner.pendingHumanAnswer(ctx, loop, vendor)
+		for _, required := range []string{"1. 小杨", "2. 杨工 — 修改问候语", "更正式", "先解释，不要修改", "not automatic approval", "before-and-after screenshots", "only on the host machine"} {
+			if !strings.Contains(prompt, required) {
+				t.Fatalf("%s resume lost %q: %s", vendor, required, prompt)
+			}
+		}
+		if vendor == "codex" && session != "original-session" {
+			t.Fatalf("lost native session: %q", session)
+		}
+		if vendor != "codex" && session != "" {
+			t.Fatalf("resumed wrong vendor: %q", session)
+		}
+	}
 }

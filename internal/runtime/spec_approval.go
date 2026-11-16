@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"github.com/nexu-io/looper/internal/workerhost"
 	"html"
 	"strings"
 	"time"
@@ -261,7 +262,7 @@ func (r *Runtime) reconcileSpecApproval(ctx context.Context) {
 		// Strict dispatches use the Plane-authoritative, revision-bound handoff. Legacy
 		// projects retain the worker-ready label bridge during the migration window.
 		if state.StrictDispatchID != "" {
-			client, ok, clientErr := planeClientForCWD(&cfg, workingDir)
+			client, ok, clientErr := workerhost.PlaneClientForCWD(&cfg, workingDir)
 			if clientErr != nil || !ok {
 				if logger != nil {
 					logger.Warn("spec approval: strict Plane client unavailable", map[string]any{"loopId": loop.ID, "error": fmt.Sprint(clientErr)})

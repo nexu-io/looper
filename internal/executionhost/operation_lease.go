@@ -1,4 +1,4 @@
-package runtime
+package executionhost
 
 import (
 	"context"
@@ -379,7 +379,7 @@ func (r *ActiveExecutionRegistry) waitPendingOperations(wait []<-chan struct{}, 
 		select {
 		case <-done:
 		case <-time.After(budget):
-			waitErr = errors.Join(waitErr, errShutdownDrainTimeout)
+			waitErr = errors.Join(waitErr, ErrShutdownDrainTimeout)
 		}
 	}
 	return waitErr
@@ -402,7 +402,7 @@ func (r *ActiveExecutionRegistry) waitBoundOperations(budget time.Duration) erro
 		}
 		select {
 		case <-deadline.C:
-			return errShutdownDrainTimeout
+			return ErrShutdownDrainTimeout
 		case <-time.After(5 * time.Millisecond):
 		}
 	}
