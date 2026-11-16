@@ -85,8 +85,10 @@ func (c Client) callData(ctx context.Context, input []byte, args ...string) (jso
 	return envelope.Data, nil
 }
 
-// VerifyPrivateChat enforces the user's test boundary before any write. Reading
-// membership uses the authorized user; outbound messages always use the bot.
+// VerifyPrivateChat enforces the configured-chat boundary before any write.
+// The chat may contain additional human collaborators; it only needs to retain
+// the configured Looper owner and the current bot. Reading membership uses the
+// authorized user; outbound messages always use the bot.
 func (c Client) VerifyPrivateChat(ctx context.Context) error {
 	var members struct {
 		Users []struct {
@@ -112,8 +114,22 @@ func (c Client) VerifyPrivateChat(ctx context.Context) error {
 	if err := json.Unmarshal(identity, &bot); err != nil {
 		return err
 	}
-	if members.HasMore || len(members.Truncations) != 0 || len(members.Users) != 1 || members.Users[0].ID != c.Config.OwnerOpenID || len(members.Bots) != 1 || !bot.Available || members.Bots[0].AppID != bot.AppID {
-		return fmt.Errorf("Feishu test chat must contain only the configured owner and current bot")
+	ownerPresent := false
+	for _, member := range members.Users {
+		if strings.TrimSpace(member.ID) == strings.TrimSpace(c.Config.OwnerOpenID) {
+			ownerPresent = true
+			break
+		}
+	}
+	botPresent := false
+	for _, member := range members.Bots {
+		if strings.TrimSpace(member.AppID) == strings.TrimSpace(bot.AppID) {
+			botPresent = true
+			break
+		}
+	}
+	if members.HasMore || len(members.Truncations) != 0 || !ownerPresent || !bot.Available || !botPresent {
+		return fmt.Errorf("Feishu chat must contain the configured owner and current bot")
 	}
 	return nil
 }
@@ -177,12 +193,12 @@ func ReplyAfterQuestion(messages []Message, cfg config.HITLFeishuConfig, questio
 			after = true
 			continue
 		}
-		if after && message.ChatID == cfg.ChatID && message.Sender.Type == "user" && message.Sender.ID == cfg.OwnerOpenID && !message.Deleted && strings.TrimSpace(message.Content) != "" {
+		if after && message.ChatID == cfg.ChatID && message.Sender.Type == "user" && !message.Deleted && strings.TrimSpace(message.Content) != "" {
 			label := "[群内讨论，仅作背景] "
 			for _, mention := range message.Mentions {
 				if mention.ID == botID {
 					directed = true
-					label = "[负责人 @bot] "
+					label = "[群成员 @bot] "
 					break
 				}
 			}

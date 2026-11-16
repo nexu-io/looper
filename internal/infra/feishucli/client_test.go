@@ -9,9 +9,29 @@ import (
 	"github.com/nexu-io/looper/internal/config"
 )
 
-func TestPrivateChatRejectsOtherPeopleBeforeSending(t *testing.T) {
+func TestConfiguredChatAllowsCollaboratorsBeforeSending(t *testing.T) {
 	for _, members := range []string{
 		`{"users":[{"member_id":"ou_owner"},{"member_id":"ou_colleague"}],"bots":[{"app_id":"cli_bot"}]}`,
+		`{"users":[{"member_id":"ou_owner"}],"bots":[{"app_id":"cli_bot"}]}`,
+	} {
+		c := Client{Config: config.HITLFeishuConfig{ChatID: "oc_test", OwnerOpenID: "ou_owner"}}
+		c.Run = func(_ context.Context, _ string, _ []byte, args ...string) ([]byte, error) {
+			if args[0] == "whoami" {
+				return []byte(`{"appId":"cli_bot","available":true}`), nil
+			}
+			if args[0] == "im" && args[1] == "+messages-send" {
+				return []byte(`{"ok":true,"data":{"message_id":"om_sent"}}`), nil
+			}
+			if args[1] != "+chat-members-list" {
+				t.Fatalf("must not send: %v", args)
+			}
+			return []byte(`{"ok":true,"data":` + members + `}`), nil
+		}
+		if _, _, err := c.AppHTTP(context.Background(), http.MethodPost, "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=chat_id", nil, []byte(`{"receive_id":"oc_test","msg_type":"interactive","content":"{}"}`)); err != nil {
+			t.Fatalf("rejected configured chat: %s: %v", members, err)
+		}
+	}
+	for _, members := range []string{
 		`{"users":[{"member_id":"ou_other"}],"bots":[{"app_id":"cli_bot"}]}`,
 		`{"users":[{"member_id":"ou_owner"}],"bots":[{"app_id":"cli_other"}]}`,
 		`{"users":[{"member_id":"ou_owner"}],"bots":[{"app_id":"cli_bot"}],"has_more":true}`,
@@ -27,7 +47,7 @@ func TestPrivateChatRejectsOtherPeopleBeforeSending(t *testing.T) {
 			return []byte(`{"ok":true,"data":` + members + `}`), nil
 		}
 		if _, _, err := c.AppHTTP(context.Background(), http.MethodPost, "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=chat_id", nil, []byte(`{"receive_id":"oc_test","msg_type":"interactive","content":"{}"}`)); err == nil {
-			t.Fatalf("accepted unsafe chat: %s", members)
+			t.Fatalf("accepted invalid configured chat: %s", members)
 		}
 	}
 }
@@ -54,7 +74,7 @@ func TestReplyAndPatchRejectMessageFromAnotherChat(t *testing.T) {
 	}
 }
 
-func TestRepliesBelongToCurrentQuestionAndOwner(t *testing.T) {
+func TestRepliesBelongToCurrentQuestionAndCollaborators(t *testing.T) {
 	cfg := config.HITLFeishuConfig{ChatID: "oc_test", OwnerOpenID: "ou_owner"}
 	message := func(id, chat, sender, senderType, text string) Message {
 		m := Message{ID: id, ChatID: chat, Content: text}
@@ -83,11 +103,23 @@ func TestRepliesBelongToCurrentQuestionAndOwner(t *testing.T) {
 	}
 	messages[len(messages)-1].Content = "为什么建议这个？先不要执行"
 	messages[len(messages)-1].Mentions[0].ID = "ou_bot"
-	if got := ReplyAfterQuestion(messages, cfg, "question"); got != "[负责人 @bot] 为什么建议这个？先不要执行" {
+	got := ReplyAfterQuestion(messages, cfg, "question")
+	if !strings.Contains(got, "[群成员 @bot] 为什么建议这个？先不要执行") {
 		t.Fatalf("reply = %q", got)
 	}
+	messages[len(messages)-1].Sender.ID = "ou_other"
+	messages[len(messages)-1].Mentions[0].ID = "ou_other"
+	got = ReplyAfterQuestion(messages, cfg, "question")
+	if got != "" {
+		t.Fatalf("non-owner reply was treated as directed: %q", got)
+	}
+	messages[len(messages)-1].Mentions[0].ID = "ou_bot"
+	got = ReplyAfterQuestion(messages, cfg, "question")
+	if !strings.Contains(got, "[群成员 @bot] 为什么建议这个？先不要执行") {
+		t.Fatalf("collaborator @bot reply = %q", got)
+	}
 	messages = append(messages, message("discussion", "oc_test", "ou_owner", "user", "补充背景"))
-	got := ReplyAfterQuestion(messages, cfg, "question")
+	got = ReplyAfterQuestion(messages, cfg, "question")
 	if !strings.Contains(got, "[群内讨论，仅作背景] 补充背景") {
 		t.Fatalf("lost discussion context: %q", got)
 	}
