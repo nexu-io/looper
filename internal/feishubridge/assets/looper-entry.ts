@@ -9,6 +9,8 @@ import type { AppConfig } from './config/schema';
 import { getProjectByChatId, addProject, listProjects } from './project/registry';
 
 interface Init {
+  memorySocket?: string;
+  memoryScript?: string;
   socket: string;
   callbackSocket: string;
   cwd: string;
@@ -29,22 +31,32 @@ const init = await new Promise<Init>((resolve, reject) => {
   input.once('close', () => reject(new Error('host closed before initialization')));
 });
 
+if (init.memorySocket && init.memoryScript) {
+  process.env.LOOPER_MEMORY_MCP_SOCKET = init.memorySocket;
+  process.env.LOOPER_MEMORY_MCP_SCRIPT = init.memoryScript;
+}
 const turns = new Map<string, string>();
-async function report(event: TurnEvent): Promise<void> {
+async function report(event: TurnEvent): Promise<string | void> {
   const key = `${event.chatId}:${event.rootMessageId}`;
   if (event.phase === 'started' || !turns.has(key)) turns.set(key, randomUUID());
   const body = JSON.stringify({ ...event, turnId: turns.get(key) });
-  await new Promise<void>((resolve, reject) => {
+  const context = await new Promise<string>((resolve, reject) => {
     const req = request({ socketPath: init.callbackSocket, path: '/bridge/events',
       method: 'POST', headers: { 'content-type': 'application/json' } }, (res) => {
-      res.resume();
-      res.on('end', () => res.statusCode === 200 ? resolve() : reject(new Error(`host rejected turn event: ${res.statusCode}`)));
+      let data = '';
+      res.setEncoding('utf8');
+      res.on('data', (chunk: string) => { data += chunk; if (data.length > 256000) req.destroy(new Error('host context too large')); });
+      res.on('end', () => {
+        if (res.statusCode !== 200) { reject(new Error(`host rejected turn event: ${res.statusCode}`)); return; }
+        try { resolve((JSON.parse(data) as {memoryContext?: string}).memoryContext ?? ''); } catch { reject(new Error('invalid host context')); }
+      });
     });
-    req.setTimeout(10_000, () => req.destroy(new Error('host event timeout')));
+    req.setTimeout(40_000, () => req.destroy(new Error('host event timeout')));
     req.on('error', reject);
     req.end(body);
   });
   if (event.phase === 'finished' || event.phase === 'failed') turns.delete(key);
+  return context;
 }
 
 const projects = await listProjects();

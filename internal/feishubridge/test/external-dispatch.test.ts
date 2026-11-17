@@ -75,7 +75,7 @@ function thread() {
   return { t, turns, consumed, options };
 }
 let orchestrator: ReturnType<typeof createOrchestrator>;
-const events = vi.fn(async (_event: unknown) => undefined);
+const events = vi.fn(async (_event: unknown): Promise<string | void> => undefined);
 let seq = 0;
 function message(text: string): NormalizedMessage {
   return { messageId: `msg-${++seq}`, chatId: 'chat', chatType: 'group', threadId: 'topic',
@@ -91,6 +91,7 @@ function setup(showModel: 'off' | 'running' | 'always' = 'always') {
 }
 beforeEach(() => {
   vi.clearAllMocks();
+  events.mockReset().mockResolvedValue(undefined);
   fake.record = undefined;
   fake.backend.listModels.mockResolvedValue([{ id: 'chosen-model', displayName: 'Chosen', description: '', supportedEfforts: ['medium', 'xhigh'], defaultEffort: 'medium', isDefault: true, hidden: false }] as never);
   fake.backend.capabilities.steer = true;
@@ -106,6 +107,23 @@ afterEach(async () => {
 const until = (check: () => void) => vi.waitFor(check);
 
 describe('Looper native dispatch seam', () => {
+  it('injects a fresh memory catalog on every turn without selecting a repository', async () => {
+    const run = thread(); fake.backend.startThread.mockResolvedValue(run.t);
+    let version = 0;
+    events.mockImplementation(async (event) => (event as {phase: string}).phase === 'started' ? `memory catalog ${++version}` : undefined);
+    const o = setup();
+    const task = {chatId:'chat',rootMessageId:'root',cwd:'/neutral',title:'task',prompt:'Start'};
+    const first = o.submitTask(task);
+    await until(() => expect(run.consumed).toHaveLength(1));
+    expect(run.consumed[0]!.text).toContain('memory catalog 1');
+    await o.submitTask({...task,threadId:'topic',prompt:'Continue'});
+    run.turns[0]!.resolve();
+    await until(() => expect(run.consumed).toHaveLength(2));
+    expect(run.consumed[1]!.text).toContain('memory catalog 2');
+    expect(run.consumed[1]!.text).not.toContain('memory catalog 1');
+    run.turns[1]!.resolve(); await first;
+  });
+
   it('adopts the real topic before completion, queues a follow-up, and keeps one native session', async () => {
     const run = thread();
     fake.backend.startThread.mockResolvedValue(run.t);

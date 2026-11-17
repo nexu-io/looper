@@ -16,9 +16,10 @@ import (
 )
 
 type planeSource struct {
-	project config.ProjectRefConfig
-	client  *forge.PlaneClient
-	nodeID  string
+	memoryEnabled bool
+	project       config.ProjectRefConfig
+	client        *forge.PlaneClient
+	nodeID        string
 }
 
 func planeSources(cfg config.Config) ([]planeSource, error) {

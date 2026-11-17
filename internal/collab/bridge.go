@@ -141,6 +141,7 @@ func serveBridge(parent context.Context, options Options) error {
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /bridge/events", host.turnEvent)
+	mux.HandleFunc("POST /memory/", host.memoryTool)
 	mux.HandleFunc("POST /bridge/human", host.humanEvent)
 	mux.HandleFunc("GET /status", host.status)
 	mux.HandleFunc("GET /people", host.people)
@@ -190,6 +191,7 @@ func serveBridge(parent context.Context, options Options) error {
 		Socket: filepath.Join(dir, "bridge.sock"), CallbackSocket: SocketPath(dir), CWD: workspace,
 		AppID: appID, AppSecret: appSecret, OwnerOpenID: cfg.HITL.Feishu.OwnerOpenID,
 		ExternalEvents: inboxURL != "",
+		MemorySocket:   SocketPath(dir), MemoryScript: filepath.Join(workspace, "memory.py"),
 	}, log, inboxToken)
 	if err != nil {
 		return err
@@ -240,6 +242,9 @@ func serveBridge(parent context.Context, options Options) error {
 	}
 	tick := time.NewTicker(time.Second)
 	defer tick.Stop()
+	memoryDone := make(chan struct{})
+	go func() { defer close(memoryDone); host.maintainMemory(ctx) }()
+	defer func() { cancel(); <-memoryDone }()
 	lastPlane, lastPR := time.Time{}, time.Time{}
 	for ctx.Err() == nil {
 		if err := host.dispatchQueued(ctx); err != nil {
@@ -413,7 +418,11 @@ func (h *bridgeHost) turnEvent(w http.ResponseWriter, r *http.Request) {
 	if id != "" && h.notify != nil {
 		h.notify.RefreshThreadHeader(r.Context(), id, nil, 0)
 	}
-	writeJSON(w, map[string]bool{"ok": true})
+	memoryContext := ""
+	if id != "" && event.Phase == "started" {
+		memoryContext = h.memoryContext(r.Context(), id)
+	}
+	writeJSON(w, map[string]any{"ok": true, "memoryContext": memoryContext})
 }
 
 func (h *bridgeHost) recordTurnEvent(ctx context.Context, event feishubridge.TurnEvent) (string, error) {
@@ -496,6 +505,14 @@ func (h *bridgeHost) recordTurnEvent(ctx context.Context, event feishubridge.Tur
 			_, _ = h.db.ExecContext(ctx, `UPDATE loops SET metadata_json=json_remove(metadata_json,'$.hitl') WHERE id=?`, loop.ID)
 		}
 		h.trackTurn(ctx, loop, state, event, status)
+		if status == "completed" && event.Phase == "finished" {
+			updated, _ := h.repos.Loops.GetByID(ctx, loop.ID)
+			if updated != nil {
+				if err := h.enqueueMemoryReview(ctx, *updated, state); err != nil {
+					h.warn("memory review retained task but enqueue failed", err)
+				}
+			}
+		}
 		return loop.ID, nil
 	}
 	return "", nil
@@ -606,6 +623,9 @@ waitingFor 中填写从当前应用目录查得的真实 open_id；不要把 own
 state 可为 needs_input（确实需要人回复）、monitoring_prs（PR 尚在推进或等待合并）、completed（任务已实际完成；有 PR 时应在收尾后）。pullRequests 记录任务涉及的全部仓库 PR，允许为空。可选 repositories 数组记录实际选择的仓库：repo（HTTPS URL）、role（modify/consult/candidate）、branch、baseSha、prUrl、validationStatus（passed/failed/not_run/blocked）。这是 Agent 上报，不代表人工验收。
 继续原话题时沿用同一个任务文件。普通聊天只有 @bot 才触发你，不要自行轮询飞书抢另一条消息通道。
 `
+	if err := h.writeMemoryTool(dir); err != nil {
+		return err
+	}
 	return os.WriteFile(filepath.Join(dir, "AGENTS.md"), []byte(text), 0600)
 }
 
@@ -630,7 +650,7 @@ func bridgePlaneSources(cfg config.Config) ([]planeSource, error) {
 			if err != nil {
 				return nil, err
 			}
-			result = append(result, planeSource{project: project, client: client, nodeID: provider.StrictDispatch.NodeID})
+			result = append(result, planeSource{project: project, client: client, nodeID: provider.StrictDispatch.NodeID, memoryEnabled: provider.StrictDispatch.MemoryEnabled})
 			break // One connection per Plane provider, regardless of repository count.
 		}
 	}

@@ -106,7 +106,7 @@ func TestBuildManifestRejectsInvalidChecksum(t *testing.T) {
 }
 
 func TestCurrentSchemaVersionUsesLatestEmbeddedMigration(t *testing.T) {
-	if got, want := CurrentSchemaVersion(), "0023_telemetry_checkpoints"; got != want {
+	if got, want := CurrentSchemaVersion(), "0024_memory_operations"; got != want {
 		t.Fatalf("CurrentSchemaVersion() = %q, want %q", got, want)
 	}
 }
