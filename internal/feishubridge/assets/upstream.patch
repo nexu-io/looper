@@ -91,7 +91,22 @@
  ): Orchestrator {
    /** Lazily-constructed backends by id — one instance per backend for the whole
     * bridge (mirrors the old single-instance shape; codex stays the default). */
-@@ -4134,7 +4138,13 @@
+@@ -958,6 +962,14 @@
+           .catch(() => undefined);
+       }
+       return;
++    }
++
++    const sender = msg.raw as { sender?: { sender_type?: string } } | undefined;
++    if (sender?.sender?.sender_type === 'user') {
++      // Observation failures must not replay a human command or block execution.
++      void externalHooks?.onHuman?.({ chatId: msg.chatId, rootId: msg.rootId,
++        threadId: msg.threadId, messageId: msg.messageId, participantId: msg.senderId,
++        at: msg.createTime }).catch((err) => log.fail('looper-human-observation', err));
+     }
+ 
+     // 多维表格「发送消息卡片」等 card 2.0 交互卡片：推送事件 / 旧版 content 只给降级
+@@ -4134,7 +4146,13 @@
  
      // M-3: 池满先排队（占位卡可见可取消）；null = 等待期被 ⏹ 取消，预订已释放。
      const slot = await acquireRunSlot(opts, state, activeKey, reaction);
@@ -106,7 +121,7 @@
      if (shuttingDown) {
        slot.release();
        active.delete(activeKey);
-@@ -4270,6 +4280,8 @@
+@@ -4270,6 +4288,8 @@
          const turnModel = rec?.model ?? opts.model;
          const turnEffort = rec?.effort ?? opts.effort;
          const modelDisp = getModelDisplay(cfg);
@@ -115,7 +130,7 @@
          const run = opts.thread.runStreamed(turnInput, { model: turnModel, effort: turnEffort });
          titleTurnAttempted = true;
          const turnStartAt = Date.now(); // turn/start 已在 runStreamed() 内发出（与下面的建卡并行）
-@@ -4310,6 +4322,8 @@
+@@ -4310,6 +4330,8 @@
                topicThreadId = key;
                rc.threadId = key;
                await persist(key);
@@ -124,7 +139,7 @@
              }
            } else {
              topicThreadId = activeKey;
-@@ -4678,6 +4692,9 @@
+@@ -4678,6 +4700,9 @@
          replyTo = finalMsgId;
          replyInThread = !opts.flat; // stay in the topic for queued turns (single: stay flat)
          log.info('card', 'final', { terminal: render.terminal() });
@@ -134,7 +149,7 @@
  
          // A stop (⏹ graceful or forced / watchdog) or a dead process ends the
          // whole run — drop any queued follow-ups, but tell the user instead of
-@@ -4715,6 +4732,9 @@
+@@ -4715,6 +4740,9 @@
        // client before the next message resumes the persisted session.
        if (topicThreadId && sessions.get(topicThreadId) === opts.thread) sessions.delete(topicThreadId);
        await opts.thread.close().catch(() => undefined);
@@ -144,7 +159,7 @@
        log.fail('intake', err);
        await channel
          .send(opts.chatId, { markdown: runFailureMessage(err, dropped) }, { replyTo: opts.replyTo, replyInThread: !opts.flat })
-@@ -5669,7 +5689,55 @@
+@@ -5669,7 +5697,55 @@
      if (op.kind === 'setCompletionReminder') refreshCompletionReminderCards();
    };
  

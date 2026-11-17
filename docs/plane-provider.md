@@ -33,6 +33,14 @@ For a teammate, prefer Plane's browser flow over asking them to copy workspace a
 
 `looper plane connect` now creates or extends the local config when the matching provider is absent. It reads the Plane workspace/project from the short-lived connection, detects `owner/repo` from the local GitHub origin, and scopes planner/worker trigger overrides to that project. Use `--project-path` and `--code-repo` when running outside the checkout. Existing matching configurations are reused unchanged.
 
+For the standalone collaboration host, add `--collab` to the connection command,
+then run `looper collab start` and `looper plane doctor --collab`. When using a
+custom configuration or state directory, pass the same `--config` and
+`--state-dir` to start and doctor. This diagnostic checks the running collab
+host, its loopernet identity and the Plane repositories actually loaded by that
+host; it does not require `looperd`. Restart collab after changing its targets.
+Passing diagnostics does not replace a real dispatch and human acceptance test.
+
 ## Explicit bootstrap (automation and legacy servers)
 
 ```bash
@@ -125,6 +133,7 @@ The bootstrap command above produces a config equivalent to the following (defau
 Validation rules for a plane provider/project:
 
 - `providers[].kind = "plane"` requires `tokenEnv`, `workspace`, and `projectId`. `baseUrl` is optional (defaults to the public Plane API base) but must be an absolute `http(s)` URL when set.
+- When the API and web app use different origins, set `providers[].webBaseUrl` to the human-facing HTTP(S) origin, such as `http://localhost:3000`. This changes task/comment links only; `baseUrl` and `strictDispatch.baseUrl` continue to identify the API. The web origin cannot contain credentials, a path, query, or fragment.
 - The bound project requires `provider` (the plane provider id) and `repo` (the GitHub code repo, `owner/name`).
 
 ## Pre-Spec multi-role decision flow (opt-in)

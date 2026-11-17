@@ -379,6 +379,7 @@ func (r *Runner) suspendForHuman(ctx context.Context, input stepInput, run stora
 	}); err != nil {
 		return ProcessResult{}, err
 	}
+	r.track(ctx, "human.requested", run.ID, input.Project.ID, input.Loop.ID, run.ID, map[string]any{"transport": ask.Transport, "askedAt": ask.AskedAt})
 	reason := "worker suspended awaiting human decision"
 	if _, err := r.repos.Queue.CancelByLoop(ctx, input.Loop.ID, nowISO, &reason); err != nil {
 		return ProcessResult{}, err

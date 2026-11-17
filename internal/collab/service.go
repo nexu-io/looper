@@ -28,6 +28,7 @@ import (
 	networkclient "github.com/nexu-io/looper/internal/network/client"
 	"github.com/nexu-io/looper/internal/projects"
 	"github.com/nexu-io/looper/internal/storage"
+	"github.com/nexu-io/looper/internal/telemetry"
 	"github.com/nexu-io/looper/internal/worker"
 	"github.com/nexu-io/looper/internal/workerhost"
 )
@@ -90,6 +91,16 @@ func Serve(parent context.Context, options Options) error {
 		return err
 	}
 	repos := storage.NewRepositories(coordinator.DB())
+	telemetryDone := make(chan struct{})
+	go func() {
+		defer close(telemetryDone)
+		telemetry.Maintain(ctx, coordinator.DB(), cfg, func(err error) {
+			if options.Logger != nil {
+				options.Logger.Warn("Plane telemetry sync failed; retained locally", map[string]any{"error": err.Error()})
+			}
+		})
+	}()
+	defer func() { cancel(); <-telemetryDone }()
 	chatManager := newTaskChatManager(cfg, repos, dir)
 	git := gitinfra.New(gitinfra.Options{GitPath: value(cfg.Tools.GitPath), Repos: repos})
 	projectService := projects.Service{DB: coordinator.DB(), Repos: repos, Config: cfg, DetectRepo: func(ctx context.Context, path string) (projects.DetectedRepo, error) {
@@ -252,7 +263,7 @@ func Serve(parent context.Context, options Options) error {
 		if ctx.Err() != nil {
 			state = "stopping"
 		}
-		writeJSON(w, Status{Service: "looper collab", PID: os.Getpid(), State: state, ActiveExecutions: owner.LiveCount(), Network: network.Status(), Tasks: tasks})
+		writeJSON(w, Status{Service: "looper collab", PID: os.Getpid(), State: state, ActiveExecutions: owner.LiveCount(), Network: network.Status(), Tasks: tasks, PlaneTargets: configuredPlaneTargets(cfg)})
 	})
 	mux.HandleFunc("POST /run", func(w http.ResponseWriter, r *http.Request) {
 		var input worker.EnqueueInput
@@ -314,6 +325,7 @@ func Serve(parent context.Context, options Options) error {
 		closed = true
 		return errors.Join(err, fmt.Errorf("execution drain failed; storage retained: %w", drainErr))
 	}
+	<-telemetryDone
 	closed = true
 	closeErr := coordinator.Close()
 	return errors.Join(err, closeErr)

@@ -2,21 +2,27 @@ package cliapp
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
+	"github.com/nexu-io/looper/internal/agent"
 	"github.com/nexu-io/looper/internal/collab"
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/executionhost"
 	"github.com/nexu-io/looper/internal/feishubridge"
 	networkclient "github.com/nexu-io/looper/internal/network/client"
+	"github.com/nexu-io/looper/internal/storage"
+	"github.com/nexu-io/looper/internal/telemetry"
 	"github.com/nexu-io/looper/internal/worker"
 	"github.com/spf13/cobra"
 )
@@ -32,11 +38,32 @@ func (r *commandRuntime) collabCommand() *cobra.Command {
 				return r.collabRequest(cmd, "GET", "/people", nil)
 			}}),
 			newCommand(commandSpec{use: "run", short: "Explicitly dispatch a task", args: cobra.NoArgs, runE: r.collabRun, localFlags: []flagSpec{stringFlag("project", "id", "Plane connection / local record namespace (does not bind a repository)"), stringFlag("module", "name", "Optional module collaboration scope"), stringFlag("title", "text", "Human-readable task title"), stringFlag("prompt-file", "path|-", "Task prompt file; - reads stdin"), stringFlag("issue", "number", "Source issue or Plane sequence number"), stringFlag("issue-url", "url", "Source task link")}}),
-			newCommand(commandSpec{use: "logs", short: "Show collaboration host logs", args: cobra.NoArgs, runE: r.collabLogs}),
+			newCommand(commandSpec{use: "logs [task|run]", short: "Show host or task execution logs", args: cobra.MaximumNArgs(1), runE: r.collabLogs, localFlags: []flagSpec{boolFlag("stderr", "Show task stderr"), stringFlag("tail", "count", "Show the last N task log lines"), boolFlag("full", "Show all retained output up to 16 MiB")}}),
+			newCommand(commandSpec{use: "dashboard", short: "Serve a read-only local task dashboard", args: cobra.NoArgs, runE: r.collabDashboard, localFlags: []flagSpec{stringFlag("port", "number", "Loopback HTTP port (default 18090)")}}),
+			newCommand(commandSpec{use: "trace <task|run>", short: "Read a metadata-only task timeline offline", args: cobra.ExactArgs(1), runE: r.collabTrace}),
+			newCommand(commandSpec{use: "sync", short: "Upload connected Plane task metadata; retry retained revisions", args: cobra.NoArgs, runE: r.collabSync}),
 			newCommand(commandSpec{use: "stop", short: "Drain executions and stop the service", args: cobra.NoArgs, runE: r.collabStop}),
 		},
 	})
 	return command
+}
+
+func (r *commandRuntime) collabSync(cmd *cobra.Command, _ []string) error {
+	cfg, dir, err := r.collabConfig(cmd)
+	if err != nil {
+		return err
+	}
+	dsn := url.URL{Scheme: "file", Path: filepath.Join(dir, "looper.sqlite"), RawQuery: "mode=rw&_busy_timeout=5000"}
+	db, err := sql.Open(storage.DriverName, dsn.String())
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	result, err := telemetry.Sync(cmd.Context(), db, cfg, true)
+	if err != nil {
+		return err
+	}
+	return writeJSON(cmd.OutOrStdout(), result)
 }
 
 func (r *commandRuntime) collabConfig(cmd *cobra.Command) (config.Config, string, error) {
@@ -193,10 +220,16 @@ func (r *commandRuntime) collabRun(cmd *cobra.Command, _ []string) error {
 	return r.collabRequest(cmd, "POST", "/run", input)
 }
 
-func (r *commandRuntime) collabLogs(cmd *cobra.Command, _ []string) error {
+func (r *commandRuntime) collabLogs(cmd *cobra.Command, args []string) error {
 	_, dir, err := r.collabConfig(cmd)
 	if err != nil {
 		return err
+	}
+	if len(args) > 0 {
+		return r.collabTaskLogs(cmd, dir, strings.TrimSpace(args[0]))
+	}
+	if getBoolFlag(cmd, "stderr") || getBoolFlag(cmd, "full") || getStringFlag(cmd, "tail") != "" {
+		return fmt.Errorf("--stderr, --tail and --full require a task or run selector")
 	}
 	file, err := os.Open(collab.LogPath(dir))
 	if err != nil {
@@ -214,6 +247,39 @@ func (r *commandRuntime) collabLogs(cmd *cobra.Command, _ []string) error {
 	}
 	_, err = io.Copy(cmd.OutOrStdout(), file)
 	return err
+}
+
+func (r *commandRuntime) collabTaskLogs(cmd *cobra.Command, dir, selector string) error {
+	if _, err := parseOptionalPositiveInt(getStringFlag(cmd, "tail"), "--tail"); err != nil {
+		return err
+	}
+	// Reading logs must not create a database, migrate it or start a host.
+	dsn := url.URL{Scheme: "file", Path: filepath.Join(dir, "looper.sqlite"), RawQuery: "mode=ro&_busy_timeout=5000"}
+	db, err := sql.Open(storage.DriverName, dsn.String())
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	repos := storage.NewRepositories(db)
+	resolved, err := resolveLoopSelector(cmd.Context(), repos, selector)
+	if err != nil {
+		return err
+	}
+	output := map[string]any{"seq": resolved.Loop.Seq, "loopId": resolved.Loop.ID, "loopType": resolved.Loop.Type, "loopStatus": resolved.Loop.Status, "run": nil, "agent": nil}
+	if run := resolved.Run; run != nil {
+		output["run"] = map[string]any{"runId": run.ID, "status": run.Status, "currentStep": run.CurrentStep, "summary": run.Summary, "errorMessage": run.ErrorMessage}
+		execution, err := repos.AgentExecutions.GetLatestByRunID(cmd.Context(), run.ID)
+		if err != nil {
+			return err
+		}
+		if execution != nil {
+			stdout, stderr := agent.ReadOutput(filepath.Join(dir, "logs"), execution.OutputJSON)
+			output["agent"] = map[string]any{"executionId": execution.ID, "vendor": execution.Vendor, "pid": execution.PID, "status": execution.Status, "errorMessage": execution.ErrorMessage, "stdout": stdout, "stderr": stderr}
+		}
+	}
+	return r.outputCommand(cmd, func(context.Context) (json.RawMessage, error) { return json.Marshal(output) }, func(w io.Writer, payload json.RawMessage) error {
+		return writeHumanLoopLogs(w, payload, getBoolFlag(cmd, "stderr"), getBoolFlag(cmd, "full"), getStringFlag(cmd, "tail"))
+	})
 }
 
 type collabLogger struct{ out io.Writer }

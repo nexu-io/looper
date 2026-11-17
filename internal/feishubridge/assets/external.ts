@@ -24,4 +24,14 @@ export interface TurnEvent {
 
 export interface ExternalHooks {
   onTurn?: (event: TurnEvent) => Promise<void>;
+  onHuman?: (event: HumanEvent) => Promise<void>;
+}
+
+export interface HumanEvent {
+  chatId: string;
+  rootId?: string;
+  threadId?: string;
+  messageId: string;
+  participantId: string;
+  at: number;
 }

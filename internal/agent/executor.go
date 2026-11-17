@@ -222,11 +222,12 @@ type completionParse struct {
 	// completion marker (`{"summary":…,"productAsk":…}`) when a spec has a real
 	// product decision only a human product owner can make. Empty for the common
 	// case; only the planner is instructed to ever populate it.
-	ProductAsk   string
-	Artifacts    []string
-	ChangedFiles []string
-	Commits      []string
-	Lifecycle    *lifecycle.State
+	ProductAsk        string
+	Artifacts         []string
+	ChangedFiles      []string
+	Commits           []string
+	Lifecycle         *lifecycle.State
+	RepositoryReports []RepositoryReport
 }
 
 type Execution interface {
@@ -992,6 +993,10 @@ func (x *execution) run(ctx context.Context) {
 		}
 		nativeFinalText = tr.assistantText()
 	}
+	if x.piJSONMode() {
+		nativeFinalText, _ = piJSONL(stdout)
+		completion = parseCompletion(nativeFinalText, stderr)
+	}
 	if status != "completed" {
 		completion = completionParse{ParseStatus: "missing"}
 	}
@@ -1091,6 +1096,12 @@ func (x *execution) run(ctx context.Context) {
 			"heartbeatCount":               result.HeartbeatCount,
 			"summary":                      result.Summary,
 		}, endedAtISO)
+		if len(completion.Artifacts) > 0 {
+			x.executor.appendLifecycleEvent("artifacts.reported", x.input, x.executionID, map[string]any{"source": "agent_report", "count": len(completion.Artifacts)}, endedAtISO)
+		}
+		for _, report := range completion.RepositoryReports {
+			x.executor.appendLifecycleEvent("repository.reported", x.input, x.executionID, map[string]any{"source": "agent_report", "repo": report.Repo, "role": report.Role, "branch": report.Branch, "baseSha": report.BaseSHA, "prUrl": report.PRURL, "validationStatus": report.ValidationStatus}, endedAtISO)
+		}
 	}
 
 	x.doneCh <- execOutcome{result: result, err: persistErr}
@@ -1502,6 +1513,9 @@ func (x *execution) maybeEmitProgress(now time.Time, stdout, stderr string) {
 		// Structured opencode feed (tool calls + text snippets) parsed from JSONL, so
 		// the card shows human activity rather than raw JSON events.
 		tail = openCodeActivityTail(stdout, liveProgressTailLines)
+	case x.piJSONMode():
+		_, activity := piJSONL(stdout)
+		tail = lastNonEmptyLines(strings.Join(activity, "\n"), liveProgressTailLines)
 	case x.claudeJSONMode():
 		// Structured claude feed (tool_use calls + text snippets) parsed from JSONL, so
 		// the card shows human activity rather than raw JSON events.
@@ -2121,6 +2135,10 @@ func resolveArgs(cfg ExecutorConfig, workingDirectory string, prompt string) []s
 		return resolveCursorArgs(cfg, resolvedArgs, prompt)
 	case config.AgentVendorGrokBuild:
 		return resolveGrokArgs(cfg, resolvedArgs, workingDirectory, prompt)
+	case config.AgentVendorPi:
+		return resolvePiArgs(cfg, resolvedArgs, prompt)
+	case config.AgentVendorOmp:
+		return resolveOmpArgs(cfg, resolvedArgs, workingDirectory, prompt)
 	default:
 		return append([]string{}, resolvedArgs...)
 	}
@@ -2212,6 +2230,41 @@ func resolveGrokArgs(cfg ExecutorConfig, args []string, workingDirectory string,
 	}
 	if !hasAnyFlag(resolved, []string{"--no-auto-update"}) {
 		resolved = append(resolved, "--no-auto-update")
+	}
+	return resolved
+}
+
+// resolvePiArgs builds argv for the Pi coding agent (https://pi.dev).
+// -p/--print is boolean; the prompt is a positional message. No --cwd flag —
+// Looper already sets process cmd.Dir to the worktree. Fresh-run only.
+func resolvePiArgs(cfg ExecutorConfig, args []string, prompt string) []string {
+	resolved := prependModelFlag(args, cfg.Model, "--model", []string{"--model"})
+	if !hasAnyFlag(resolved, []string{"--mode"}) {
+		resolved = append([]string{"--mode", "json"}, resolved...)
+	}
+	if !hasAnyFlag(resolved, []string{"-p", "--print"}) {
+		// Operator-owned print/prompt: when -p/--print is already configured,
+		// do not append Looper's generated prompt (matches claude-code).
+		resolved = append(resolved, "-p", prompt)
+	}
+	if !hasAnyFlag(resolved, []string{"-a", "--approve", "-na", "--no-approve"}) {
+		resolved = append(resolved, "--approve")
+	}
+	return resolved
+}
+
+// resolveOmpArgs builds argv for Oh My Pi / omp (https://omp.sh).
+// Print mode matches pi (-p/--print boolean + positional prompt). Fresh-run only.
+func resolveOmpArgs(cfg ExecutorConfig, args []string, workingDirectory string, prompt string) []string {
+	resolved := prependModelFlag(args, cfg.Model, "--model", []string{"--model"})
+	if !hasAnyFlag(resolved, []string{"-p", "--print"}) {
+		resolved = append(resolved, "-p", prompt)
+	}
+	if strings.TrimSpace(workingDirectory) != "" && !hasAnyFlag(resolved, []string{"--cwd"}) {
+		resolved = append(resolved, "--cwd", workingDirectory)
+	}
+	if !hasAnyFlag(resolved, []string{"--auto-approve", "--approval-mode"}) {
+		resolved = append(resolved, "--auto-approve")
 	}
 	return resolved
 }
@@ -2669,11 +2722,12 @@ func parseCompletion(stdout, stderr string) completionParse {
 			return completionParse{ParseStatus: "invalid_json", CompletionSignal: CompletionMarkerPrefix}
 		}
 		result := completionParse{
-			ParseStatus:      "parsed",
-			CompletionSignal: CompletionMarkerPrefix,
-			Artifacts:        asStringSlice(parsed["artifacts"]),
-			ChangedFiles:     asStringSlice(parsed["changedFiles"]),
-			Commits:          asStringSlice(parsed["commits"]),
+			ParseStatus:       "parsed",
+			CompletionSignal:  CompletionMarkerPrefix,
+			Artifacts:         asStringSlice(parsed["artifacts"]),
+			RepositoryReports: parseRepositoryReports(parsed["repositories"]),
+			ChangedFiles:      asStringSlice(parsed["changedFiles"]),
+			Commits:           asStringSlice(parsed["commits"]),
 		}
 		if state, err := lifecycle.FromMap(parsed["git_pr_lifecycle"]); err == nil {
 			result.Lifecycle = state
@@ -2706,6 +2760,9 @@ func parseCompletion(stdout, stderr string) completionParse {
 		}
 		if len(primary.Artifacts) == 0 {
 			primary.Artifacts = result.Artifacts
+		}
+		if len(primary.RepositoryReports) == 0 {
+			primary.RepositoryReports = result.RepositoryReports
 		}
 		if strings.TrimSpace(primary.ProductAsk) == "" && strings.TrimSpace(result.ProductAsk) != "" {
 			primary.ProductAsk = result.ProductAsk
@@ -2876,6 +2933,7 @@ func (e *ConfiguredExecutor) appendLifecycleEvent(eventType string, input RunInp
 		ProjectID:        emptyToNil(input.ProjectID),
 		LoopID:           emptyToNil(input.LoopID),
 		RunID:            emptyToNil(input.RunID),
+		CorrelationID:    emptyToNil(input.LoopID),
 		EntityType:       stringPtr("agent_execution"),
 		EntityID:         &executionID,
 		ActorType:        stringPtr("agent"),

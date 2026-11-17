@@ -9,6 +9,31 @@ import (
 	"testing"
 )
 
+func TestPlaneSeparateWebOriginKeepsAPITransport(t *testing.T) {
+	server, _ := planeTestServer(t)
+	workspace, project, tokenEnv := "acme", "proj-123", "LOOPER_TEST_PLANE_WEB_TOKEN"
+	t.Setenv(tokenEnv, "test-token")
+	web := "http://localhost:3000/"
+	provider := config.ProviderConfig{ID: "plane-local", Kind: config.ProviderKindPlane, BaseURL: server.URL + "/api/v1", WebBaseURL: &web, Workspace: &workspace, ProjectID: &project, TokenEnv: &tokenEnv}
+	client, err := NewPlaneClientFromConfig(provider, "acme/looper", WithPlaneHTTPClient(server.Client()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	issues, err := client.ListOpenIssues(context.Background(), ListIssuesInput{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if issues[0].HTMLURL != "http://localhost:3000/acme/projects/proj-123/issues/wi-1" {
+		t.Fatalf("wrong web URL: %s", issues[0].HTMLURL)
+	}
+	for _, invalid := range []string{"javascript:alert(1)", "https://user:secret@example.test", "https://example.test/path", "https://example.test?q=secret", "https://example.test#fragment"} {
+		provider.WebBaseURL = &invalid
+		if _, err := NewPlaneClientFromConfig(provider, "acme/looper"); err == nil {
+			t.Errorf("accepted invalid web origin %q", invalid)
+		}
+	}
+}
+
 // planeTestServer serves a canned Plane project (labels + work-items + user) and
 // records the auth / user-agent headers of every request so the mapping and the
 // Cloudflare-safe User-Agent can be asserted without touching the network.

@@ -46,7 +46,7 @@ func TestPlaneLinkAndEnableCreateOwnerBoundStrictCredentials(t *testing.T) {
 		switch request.URL.Path {
 		case "/api/v1/users/me/":
 			writePlaneCommandTestJSON(t, response, map[string]any{"id": memberID})
-		case "/api/v1/workspaces/open-design":
+		case "/api/v1/workspaces/open-design/":
 			writePlaneCommandTestJSON(t, response, map[string]any{"id": planeprotocolUUIDString(workspaceID)})
 		case "/v1/link-challenges":
 			if request.Header.Get("Authorization") != "Bearer node-token" {

@@ -48,7 +48,7 @@ type Reply struct {
 // MarkReplyProcessing is a receipt, not a decision or an acceptance result.
 func (c Client) MarkReplyProcessing(ctx context.Context, messageID string) error {
 	params, _ := json.Marshal(map[string]string{"message_id": messageID})
-	_, err := c.callData(ctx, nil, "im", "reactions", "create", "--params", string(params), "--data", `{"reaction_type":{"emoji_type":"OnIt"}}`, "--as", "bot")
+	_, err := c.callData(ctx, nil, "im", "reactions", "create", "--params", string(params), "--data", `{"reaction_type":{"emoji_type":"Get"}}`, "--as", "bot")
 	return err
 }
 
@@ -304,7 +304,7 @@ func ReplyAfterQuestion(messages []Message, cfg config.HITLFeishuConfig, questio
 			after = true
 			continue
 		}
-		if after && message.ChatID == cfg.ChatID && message.Sender.Type == "user" && !message.Deleted && strings.TrimSpace(message.Content) != "" {
+		if after && message.ID != "" && message.ChatID == cfg.ChatID && message.Sender.Type == "user" && !message.Deleted && strings.TrimSpace(message.Content) != "" {
 			label := "[群内讨论，仅作背景] "
 			content := message.Content
 			for _, mention := range message.Mentions {

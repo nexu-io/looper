@@ -185,7 +185,7 @@ func (r *commandRuntime) joinPlaneNetwork(cmd *cobra.Command, enrollment planeEn
 }
 
 func (r *commandRuntime) personalPlaneDoctor(ctx context.Context, cfg config.Config, device planestrict.DeviceConnection, stateDir string, add func(string, string, string, string)) {
-	r.planeDoctorToolChecks(ctx, cfg, true, add)
+	r.planeDoctorToolChecks(ctx, cfg, add, true)
 	client, err := device.Client(device.Workspace, device.ProjectID, planestrict.WithHTTPClient(r.httpClient()))
 	if err != nil {
 		add("personal-device", "failed", err.Error(), "Reconnect from My Looper in personal Plane settings.")

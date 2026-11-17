@@ -1,9 +1,10 @@
+import { randomUUID } from 'node:crypto';
 import { chmod, mkdir, unlink } from 'node:fs/promises';
 import { createServer, request } from 'node:http';
 import { dirname } from 'node:path';
 import { createInterface } from 'node:readline';
 import { startBridge } from './bot/bridge';
-import type { ExternalTask, TurnEvent } from './bot/external';
+import type { ExternalTask, TurnEvent, HumanEvent } from './bot/external';
 import type { AppConfig } from './config/schema';
 import { getProjectByChatId, addProject, listProjects } from './project/registry';
 
@@ -28,8 +29,11 @@ const init = await new Promise<Init>((resolve, reject) => {
   input.once('close', () => reject(new Error('host closed before initialization')));
 });
 
+const turns = new Map<string, string>();
 async function report(event: TurnEvent): Promise<void> {
-  const body = JSON.stringify(event);
+  const key = `${event.chatId}:${event.rootMessageId}`;
+  if (event.phase === 'started' || !turns.has(key)) turns.set(key, randomUUID());
+  const body = JSON.stringify({ ...event, turnId: turns.get(key) });
   await new Promise<void>((resolve, reject) => {
     const req = request({ socketPath: init.callbackSocket, path: '/bridge/events',
       method: 'POST', headers: { 'content-type': 'application/json' } }, (res) => {
@@ -40,6 +44,7 @@ async function report(event: TurnEvent): Promise<void> {
     req.on('error', reject);
     req.end(body);
   });
+  if (event.phase === 'finished' || event.phase === 'failed') turns.delete(key);
 }
 
 const projects = await listProjects();
@@ -54,8 +59,33 @@ const cfg: AppConfig = { accounts: { app: {
 // startBridge receives the secret directly; agent children must not inherit it.
 const bridge = await startBridge({ cfg, appSecret: init.appSecret, fallbackCwd: init.cwd,
   transport: init.externalEvents ? 'webhook' : 'websocket',
-  externalHooks: { onTurn: report } });
+  externalHooks: { onTurn: report, onHuman: reportHuman } });
 init.appSecret = '';
+
+async function reportHuman(event: HumanEvent): Promise<void> {
+  if (!Number.isFinite(event.at) || event.at <= 0) throw new Error('missing source message time');
+  let messageUrl = '';
+  try {
+    const response = await bridge.channel.rawClient.im.v1.message.get({ path: { message_id: event.messageId } });
+    const message = response.data?.items?.[0] as { message_position?: string } | undefined;
+    if (message?.message_position != null && /^\d+$/.test(String(message.message_position))) {
+      messageUrl = `https://applink.feishu.cn/client/chat/open?${new URLSearchParams({
+        openChatId: event.chatId, position: String(message.message_position),
+      })}`;
+    }
+  } catch { /* Keep the observed identity even when Feishu cannot provide a link. */ }
+  const body = JSON.stringify({ ...event, at: new Date(event.at).toISOString(), messageUrl });
+  await new Promise<void>((resolve, reject) => {
+    const req = request({ socketPath: init.callbackSocket, path: '/bridge/human', method: 'POST',
+      headers: { 'content-type': 'application/json' } }, (res) => {
+      res.resume();
+      res.on('end', () => res.statusCode === 200 ? resolve() : reject(new Error(`host rejected human metadata: ${res.statusCode}`)));
+    });
+    req.setTimeout(10_000, () => req.destroy(new Error('host observation timeout')));
+    req.on('error', reject);
+    req.end(body);
+  });
+}
 
 async function readBody(req: import('node:http').IncomingMessage): Promise<unknown> {
   const chunks: Buffer[] = [];

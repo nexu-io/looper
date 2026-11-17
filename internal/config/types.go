@@ -8,6 +8,8 @@ const (
 	AgentVendorOpenCode   AgentVendor = "opencode"
 	AgentVendorCursorCLI  AgentVendor = "cursor-cli"
 	AgentVendorGrokBuild  AgentVendor = "grok-build"
+	AgentVendorPi         AgentVendor = "pi"
+	AgentVendorOmp        AgentVendor = "omp"
 )
 
 type LogLevel string
@@ -220,12 +222,13 @@ type ProviderConfig struct {
 }
 
 type PlaneStrictDispatchConfig struct {
-	Enabled        bool   `json:"enabled"`
-	BaseURL        string `json:"baseUrl"`
-	NodeID         string `json:"nodeId"`
-	BindingID      string `json:"bindingId"`
-	KeyRevision    uint64 `json:"keyRevision"`
-	PrivateKeyFile string `json:"privateKeyFile"`
+	TelemetryEnabled bool   `json:"telemetryEnabled,omitempty"`
+	Enabled          bool   `json:"enabled"`
+	BaseURL          string `json:"baseUrl"`
+	NodeID           string `json:"nodeId"`
+	BindingID        string `json:"bindingId"`
+	KeyRevision      uint64 `json:"keyRevision"`
+	PrivateKeyFile   string `json:"privateKeyFile"`
 }
 
 // AgentBindingConfig is vendor+model only (profiles).

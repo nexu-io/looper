@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/nexu-io/looper/internal/agent"
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/feishubridge"
 	"github.com/nexu-io/looper/internal/storage"
@@ -58,19 +59,34 @@ func TestBridgeTaskCrossRepositoryConversation(t *testing.T) {
 	if err := h.patch(ctx, loop.ID, "running", state, ""); err != nil {
 		t.Fatal(err)
 	}
+	turnID := "turn-1"
 	event := func(phase, root, thread string) {
 		t.Helper()
-		id, err := h.recordTurnEvent(ctx, feishubridge.TurnEvent{Phase: phase, RootMessageID: root, ThreadID: thread, SessionID: "native-session", Terminal: "done"})
+		id, err := h.recordTurnEvent(ctx, feishubridge.TurnEvent{TurnID: turnID, Phase: phase, RootMessageID: root, ThreadID: thread, SessionID: "native-session", Terminal: "done"})
 		if err != nil || id != loop.ID {
 			t.Fatalf("%s callback: id=%s err=%v", phase, id, err)
 		}
 	}
 	event("started", "om_root", "")
 	event("bound", "om_root", "omt_topic")
+	event("started", "om_root", "omt_topic") // replay must not create a second run
 	saved, _ := repos.Loops.GetByID(ctx, loop.ID)
 	_, bound, _ := readBridgeTask(*saved)
 	if bound.ThreadID != "omt_topic" || bound.SessionID != "native-session" {
 		t.Fatalf("session not durable mid-turn: %+v", bound)
+	}
+	if err := repos.FeishuThreads.Upsert(ctx, "om_root", loop.ID, loop.ID, "oc_task", "2026-11-17T00:00:00.000Z"); err != nil {
+		t.Fatal(err)
+	}
+	human := humanObservation{ChatID: "oc_task", ThreadID: "omt_topic", MessageID: "om_feedback", ParticipantID: "ou_colleague", At: "2026-11-17T00:00:01Z"}
+	for i := 0; i < 2; i++ {
+		if err := h.recordHuman(ctx, human); err != nil {
+			t.Fatal(err)
+		}
+	}
+	human.ChatID, human.MessageID = "oc_unrelated", "om_unrelated"
+	if err := h.recordHuman(ctx, human); err != nil {
+		t.Fatal(err)
 	}
 	writeResult := func(o Outcome) {
 		t.Helper()
@@ -85,12 +101,14 @@ func TestBridgeTaskCrossRepositoryConversation(t *testing.T) {
 	if saved.Status != "awaiting_human" || len(h.active) != 0 {
 		t.Fatalf("not waiting: %+v", saved)
 	}
+	event("finished", "om_root", "omt_topic") // replay must not change the first turn
+	turnID = "turn-2"
 	// A subsequent human reply has its own message ID; the real topic routes it.
 	event("started", "om_colleague_reply", "omt_topic")
 	if _, err := os.Stat(h.resultPath(loop.ID)); !os.IsNotExist(err) {
 		t.Fatal("prior conclusion leaked into next turn")
 	}
-	writeResult(Outcome{State: "completed", Summary: "Read-only investigation completed"})
+	writeResult(Outcome{State: "completed", Summary: "Read-only investigation completed", Repositories: agent.ParseRepositoryReports([]map[string]string{{"repo": "https://github.com/acme/frontend", "role": "consult", "validationStatus": "not_run"}, {"repo": "https://github.com/acme/backend", "role": "consult", "validationStatus": "not_run"}})})
 	event("finished", "om_colleague_reply", "omt_topic")
 	saved, _ = repos.Loops.GetByID(ctx, loop.ID)
 	_, finalState, _ := readBridgeTask(*saved)
@@ -100,8 +118,48 @@ func TestBridgeTaskCrossRepositoryConversation(t *testing.T) {
 	if saved.Status != "completed" || strings.Contains(*saved.MetadataJSON, `"hitl"`) || len(taskStatus(*saved).PullRequests) != 0 {
 		t.Fatalf("read-only task failed to finish: %+v", saved)
 	}
+	runs, err := repos.Runs.ListByLoop(ctx, loop.ID)
+	if err != nil || len(runs) != 2 {
+		t.Fatalf("turn count: %d %v", len(runs), err)
+	}
+	for _, r := range runs {
+		if r.EndedAt == nil || r.Status != "success" {
+			t.Fatal("ended turn left active")
+		}
+	}
+	events, err := repos.Events.ListByLoop(ctx, loop.ID)
+	counts := map[string]int{}
+	for _, e := range events {
+		counts[e.EventType]++
+		if e.CorrelationID == nil || *e.CorrelationID != loop.ID {
+			t.Fatal("uncorrelated event")
+		}
+	}
+	if err != nil || counts["human.collaboration"] != 1 || counts["task.received"] != 1 || counts["run.started"] != 2 || counts["run.ended"] != 2 || counts["human.answered"] != 1 || counts["repository.reported"] != 2 {
+		t.Fatalf("timeline: %v %v", counts, err)
+	}
 	if id, err := h.recordTurnEvent(ctx, feishubridge.TurnEvent{Phase: "started", ThreadID: "omt_unrelated"}); err != nil || id != "" {
 		t.Fatalf("unrelated topic routed to task: %s %v", id, err)
+	}
+	turnID = "turn-3"
+	event("started", "om_followup", "omt_topic")
+	if err := h.interruptTrackedTurns(ctx); err != nil {
+		t.Fatal(err)
+	}
+	interrupted, err := repos.Runs.GetByID(ctx, bridgeRunID(loop.ID, turnID))
+	if err != nil || interrupted == nil || interrupted.Status != "interrupted" || interrupted.EndedAt == nil {
+		t.Fatalf("lost crash evidence: %+v %v", interrupted, err)
+	}
+	executions, err := repos.AgentExecutions.ListByRun(ctx, interrupted.ID)
+	if err != nil || len(executions) != 1 || executions[0].Status != "failed" {
+		t.Fatalf("crash execution: %+v %v", executions, err)
+	}
+	if err := h.saveTurn(ctx, *saved, bridgeTask{TrackingRunID: interrupted.ID}, feishubridge.TurnEvent{Phase: "finished", Terminal: "done"}, "completed"); err != nil {
+		t.Fatal(err)
+	}
+	preserved, _ := repos.Runs.GetByID(ctx, interrupted.ID)
+	if preserved.Status != "interrupted" {
+		t.Fatal("late legacy callback replaced terminal evidence")
 	}
 }
 

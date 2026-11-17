@@ -38,6 +38,8 @@ export const AGENT_VENDOR_OPTIONS = [
   "opencode",
   "cursor-cli",
   "grok-build",
+  "pi",
+  "omp",
 ] as const;
 
 const agentProfileLeafPath = /^agent\.profiles\.[A-Za-z0-9_-]+\.(vendor|model)$/;

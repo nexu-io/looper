@@ -62,7 +62,8 @@ jobs:
         run: go vet ./...
 
       - name: Test
-        run: go test ./...
+        # Bound compiler/package concurrency so real Chrome can finish on small runners.
+        run: go test -p 2 ./...
 
       - name: Build
         env:

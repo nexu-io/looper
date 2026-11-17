@@ -342,6 +342,9 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 			}
 		}
 		if provider.Kind == ProviderKindPlane {
+			if !isNilOrEmptyString(provider.WebBaseURL) && !IsHTTPOrigin(*provider.WebBaseURL) {
+				issues = append(issues, ValidationIssue{Path: prefix + ".webBaseUrl", Message: "must be an http(s) origin without credentials, path, query or fragment"})
+			}
 			// baseUrl is optional (a default Plane host is used when omitted); if
 			// provided it must be an absolute http(s) URL.
 			if strings.TrimSpace(provider.BaseURL) != "" && !isAbsoluteHTTPURL(provider.BaseURL) {
@@ -557,6 +560,12 @@ func isAbsoluteHTTPURL(value string) bool {
 		return false
 	}
 	return (parsed.Scheme == "http" || parsed.Scheme == "https") && parsed.Host != ""
+}
+
+// IsHTTPOrigin validates a human-facing web origin without embedded credentials.
+func IsHTTPOrigin(value string) bool {
+	parsed, err := url.Parse(strings.TrimSpace(value))
+	return err == nil && (parsed.Scheme == "http" || parsed.Scheme == "https") && parsed.Host != "" && parsed.User == nil && (parsed.Path == "" || parsed.Path == "/") && parsed.RawQuery == "" && parsed.Fragment == ""
 }
 
 func validateForgejoRoleCapabilities(roles RoleConfigs, prefix string, issues *[]ValidationIssue) {
@@ -941,7 +950,7 @@ func isNilOrEmptyString(value *string) bool {
 
 func isValidAgentVendor(vendor AgentVendor) bool {
 	switch vendor {
-	case AgentVendorClaudeCode, AgentVendorCodex, AgentVendorOpenCode, AgentVendorCursorCLI, AgentVendorGrokBuild:
+	case AgentVendorClaudeCode, AgentVendorCodex, AgentVendorOpenCode, AgentVendorCursorCLI, AgentVendorGrokBuild, AgentVendorPi, AgentVendorOmp:
 		return true
 	default:
 		return false
@@ -949,7 +958,7 @@ func isValidAgentVendor(vendor AgentVendor) bool {
 }
 
 func agentVendorValidationMessage() string {
-	return fmt.Sprintf("must be one of: %s, %s, %s, %s, %s", AgentVendorClaudeCode, AgentVendorCodex, AgentVendorOpenCode, AgentVendorCursorCLI, AgentVendorGrokBuild)
+	return fmt.Sprintf("must be one of: %s, %s, %s, %s, %s, %s, %s", AgentVendorClaudeCode, AgentVendorCodex, AgentVendorOpenCode, AgentVendorCursorCLI, AgentVendorGrokBuild, AgentVendorPi, AgentVendorOmp)
 }
 
 func validateAgentProfiles(profiles map[string]AgentBindingConfig, issues *[]ValidationIssue) {
