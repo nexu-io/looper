@@ -157,6 +157,8 @@ describe('Looper native dispatch seam', () => {
       await receive('reply', '@_user_1 Also check compatibility', true);
       await until(() => expect(run.t.steer).toHaveBeenCalledTimes(1));
       expect(run.t.steer.mock.calls[0]![0].text).toContain('Also check compatibility');
+      expect(run.t.steer.mock.calls[0]![0].text).toContain('message_id=reply');
+      expect(run.t.steer.mock.calls[0]![0].text).toMatch(/发送时间=\d{4}-\d{2}-\d{2}T/);
       expect(run.t.abort).not.toHaveBeenCalled();
       await receive('reply', '@_user_1 Also check compatibility', true);
       expect(run.t.steer).toHaveBeenCalledTimes(1);

@@ -227,3 +227,22 @@
  const larkCliDir = join(appDir, 'lark-cli');
  const codexCliDir = join(appDir, 'codex-cli');
  
+--- a/src/bot/context-weave.ts
++++ b/src/bot/context-weave.ts
+@@ -442,10 +442,14 @@
+  * uploader-influenced, so oneLine=true collapses it so a crafted name can't
+  * forge a fenced block (mirrors weaveQuote / weaveThreadHistory).
+  */
+-export function weaveSender(text: string, sender: { senderId?: string; senderName?: string }): string {
++export function weaveSender(text: string, sender: { senderId?: string; senderName?: string; messageId?: string; createTime?: number }): string {
+   const id = (sender.senderId ?? '').trim();
+   if (!id) return text;
+   const who = sanitizeContext(sender.senderName ?? '', SENDER_NAME_MAX, true) || '某用户';
+-  const block = `[本条消息的发信人：${who}（open_id：${id}）]`;
++  const messageId = sanitizeContext(sender.messageId ?? '', 100, true);
++  const sentAt = sender.createTime && Number.isFinite(sender.createTime)
++    ? new Date(sender.createTime).toISOString() : '';
++  const source = messageId ? `\n[来源消息：message_id=${messageId}；发送时间=${sentAt || '未知'}]` : '';
++  const block = `[本条消息的发信人：${who}（open_id：${id}）]${source}`;
+   return prependBlock(block, text);
+ }

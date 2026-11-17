@@ -85,7 +85,7 @@ server.listen(init.socket);const stop=()=>server.close(()=>process.exit(0));proc
 	if err := json.Unmarshal(body, &task); err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"chat_id：oc_private", "message_id：om_accepted"} {
+	for _, want := range []string{"chat_id：oc_private", "message_id：om_accepted", "当前飞书应用 open_id：ou_owner"} {
 		if !strings.Contains(task.Prompt, want) {
 			t.Errorf("agent lacks current conversation context %q", want)
 		}
