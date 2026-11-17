@@ -118,6 +118,9 @@ func serveBridge(parent context.Context, options Options) error {
 		FeishuCLI: workerhost.PrivateFeishuClient(&cfg), LogFilePath: LogPath(dir),
 		ResolveOwnerName:   host.ownerName,
 		ResolveOwnerOpenID: func(project string) string { return config.ProjectOwner(cfg, project) }})
+	if err := host.interruptTrackedTurns(ctx); err != nil {
+		host.warn("prior turn tracking recovery failed", err)
+	}
 	workspace := filepath.Join(dir, "workspace")
 	if err := host.writeWorkspace(workspace); err != nil {
 		return err
@@ -212,9 +215,6 @@ func serveBridge(parent context.Context, options Options) error {
 		host.maintainPeople(ctx, appID)
 	}()
 	defer func() { cancel(); <-peopleDone }()
-	if err := host.interruptTrackedTurns(ctx); err != nil {
-		host.warn("prior turn tracking recovery failed", err)
-	}
 	host.ready.Store(true)
 	// A bridge resume uses the native session recorded by upstream. No recovered
 	// OS PID is inspected or killed, and no synthetic human answer is generated.

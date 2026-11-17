@@ -137,6 +137,13 @@ func TestBridgeTaskCrossRepositoryConversation(t *testing.T) {
 	if err != nil || len(executions) != 1 || executions[0].Status != "failed" {
 		t.Fatalf("crash execution: %+v %v", executions, err)
 	}
+	if err := h.saveTurn(ctx, *saved, bridgeTask{TrackingRunID: interrupted.ID}, feishubridge.TurnEvent{Phase: "finished", Terminal: "done"}, "completed"); err != nil {
+		t.Fatal(err)
+	}
+	preserved, _ := repos.Runs.GetByID(ctx, interrupted.ID)
+	if preserved.Status != "interrupted" {
+		t.Fatal("late legacy callback replaced terminal evidence")
+	}
 }
 
 func TestBridgeStatusPreservesAllPullRequests(t *testing.T) {

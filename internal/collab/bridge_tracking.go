@@ -57,6 +57,9 @@ func (h *bridgeHost) saveTurn(ctx context.Context, loop storage.LoopRecord, stat
 	if err != nil {
 		return err
 	}
+	if run != nil && run.EndedAt != nil {
+		return nil
+	} // Older bridges have no callback identity.
 	if run == nil {
 		run = &storage.RunRecord{ID: id, LoopID: loop.ID, Status: "running", StartedAt: now, CreatedAt: now}
 	}
