@@ -247,6 +247,13 @@ func (plane *PlaneClient) StrictDispatchInbox(ctx context.Context) (planestrict.
 	return plane.strictClient.Inbox(ctx, "")
 }
 
+func (plane *PlaneClient) PublishTaskContext(ctx context.Context, dispatch planestrict.Dispatch, input planestrict.TaskContext) error {
+	if plane.strictClient == nil {
+		return errors.New("Plane strict dispatch is not configured")
+	}
+	return plane.strictClient.PublishTaskContext(ctx, dispatch, input)
+}
+
 func (plane *PlaneClient) ClaimStrictDispatch(ctx context.Context, dispatch planestrict.Dispatch) error {
 	if plane.strictClient == nil {
 		return errors.New("Plane strict dispatch is not configured")

@@ -127,6 +127,19 @@ func TestClientSignsInboxClaimAndTransition(t *testing.T) {
 			writeJSON(t, response, MutationResponse{Dispatch: Dispatch{
 				ID: dispatchID, Revision: 3, StateVersion: 4, State: "queued", ActiveRole: "worker",
 			}})
+		case "/api/workspaces/open-design/projects/project-id/looper/dispatch/" + dispatchID + "/context/":
+			dispatch := Dispatch{ID: dispatchID, Revision: 3, StateVersion: 3, ExecutionAttemptID: &attemptID, FencingToken: 9}
+			expectedDispatch = &dispatch
+			var body struct {
+				Context TaskContext `json:"context"`
+			}
+			if err := json.Unmarshal(rawBody, &body); err != nil {
+				t.Fatal(err)
+			}
+			if body.Context.Summary != "范围已确认" || len(body.Context.Events) != 1 || body.Context.Events[0].ActorOpenID != "ou_product" {
+				t.Fatalf("context = %#v", body.Context)
+			}
+			writeJSON(t, response, map[string]any{"context": body.Context})
 		default:
 			t.Fatalf("unexpected path %s", request.URL.Path)
 		}
@@ -137,7 +150,7 @@ func TestClientSignsInboxClaimAndTransition(t *testing.T) {
 	client, err := NewClient(server.URL, "open-design", "project-id", Credentials{
 		BindingID: bindingID, KeyRevision: 2, PrivateKey: privateKey, NodeID: "node-cyan",
 		SessionID: sessionID, InstanceNonce: instanceNonce,
-	}, WithClock(func() time.Time { return now }), WithRandom(bytes.NewReader(bytes.Repeat([]byte{0x11}, 144))))
+	}, WithClock(func() time.Time { return now }), WithRandom(bytes.NewReader(bytes.Repeat([]byte{0x11}, 160))))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -159,6 +172,9 @@ func TestClientSignsInboxClaimAndTransition(t *testing.T) {
 	})
 	if err != nil || roleRequest.RoleRequest.EligibleMemberName != "Product" {
 		t.Fatalf("CreateRoleRequest() = %#v, %v", roleRequest, err)
+	}
+	if err := client.PublishTaskContext(context.Background(), transitioned.Dispatch, TaskContext{Summary: "范围已确认", Context: "涉及两个仓库", Events: []TaskEvent{{ID: "decision-1", Title: "兼容旧名称", ActorOpenID: "ou_product", SourceURL: "https://applink.feishu.cn/example"}}}); err != nil {
+		t.Fatal(err)
 	}
 	waitKind := "technical_spec_approval"
 	awaiting, err := client.Transition(context.Background(), transitioned.Dispatch, "awaiting_human", &waitKind)
@@ -185,8 +201,8 @@ func TestClientSignsInboxClaimAndTransition(t *testing.T) {
 	if err != nil || handedOff.Dispatch.ActiveRole != "worker" {
 		t.Fatalf("Handoff() = %#v, %v", handedOff, err)
 	}
-	if requestCount != 9 {
-		t.Fatalf("requests = %d, want 9", requestCount)
+	if requestCount != 10 {
+		t.Fatalf("requests = %d, want 10", requestCount)
 	}
 }
 

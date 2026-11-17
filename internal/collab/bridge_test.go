@@ -93,6 +93,10 @@ func TestBridgeTaskCrossRepositoryConversation(t *testing.T) {
 	writeResult(Outcome{State: "completed", Summary: "Read-only investigation completed"})
 	event("finished", "om_colleague_reply", "omt_topic")
 	saved, _ = repos.Loops.GetByID(ctx, loop.ID)
+	_, finalState, _ := readBridgeTask(*saved)
+	if len(finalState.Outcome.WaitingFor) != 0 {
+		t.Fatal("completed task retained previous waiting recipients")
+	}
 	if saved.Status != "completed" || strings.Contains(*saved.MetadataJSON, `"hitl"`) || len(taskStatus(*saved).PullRequests) != 0 {
 		t.Fatalf("read-only task failed to finish: %+v", saved)
 	}
