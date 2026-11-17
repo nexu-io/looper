@@ -128,10 +128,11 @@ func serveBridge(parent context.Context, options Options) error {
 	host.notify = notify.NewGateway(notify.Options{Config: cfg.Notifications, Repositories: repos,
 		FeishuCLI: workerhost.PrivateFeishuClient(&cfg), LogFilePath: LogPath(dir),
 		ResolveOwnerName:   host.ownerName,
-		ResolveOwnerOpenID: func(project string) string { return config.ProjectOwner(cfg, project) }})
+		ResolveOwnerOpenID: host.ownerOpenID})
 	if err := host.interruptTrackedTurns(ctx); err != nil {
 		host.warn("prior turn tracking recovery failed", err)
 	}
+
 	workspace := filepath.Join(dir, "workspace")
 	if err := host.writeWorkspace(workspace); err != nil {
 		return err

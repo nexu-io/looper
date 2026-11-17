@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/forge"
 	"github.com/nexu-io/looper/internal/infra/feishucli"
 )
@@ -35,6 +36,16 @@ type PlanePeople struct {
 
 func (h *bridgeHost) peoplePath() string {
 	return filepath.Join(h.dir, "workspace", "people.json")
+}
+
+func (h *bridgeHost) ownerOpenID(project string) string {
+	if owner := config.ProjectOwner(h.cfg, project); owner != "" {
+		return owner
+	}
+	if h.cfg.HITL.Feishu != nil {
+		return h.cfg.HITL.Feishu.OwnerOpenID
+	}
+	return ""
 }
 
 // Use the existing directory snapshot; rendering a card must not wait on a
