@@ -2,8 +2,6 @@ package agent
 
 import (
 	"context"
-	"os"
-	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -27,18 +25,14 @@ partial`
 }
 
 func TestPiStreamActivitySurvivesIdleWindow(t *testing.T) {
-	script := filepath.Join(t.TempDir(), "pi")
-	body := `#!/bin/sh
-for i in 1 2 3 4 5 6 7 8 9 10; do
+	// Run via the installed shell so the idle assertion does not also depend on executing a fresh file.
+	body := `for i in 1 2 3 4 5 6 7 8 9 10; do
  printf '%s\n' '{"type":"tool_execution_start","toolName":"bash"}'
  sleep 0.1
 done
 printf '%s\n' '{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"__LOOPER_RESULT__={\"summary\":\"真实结果\",\"artifacts\":[\"guide.md\"]}"}]}}'
 `
-	if err := os.WriteFile(script, []byte(body), 0700); err != nil {
-		t.Fatal(err)
-	}
-	e := New(ExecutorOptions{Config: ExecutorConfig{Vendor: config.AgentVendorPi, Params: map[string]any{"command": script}}, ParamsOwnerVendor: piOwner()})
+	e := New(ExecutorOptions{Config: ExecutorConfig{Vendor: config.AgentVendorPi, Params: map[string]any{"command": "/bin/sh", "args": []string{"-c", body, "pi", "--mode", "json"}}}, ParamsOwnerVendor: piOwner()})
 	run, err := e.Start(context.Background(), RunInput{WorkingDirectory: t.TempDir(), Prompt: "run real checks", Timeout: 10 * time.Second, HeartbeatTimeout: 500 * time.Millisecond})
 	if err != nil {
 		t.Fatal(err)
