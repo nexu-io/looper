@@ -49,6 +49,7 @@ type CollaborationScope struct {
 }
 
 type Dispatch struct {
+	Issue               *DispatchIssue      `json:"issue,omitempty"`
 	TaskContext         TaskContext         `json:"task_context,omitempty"`
 	TaskTimeline        []TaskEvent         `json:"task_timeline,omitempty"`
 	CollaborationScope  *CollaborationScope `json:"collaboration_scope,omitempty"`
@@ -67,6 +68,13 @@ type Dispatch struct {
 	ExecutionAttemptID  *string             `json:"execution_attempt_id"`
 	FencingToken        uint64              `json:"fencing_token"`
 	ClaimLeaseExpiresAt *time.Time          `json:"claim_lease_expires_at"`
+}
+
+type DispatchIssue struct {
+	Title  string `json:"title"`
+	Body   string `json:"body"`
+	Number int64  `json:"number"`
+	Path   string `json:"path"`
 }
 
 type InboxResponse struct {
@@ -444,22 +452,34 @@ func (c *Client) do(ctx context.Context, method, path string, query url.Values, 
 			return err
 		}
 	}
+	request, err := c.signedRequest(ctx, method, path, query, rawBody, signed)
+	if err != nil {
+		return err
+	}
+	return c.send(request, output)
+}
+
+func (c *Client) signedRequest(ctx context.Context, method, path string, query url.Values, rawBody []byte, signed *signingContext) (*http.Request, error) {
 	requestURL := *c.baseURL
 	requestURL.Path = strings.TrimRight(c.baseURL.Path, "/") + path
 	requestURL.RawQuery = query.Encode()
 	request, err := http.NewRequestWithContext(ctx, method, requestURL.String(), bytes.NewReader(rawBody))
 	if err != nil {
-		return err
+		return nil, err
 	}
-	if body != nil {
+	if rawBody != nil {
 		request.Header.Set("Content-Type", "application/json")
 	}
 	request.Header.Set("User-Agent", "looper-strict-dispatch/1.0")
 	header, err := c.signatureHeader(method, requestURL.EscapedPath(), requestURL.RawQuery, rawBody, signed)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	request.Header.Set("Looper-Signature", header)
+	return request, nil
+}
+
+func (c *Client) send(request *http.Request, output any) error {
 	response, err := c.httpClient.Do(request)
 	if err != nil {
 		return err

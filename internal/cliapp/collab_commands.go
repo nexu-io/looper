@@ -308,17 +308,20 @@ func writeCollabOutput(cmd *cobra.Command, result json.RawMessage) error {
 	}
 	if status.Service != "" {
 		fmt.Fprintf(cmd.OutOrStdout(), "%s · %s · PID %d · %d 个执行中\n", status.Service, status.State, status.PID, status.ActiveExecutions)
-		networkState := "尚未绑定设备"
-		if status.Network.Configured {
-			networkState = "设备已绑定，连接不可达"
-			if status.Network.CloudReachable {
-				networkState = "设备在线"
+		if status.Plane.DeviceID != "" {
+			plane, relay := "连接不可达", "尚未收到心跳确认"
+			if status.Plane.Reachable {
+				plane = "已连接"
 			}
-			if status.Network.IdentityDrift {
-				networkState = "设备身份与当前代码托管账号不一致"
+			if status.Plane.RelayReachable {
+				relay = "在线"
 			}
+			fmt.Fprintf(cmd.OutOrStdout(), "Plane · %s · CF 心跳 · %s\n", plane, relay)
+		} else if status.Network.Configured {
+			fmt.Fprintf(cmd.OutOrStdout(), "loopernet · %s · 在线 %t\n", status.Network.NodeName, status.Network.CloudReachable)
+		} else {
+			fmt.Fprintln(cmd.OutOrStdout(), "Plane 尚未连接 · 可从 Plane 个人设置复制连接命令；连接后会自动接入。")
 		}
-		fmt.Fprintf(cmd.OutOrStdout(), "loopernet · %s · %s\n", networkState, status.Network.NodeName)
 		for _, task := range status.Tasks {
 			fmt.Fprintf(cmd.OutOrStdout(), "#%d  %s  %s  %s\n", task.Seq, task.Status, task.Repo, task.Title)
 		}

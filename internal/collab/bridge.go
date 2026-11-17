@@ -64,20 +64,26 @@ type bridgeTask struct {
 }
 
 type bridgeHost struct {
-	options Options
-	cfg     config.Config
-	dir     string
-	db      *sql.DB
-	repos   *storage.Repositories
-	chats   *taskChatManager
-	notify  *notify.Gateway
-	client  *feishubridge.Client
-	gh      *githubinfra.Gateway
-	mu      sync.Mutex // Serialize local task patches, never hold during Agent execution.
-	active  map[string]bool
-	ready   atomic.Bool
-	network *networkclient.Manager
-	sources []planeSource
+	options         Options
+	cfg             config.Config
+	dir             string
+	db              *sql.DB
+	repos           *storage.Repositories
+	chats           *taskChatManager
+	notify          *notify.Gateway
+	client          *feishubridge.Client
+	gh              *githubinfra.Gateway
+	mu              sync.Mutex // Serialize local task patches, never hold during Agent execution.
+	active          map[string]bool
+	ready           atomic.Bool
+	network         *networkclient.Manager
+	sources         []planeSource
+	legacySources   []planeSource
+	personalPlane   *planestrict.DeviceConnection
+	personalClient  *planestrict.Client
+	personalSources map[string]planeSource
+	personalPath    string
+	planeStatus     PlaneStatus
 }
 
 func serveBridge(parent context.Context, options Options) error {
@@ -203,17 +209,29 @@ func serveBridge(parent context.Context, options Options) error {
 		}
 		networkPath = networkclient.DefaultStatePath(home)
 	}
-	network := networkclient.NewCollaborationManager(networkPath, cfg, repos, host.gh)
-	if err := network.Start(ctx); err != nil {
+	if err := host.loadPersonalPlane(networkPath); err != nil {
 		return err
 	}
-	defer network.Stop()
-	host.mu.Lock()
-	host.network = network
-	host.mu.Unlock()
+	host.personalPath = networkPath
 	host.sources, err = bridgePlaneSources(cfg)
 	if err != nil {
 		return err
+	}
+	host.legacySources = append([]planeSource(nil), host.sources...)
+	networkCfg := cfg
+	legacyPersonal := host.personalPlane != nil && host.personalPlane.Pairing != "device_v1"
+	if legacyPersonal {
+		networkCfg.Providers = append(append([]config.ProviderConfig(nil), cfg.Providers...), config.ProviderConfig{ID: "personal-plane", Kind: config.ProviderKindPlane, StrictDispatch: &config.PlaneStrictDispatchConfig{Enabled: true}})
+	}
+	if legacyPersonal || len(host.legacySources) > 0 {
+		network := networkclient.NewCollaborationManager(networkPath, networkCfg, repos, host.gh)
+		if err := network.Start(ctx); err != nil {
+			return err
+		}
+		defer network.Stop()
+		host.mu.Lock()
+		host.network = network
+		host.mu.Unlock()
 	}
 	telemetryDone := make(chan struct{})
 	go func() {
@@ -221,12 +239,16 @@ func serveBridge(parent context.Context, options Options) error {
 		telemetry.Maintain(ctx, coordinator.DB(), cfg, func(err error) { host.warn("Plane telemetry sync failed; retained locally", err) })
 	}()
 	defer func() { cancel(); <-telemetryDone }()
+
 	peopleDone := make(chan struct{})
 	go func() {
 		defer close(peopleDone)
 		host.maintainPeople(ctx, appID)
 	}()
 	defer func() { cancel(); <-peopleDone }()
+	heartbeatDone := make(chan struct{})
+	go func() { defer close(heartbeatDone); host.maintainPersonalHeartbeat(ctx) }()
+	defer func() { cancel(); <-heartbeatDone }()
 	host.ready.Store(true)
 	// A bridge resume uses the native session recorded by upstream. No recovered
 	// OS PID is inspected or killed, and no synthetic human answer is generated.
@@ -242,14 +264,14 @@ func serveBridge(parent context.Context, options Options) error {
 	defer tick.Stop()
 	lastPlane, lastPR := time.Time{}, time.Time{}
 	for ctx.Err() == nil {
-		if err := host.dispatchQueued(ctx); err != nil {
-			host.warn("bridge task dispatch failed", err)
-		}
-		if time.Since(lastPlane) >= 10*time.Second && network.Status().CloudReachable {
+		if time.Since(lastPlane) >= 10*time.Second {
 			if err := host.pollPlane(ctx); err != nil {
 				host.warn("Plane dispatch poll failed", err)
 			}
 			lastPlane = time.Now()
+		}
+		if err := host.dispatchQueued(ctx); err != nil {
+			host.warn("bridge task dispatch failed", err)
 		}
 		if time.Since(lastPR) >= time.Minute {
 			host.pollPullRequests(ctx)
@@ -406,7 +428,11 @@ func (h *bridgeHost) turnEvent(w http.ResponseWriter, r *http.Request) {
 	}
 	id, err := h.recordTurnEvent(r.Context(), event)
 	if err != nil {
-		http.Error(w, err.Error(), 500)
+		code := http.StatusInternalServerError
+		if errors.Is(err, errBridgeTaskStopped) {
+			code = http.StatusConflict
+		}
+		http.Error(w, err.Error(), code)
 		return
 	}
 	// Feishu delivery can take seconds. Keep it out of the task-state lock.
@@ -415,6 +441,8 @@ func (h *bridgeHost) turnEvent(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, map[string]bool{"ok": true})
 }
+
+var errBridgeTaskStopped = errors.New("task has been stopped from Plane")
 
 func (h *bridgeHost) recordTurnEvent(ctx context.Context, event feishubridge.TurnEvent) (string, error) {
 	h.mu.Lock()
@@ -425,8 +453,16 @@ func (h *bridgeHost) recordTurnEvent(ctx context.Context, event feishubridge.Tur
 	}
 	for _, loop := range items {
 		input, state, ok := readBridgeTask(loop)
-		if !ok || loop.Status == "terminated" || !((event.ThreadID != "" && event.ThreadID == state.ThreadID) || (event.RootMessageID != "" && event.RootMessageID == state.RootID)) {
+		if !ok || !((event.ThreadID != "" && event.ThreadID == state.ThreadID) || (event.RootMessageID != "" && event.RootMessageID == state.RootID)) {
 			continue
+		}
+		if loop.Status == "terminated" {
+			// Upstream awaits this callback before invoking the coding agent.
+			// Reject only an explicitly stopped task, not unrelated conversations.
+			if event.Phase == "started" {
+				return "", errBridgeTaskStopped
+			}
+			return "", nil
 		}
 		if event.Phase != "started" && event.Phase != "bound" && event.Phase != "finished" && event.Phase != "failed" {
 			return "", fmt.Errorf("unknown turn phase %q", event.Phase)
@@ -439,6 +475,7 @@ func (h *bridgeHost) recordTurnEvent(ctx context.Context, event feishubridge.Tur
 		}
 		if event.Phase == "started" {
 			state.TrackingRunID = bridgeRunID(loop.ID, event.TurnID)
+
 		}
 		if event.ThreadID != "" {
 			state.ThreadID = event.ThreadID
@@ -538,7 +575,11 @@ func (h *bridgeHost) status(w http.ResponseWriter, r *http.Request) {
 	if h.ready.Load() {
 		state = "running"
 	}
-	writeJSON(w, Status{Service: "looper collab · feishu-codex-bridge", PID: os.Getpid(), State: state, ActiveExecutions: active, Tasks: tasks, Network: h.networkStatus(), PlaneTargets: configuredPlaneTargets(h.cfg)})
+	h.mu.Lock()
+	plane := h.planeStatus
+	h.mu.Unlock()
+	writeJSON(w, Status{Service: "looper collab · feishu-codex-bridge", PID: os.Getpid(), State: state, ActiveExecutions: active, Tasks: tasks, Network: h.networkStatus(), Plane: plane, PlaneTargets: configuredPlaneTargets(h.cfg)})
+
 }
 
 func (h *bridgeHost) resultPath(id string) string {
@@ -574,6 +615,12 @@ func (h *bridgeHost) writeWorkspace(dir string) error {
 下面是可用仓库，不是任务绑定。先读任务和相关代码，自行判断涉及哪些仓库，允许跨多个仓库。调查后仍有歧义时，在原话题问人。不要求人先选仓库。
 ` + repos.String() + `
 并行修改时按需为各仓创建独立 worktree；不要覆盖别人正在做的修改。当前目录是协作上下文，不是目标代码仓库。
+
+## 团队技能
+
+团队技能来源是 core/skills（https://code.powerformer.net/core/skills），通过软链接安装到 ~/.agents/skills，由 Codex 原生发现。不要在本工作目录复制或内嵌一份技能。
+定位任务仓库时先使用 repo-find，读取 ~/.agents/skills/repo-find/SKILL.md 及其引用的仓库地图，再核对实际代码；其他技能按任务需要选用，不要求逐个执行。
+每个新任务使用磁盘上的当前技能内容；续跑中需要再次使用技能时也重新读取，不依赖会话中记住的旧版本。技能未安装或暂时读不到时照常调查，必要时问 owner，不把技能安装变成人工审批或执行门禁。
 
 ## 工作方式
 
@@ -648,7 +695,10 @@ func (h *bridgeHost) networkStatus() networkclient.Status {
 
 func (h *bridgeHost) pollPlane(ctx context.Context) error {
 	var failures []error
-	for _, source := range h.sources {
+	if err := h.refreshPersonalPlane(ctx); err != nil {
+		failures = append(failures, err)
+	}
+	for _, source := range h.planeSources() {
 		inbox, err := source.client.StrictDispatchInbox(ctx)
 		if err != nil {
 			failures = append(failures, err)
@@ -702,24 +752,18 @@ func (h *bridgeHost) planeDispatch(ctx context.Context, client *forge.PlaneClien
 	if !ok {
 		return nil
 	}
-	if dispatch.State == "stop_requested" {
-		key := state.ThreadID
-		if key == "" {
-			key = "pending:" + state.RootID
+	if dispatch.State == "stop_requested" || dispatch.State == "confirmed_stopped" {
+		if loop.Status == "terminated" && dispatch.State == "confirmed_stopped" {
+			return nil
 		}
-		if err := h.client.Request(ctx, http.MethodPost, "/stop-task", map[string]string{"threadId": key}); err != nil {
+		stopped, err := h.stopBridgeTask(ctx, *loop)
+		if err != nil || !stopped {
 			return err
 		}
-		h.mu.Lock()
-		active := h.active[loop.ID]
-		h.mu.Unlock()
-		if active {
-			return nil // The actual turn-end callback, not the stop request, proves exit.
+		if dispatch.State == "stop_requested" {
+			return client.TransitionStrictDispatch(ctx, dispatch.ID, "confirmed_stopped", nil)
 		}
-		if err := h.patch(ctx, loop.ID, "terminated", state, "已从 Plane 停止"); err != nil {
-			return err
-		}
-		return client.TransitionStrictDispatch(ctx, dispatch.ID, "confirmed_stopped", nil)
+		return nil
 	}
 	status := ""
 	var wait *string
@@ -748,6 +792,35 @@ func (h *bridgeHost) planeDispatch(ctx context.Context, client *forge.PlaneClien
 		return h.publishPlaneContext(ctx, client, dispatch, *loop, state)
 	}
 	return nil
+}
+
+func (h *bridgeHost) stopBridgeTask(ctx context.Context, loop storage.LoopRecord) (bool, error) {
+	_, state, ok := readBridgeTask(loop)
+	if !ok || loop.Status == "terminated" {
+		return true, nil
+	}
+	key := state.ThreadID
+	if key == "" {
+		key = "pending:" + state.RootID
+	}
+	if err := h.client.Request(ctx, http.MethodPost, "/stop-task", map[string]string{"threadId": key}); err != nil {
+		return false, err
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.active[loop.ID] {
+		return false, nil // Only the actual turn-end callback proves exit.
+	}
+	// A turn may finish while the bridge handles the stop request. Preserve
+	// its latest conclusion and human context when marking the task stopped.
+	current, err := h.repos.Loops.GetByID(ctx, loop.ID)
+	if err != nil {
+		return false, err
+	}
+	if current != nil {
+		_, state, _ = readBridgeTask(*current)
+	}
+	return true, h.patch(ctx, loop.ID, "terminated", state, "已从 Plane 停止")
 }
 
 func (h *bridgeHost) pollPullRequests(ctx context.Context) {

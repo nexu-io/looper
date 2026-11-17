@@ -52,6 +52,27 @@ type PlaneClient struct {
 
 type PlaneOption func(*PlaneClient)
 
+// NewDevicePlaneClient uses the person's signed device credential. Collaboration
+// task data arrives in the signed inbox, so no separate Plane API key is needed.
+func NewDevicePlaneClient(connection planestrict.DeviceConnection, workspace, projectID string) (*PlaneClient, error) {
+	strict, err := connection.Client(workspace, projectID)
+	if err != nil {
+		return nil, err
+	}
+	baseURL, err := parsePlaneBaseURL(connection.BaseURL + "/api/v1")
+	if err != nil {
+		return nil, err
+	}
+	webURL := strings.TrimRight(connection.WebBaseURL, "/")
+	if webURL == "" {
+		webURL = connection.BaseURL
+	}
+	return &PlaneClient{baseURL: baseURL, webBaseURL: webURL,
+		workspace: workspace, projectID: projectID, strictClient: strict,
+		httpClient: &http.Client{Timeout: defaultPlaneTimeout}, userAgent: planeUserAgent,
+		repo: RepositoryRef{ProviderID: "personal-" + projectID, Kind: ProviderKindPlane, BaseURL: connection.BaseURL}}, nil
+}
+
 // WithPlaneHTTPClient injects an *http.Client (used by tests to avoid network).
 func WithPlaneHTTPClient(client *http.Client) PlaneOption {
 	return func(plane *PlaneClient) {
@@ -274,6 +295,10 @@ func (plane *PlaneClient) CollaborationURL(scope *planestrict.CollaborationScope
 }
 
 func (plane *PlaneClient) StrictDispatchIssue(ctx context.Context, dispatch planestrict.Dispatch) (Issue, error) {
+	if dispatch.RequestedMode == "collab" && dispatch.Issue != nil {
+		item := dispatch.Issue
+		return Issue{Title: item.Title, Body: item.Body, Number: item.Number, HTMLURL: plane.webBaseURL + item.Path, StrictDispatchID: dispatch.ID}, nil
+	}
 	item, err := plane.workItemByID(ctx, dispatch.IssueID)
 	if err != nil {
 		return Issue{}, err

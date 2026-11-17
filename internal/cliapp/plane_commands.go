@@ -60,15 +60,27 @@ type planeLinkBinding struct {
 	KeyRevision uint64 `json:"revision"`
 }
 
+type planeEnrollment struct {
+	BaseURL   string `json:"base_url"`
+	NetworkID string `json:"network_id"`
+	JoinKey   string `json:"join_key"`
+}
+
 type planeConnectExchange struct {
-	ConnectionID string `json:"connection_id"`
-	Status       string `json:"status"`
-	Workspace    string `json:"workspace"`
-	WorkspaceID  string `json:"workspace_id"`
-	ProjectID    string `json:"project_id"`
-	MemberID     string `json:"member_id"`
-	BindingID    string `json:"binding_id"`
-	NodeID       string `json:"node_id"`
+	Pairing      string           `json:"pairing"`
+	RelayURL     string           `json:"relay_url"`
+	Enrollment   *planeEnrollment `json:"enrollment"`
+	WebBaseURL   string           `json:"web_base_url"`
+	Personal     bool             `json:"personal"`
+	DeviceID     string           `json:"device_id"`
+	ConnectionID string           `json:"connection_id"`
+	Status       string           `json:"status"`
+	Workspace    string           `json:"workspace"`
+	WorkspaceID  string           `json:"workspace_id"`
+	ProjectID    string           `json:"project_id"`
+	MemberID     string           `json:"member_id"`
+	BindingID    string           `json:"binding_id"`
+	NodeID       string           `json:"node_id"`
 }
 
 type planeLinkProofIdentity struct {
@@ -86,19 +98,39 @@ func (r *commandRuntime) planeConnect(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	exchangeBody, _ := json.Marshal(map[string]string{"code": connectCode})
+	homeDir, err := r.homeDir()
+	if err != nil {
+		return err
+	}
+	networkState, networkErr := networkclient.LoadState(networkclient.DefaultStatePath(homeDir))
+	exchangeInput := map[string]any{"code": connectCode, "pairing": "device_v1"}
+	if networkErr != nil {
+		exchangeInput["needs_network"] = true
+	}
+	exchangeBody, _ := json.Marshal(exchangeInput)
 	exchange := planeConnectExchange{}
 	if err := r.planeRawRequest(cmd.Context(), planeOrigin, "", http.MethodPost, "/api/looper/connections/exchange/", "application/json", exchangeBody, &exchange); err != nil {
 		return fmt.Errorf("exchange Plane connection code: %w", err)
 	}
 
-	homeDir, err := r.homeDir()
-	if err != nil {
-		return err
+	if exchange.Personal && exchange.Pairing == "device_v1" {
+		return r.connectPersonalPlane(cmd, planeOrigin, connectCode, exchange, networkclient.LocalState{})
 	}
-	networkState, err := networkclient.LoadState(networkclient.DefaultStatePath(homeDir))
-	if err != nil {
-		return fmt.Errorf("plane connect requires this computer to join loopernet first: %w; run the network join command shown by your team setup, then repeat this command", err)
+	if networkErr != nil && !os.IsNotExist(networkErr) {
+		return fmt.Errorf("read local Looper network identity: %w", networkErr)
+	}
+	if networkErr != nil {
+		if !exchange.Personal || exchange.Enrollment == nil {
+			return fmt.Errorf("Plane did not provide network enrollment for this connection; contact the Looper maintainer to configure server-side enrollment")
+		}
+		networkState, err = r.joinPlaneNetwork(cmd, *exchange.Enrollment, homeDir)
+		if err != nil {
+			return err
+		}
+	}
+
+	if exchange.Personal {
+		return r.connectPersonalPlane(cmd, planeOrigin, connectCode, exchange, networkState)
 	}
 	loaded, providerIndex, provider, err := r.preparePlaneConnectProvider(cmd, planeOrigin, exchange)
 	if err != nil {
@@ -396,6 +428,14 @@ func (r *commandRuntime) buildPlaneLinkRequest(
 	networkState networkclient.LocalState,
 	identity planeLinkProofIdentity,
 ) ([]byte, ed25519.PrivateKey, error) {
+	_, key, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		return nil, nil, err
+	}
+	return r.buildPlaneLinkRequestWithKey(ctx, networkState, identity, key)
+}
+
+func (r *commandRuntime) buildPlaneLinkRequestWithKey(ctx context.Context, networkState networkclient.LocalState, identity planeLinkProofIdentity, privateKey ed25519.PrivateKey) ([]byte, ed25519.PrivateKey, error) {
 	workspaceID, err := parsePlaneProtocolUUID(identity.WorkspaceID)
 	if err != nil {
 		return nil, nil, fmt.Errorf("Plane workspace id: %w", err)
@@ -408,10 +448,7 @@ func (r *commandRuntime) buildPlaneLinkRequest(
 	if err != nil {
 		return nil, nil, fmt.Errorf("Plane member id: %w", err)
 	}
-	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		return nil, nil, err
-	}
+	publicKey := privateKey.Public().(ed25519.PublicKey)
 	publicHash := sha256.Sum256(publicKey)
 	audience := "plane:" + identity.WorkspaceID
 	challengeResponse, err := networkclient.New(

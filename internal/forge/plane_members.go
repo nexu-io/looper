@@ -2,6 +2,7 @@ package forge
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 )
 
@@ -16,6 +17,15 @@ type PlaneMember struct {
 
 func (plane *PlaneClient) ProjectMembers(ctx context.Context) ([]PlaneMember, error) {
 	var members []PlaneMember
-	err := plane.do(ctx, http.MethodGet, plane.projectPath("members"), nil, nil, &members)
+	var err error
+	if plane.strictClient != nil {
+		var data []byte
+		data, err = plane.strictClient.ProjectMembers(ctx)
+		if err == nil {
+			err = json.Unmarshal(data, &members)
+		}
+	} else {
+		err = plane.do(ctx, http.MethodGet, plane.projectPath("members"), nil, nil, &members)
+	}
 	return members, err
 }
