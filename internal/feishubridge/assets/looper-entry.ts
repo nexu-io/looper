@@ -4,7 +4,7 @@ import { createServer, request } from 'node:http';
 import { dirname } from 'node:path';
 import { createInterface } from 'node:readline';
 import { startBridge } from './bot/bridge';
-import type { ExternalTask, TurnEvent } from './bot/external';
+import type { ExternalTask, TurnEvent, HumanEvent } from './bot/external';
 import type { AppConfig } from './config/schema';
 import { getProjectByChatId, addProject, listProjects } from './project/registry';
 
@@ -59,8 +59,33 @@ const cfg: AppConfig = { accounts: { app: {
 // startBridge receives the secret directly; agent children must not inherit it.
 const bridge = await startBridge({ cfg, appSecret: init.appSecret, fallbackCwd: init.cwd,
   transport: init.externalEvents ? 'webhook' : 'websocket',
-  externalHooks: { onTurn: report } });
+  externalHooks: { onTurn: report, onHuman: reportHuman } });
 init.appSecret = '';
+
+async function reportHuman(event: HumanEvent): Promise<void> {
+  if (!Number.isFinite(event.at) || event.at <= 0) throw new Error('missing source message time');
+  let messageUrl = '';
+  try {
+    const response = await bridge.channel.rawClient.im.v1.message.get({ path: { message_id: event.messageId } });
+    const message = response.data?.items?.[0] as { message_position?: string } | undefined;
+    if (message?.message_position != null && /^\d+$/.test(String(message.message_position))) {
+      messageUrl = `https://applink.feishu.cn/client/chat/open?${new URLSearchParams({
+        openChatId: event.chatId, position: String(message.message_position),
+      })}`;
+    }
+  } catch { /* Keep the observed identity even when Feishu cannot provide a link. */ }
+  const body = JSON.stringify({ ...event, at: new Date(event.at).toISOString(), messageUrl });
+  await new Promise<void>((resolve, reject) => {
+    const req = request({ socketPath: init.callbackSocket, path: '/bridge/human', method: 'POST',
+      headers: { 'content-type': 'application/json' } }, (res) => {
+      res.resume();
+      res.on('end', () => res.statusCode === 200 ? resolve() : reject(new Error(`host rejected human metadata: ${res.statusCode}`)));
+    });
+    req.setTimeout(10_000, () => req.destroy(new Error('host observation timeout')));
+    req.on('error', reject);
+    req.end(body);
+  });
+}
 
 async function readBody(req: import('node:http').IncomingMessage): Promise<unknown> {
   const chunks: Buffer[] = [];

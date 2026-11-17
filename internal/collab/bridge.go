@@ -137,6 +137,7 @@ func serveBridge(parent context.Context, options Options) error {
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /bridge/events", host.turnEvent)
+	mux.HandleFunc("POST /bridge/human", host.humanEvent)
 	mux.HandleFunc("GET /status", host.status)
 	mux.HandleFunc("GET /people", host.people)
 	mux.HandleFunc("POST /run", func(w http.ResponseWriter, r *http.Request) {

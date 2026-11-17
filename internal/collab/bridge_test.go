@@ -75,6 +75,19 @@ func TestBridgeTaskCrossRepositoryConversation(t *testing.T) {
 	if bound.ThreadID != "omt_topic" || bound.SessionID != "native-session" {
 		t.Fatalf("session not durable mid-turn: %+v", bound)
 	}
+	if err := repos.FeishuThreads.Upsert(ctx, "om_root", loop.ID, loop.ID, "oc_task", "2026-11-17T00:00:00.000Z"); err != nil {
+		t.Fatal(err)
+	}
+	human := humanObservation{ChatID: "oc_task", ThreadID: "omt_topic", MessageID: "om_feedback", ParticipantID: "ou_colleague", At: "2026-11-17T00:00:01Z"}
+	for i := 0; i < 2; i++ {
+		if err := h.recordHuman(ctx, human); err != nil {
+			t.Fatal(err)
+		}
+	}
+	human.ChatID, human.MessageID = "oc_unrelated", "om_unrelated"
+	if err := h.recordHuman(ctx, human); err != nil {
+		t.Fatal(err)
+	}
 	writeResult := func(o Outcome) {
 		t.Helper()
 		data, _ := json.Marshal(o)
@@ -118,7 +131,7 @@ func TestBridgeTaskCrossRepositoryConversation(t *testing.T) {
 			t.Fatal("uncorrelated event")
 		}
 	}
-	if err != nil || counts["task.received"] != 1 || counts["run.started"] != 2 || counts["run.ended"] != 2 || counts["human.answered"] != 1 || counts["repository.reported"] != 2 {
+	if err != nil || counts["human.collaboration"] != 1 || counts["task.received"] != 1 || counts["run.started"] != 2 || counts["run.ended"] != 2 || counts["human.answered"] != 1 || counts["repository.reported"] != 2 {
 		t.Fatalf("timeline: %v %v", counts, err)
 	}
 	if id, err := h.recordTurnEvent(ctx, feishubridge.TurnEvent{Phase: "started", ThreadID: "omt_unrelated"}); err != nil || id != "" {
