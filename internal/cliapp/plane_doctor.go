@@ -101,6 +101,15 @@ func (r *commandRuntime) runPlaneDoctor(cmd *cobra.Command, args []string) plane
 		if resolved, ok := config.ResolveAgent(toolConfig, "", config.CodingRoleWorker); ok {
 			toolConfig.Agent.Vendor = &resolved.Vendor
 		}
+		probeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		raw, err := collab.Request(probeCtx, collab.StateDir(loaded.Config, getStringFlag(cmd, "state-dir")), "GET", "/status", nil)
+		cancel()
+		var host collab.Status
+		if err == nil && json.Unmarshal(raw, &host) == nil && host.Service == "looper collab · feishu-codex-bridge" {
+			vendor := config.AgentVendorCodex
+			toolConfig.Agent.Vendor = &vendor
+			toolConfig.Agent.Params = nil // The native bridge does not use Worker argv overrides.
+		}
 	}
 	r.planeDoctorToolChecks(ctx, toolConfig, add, getBoolFlag(cmd, "collab"))
 

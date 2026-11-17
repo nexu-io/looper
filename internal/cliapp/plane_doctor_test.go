@@ -74,7 +74,7 @@ func TestPlaneDoctorCollabUsesIndependentSocketWithoutDaemonOrPlaneCLI(t *testin
 			found = check.Status == "failed" // This transport-only fixture has no active node binding.
 		}
 	}
-	if !found || reads != 1 {
+	if !found || reads != 2 {
 		t.Fatalf("collab not checked: %+v reads=%d", result.Checks, reads)
 	}
 }
@@ -178,7 +178,7 @@ func TestPlaneDoctorCollabUsesLoadedTargetsWithoutDaemon(t *testing.T) {
 	t.Setenv("COLLAB_DOCTOR_TEST_TOKEN", "fixture")
 	configPath := writeEditableCLIConfigWithPayload(t, map[string]any{
 		"server":    map[string]any{"baseUrl": server.URL},
-		"roles":     map[string]any{"worker": map[string]any{"agent": map[string]any{"vendor": "codex"}}},
+		"roles":     map[string]any{"worker": map[string]any{"agent": map[string]any{"vendor": "pi"}}},
 		"projects":  []any{map[string]any{"id": "local", "name": "local", "repo": "acme/local", "repoPath": homeDir, "provider": "plane"}},
 		"providers": []any{map[string]any{"id": "plane", "kind": "plane", "baseUrl": server.URL + "/api/v1", "workspace": "fixture", "projectId": projectID, "tokenEnv": "COLLAB_DOCTOR_TEST_TOKEN", "strictDispatch": map[string]any{"enabled": true, "baseUrl": server.URL, "nodeId": "node", "bindingId": "55555555-6666-4777-8888-999999999999", "keyRevision": 1, "privateKeyFile": keyPath}}},
 	})
@@ -186,6 +186,7 @@ func TestPlaneDoctorCollabUsesLoadedTargetsWithoutDaemon(t *testing.T) {
 		return commandExecutionResult{ExitCode: 0}, nil
 	}})
 	status := doctorCollabStatus()
+	status.Service = "looper collab · feishu-codex-bridge"
 	status.PlaneTargets[0].ProjectID = projectID
 	serveDoctorCollabStatus(t, dir, status, func() {
 		code, stdout, stderr := runAppWithDeps(t, app, []string{"plane", "doctor", "--collab", "--state-dir", dir, "--json", "--config", configPath})
@@ -193,7 +194,7 @@ func TestPlaneDoctorCollabUsesLoadedTargetsWithoutDaemon(t *testing.T) {
 		if err := json.Unmarshal([]byte(stdout), &result); err != nil {
 			t.Fatal(err)
 		}
-		if code != 0 || !result.Ready || daemonProbes != 0 {
+		if code != 0 || !result.Ready || daemonProbes != 0 || !strings.Contains(stdout, "codex") {
 			t.Fatalf("exit=%d result=%+v stderr=%s daemon probes=%d", code, result, stderr, daemonProbes)
 		}
 	})

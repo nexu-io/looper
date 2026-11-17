@@ -361,6 +361,8 @@ Grok Build support is fresh-run only. Daemon native resume and interactive takeo
 
 ## Pi
 
+These runtime settings apply to the Go executor. The standalone `collab start` currently uses the pinned feishu-codex-bridge and local Codex app-server; its backend is not selected by `agent.vendor` or Worker argv overrides.
+
 Use `pi` as the `agent.vendor` identifier. Looper invokes the [Pi](https://pi.dev) coding agent executable as `pi`:
 
 ```toml
