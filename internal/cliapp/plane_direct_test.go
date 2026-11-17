@@ -62,7 +62,7 @@ func TestPersonalConnectDoesNotEnrollOrRequireNetworkIdentity(t *testing.T) {
 		t.Fatalf("network state created: %v", err)
 	}
 	device, err := planestrict.LoadDeviceConnection(filepath.Join(home, ".looper", "plane-device.json"))
-	if err != nil || device.Pairing != "device_v1" || device.DeviceID != deviceID || device.RelayURL != "https://relay.example/collab" {
+	if err != nil || device.Pairing != "device_v1" || device.DeviceID != deviceID {
 		t.Fatalf("device=%+v err=%v", device, err)
 	}
 	if calls["/api/looper/connections/complete/"] != 1 {

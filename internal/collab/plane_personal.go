@@ -57,11 +57,6 @@ func (h *bridgeHost) refreshPersonalPlane(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if listing.RelayURL != "" {
-		h.mu.Lock()
-		h.personalPlane.RelayURL = listing.RelayURL
-		h.mu.Unlock()
-	}
 	allowed := make(map[string]bool)
 	if listing.State == "active" {
 		for _, project := range listing.Projects {
@@ -108,19 +103,17 @@ func (h *bridgeHost) refreshPersonalPlane(ctx context.Context) error {
 
 func (h *bridgeHost) heartbeatPersonalPlane(ctx context.Context) error {
 	h.mu.Lock()
-	client, relayURL := h.personalClient, ""
-	if h.personalPlane != nil {
-		relayURL = h.personalPlane.RelayURL
-	}
+	client := h.personalClient
+	direct := h.personalPlane != nil && h.personalPlane.Pairing == "device_v1"
 	h.mu.Unlock()
-	if client == nil || relayURL == "" {
+	if client == nil || !direct {
 		return nil
 	}
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	err := client.DeviceHeartbeat(ctx, relayURL)
+	err := client.DeviceHeartbeat(ctx)
 	h.mu.Lock()
-	h.planeStatus.RelayReachable = err == nil
+	h.planeStatus.HeartbeatReachable = err == nil
 	h.mu.Unlock()
 	return err
 }
@@ -130,7 +123,7 @@ func (h *bridgeHost) maintainPersonalHeartbeat(ctx context.Context) {
 	defer tick.Stop()
 	for ctx.Err() == nil {
 		if err := h.heartbeatPersonalPlane(ctx); err != nil {
-			h.warn("CF device heartbeat failed; Plane task polling continues", err)
+			h.warn("Plane device heartbeat failed; Plane task polling continues", err)
 		}
 		select {
 		case <-ctx.Done():

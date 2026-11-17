@@ -82,21 +82,17 @@ and check that saved events do not trigger another completed turn. Internal
 callback fixtures are useful regression coverage but do not substitute for
 this real Feishu test.
 
-## Standalone device presence
+## Standalone collaboration
 
-The same Worker can store personal-device heartbeat times, without running
-loopernet. Apply `migrations/0002_device_presence.sql`, configure `PLANE_BASE_URL`
-with the fixed Plane origin, and install a separate `PRESENCE_TOKEN` secret.
-Plane uses that secret as `LOOPER_COLLAB_RELAY_TOKEN`; configure its
-`LOOPER_COLLAB_RELAY_URL` with this Worker's base URL (including the path prefix).
+The Worker only receives Feishu callbacks and serves the durable inbox. It does
+not call Plane or track device presence. Local Looper sends signed heartbeats
+directly to its paired Plane, which records receipt time and computes expiry.
+No corporate-network exception or presence secret is needed for this Worker.
 
-`POST /devices/heartbeat` forwards the device's `Looper-Signature` and unchanged
-body to Plane's `/api/looper/devices/heartbeat/`. Only a successfully verified,
-active device refreshes its D1 timestamp. Redirects are not followed. The
-client cannot supply a verification origin. `GET /devices/<device-id>` requires
-the server-only presence bearer; the inbox poll bearer does not grant access.
-The Worker stores receipt time only; Plane computes online expiry and remains
-the authority for identity, revocation and task ownership.
+The former `/devices/heartbeat` and `/devices/<device-id>` endpoints have been
+removed. Upgrade Plane and local clients before publishing this Worker. The
+historical `0002_device_presence.sql` migration can remain applied; its table is
+no longer used and is not needed for new installations. Existing events remain.
 
-See [the collaboration relay guide](../../docs/collab-cf-relay.zh-CN.md) for the
+See [the collaboration connection guide](../../docs/collab-cf-relay.zh-CN.md) for
 rollout, legacy compatibility and remaining onboarding limitations.
