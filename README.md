@@ -24,6 +24,7 @@ Each role is an agent that keeps looping until *its* exit condition is met — n
 
 - 🧭 **Planner** — *loops until the spec is reviewable.* Reads the issue, explores the repo, drafts a spec, critiques it, and revises until the plan is concrete enough to open a spec PR. Done when the spec PR is open and labeled `looper:spec-reviewing`.
 - 🔍 **Reviewer** — *loops until the PR meets the bar.* Re-reads the PR on every new commit, posts inline threads, and keeps re-reviewing as the fixer pushes changes. Done when no actionable threads remain and the review comes back clean.
+  Optional [nono subprocess isolation](docs/reviewer-nono.md) is available for Reviewer agents through operator-owned policy.
 - 🔧 **Fixer** — *loops until reviewer threads are handled.* Pulls open review comments, addresses them in the worktree, pushes, and waits for the reviewer's next pass. Ping-pongs with the reviewer until the PR converges. Done when every actionable thread is resolved, or replied to when human input is needed.
 - 🚢 **Worker** — *loops until the PR is ready for merge.* Takes the `looper:spec-ready` spec PR, implements the spec on top of it, runs checks, and iterates on its own output. Done when checks pass and the PR is ready for human review and merge.
 
@@ -32,7 +33,7 @@ The loops compose: planner hands off to reviewer↔fixer, reviewer↔fixer hands
 ## Features
 
 - 🚢 **Start from an issue, not a prompt.** Label an issue `looper:plan`, assign it to yourself, and a spec PR shows up. Once it reaches `looper:spec-ready`, implementation begins.
-- 🐙 **The forge is the source of truth.** Issues, PRs, labels, reviews, and assignees *are* the workflow — no external task tracker, no YAML pipeline. GitHub is fully supported; Forgejo supports planner, worker, native reviewer requests/reviews, and summary-comment compatibility flows.
+- 🐙 **The forge is the source of truth.** Issues, PRs, labels, reviews, and assignees *are* the workflow — no external task tracker, no YAML pipeline. GitHub is fully supported; Forgejo supports planner, worker, native reviewer/fixer loops, summary-comment compatibility, and opt-in reviewer auto-merge.
 - 🛰️ **Many repos, one daemon.** Register your projects once — Looper watches them together and runs loops across repos in parallel.
 - 🌳 **Parallel-safe by design.** Every loop runs in its own git worktree, so agents work across issues and repos without stepping on each other.
 - 🤖 **Bring your own agent.** Pluggable vendor layer (`opencode`, `claude-code`, `codex`, `cursor-cli`, `grok-build`, `pi`, `omp`) so you're not locked into one model or CLI.
@@ -52,7 +53,7 @@ It contains a one-shot, step-by-step flow (preflight → install → bootstrap �
 
 ### For humans
 
-Fast path (macOS `darwin-arm64` or Linux `linux-amd64`):
+Fast path (macOS `darwin-arm64` or Linux `linux-amd64` / `linux-arm64`):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/nexu-io/looper/main/scripts/install.sh | sh
@@ -72,7 +73,7 @@ looper project add .
 
 Add each repo you want Looper to watch after bootstrap. Full install, upgrade, uninstall, and from-source instructions: **[docs/installation.md](docs/installation.md)**.
 
-Once `looper status` succeeds and your forge credentials are configured (`gh auth status` for GitHub, or a configured Forgejo token environment variable), drive loops manually:
+Once `looper status` succeeds and your forge credentials are configured (`gh auth status` for GitHub, or a configured Forgejo token environment variable or tea login), drive loops manually:
 
 ```bash
 # plan a spec from an issue
@@ -193,7 +194,7 @@ issue (looper:plan, assigned)
 
 Each role runs in its own worktree, coordinated by `looperd` and gated by labels. The planner opens the spec PR, the reviewer and fixer loop on it until it's clean, and `looper:spec-ready` is the signal that hands work to the worker — which implements on the same PR rather than opening a new one.
 
-Looper is poll-driven by default: keep `looperd` running and forge credentials available for the loop to fire. GitHub projects still use `gh`; Forgejo projects use the configured REST provider and do not require `gh` in Forgejo-only installs. Everything runs locally — no hosted control plane required.
+Looper is poll-driven by default: keep `looperd` running and forge credentials available for the loop to fire. GitHub projects still use `gh`; Forgejo projects use the configured REST provider and do not require `gh` in Forgejo-only installs. Native [tunnel webhooks](docs/configuration.md#forgejo-webhook-setup) can trigger GitHub and Forgejo discovery immediately, with polling as fallback. Everything runs locally — no hosted control plane required.
 
 ## Networked operation
 
@@ -295,6 +296,10 @@ go test ./internal/e2e -run 'Forgejo|Smoke|FailsFast|GitHubSandboxRepoEnv' -coun
 ```
 
 Forgejo live sandbox e2e is local/manual only and skipped unless explicitly enabled. Use a dedicated existing sandbox repo; tests create and clean run-scoped issues, branches, PRs, labels, and comments:
+
+For a real Codex Reviewer → Fixer → Reviewer cycle with an existing tea login, run `python3 scripts/forgejo-review-fix-smoke.py --base-url https://code.example.com --repo owner/looper-sandbox --tea-login sandbox`. It verifies the pushed repair, common message templates, and restart stability in an isolated runtime, then cleans its own resources. See [Forgejo live checks](docs/configuration.md#forgejo-live-sandbox-e2e) for the provider conflict/status/guarded-merge check and [implementation notes](docs/DESIGN-forgejo-reviewer-fixer.md) for configuration and acceptance results.
+
+The token-backed provider suite remains available:
 
 ```bash
 LOOPER_E2E_FORGEJO=1 \

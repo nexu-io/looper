@@ -1,0 +1,4 @@
+provider               model                                               context  max-out  thinking  images
+openai                 gpt-4o                                              128K     16K      no        yes
+anthropic              claude-sonnet-4-5                                   200K     64K      yes       yes
+google                 gemini-2.5-pro                                      1M       64K      yes       yes

@@ -25,7 +25,7 @@ func TestReconcileTunnelHookMissingSecretDegradesWithoutMutation(t *testing.T) {
 	rt := newWebhookRuntime(cfg, &testLogger{}, func() time.Time { return time.Unix(10, 0) })
 	rt.tunnelClient = client
 
-	state := rt.reconcileTunnelHook(ctx, repos.WebhookTunnelHooks, record.Repo, record, true, time.Now().UnixNano())
+	state := rt.reconcileTunnelHook(ctx, repos.WebhookTunnelHooks, cfg, record.Repo, record, true, time.Now().UnixNano())
 
 	if state.LastError == "" || !strings.Contains(state.LastError, "read webhook secret") {
 		t.Fatalf("state.LastError = %q, want read webhook secret failure", state.LastError)
@@ -57,13 +57,83 @@ func TestReconcileTunnelHookEmptySecretDegradesWithoutMutation(t *testing.T) {
 	rt := newWebhookRuntime(cfg, &testLogger{}, func() time.Time { return time.Unix(10, 0) })
 	rt.tunnelClient = client
 
-	state := rt.reconcileTunnelHook(ctx, repos.WebhookTunnelHooks, record.Repo, record, true, time.Now().UnixNano())
+	state := rt.reconcileTunnelHook(ctx, repos.WebhookTunnelHooks, cfg, record.Repo, record, true, time.Now().UnixNano())
 
 	if state.LastError == "" || !strings.Contains(state.LastError, "read webhook secret") || !strings.Contains(state.LastError, "is empty") {
 		t.Fatalf("state.LastError = %q, want empty-secret read failure", state.LastError)
 	}
 	if client.createCalls != 0 || client.updateCalls != 0 {
 		t.Fatalf("client calls = create:%d update:%d, want no mutation", client.createCalls, client.updateCalls)
+	}
+}
+
+func TestReconcileTunnelHookMissingRemoteSecretRepatchesHook(t *testing.T) {
+	t.Parallel()
+
+	ctx, repos, cfg := setupWebhookTunnelTestRepos(t)
+	record := storage.WebhookTunnelHookRecord{Repo: "acme/looper", HookID: 42, ManagedURL: webhookTunnelManagedURL(cfg, "acme/looper"), SecretRef: webhookTunnelSecretRef("acme/looper"), CreatedAt: 1, UpdatedAt: 1}
+	if err := repos.WebhookTunnelHooks.Upsert(ctx, record); err != nil {
+		t.Fatalf("WebhookTunnelHooks.Upsert() error = %v", err)
+	}
+	secretPath := webhookTunnelSecretPath(cfg.Storage.DBPath, record.SecretRef)
+	if err := os.MkdirAll(filepath.Dir(secretPath), 0o700); err != nil {
+		t.Fatalf("os.MkdirAll() error = %v", err)
+	}
+	if err := os.WriteFile(secretPath, []byte("top-secret"), 0o600); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+	hook := webhookTunnelGitHubHook{ID: 42, Active: true, Events: webhookForwardEvents}
+	hook.Config.URL = record.ManagedURL
+	hook.Config.ContentType = "json"
+	hook.Config.InsecureSSL = "0"
+	client := &fakeWebhookTunnelGitHubClient{getHook: hook, getFound: true}
+	rt := newWebhookRuntime(cfg, &testLogger{}, func() time.Time { return time.Unix(10, 0) })
+	rt.tunnelClient = client
+
+	state := rt.reconcileTunnelHook(ctx, repos.WebhookTunnelHooks, cfg, record.Repo, record, true, time.Now().UnixNano())
+
+	if state.LastError != "" {
+		t.Fatalf("state.LastError = %q, want empty", state.LastError)
+	}
+	if client.updateCalls != 1 {
+		t.Fatalf("UpdateHook calls = %d, want 1 to restore missing remote secret", client.updateCalls)
+	}
+	if client.lastUpdate.secret != "top-secret" {
+		t.Fatalf("UpdateHook secret = %q, want local secret", client.lastUpdate.secret)
+	}
+}
+
+func TestReconcileTunnelHookRedactedRemoteSecretDoesNotRepatch(t *testing.T) {
+	t.Parallel()
+
+	ctx, repos, cfg := setupWebhookTunnelTestRepos(t)
+	record := storage.WebhookTunnelHookRecord{Repo: "acme/looper", HookID: 42, ManagedURL: webhookTunnelManagedURL(cfg, "acme/looper"), SecretRef: webhookTunnelSecretRef("acme/looper"), CreatedAt: 1, UpdatedAt: 1}
+	if err := repos.WebhookTunnelHooks.Upsert(ctx, record); err != nil {
+		t.Fatalf("WebhookTunnelHooks.Upsert() error = %v", err)
+	}
+	secretPath := webhookTunnelSecretPath(cfg.Storage.DBPath, record.SecretRef)
+	if err := os.MkdirAll(filepath.Dir(secretPath), 0o700); err != nil {
+		t.Fatalf("os.MkdirAll() error = %v", err)
+	}
+	if err := os.WriteFile(secretPath, []byte("top-secret"), 0o600); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+	hook := webhookTunnelGitHubHook{ID: 42, Active: true, Events: webhookForwardEvents}
+	hook.Config.URL = record.ManagedURL
+	hook.Config.ContentType = "json"
+	hook.Config.InsecureSSL = "0"
+	hook.Config.Secret = "********"
+	client := &fakeWebhookTunnelGitHubClient{getHook: hook, getFound: true}
+	rt := newWebhookRuntime(cfg, &testLogger{}, func() time.Time { return time.Unix(10, 0) })
+	rt.tunnelClient = client
+
+	state := rt.reconcileTunnelHook(ctx, repos.WebhookTunnelHooks, cfg, record.Repo, record, true, time.Now().UnixNano())
+
+	if state.LastError != "" {
+		t.Fatalf("state.LastError = %q, want empty", state.LastError)
+	}
+	if client.updateCalls != 0 {
+		t.Fatalf("UpdateHook calls = %d, want 0 when GitHub reports a secret is set", client.updateCalls)
 	}
 }
 
@@ -77,7 +147,7 @@ func TestReconcileTunnelHooksMarksExistingRecordsOrphanedWhenRepoSetBecomesEmpty
 	}
 	rt := newWebhookRuntime(cfg, &testLogger{}, func() time.Time { return time.Unix(10, 0) })
 
-	rt.reconcileTunnelHooks(ctx, repos, map[string]struct{}{})
+	rt.reconcileTunnelHooks(ctx, repos, cfg, map[string]struct{}{})
 
 	updated, ok, err := repos.WebhookTunnelHooks.Get(ctx, record.Repo)
 	if err != nil {
@@ -111,12 +181,13 @@ func TestReconcileTunnelHooksReactivatesOrphanedRecordWhenRepoIsReadded(t *testi
 	hook.Config.URL = record.ManagedURL
 	hook.Config.ContentType = "json"
 	hook.Config.InsecureSSL = "0"
+	hook.Config.Secret = "********"
 	client := &fakeWebhookTunnelGitHubClient{getHook: hook, getFound: true}
 	rt := newWebhookRuntime(cfg, &testLogger{}, func() time.Time { return time.Unix(10, 0) })
 	rt.ghPath = "/usr/bin/gh"
 	rt.tunnelClient = client
 
-	rt.reconcileTunnelHooks(ctx, repos, map[string]struct{}{"acme/looper": {}})
+	rt.reconcileTunnelHooks(ctx, repos, cfg, map[string]struct{}{"acme/looper": {}})
 	defer rt.stopTunnelServer()
 
 	updated, ok, err := repos.WebhookTunnelHooks.Get(ctx, record.Repo)
@@ -156,7 +227,7 @@ func TestReconcileTunnelHooksDisabledHookAtThresholdLatchesAndDegrades(t *testin
 	rt.ghPath = "/usr/bin/gh"
 	rt.tunnelClient = client
 
-	rt.reconcileTunnelHooks(ctx, repos, map[string]struct{}{"acme/looper": {}})
+	rt.reconcileTunnelHooks(ctx, repos, cfg, map[string]struct{}{"acme/looper": {}})
 	defer rt.stopTunnelServer()
 
 	status := rt.Status()
@@ -207,7 +278,7 @@ func TestReconcileTunnelHooksDisabledHookAtThresholdReportsPersistFailure(t *tes
 	rt.ghPath = "/usr/bin/gh"
 	rt.tunnelClient = client
 
-	state := rt.reconcileTunnelHook(ctx, repos.WebhookTunnelHooks, record.Repo, record, true, time.Unix(10, 0).UnixNano())
+	state := rt.reconcileTunnelHook(ctx, repos.WebhookTunnelHooks, cfg, record.Repo, record, true, time.Unix(10, 0).UnixNano())
 
 	if !strings.Contains(state.LastError, "persist latch state") {
 		t.Fatalf("state.LastError = %q, want persist latch state failure", state.LastError)

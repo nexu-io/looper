@@ -141,6 +141,10 @@ func MaterializeCatalog(global config.Config, records []storage.ProjectRecord) (
 			Provider:   metadataString(metadata, "provider"),
 			Repo:       metadataString(metadata, "repo"),
 		}
+		if err := decodeMetadataValue(metadata, "identity", &project.Identity); err != nil {
+			return nil, fmt.Errorf("decode project %q hosting identity: %w", project.ID, err)
+		}
+		project.Identity = strings.TrimSpace(project.Identity)
 		if project.Provider != "" && !configuredProviderExists(global, project.Provider) {
 			return nil, fmt.Errorf("project %q references unknown provider %q", project.ID, project.Provider)
 		}
@@ -177,6 +181,11 @@ func MaterializeCatalog(global config.Config, records []storage.ProjectRecord) (
 			}
 		}
 		projects = append(projects, project)
+	}
+	candidate := global
+	candidate.Projects = projects
+	if err := config.ValidateHostingIdentities(candidate); err != nil {
+		return nil, err
 	}
 	return projects, nil
 }

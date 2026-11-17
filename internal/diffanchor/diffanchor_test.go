@@ -1,6 +1,8 @@
 package diffanchor
 
 import (
+	"errors"
+	"io"
 	"strings"
 	"testing"
 )
@@ -196,6 +198,7 @@ func TestValidateTopLevelLocationFlagsMissingContext(t *testing.T) {
 		"This has concerns and should be improved.",
 		"This needs work on these lines.",
 		"The function needs work.",
+		"App identity sandbox review looper-e2e:xyz App identity",
 	} {
 		if got := ValidateTopLevelLocation(body); !got.QualityFlagged {
 			t.Fatalf("expected missing location to be quality flagged for %q: %#v", body, got)
@@ -209,9 +212,23 @@ func TestValidateTopLevelLocationFlagsMissingContext(t *testing.T) {
 		"function ValidateTopLevelLocation should reject vague line references.",
 		"lines 12-14 should use the parsed anchor range.",
 		"section Reviewer anchors needs a validation example.",
+		"agent-commit.txt: App identity sandbox review looper-e2e:xyz App identity",
 	} {
 		if got := ValidateTopLevelLocation(body); !got.Valid {
 			t.Fatalf("expected exact location context to pass for %q: %#v", body, got)
 		}
+	}
+}
+
+type failingPatchReader struct{ err error }
+
+func (r failingPatchReader) Read([]byte) (int, error) { return 0, r.err }
+
+func TestParseReaderRejectsIncompleteInput(t *testing.T) {
+	failure := errors.New("patch read failed")
+	reader := io.MultiReader(strings.NewReader("diff --git a/a.go b/a.go\n@@ -0,0 +1 @@\n+new\n"), failingPatchReader{err: failure})
+	index, err := ParseReader(reader)
+	if !errors.Is(err, failure) || len(index.Ranges) != 0 {
+		t.Fatalf("partial patch accepted: %v, %v", index, err)
 	}
 }

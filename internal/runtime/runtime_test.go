@@ -3976,6 +3976,16 @@ func TestShouldRequeueLoopKeepsPausedLoopsExcluded(t *testing.T) {
 	}
 }
 
+func TestShouldRequeueLoopKeepsAwaitingHumanExcluded(t *testing.T) {
+	t.Parallel()
+
+	loop := storage.LoopRecord{Status: "awaiting_human"}
+	run := &storage.RunRecord{Status: "interrupted"}
+	if shouldRequeueLoop(loop, run, false) {
+		t.Fatal("shouldRequeueLoop() = true, want false for awaiting_human loop")
+	}
+}
+
 func TestShouldAutoRecoverFailedReviewerLoopIgnoresLegacyBudgetTermination(t *testing.T) {
 	t.Parallel()
 	errorKind := "retryable_after_resume"

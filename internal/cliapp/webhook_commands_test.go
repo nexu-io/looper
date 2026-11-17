@@ -611,3 +611,38 @@ func TestWebhookCleanupConfirmContinuesPastMissingShownHook(t *testing.T) {
 		t.Fatalf("stdout = %q, want delete confirmation after continuing past a missing hook", stdout.String())
 	}
 }
+
+func TestWebhookHookEventsIncludeReviewThread(t *testing.T) {
+	t.Parallel()
+	want := map[string]struct{}{
+		"check_run":                   {},
+		"issue_comment":               {},
+		"pull_request":                {},
+		"pull_request_review":         {},
+		"pull_request_review_comment": {},
+		"pull_request_review_thread":  {},
+		"push":                        {},
+	}
+	if len(webhookHookEvents) != len(want) {
+		t.Fatalf("webhookHookEvents = %v, want %d events", webhookHookEvents, len(want))
+	}
+	for _, event := range webhookHookEvents {
+		if _, ok := want[event]; !ok {
+			t.Fatalf("webhookHookEvents contains unexpected %q: %v", event, webhookHookEvents)
+		}
+	}
+	var body map[string]any
+	if err := json.Unmarshal(webhookHookMutationBodyForCLI("https://example.com/hook", "secret"), &body); err != nil {
+		t.Fatalf("json.Unmarshal(hook body) error = %v", err)
+	}
+	rawEvents, _ := body["events"].([]any)
+	if len(rawEvents) != len(want) {
+		t.Fatalf("hook body events = %#v, want %d events including pull_request_review_thread", rawEvents, len(want))
+	}
+	for _, item := range rawEvents {
+		event, _ := item.(string)
+		if _, ok := want[event]; !ok {
+			t.Fatalf("hook body events contain unexpected %q: %#v", event, rawEvents)
+		}
+	}
+}

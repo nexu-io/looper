@@ -83,6 +83,40 @@ func TestClassifyUsesWrappedBoundaryAuthority(t *testing.T) {
 	}
 }
 
+func TestWithBoundaryPreservesExistingBoundary(t *testing.T) {
+	local := WithBoundary(errors.New("forgejo client: environment variable FORGEJO_TOKEN is required"), BoundaryConfig)
+	wrapped := WithBoundary(local, BoundaryGitHubAPI)
+	var boundaryErr *BoundaryError
+	if !errors.As(wrapped, &boundaryErr) || boundaryErr.Boundary != BoundaryConfig {
+		t.Fatalf("WithBoundary() = %#v, want preserved BoundaryConfig", wrapped)
+	}
+	got := Classify(wrapped, Context{Runner: RunnerFixer, Boundary: BoundaryUnknown})
+	if got != NonRetryable {
+		t.Fatalf("Classify() = %s, want %s for preserved local config boundary", got, NonRetryable)
+	}
+}
+
+func TestWithBoundaryAppliesWhenAbsent(t *testing.T) {
+	wrapped := WithBoundary(errors.New("error connecting to api.github.com"), BoundaryGitHubAPI)
+	var boundaryErr *BoundaryError
+	if !errors.As(wrapped, &boundaryErr) || boundaryErr.Boundary != BoundaryGitHubAPI {
+		t.Fatalf("WithBoundary() = %#v, want BoundaryGitHubAPI", wrapped)
+	}
+}
+
+func TestClassifyWrappedLocalWorktreeOverridesStepRemoteBoundary(t *testing.T) {
+	// Reviewer worktree steps default to git_remote (fetch), but a confirmed
+	// local integrity failure must park as MI rather than infinite transient retry.
+	err := WithBoundary(
+		errors.New("worktree path /tmp/wt is unusable and not empty; manual intervention required"),
+		BoundaryLocalWorktree,
+	)
+	got := Classify(err, Context{Runner: RunnerReviewer, Boundary: BoundaryGitRemote})
+	if got != ManualIntervention {
+		t.Fatalf("Classify() = %s, want %s", got, ManualIntervention)
+	}
+}
+
 func TestClassifyRetriesGitHubGraphQLUnauthorizedAtGitHubBoundary(t *testing.T) {
 	got := Classify(errors.New(`Post "https://api.github.com/graphql": HTTP 401 Unauthorized`), Context{Runner: RunnerReviewer, Boundary: BoundaryGitHubAPI})
 	if got != RetryableTransient {
@@ -149,6 +183,79 @@ func TestClassifyGenericGitHub404StaysRetryable(t *testing.T) {
 	}
 }
 
+func TestClassifyOneRunningRunPerLoopUniqueIsRetryable(t *testing.T) {
+	// Leaked SQLite UNIQUE from idx_runs_one_running_per_loop must never become
+	// non_retryable/MI when createRun race mapping is skipped (issue #634).
+	tests := []struct {
+		name    string
+		message string
+	}{
+		{name: "wrapped upsert", message: "upsert run: UNIQUE constraint failed: runs.loop_id"},
+		{name: "index name", message: "UNIQUE constraint failed: idx_runs_one_running_per_loop"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := Classify(errors.New(tt.message), Context{Runner: RunnerReviewer, Boundary: BoundaryStorage})
+			if got != RetryableTransient {
+				t.Fatalf("Classify() = %s, want %s", got, RetryableTransient)
+			}
+			if !IsOneRunningRunPerLoopViolation(errors.New(tt.message)) {
+				t.Fatalf("IsOneRunningRunPerLoopViolation(%q) = false, want true", tt.message)
+			}
+		})
+	}
+}
+
+// typedHTTPStatusError mirrors provider errors such as forge.ForgejoHTTPError
+// that expose the original HTTP status without importing provider packages.
+type typedHTTPStatusError struct {
+	status  int
+	message string
+}
+
+func (e *typedHTTPStatusError) Error() string {
+	return e.message
+}
+
+func (e *typedHTTPStatusError) HTTPStatusCode() int {
+	if e == nil {
+		return 0
+	}
+	return e.status
+}
+
+func TestClassifyTypedHostingAPIClientFailuresAreTerminal(t *testing.T) {
+	// Forgejo (and similar providers) return typed HTTP errors. When the fixer
+	// tags them BoundaryGitHubAPI, a deleted PR's 404 must stay non_retryable
+	// so unlimited queues park instead of requeueing forever.
+	tests := []struct {
+		name   string
+		status int
+		msg    string
+	}{
+		{name: "forgejo pr 404", status: 404, msg: "forgejo API GET /api/v1/repos/acme/looper/pulls/42 returned HTTP 404: Not Found"},
+		{name: "typed 400", status: 400, msg: "forgejo API POST /api/v1/repos/acme/looper/issues returned HTTP 400: bad request"},
+		{name: "typed 422", status: 422, msg: "forgejo API PATCH /api/v1/repos/acme/looper/pulls/1 returned HTTP 422: unprocessable"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := WithBoundary(&typedHTTPStatusError{status: tt.status, message: tt.msg}, BoundaryGitHubAPI)
+			got := Classify(err, Context{Runner: RunnerFixer, Boundary: BoundaryUnknown})
+			if got != NonRetryable {
+				t.Fatalf("Classify() = %s, want %s for typed HTTP %d", got, NonRetryable, tt.status)
+			}
+		})
+	}
+}
+
+func TestClassifyTypedHostingAPIServerFailuresStayRetryable(t *testing.T) {
+	err := WithBoundary(&typedHTTPStatusError{status: 502, message: "forgejo API GET /user returned HTTP 502: bad gateway"}, BoundaryGitHubAPI)
+	got := Classify(err, Context{Runner: RunnerFixer, Boundary: BoundaryUnknown})
+	if got != RetryableTransient {
+		t.Fatalf("Classify() = %s, want %s for typed HTTP 502", got, RetryableTransient)
+	}
+}
+
 func TestClassifyIssueREST404StaysRetryable(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -183,6 +290,21 @@ func TestClassifyPermanentExternalDenialsStayTerminal(t *testing.T) {
 			got := Classify(errors.New(tt.message), Context{Runner: RunnerWorker, Boundary: BoundaryGitHubAPI})
 			if got != NonRetryable {
 				t.Fatalf("Classify() = %s, want %s", got, NonRetryable)
+			}
+		})
+	}
+}
+
+func TestRecoverableInfraDoesNotReplaceLegacyRunnerPolicies(t *testing.T) {
+	for _, runner := range []RunnerKind{RunnerReviewer, RunnerFixer, RunnerPlanner, RunnerWorker} {
+		t.Run(string(runner), func(t *testing.T) {
+			missingCLI := WithBoundary(fmt.Errorf("fork/exec /missing/tool: %w", syscall.ENOENT), BoundaryConfig)
+			if got := Classify(missingCLI, Context{Runner: runner}); got != NonRetryable {
+				t.Fatalf("configured executable = %s, want non_retryable", got)
+			}
+			pressure := WithBoundary(fmt.Errorf("start command: fork/exec /tool: %w", syscall.EAGAIN), BoundaryGitHubAPI)
+			if got := Classify(pressure, Context{Runner: runner}); got != RetryableTransient {
+				t.Fatalf("transient hosting launch = %s, want retryable_transient", got)
 			}
 		})
 	}

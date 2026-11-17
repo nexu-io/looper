@@ -173,8 +173,8 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 					newCommand(commandSpec{use: "disable", short: "Disable webhook mode", runE: runtime.webhookDisable}),
 					newCommand(commandSpec{use: "status", short: "Show webhook status", runE: runtime.webhookStatus, localFlags: []flagSpec{boolFlag("verbose", "Show per-repo forwarder details and log tails")}}),
 					newCommand(commandSpec{use: "cleanup <owner/repo>", short: "Inspect or delete stale GitHub CLI webhook hooks", args: cobra.ExactArgs(1), runE: runtime.webhookCleanup, localFlags: []flagSpec{boolFlag("confirm", "Delete matching stale GitHub CLI webhook hooks instead of showing a dry run")}, exampleLines: []string{"$ looper webhook cleanup owner/repo", "$ looper webhook cleanup owner/repo --confirm"}}),
-					newCommand(commandSpec{use: "delete <owner/repo>", short: "Delete a Looper-managed tunnel webhook", args: cobra.ExactArgs(1), runE: runtime.webhookDelete, localFlags: []flagSpec{boolFlag("confirm", "Delete the managed tunnel webhook"), boolFlag("forget", "Forget the local tunnel webhook record without deleting the remote hook")}, exampleLines: []string{"$ looper webhook delete owner/repo --confirm", "$ looper webhook delete owner/repo --confirm --forget"}}),
-					newCommand(commandSpec{use: "rotate <owner/repo>", short: "Rotate a Looper-managed tunnel webhook secret", args: cobra.ExactArgs(1), runE: runtime.webhookRotate, exampleLines: []string{"$ looper webhook rotate owner/repo"}}),
+					newCommand(commandSpec{use: "delete <repo>", short: "Delete a Looper-managed tunnel webhook", args: cobra.ExactArgs(1), runE: runtime.webhookDelete, localFlags: []flagSpec{boolFlag("confirm", "Delete the managed tunnel webhook"), boolFlag("forget", "Forget the local tunnel webhook record without deleting the remote hook")}, exampleLines: []string{"$ looper webhook delete owner/repo --confirm", "$ looper webhook delete owner/repo --confirm --forget", "$ looper webhook delete https://code.example.com/owner/repo --confirm"}}),
+					newCommand(commandSpec{use: "rotate <repo>", short: "Rotate a Looper-managed tunnel webhook secret", args: cobra.ExactArgs(1), runE: runtime.webhookRotate, exampleLines: []string{"$ looper webhook rotate owner/repo", "$ looper webhook rotate https://code.example.com/owner/repo"}}),
 					newCommand(commandSpec{use: "list-orphans", short: "List orphaned tunnel webhook records", runE: runtime.webhookListOrphans}),
 				},
 			}),
@@ -434,10 +434,10 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 					newCommand(commandSpec{use: "start", short: "Start a loop", runE: runtime.loopStart, localFlags: []flagSpec{stringFlag("type", "type", "Loop type"), stringFlag("pr", "repo#number", "Pull request reference"), stringFlag("project", "projectId", "Project id")}}),
 					newCommand(commandSpec{use: "pause [id]", short: "Pause a loop", args: cobra.MaximumNArgs(1), runE: runtime.loopPause, localFlags: []flagSpec{stringFlag("id", "id", "Loop id")}}),
 					newCommand(commandSpec{use: "stop <id|seq>", short: "Interrupt an active loop", args: cobra.ExactArgs(1), runE: runtime.stopLoop}),
-					newCommand(commandSpec{use: "retry <seq|loopId>", short: "Retry a loop", args: cobra.ExactArgs(1), runE: runtime.loopRetry, localFlags: []flagSpec{stringFlag("mode", "auto|resume|rediscover", "Retry mode"), boolFlag("discard-worktree-changes", "Discard dirty worktree changes before retrying"), boolFlag("confirm", "Confirm destructive retry action")}}),
+					newCommand(commandSpec{use: "retry <seq|loopId>", short: "Retry a loop", args: cobra.ExactArgs(1), runE: runtime.loopRetry, localFlags: []flagSpec{stringFlag("mode", "auto|resume|rediscover", "Retry mode"), boolFlag("discard-worktree-changes", "Discard dirty worktree changes before retrying"), boolFlag("clear-unusable-worktree", "Remove unusable managed worktree path leftovers before retrying"), boolFlag("confirm", "Confirm destructive retry action")}}),
 				},
 			}),
-			newCommand(commandSpec{use: "retry <seq|loopId>", short: "Retry a loop", args: cobra.ExactArgs(1), runE: runtime.loopRetry, localFlags: []flagSpec{stringFlag("mode", "auto|resume|rediscover", "Retry mode"), boolFlag("discard-worktree-changes", "Discard dirty worktree changes before retrying"), boolFlag("confirm", "Confirm destructive retry action")}}),
+			newCommand(commandSpec{use: "retry <seq|loopId>", short: "Retry a loop", args: cobra.ExactArgs(1), runE: runtime.loopRetry, localFlags: []flagSpec{stringFlag("mode", "auto|resume|rediscover", "Retry mode"), boolFlag("discard-worktree-changes", "Discard dirty worktree changes before retrying"), boolFlag("clear-unusable-worktree", "Remove unusable managed worktree path leftovers before retrying"), boolFlag("confirm", "Confirm destructive retry action")}}),
 			newCommand(commandSpec{
 				use:   "work",
 				short: "Create a worker run",
@@ -652,6 +652,7 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 	})
 
 	addFlags(root.PersistentFlags(), globalFlags())
+	root.AddCommand(runtime.hostCommand())
 	root.PersistentPreRunE = runtime.maybeRunAutoUpgrade
 	root.SetOut(a.stdout())
 	root.SetErr(a.stderr())
@@ -845,7 +846,11 @@ func globalFlags() []flagSpec {
 		hiddenStringFlag("reviewer-blocking-review-event", "event", "Reviewer event for blocking findings: COMMENT or REQUEST_CHANGES"),
 		stringFlag("roles-reviewer-behavior-loop-quiet-period-seconds", "seconds", "Reviewer loop quiet period"),
 		hiddenStringFlag("reviewer-quiet-period-seconds", "seconds", "Reviewer loop quiet period"),
+		stringFlag("defaults-loop-quiet-period-seconds", "seconds", "Shared default loop quiet period"),
+		stringFlag("roles-fixer-behavior-loop-quiet-period-seconds", "seconds", "Fixer loop quiet period"),
 		stringFlag("roles-reviewer-behavior-loop-min-publish-interval-seconds", "seconds", "Reviewer loop minimum publish interval"),
+		stringFlag("roles-reviewer-behavior-loop-max-publishes-per-pr", "count", "Max successful reviewer publishes per PR (0 disables)"),
+		stringFlag("roles-fixer-behavior-loop-max-pushes-per-pr", "count", "Max successful fixer pushes per PR (0 disables)"),
 		hiddenStringFlag("reviewer-min-publish-interval-seconds", "seconds", "Reviewer loop minimum publish interval"),
 		stringFlag("roles-reviewer-behavior-loop-max-iterations-per-pr", "count", "Deprecated; ignored by reviewer loop filtering"),
 		hiddenStringFlag("reviewer-max-iterations-per-pr", "count", "Deprecated; ignored by reviewer loop filtering"),
@@ -930,6 +935,8 @@ var configFlagNames = map[string]struct{}{
 	"reviewer-enable-self-review":                               {},
 	"roles-reviewer-behavior-loop-quiet-period-seconds":         {},
 	"reviewer-quiet-period-seconds":                             {},
+	"defaults-loop-quiet-period-seconds":                        {},
+	"roles-fixer-behavior-loop-quiet-period-seconds":            {},
 	"roles-reviewer-behavior-loop-min-publish-interval-seconds": {},
 	"reviewer-min-publish-interval-seconds":                     {},
 	"roles-reviewer-behavior-loop-max-iterations-per-pr":        {},

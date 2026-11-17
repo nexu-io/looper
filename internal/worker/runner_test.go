@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -17,6 +18,7 @@ import (
 	"github.com/nexu-io/looper/internal/network/protocol"
 	"github.com/nexu-io/looper/internal/networkpolicy"
 	"github.com/nexu-io/looper/internal/storage"
+	"github.com/nexu-io/looper/internal/worktreesafety"
 )
 
 func TestProcessNextIgnoresOtherQueueTypes(t *testing.T) {
@@ -1329,6 +1331,278 @@ func TestRunExecuteStepRecoversWorktreeOutsideWorktreeRootBeforeAgentStart(t *te
 	}
 	if len(agent.starts) != 1 || agent.starts[0].WorkingDirectory != recoveredPath {
 		t.Fatalf("agent starts = %#v, want recovered working directory", agent.starts)
+	}
+}
+
+// Post-prepare resume at execute must share LocalCheckoutUsable with prepare:
+// a path under the managed worktree root that still has a .git entry must not
+// skip recovery when that entry is malformed or linked metadata is corrupt.
+func TestRunExecuteStepRecoversMalformedGitCheckoutAfterPrepare(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repoPath := t.TempDir()
+	worktreeRoot := filepath.Join(t.TempDir(), "worktrees")
+	if err := os.MkdirAll(worktreeRoot, 0o755); err != nil {
+		t.Fatalf("MkdirAll worktreeRoot: %v", err)
+	}
+	// Checkpoint worktree from a prior prepare: path exists under root, and .git
+	// is present but unusable (malformed gitfile — the pre-fix existence check
+	// would have accepted this and failed later under an external step boundary).
+	corruptPath := filepath.Join(worktreeRoot, "worker-wt")
+	if err := os.MkdirAll(corruptPath, 0o755); err != nil {
+		t.Fatalf("MkdirAll corruptPath: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(corruptPath, ".git"), []byte("not-a-valid-gitfile\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile malformed .git: %v", err)
+	}
+	if worktreesafety.LocalCheckoutUsable(corruptPath) {
+		t.Fatal("LocalCheckoutUsable(corruptPath) = true, want false for malformed gitfile")
+	}
+	recoveredPath := filepath.Join(worktreeRoot, "recovered")
+	metadata := fmt.Sprintf(`{"worktreeRoot":%q}`, worktreeRoot)
+	branch := "looper/feature"
+	git := &fakeGitGateway{
+		restoreResult: &RestoreWorktreeResult{WorktreePath: recoveredPath, Branch: branch, BaseBranch: "main", HeadSHA: "def456", WorktreeID: "worktree_recovered"},
+		inspectResult: InspectHeadResult{HeadSHA: "def456"},
+	}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "done", ParseStatus: "parsed"}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Git: git, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true})
+	run := storage.RunRecord{ID: "run_malformed_git_resume", LoopID: "loop_worker_1", Status: "running", CurrentStep: stringPtr(string(stepExecute)), StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	if err := fixture.repos.Runs.Upsert(context.Background(), run); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), "loop_worker_1")
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v), want loop", loop, err)
+	}
+
+	checkpoint, err := runner.runExecuteStep(context.Background(), stepInput{
+		Project: storage.ProjectRecord{ID: "project_1", RepoPath: repoPath, MetadataJSON: &metadata},
+		Loop:    *loop,
+		Run:     run,
+		Checkpoint: workerCheckpoint{
+			Work:     &workerInput{Title: "Implement worker loop", Repo: "acme/looper", IssueNumber: 27, BaseBranch: "main", ExecutionMode: "create-pr"},
+			Worktree: &checkpointWorktree{ID: "worktree_old", Path: corruptPath, Branch: branch, BaseBranch: "main", HeadSHA: "abc123"},
+			Plan:     &checkpointPlan{Summary: "Implement worker loop", Items: []string{"Do it"}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("runExecuteStep() error = %v", err)
+	}
+	if checkpoint.Worktree == nil || checkpoint.Worktree.Path != recoveredPath || checkpoint.Worktree.ID != "worktree_recovered" {
+		t.Fatalf("checkpoint.Worktree = %#v, want recovered worktree after malformed .git", checkpoint.Worktree)
+	}
+	if len(git.restoreCalls) != 1 || git.restoreCalls[0].ExpectedWorktreePath != corruptPath || git.restoreCalls[0].WorktreeRoot != worktreeRoot {
+		t.Fatalf("restoreCalls = %#v, want recovery of malformed managed worktree", git.restoreCalls)
+	}
+	if len(agent.starts) != 1 || agent.starts[0].WorkingDirectory != recoveredPath {
+		t.Fatalf("agent starts = %#v, want recovered working directory", agent.starts)
+	}
+	persisted, err := fixture.repos.Runs.GetByID(context.Background(), run.ID)
+	if err != nil || persisted == nil {
+		t.Fatalf("Runs.GetByID() = (%#v, %v), want persisted run", persisted, err)
+	}
+	persistedCheckpoint, err := parseCheckpoint(persisted.CheckpointJSON)
+	if err != nil {
+		t.Fatalf("parseCheckpoint() error = %v", err)
+	}
+	if persistedCheckpoint.Worktree == nil || persistedCheckpoint.Worktree.Path != recoveredPath {
+		t.Fatalf("persisted checkpoint worktree = %#v, want recovered path", persistedCheckpoint.Worktree)
+	}
+}
+
+// Resumed post-prepare steps must not recreate when the checkpoint worktree is
+// the project repo itself. Create-after-restore-nil is for hollow managed
+// paths under the worktree root; inventing a fresh path would let validate /
+// open_pr succeed after a corrupt "ran in user repo" checkpoint.
+func TestRunValidateStepRejectsCheckpointWorktreePathAtUserRepo(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repoPath := t.TempDir()
+	worktreeRoot := filepath.Join(t.TempDir(), "worktrees")
+	if err := os.MkdirAll(worktreeRoot, 0o755); err != nil {
+		t.Fatalf("MkdirAll worktreeRoot: %v", err)
+	}
+	metadata := fmt.Sprintf(`{"worktreeRoot":%q}`, worktreeRoot)
+	branch := "looper/bad-checkpoint"
+	git := &fakeGitGateway{
+		restoreNil:   true,
+		createResult: CreateWorktreeResult{WorktreePath: filepath.Join(worktreeRoot, "recreated"), Branch: branch, BaseBranch: "main", HeadSHA: "def456", WorktreeID: "worktree_created"},
+	}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Git: git, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true})
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), "loop_worker_1")
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v), want loop", loop, err)
+	}
+
+	_, err = runner.runValidateStep(context.Background(), stepInput{
+		Project: storage.ProjectRecord{ID: "project_1", RepoPath: repoPath, MetadataJSON: &metadata},
+		Loop:    *loop,
+		Run:     storage.RunRecord{ID: "run_bad_repo_checkpoint", LoopID: loop.ID},
+		Checkpoint: workerCheckpoint{
+			Work:      &workerInput{Title: "Reject unsafe worktree checkpoint", Repo: "acme/looper", IssueNumber: 27, BaseBranch: "main", ExecutionMode: "create-pr"},
+			Worktree:  &checkpointWorktree{ID: "worktree_bad", Path: repoPath, Branch: branch, BaseBranch: "main", HeadSHA: "abc123"},
+			Plan:      &checkpointPlan{Summary: "Reject unsafe worktree checkpoint", Items: []string{"Never use the user repo as worker cwd"}},
+			Execution: &checkpointExecution{Status: "completed", Summary: "prior execution completed", ParseStatus: "parsed"},
+		},
+	})
+	var loopErr *loopError
+	if !errors.As(err, &loopErr) {
+		t.Fatalf("runValidateStep() error = %v, want *loopError", err)
+	}
+	if loopErr.kind != FailureManualIntervention {
+		t.Fatalf("loopErr.kind = %v, want %v", loopErr.kind, FailureManualIntervention)
+	}
+	if !strings.Contains(loopErr.message, "Worker worktree path") {
+		t.Fatalf("error = %q, want Worker worktree path rejection", loopErr.message)
+	}
+	if !strings.Contains(loopErr.message, "must not equal project repo path") {
+		t.Fatalf("error = %q, want project-repo-path detail", loopErr.message)
+	}
+	if len(git.restoreCalls) != 0 {
+		t.Fatalf("restoreCalls = %#v, want no restore for project-repo checkpoint", git.restoreCalls)
+	}
+	if len(git.createCalls) != 0 {
+		t.Fatalf("createCalls = %#v, want no recreate for project-repo checkpoint", git.createCalls)
+	}
+}
+
+// Production RestoreWorktree clears empty/metadata-only hollow leftovers and
+// returns (nil, nil) when no healthy registered worktree remains. Recovery must
+// fall through to CreateWorktree instead of parking as stale-worktree MI.
+func TestRunExecuteStepRecreatesAfterRestoreReturnsNil(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repoPath := t.TempDir()
+	worktreeRoot := filepath.Join(t.TempDir(), "worktrees")
+	if err := os.MkdirAll(worktreeRoot, 0o755); err != nil {
+		t.Fatalf("MkdirAll worktreeRoot: %v", err)
+	}
+	corruptPath := filepath.Join(worktreeRoot, "hollow-wt")
+	if err := os.MkdirAll(corruptPath, 0o755); err != nil {
+		t.Fatalf("MkdirAll corruptPath: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(corruptPath, ".git"), []byte("gitdir: /missing/gitdir\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile malformed .git: %v", err)
+	}
+	recreatedPath := filepath.Join(worktreeRoot, "recreated")
+	metadata := fmt.Sprintf(`{"worktreeRoot":%q}`, worktreeRoot)
+	branch := "looper/feature"
+	git := &fakeGitGateway{
+		restoreNil:    true,
+		createResult:  CreateWorktreeResult{WorktreePath: recreatedPath, Branch: branch, BaseBranch: "main", HeadSHA: "def456", WorktreeID: "worktree_created"},
+		inspectResult: InspectHeadResult{HeadSHA: "def456"},
+	}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "done", ParseStatus: "parsed"}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Git: git, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true})
+	run := storage.RunRecord{ID: "run_restore_nil_recreate", LoopID: "loop_worker_1", Status: "running", CurrentStep: stringPtr(string(stepExecute)), StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	if err := fixture.repos.Runs.Upsert(context.Background(), run); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), "loop_worker_1")
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v), want loop", loop, err)
+	}
+
+	checkpoint, err := runner.runExecuteStep(context.Background(), stepInput{
+		Project: storage.ProjectRecord{ID: "project_1", RepoPath: repoPath, MetadataJSON: &metadata},
+		Loop:    *loop,
+		Run:     run,
+		Checkpoint: workerCheckpoint{
+			Work:     &workerInput{Title: "Implement worker loop", Repo: "acme/looper", IssueNumber: 27, BaseBranch: "main", ExecutionMode: "create-pr"},
+			Worktree: &checkpointWorktree{ID: "worktree_old", Path: corruptPath, Branch: branch, BaseBranch: "main", HeadSHA: "abc123"},
+			Plan:     &checkpointPlan{Summary: "Implement worker loop", Items: []string{"Do it"}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("runExecuteStep() error = %v", err)
+	}
+	if checkpoint.Worktree == nil || checkpoint.Worktree.Path != recreatedPath || checkpoint.Worktree.ID != "worktree_created" {
+		t.Fatalf("checkpoint.Worktree = %#v, want recreated worktree after restore nil", checkpoint.Worktree)
+	}
+	if len(git.restoreCalls) != 1 {
+		t.Fatalf("restoreCalls = %#v, want 1", git.restoreCalls)
+	}
+	if len(git.createCalls) != 1 || git.createCalls[0].Branch != branch || git.createCalls[0].WorktreeRoot != worktreeRoot {
+		t.Fatalf("createCalls = %#v, want CreateWorktree fallback after restore nil", git.createCalls)
+	}
+	if len(agent.starts) != 1 || agent.starts[0].WorkingDirectory != recreatedPath {
+		t.Fatalf("agent starts = %#v, want recreated working directory", agent.starts)
+	}
+}
+
+// Production RestoreWorktree preserves populated unusable paths and returns
+// ErrUnusableWorktreePreserved. Recovery must park as FailureManualIntervention
+// so unlimited queues cannot infinite-retry.
+func TestRunExecuteStepParksPreservedUnusableWorktreeAsManualIntervention(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repoPath := t.TempDir()
+	worktreeRoot := filepath.Join(t.TempDir(), "worktrees")
+	if err := os.MkdirAll(worktreeRoot, 0o755); err != nil {
+		t.Fatalf("MkdirAll worktreeRoot: %v", err)
+	}
+	corruptPath := filepath.Join(worktreeRoot, "populated-hollow")
+	if err := os.MkdirAll(corruptPath, 0o755); err != nil {
+		t.Fatalf("MkdirAll corruptPath: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(corruptPath, ".git"), []byte("gitdir: /missing/gitdir\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile malformed .git: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(corruptPath, "agent-output.txt"), []byte("keep me\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile agent-output: %v", err)
+	}
+	metadata := fmt.Sprintf(`{"worktreeRoot":%q}`, worktreeRoot)
+	branch := "looper/feature"
+	preservedErr := fmt.Errorf("worktree path %s is unusable and not empty; manual intervention required: %w", corruptPath, worktreesafety.ErrUnusableWorktreePreserved)
+	git := &fakeGitGateway{restoreErr: preservedErr}
+	agent := &fakeAgentExecutor{}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Git: git, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true})
+	run := storage.RunRecord{ID: "run_preserve_mi", LoopID: "loop_worker_1", Status: "running", CurrentStep: stringPtr(string(stepExecute)), StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	if err := fixture.repos.Runs.Upsert(context.Background(), run); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), "loop_worker_1")
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v), want loop", loop, err)
+	}
+
+	_, err = runner.runExecuteStep(context.Background(), stepInput{
+		Project: storage.ProjectRecord{ID: "project_1", RepoPath: repoPath, MetadataJSON: &metadata},
+		Loop:    *loop,
+		Run:     run,
+		Checkpoint: workerCheckpoint{
+			Work:     &workerInput{Title: "Implement worker loop", Repo: "acme/looper", IssueNumber: 27, BaseBranch: "main", ExecutionMode: "create-pr"},
+			Worktree: &checkpointWorktree{ID: "worktree_old", Path: corruptPath, Branch: branch, BaseBranch: "main", HeadSHA: "abc123"},
+			Plan:     &checkpointPlan{Summary: "Implement worker loop", Items: []string{"Do it"}},
+		},
+	})
+	var loopErr *loopError
+	if !errors.As(err, &loopErr) {
+		t.Fatalf("runExecuteStep() error = %v, want *loopError", err)
+	}
+	if loopErr.kind != FailureManualIntervention {
+		t.Fatalf("loopErr.kind = %v, want %v", loopErr.kind, FailureManualIntervention)
+	}
+	if !errors.Is(err, worktreesafety.ErrUnusableWorktreePreserved) && !strings.Contains(loopErr.message, "manual intervention required") {
+		t.Fatalf("error = %q, want preserved unusable worktree message", loopErr.message)
+	}
+	if len(git.restoreCalls) != 1 {
+		t.Fatalf("restoreCalls = %#v, want 1", git.restoreCalls)
+	}
+	if len(git.createCalls) != 0 {
+		t.Fatalf("createCalls = %#v, want 0 (must not recreate preserved path)", git.createCalls)
+	}
+	if len(agent.starts) != 0 {
+		t.Fatalf("agent starts = %#v, want none", agent.starts)
+	}
+	// Queue classification must park under unlimited maxAttempts.
+	if shouldRetryQueueFailure(loopErr.kind, 242, -1) {
+		t.Fatal("preserved unusable worktree must not requeue under unlimited maxAttempts")
+	}
+	got, readErr := os.ReadFile(filepath.Join(corruptPath, "agent-output.txt"))
+	if readErr != nil || string(got) != "keep me\n" {
+		t.Fatalf("agent-output = %q err=%v, want preserved", got, readErr)
 	}
 }
 
@@ -2734,6 +3008,60 @@ func TestProcessClaimedItemSelfAssignsIssue(t *testing.T) {
 	}
 }
 
+func TestProcessClaimedItemGitHubAppSkipsSelfAssign(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	fixture.cfg.Projects = []config.ProjectRefConfig{{ID: "project_1", Repo: "acme/looper", Identity: "worker-bot"}}
+	fixture.cfg.Identities = map[string]config.HostingIdentityConfig{"worker-bot": {Kind: config.HostingIdentityGitHubApp, AppID: 1, InstallationID: 2, PrivateKeyFile: "/not-read-by-fake-transports.pem"}}
+	github := &fakeGitHubGateway{currentLogin: "looper-sandbox-e2e[bot]", issueDetail: IssueDetail{Number: 27, Title: "Implement worker loop", State: "open"}, addAssigneeErr: fmt.Errorf("Forbidden (HTTP 403)")}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, CustomInstructions: fixture.cfg})
+
+	claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "worker-1", "worker")
+	if err != nil || claim == nil {
+		t.Fatalf("ClaimNextOfType() = (%#v, %v), want claimed item", claim, err)
+	}
+	result, err := runner.ProcessClaimedQueueItem(context.Background(), *claim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedQueueItem() error = %v", err)
+	}
+	if result == nil || result.Status == "failed" {
+		t.Fatalf("result = %#v, want GitHub App worker to continue without self-assignment", result)
+	}
+	if len(github.addAssigneeCalls) != 0 {
+		t.Fatalf("addAssigneeCalls = %#v, want no GitHub App self-assignment", github.addAssigneeCalls)
+	}
+}
+
+func TestProcessClaimedItemGitHubAppPlaneStillSelfAssigns(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	fixture.cfg.Providers = []config.ProviderConfig{{ID: "plane-open-design", Kind: config.ProviderKindPlane}}
+	fixture.cfg.Projects = []config.ProjectRefConfig{{ID: "project_1", Provider: "plane-open-design", Repo: "acme/looper", Identity: "worker-bot"}}
+	fixture.cfg.Identities = map[string]config.HostingIdentityConfig{"worker-bot": {Kind: config.HostingIdentityGitHubApp, AppID: 1, InstallationID: 2, PrivateKeyFile: "/not-read-by-fake-transports.pem"}}
+	const planeLogin = "11111111-2222-3333-4444-555555555555"
+	github := &fakeGitHubGateway{currentLogin: planeLogin, issueDetail: IssueDetail{Number: 27, Title: "Implement worker loop", State: "open"}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, CustomInstructions: fixture.cfg})
+
+	claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "worker-1", "worker")
+	if err != nil || claim == nil {
+		t.Fatalf("ClaimNextOfType() = (%#v, %v), want claimed item", claim, err)
+	}
+	result, err := runner.ProcessClaimedQueueItem(context.Background(), *claim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedQueueItem() error = %v", err)
+	}
+	if result == nil || result.Status == "failed" {
+		t.Fatalf("result = %#v, want Plane assignment to proceed under a GitHub App identity", result)
+	}
+	if len(github.addAssigneeCalls) != 1 {
+		t.Fatalf("addAssigneeCalls = %#v, want Plane self-assignment despite GitHub App hosting identity", github.addAssigneeCalls)
+	}
+	call := github.addAssigneeCalls[0]
+	if call.IssueNumber != 27 || len(call.Assignees) != 1 || call.Assignees[0] != planeLogin {
+		t.Fatalf("add assignee call = %#v, want Plane login on issue 27", call)
+	}
+}
+
 func TestProcessClaimedItemAutoDiscoveredIssueSkipsSelfAssignWhenAssigneePolicyDisabled(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
@@ -2759,6 +3087,131 @@ func TestProcessClaimedItemAutoDiscoveredIssueSkipsSelfAssignWhenAssigneePolicyD
 	}
 	if len(github.addAssigneeCalls) != 0 {
 		t.Fatalf("addAssigneeCalls = %#v, want no self-assignment", github.addAssigneeCalls)
+	}
+}
+
+func TestEnsureLoopForDiscoveredIssueInheritsPlannerSpecPullRequest(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{}, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+	ctx := context.Background()
+	project, err := fixture.repos.Projects.GetByID(ctx, "project_1")
+	if err != nil || project == nil {
+		t.Fatalf("Projects.GetByID() = (%#v, %v), want project", project, err)
+	}
+	nowISO := fixture.nowISO()
+	plannerTargetID := "issue:acme/looper:52"
+	plannerMeta := `{"specPath":"specs/52.md","prNumber":42}`
+	prNumber := int64(42)
+	if err := fixture.repos.Loops.Upsert(ctx, storage.LoopRecord{ID: "loop_planner_1", Seq: 2, ProjectID: "project_1", Type: "planner", TargetType: "issue", TargetID: &plannerTargetID, Repo: stringPtr("acme/looper"), PRNumber: &prNumber, Status: "completed", MetadataJSON: &plannerMeta, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	snapshotPayload := `{"detail":{"state":"open"}}`
+	if err := fixture.repos.PullRequestSnapshots.Upsert(ctx, storage.PullRequestSnapshotRecord{ID: "snapshot_1", ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42, PayloadJSON: &snapshotPayload, CapturedAt: nowISO, CreatedAt: nowISO}); err != nil {
+		t.Fatalf("PullRequestSnapshots.Upsert() error = %v", err)
+	}
+	issue := IssueSummary{Number: 52, Title: "Implement worker loop", URL: "https://example/issues/52", Labels: []string{"looper:worker-ready"}}
+	fingerprint := buildWorkerDiscoveryFingerprint("acme/looper", derefString(project.BaseBranch), issue)
+	loopResult, err := runner.ensureLoopForDiscoveredIssue(ctx, *project, "acme/looper", issue, fingerprint)
+	if err != nil {
+		t.Fatalf("ensureLoopForDiscoveredIssue() error = %v", err)
+	}
+	loop := loopResult.record
+	if !loopResult.created || loop.TargetType != "pull_request" || derefString(loop.TargetID) != "pr:acme/looper:42" || derefInt64(loop.PRNumber) != 42 {
+		t.Fatalf("loop = %#v (created=%v), want new pull_request loop targeting pr:acme/looper:42", loop, loopResult.created)
+	}
+	queueItem, err := runner.enqueueDiscoveredIssue(ctx, *project, loop, "acme/looper", issue, fingerprint)
+	if err != nil {
+		t.Fatalf("enqueueDiscoveredIssue() error = %v", err)
+	}
+	if queueItem.TargetType != "pull_request" || queueItem.TargetID != "pr:acme/looper:42" || derefInt64(queueItem.PRNumber) != 42 {
+		t.Fatalf("queueItem target = %s %s pr=%v, want pull_request pr:acme/looper:42", queueItem.TargetType, queueItem.TargetID, queueItem.PRNumber)
+	}
+	if queueItem.DedupeKey != "worker:project_1:acme/looper:42" || derefString(queueItem.LockKey) != storage.PullRequestLockKey("project_1", "acme/looper", 42) {
+		t.Fatalf("queueItem dedupe/lock = %q/%q, want PR-scoped keys", queueItem.DedupeKey, derefString(queueItem.LockKey))
+	}
+	payload := parseJSONObject(queueItem.PayloadJSON)
+	if stringFromAnyDefault(payload["specPath"]) != "specs/52.md" || int64FromAny(payload["prNumber"]) != 42 || stringFromAnyDefault(payload["executionMode"]) != "push-existing" || int64FromAny(payload["issueNumber"]) != 52 {
+		t.Fatalf("payload = %s, want specPath/prNumber/push-existing inherited from planner", derefString(queueItem.PayloadJSON))
+	}
+}
+
+func TestEnsureLoopForDiscoveredIssueKeepsIssueTargetWhenPlannerPRClosed(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{}, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+	ctx := context.Background()
+	project, err := fixture.repos.Projects.GetByID(ctx, "project_1")
+	if err != nil || project == nil {
+		t.Fatalf("Projects.GetByID() = (%#v, %v), want project", project, err)
+	}
+	nowISO := fixture.nowISO()
+	plannerTargetID := "issue:acme/looper:52"
+	plannerMeta := `{"specPath":"specs/52.md","prNumber":42}`
+	prNumber := int64(42)
+	if err := fixture.repos.Loops.Upsert(ctx, storage.LoopRecord{ID: "loop_planner_1", Seq: 2, ProjectID: "project_1", Type: "planner", TargetType: "issue", TargetID: &plannerTargetID, Repo: stringPtr("acme/looper"), PRNumber: &prNumber, Status: "completed", MetadataJSON: &plannerMeta, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	snapshotPayload := `{"detail":{"state":"closed"}}`
+	if err := fixture.repos.PullRequestSnapshots.Upsert(ctx, storage.PullRequestSnapshotRecord{ID: "snapshot_1", ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42, PayloadJSON: &snapshotPayload, CapturedAt: nowISO, CreatedAt: nowISO}); err != nil {
+		t.Fatalf("PullRequestSnapshots.Upsert() error = %v", err)
+	}
+	issue := IssueSummary{Number: 52, Title: "Implement worker loop", URL: "https://example/issues/52", Labels: []string{"looper:worker-ready"}}
+	fingerprint := buildWorkerDiscoveryFingerprint("acme/looper", derefString(project.BaseBranch), issue)
+	loopResult, err := runner.ensureLoopForDiscoveredIssue(ctx, *project, "acme/looper", issue, fingerprint)
+	if err != nil {
+		t.Fatalf("ensureLoopForDiscoveredIssue() error = %v", err)
+	}
+	loop := loopResult.record
+	if !loopResult.created || loop.TargetType != "issue" || derefString(loop.TargetID) != "issue:acme/looper:52" || loop.PRNumber != nil {
+		t.Fatalf("loop = %#v (created=%v), want new issue loop without prNumber", loop, loopResult.created)
+	}
+	workerMeta, _ := parseJSONObject(loop.MetadataJSON)["worker"].(map[string]any)
+	if stringFromAnyDefault(workerMeta["specPath"]) != "specs/52.md" {
+		t.Fatalf("worker metadata = %s, want inherited specPath", derefString(loop.MetadataJSON))
+	}
+}
+
+func TestEnsureLoopForDiscoveredIssueMergesSpecPathIntoExistingIssueLoop(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{}, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+	ctx := context.Background()
+	project, err := fixture.repos.Projects.GetByID(ctx, "project_1")
+	if err != nil || project == nil {
+		t.Fatalf("Projects.GetByID() = (%#v, %v), want project", project, err)
+	}
+	nowISO := fixture.nowISO()
+	issueTargetID := "issue:acme/looper:52"
+	existingMeta := `{"worker":{"title":"Implement worker loop","repo":"acme/looper","issueNumber":52,"baseBranch":"main","executionMode":"create-pr"}}`
+	if err := fixture.repos.Loops.Upsert(ctx, storage.LoopRecord{ID: "loop_worker_52", Seq: 2, ProjectID: "project_1", Type: "worker", TargetType: "issue", TargetID: &issueTargetID, Repo: stringPtr("acme/looper"), Status: "queued", MetadataJSON: &existingMeta, NextRunAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	plannerMeta := `{"specPath":"specs/52.md","prNumber":42}`
+	prNumber := int64(42)
+	if err := fixture.repos.Loops.Upsert(ctx, storage.LoopRecord{ID: "loop_planner_1", Seq: 3, ProjectID: "project_1", Type: "planner", TargetType: "issue", TargetID: &issueTargetID, Repo: stringPtr("acme/looper"), PRNumber: &prNumber, Status: "completed", MetadataJSON: &plannerMeta, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	snapshotPayload := `{"detail":{"state":"open"}}`
+	if err := fixture.repos.PullRequestSnapshots.Upsert(ctx, storage.PullRequestSnapshotRecord{ID: "snapshot_1", ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42, PayloadJSON: &snapshotPayload, CapturedAt: nowISO, CreatedAt: nowISO}); err != nil {
+		t.Fatalf("PullRequestSnapshots.Upsert() error = %v", err)
+	}
+	issue := IssueSummary{Number: 52, Title: "Implement worker loop", URL: "https://example/issues/52", Labels: []string{"looper:worker-ready"}}
+	fingerprint := buildWorkerDiscoveryFingerprint("acme/looper", derefString(project.BaseBranch), issue)
+	loopResult, err := runner.ensureLoopForDiscoveredIssue(ctx, *project, "acme/looper", issue, fingerprint)
+	if err != nil {
+		t.Fatalf("ensureLoopForDiscoveredIssue() error = %v", err)
+	}
+	loop := loopResult.record
+	if loopResult.created || loop.TargetType != "issue" || loop.PRNumber != nil {
+		t.Fatalf("loop = %#v (created=%v), want existing issue loop kept on issue target", loop, loopResult.created)
+	}
+	workerMeta, _ := parseJSONObject(loop.MetadataJSON)["worker"].(map[string]any)
+	if stringFromAnyDefault(workerMeta["specPath"]) != "specs/52.md" {
+		t.Fatalf("worker metadata = %s, want merged specPath", derefString(loop.MetadataJSON))
+	}
+	if int64FromAny(workerMeta["prNumber"]) != 0 {
+		t.Fatalf("worker metadata = %s, want no prNumber on issue-targeted loop", derefString(loop.MetadataJSON))
 	}
 }
 
@@ -4750,8 +5203,10 @@ func (f *fakeGitHubGateway) AddPullRequestReviewers(_ context.Context, input Pul
 
 type fakeGitGateway struct {
 	createResult      CreateWorktreeResult
+	createErr         error
 	restoreResult     *RestoreWorktreeResult
-	restoreReturnsNil bool
+	restoreErr        error
+	restoreNil        bool
 	prepareResult     PrepareWorktreeResult
 	inspectResult     InspectHeadResult
 	inspectResults    []InspectHeadResult
@@ -4766,10 +5221,14 @@ type fakeGitGateway struct {
 	commitCalls       []CommitInput
 	pushErrors        []error
 	pushIndex         int
+	restoreReturnsNil bool
 }
 
 func (f *fakeGitGateway) CreateWorktree(_ context.Context, input CreateWorktreeInput) (CreateWorktreeResult, error) {
 	f.createCalls = append(f.createCalls, input)
+	if f.createErr != nil {
+		return CreateWorktreeResult{}, f.createErr
+	}
 	result := f.createResult
 	if result.WorktreePath == "" {
 		result.WorktreePath = filepath.Join(input.WorktreeRoot, "wt")
@@ -4788,7 +5247,10 @@ func (f *fakeGitGateway) CreateWorktree(_ context.Context, input CreateWorktreeI
 
 func (f *fakeGitGateway) RestoreWorktree(_ context.Context, input RestoreWorktreeInput) (*RestoreWorktreeResult, error) {
 	f.restoreCalls = append(f.restoreCalls, input)
-	if f.restoreReturnsNil {
+	if f.restoreErr != nil {
+		return nil, f.restoreErr
+	}
+	if f.restoreNil || f.restoreReturnsNil {
 		return nil, nil
 	}
 	if f.restoreResult != nil {

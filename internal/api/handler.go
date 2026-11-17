@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/subtle"
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
@@ -23,16 +24,19 @@ import (
 	"time"
 
 	"github.com/nexu-io/looper/internal/agent"
+	"github.com/nexu-io/looper/internal/agent/modelcatalog"
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/domain"
 	"github.com/nexu-io/looper/internal/eventlog"
 	"github.com/nexu-io/looper/internal/forge"
+	"github.com/nexu-io/looper/internal/hostingidentity"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/infra/shell"
 	"github.com/nexu-io/looper/internal/loops"
 	loopcondition "github.com/nexu-io/looper/internal/loops/condition"
 	loopengine "github.com/nexu-io/looper/internal/loops/engine"
 	networkclient "github.com/nexu-io/looper/internal/network/client"
+	"github.com/nexu-io/looper/internal/processcontainment"
 	"github.com/nexu-io/looper/internal/projects"
 	"github.com/nexu-io/looper/internal/reviewer"
 	looperdruntime "github.com/nexu-io/looper/internal/runtime"
@@ -144,6 +148,10 @@ type Context struct {
 	TakeoverLoop         func(context.Context, string, string) (TakeoverResult, error)
 	RepairReviewer       func(context.Context, reviewer.RepairInput) (reviewer.RepairResult, error)
 	TriggerSchedulerTick func()
+	// NotifyHumanAttention observes a durable human-attention park after a
+	// non-claim path (budget Continue → scope promotion). Optional; Runtime
+	// NotifyHumanAttention is used when unset.
+	NotifyHumanAttention func(context.Context, string)
 }
 
 // TakeoverResult is what a takeover yields: the native session id + worktree +
@@ -162,6 +170,7 @@ type Handler struct {
 	recoverySummary  func() any
 	webhookForwarder webhookforward.Forwarder
 	bootstrap        *bootstrapCodes
+	modelCatalog     *modelcatalog.Service
 	// discardBeforeGitHook is test-only: invoked after discard preflight recheck
 	// and immediately before git reset/clean so tests can inject a requeue race
 	// that bypasses LockLoopRequeue (defense-in-depth for the pre-git recheck).
@@ -215,12 +224,32 @@ func NewHandler(context Context) *Handler {
 	bootstrap := newBootstrapCodes()
 	bootstrap.now = now
 
+	// Model catalog probes are Supervisor-owned non-agent work: track handles
+	// for shutdown drain and cancel shared probe lifetime on BeginShutdown
+	// (independent of popup/request AbortController cancel).
+	var tracker processcontainment.LiveTracker
+	if context.Runtime != nil {
+		if ae := context.Runtime.Services().ActiveExecutions; ae != nil {
+			tracker = ae
+		}
+	}
+	modelCatalog := modelcatalog.NewService(modelcatalog.Options{
+		Now:     now,
+		Tracker: tracker,
+	})
+	if register, ok := any(context.Runtime).(interface {
+		OnBeginShutdown(func())
+	}); ok {
+		register.OnBeginShutdown(modelCatalog.Shutdown)
+	}
+
 	return &Handler{
 		context:          context,
 		now:              now,
 		recoverySummary:  recoverySummary,
 		webhookForwarder: forwarder,
 		bootstrap:        bootstrap,
+		modelCatalog:     modelCatalog,
 	}
 }
 
@@ -361,6 +390,9 @@ func (h *Handler) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	case apiBasePath + "/config":
 		h.handleConfigRoute(w, r, requestID)
 		return
+	case apiBasePath + "/agent/models":
+		h.handleAgentModelsRoute(w, r, requestID)
+		return
 	case apiBasePath + "/webhook/status":
 		if !assertMethod(r.Method, http.MethodGet, path, w, requestID, h.writeError) {
 			return
@@ -496,6 +528,11 @@ func (h *Handler) serveHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		h.writeSuccess(w, requestID, payload)
+		return
+	}
+
+	if path == apiBasePath+"/hitl/feishu" {
+		h.handleFeishuCardActionRoute(w, r, requestID)
 		return
 	}
 
@@ -1136,6 +1173,80 @@ type statusTools struct {
 	Osascript bool `json:"osascript"`
 }
 
+func (h *Handler) handleAgentModelsRoute(w http.ResponseWriter, r *http.Request, requestID string) {
+	if !assertMethod(r.Method, http.MethodGet, apiBasePath+"/agent/models", w, requestID, h.writeError) {
+		return
+	}
+	vendorRaw := strings.TrimSpace(r.URL.Query().Get("vendor"))
+	if vendorRaw == "" {
+		h.writeError(w, requestID, apiError{
+			code:    pkgapi.ErrorCodeValidationFailed,
+			status:  http.StatusBadRequest,
+			message: "vendor query parameter is required",
+		})
+		return
+	}
+	vendor := config.AgentVendor(vendorRaw)
+	switch vendor {
+	case config.AgentVendorClaudeCode, config.AgentVendorCodex, config.AgentVendorOpenCode,
+		config.AgentVendorCursorCLI, config.AgentVendorGrokBuild, config.AgentVendorPi, config.AgentVendorOmp:
+	default:
+		h.writeError(w, requestID, apiError{
+			code:    pkgapi.ErrorCodeValidationFailed,
+			status:  http.StatusBadRequest,
+			message: "vendor must be one of: claude-code, codex, opencode, cursor-cli, grok-build, pi, omp",
+		})
+		return
+	}
+
+	refreshRaw := strings.TrimSpace(strings.ToLower(r.URL.Query().Get("refresh")))
+	refresh := refreshRaw == "1" || refreshRaw == "true" || refreshRaw == "yes"
+	// refresh=1 bypasses the probe cache and launches the vendor CLI. Under
+	// authMode=none, originless no-CORS GETs to loopback are Host-allowed; a
+	// cross-site page could therefore force repeated probes. Reject forced
+	// refresh when browser fetch metadata marks the request cross-site.
+	if refresh && !allowForcedModelCatalogRefresh(r) {
+		h.writeError(w, requestID, apiError{
+			code:    pkgapi.ErrorCodeUnauthorized,
+			status:  http.StatusForbidden,
+			message: "forced model catalog refresh is not allowed for cross-site requests",
+		})
+		return
+	}
+
+	cfg := h.effectiveConfig()
+	// Spawn-equivalent params ownership: when global agent.vendor owns
+	// agent.params and the catalog vendor diverges, strip command/args so a
+	// Codex wrapper is never used to probe OpenCode (or vice versa).
+	params := agent.ParamsForRoleVendor(cfg.Agent.Params, cfg.Agent.Vendor, vendor, nil)
+
+	svc := h.modelCatalog
+	if svc == nil {
+		svc = modelcatalog.NewService(modelcatalog.Options{Now: h.now})
+	}
+	// Pass agent.env so vendor CLIs that authenticate via configured env
+	// (OpenCode/Grok API keys, etc.) probe with the same credentials as spawn.
+	result, err := svc.List(r.Context(), modelcatalog.ListOptions{
+		Vendor:  vendor,
+		Params:  params,
+		Env:     cfg.Agent.Env,
+		Refresh: refresh,
+	})
+	if err != nil {
+		if errors.Is(err, modelcatalog.ErrUnknownVendor) {
+			h.writeError(w, requestID, apiError{
+				code:    pkgapi.ErrorCodeValidationFailed,
+				status:  http.StatusBadRequest,
+				message: "vendor must be one of: claude-code, codex, opencode, cursor-cli, grok-build, pi, omp",
+			})
+			return
+		}
+		h.writeError(w, requestID, internalServerError(err))
+		return
+	}
+	h.writeSuccess(w, requestID, result)
+}
+
 func (h *Handler) handleConfigRoute(w http.ResponseWriter, r *http.Request, requestID string) {
 	switch r.Method {
 	case http.MethodGet:
@@ -1375,6 +1486,8 @@ func asConfigRequestError(err error) (ConfigRequestError, bool) {
 }
 
 type configResponse struct {
+	Identities map[string]config.HostingIdentityConfig `json:"identities,omitempty"`
+
 	Server        configServerResponse      `json:"server"`
 	Storage       config.StorageConfig      `json:"storage"`
 	Scheduler     config.SchedulerConfig    `json:"scheduler"`
@@ -1429,6 +1542,7 @@ func (h *Handler) buildConfigResponse() configResponse {
 	cfg := h.context.Config
 
 	return configResponse{
+		Identities: cfg.Identities,
 		Server: configServerResponse{
 			Host:     cfg.Server.Host,
 			Port:     cfg.Server.Port,
@@ -1621,7 +1735,7 @@ func (h *Handler) buildStatusResponse(ctx context.Context) (statusResponse, erro
 				InstallDir:       installDir,
 				CurrentTarget:    currentTarget,
 				ArtifactName:     artifactName,
-				SupportedTargets: []string{"darwin-arm64", "linux-amd64"},
+				SupportedTargets: []string{"darwin-arm64", "linux-amd64", "linux-arm64"},
 			},
 		},
 		Storage: statusStorage{
@@ -1961,15 +2075,35 @@ type pullRequestLoopStatus struct {
 }
 
 type loopResponse struct {
-	ID            string             `json:"id"`
-	Seq           int64              `json:"seq"`
-	ProjectID     string             `json:"projectId"`
-	Type          string             `json:"type"`
-	TargetType    string             `json:"targetType"`
-	TargetID      *string            `json:"targetId"`
-	Repo          *string            `json:"repo"`
-	PRNumber      *int64             `json:"prNumber"`
-	Status        string             `json:"status"`
+	ID         string  `json:"id"`
+	Seq        int64   `json:"seq"`
+	ProjectID  string  `json:"projectId"`
+	Type       string  `json:"type"`
+	TargetType string  `json:"targetType"`
+	TargetID   *string `json:"targetId"`
+	Repo       *string `json:"repo"`
+	PRNumber   *int64  `json:"prNumber"`
+	Status     string  `json:"status"`
+	// DisplayStatus is a read-only, non-persisted dashboard projection of durable
+	// queue/checkpoint facts (e.g. manual_intervention, backing_off). It never
+	// becomes a true loop status; clients must keep Status as the authority for
+	// mutations and lifecycle transitions.
+	//
+	// Trade-off (AGENTS.md new-concept checklist):
+	//   Failure prevented: operators could not see why automation stopped when
+	//   loop.Status stayed paused/failed/queued while queue last_error_kind or
+	//   checkpoint resumePolicy already encoded a hard hold — without a
+	//   projection, the recovery card would re-parse diagnostics ad hoc or the
+	//   daemon would need a new true loop status (rejected).
+	//   Costs: DisplayStatus must stay in sync with decorateActiveRunView and
+	//   decorateLoopDiagnostics; active queue, closed loops, and awaiting_human
+	//   must win over stale retained kinds; empty projection falls back to
+	//   Status so list/detail never invent a third authority.
+	//   Why not Status + diagnostics alone: Status is lifecycle authority and
+	//   does not carry hold semantics; exposing lastFailureKind/resumePolicy raw
+	//   forces every client to reimplement supersede rules (active queue, HITL,
+	//   closed loops). Centralizing projection keeps one contract for the card.
+	DisplayStatus string             `json:"displayStatus,omitempty"`
 	ConfigJSON    *string            `json:"configJson"`
 	MetadataJSON  *string            `json:"metadataJson"`
 	LastRunAt     *string            `json:"lastRunAt"`
@@ -1982,6 +2116,7 @@ type loopResponse struct {
 	MaxAttempts       *int64  `json:"maxAttempts,omitempty"`
 	LastFailureKind   *string `json:"lastFailureKind,omitempty"`
 	LastFailureReason *string `json:"lastFailureReason,omitempty"`
+	ResumePolicy      *string `json:"resumePolicy,omitempty"`
 }
 
 type loopRelationships struct {
@@ -2038,8 +2173,11 @@ type projectResponse struct {
 	BaseBranch string `json:"baseBranch"`
 	Archived   bool   `json:"archived"`
 	// Provider is the resolved provider kind for display (github, forgejo, plane).
-	Provider     string  `json:"provider"`
-	Repo         *string `json:"repo"`
+	Provider string  `json:"provider"`
+	Repo     *string `json:"repo"`
+	// RepoURL is the forge HTML URL for the repo (provider base + owner/name).
+	// Nil when repo slug or forge base cannot be resolved.
+	RepoURL      *string `json:"repoUrl"`
 	WorktreeRoot *string `json:"worktreeRoot"`
 	CreatedAt    string  `json:"createdAt"`
 	UpdatedAt    string  `json:"updatedAt"`
@@ -2103,6 +2241,7 @@ type activeRunView struct {
 	ResumePolicy      *string            `json:"resumePolicy,omitempty"`
 	CurrentStep       *string            `json:"currentStep"`
 	StartedAt         *string            `json:"startedAt"`
+	AvailableAt       *string            `json:"availableAt,omitempty"`
 	EndedAt           *string            `json:"endedAt,omitempty"`
 	Target            activeRunTarget    `json:"target"`
 	Agent             *activeRunAgent    `json:"agent"`
@@ -2110,18 +2249,25 @@ type activeRunView struct {
 }
 
 type retryLoopRequest struct {
-	Mode                   string `json:"mode"`
-	ResetAttempts          *bool  `json:"resetAttempts"`
-	DiscardWorktreeChanges *bool  `json:"discardWorktreeChanges"`
+	Mode                      string `json:"mode"`
+	ResetAttempts             *bool  `json:"resetAttempts"`
+	DiscardWorktreeChanges    *bool  `json:"discardWorktreeChanges"`
+	ClearUnusableWorktreePath *bool  `json:"clearUnusableWorktreePath"`
+	// ExpectedWorktreePath binds operator clear confirmation to the path shown
+	// by GET /worktree. Required when clearUnusableWorktreePath is true; clear
+	// refuses if the daemon-resolved path drifts before RemoveAll.
+	ExpectedWorktreePath *string `json:"expectedWorktreePath"`
 }
 
 type retryLoopResponse struct {
-	Loop                   loopResponse           `json:"loop"`
-	QueueItemID            *string                `json:"queueItemId,omitempty"`
-	Mode                   string                 `json:"mode"`
-	ResetAttempts          bool                   `json:"resetAttempts"`
-	DiscardWorktreeChanges bool                   `json:"discardWorktreeChanges"`
-	WorktreeDiscard        *worktreeDiscardResult `json:"worktreeDiscard,omitempty"`
+	Loop                      loopResponse                 `json:"loop"`
+	QueueItemID               *string                      `json:"queueItemId,omitempty"`
+	Mode                      string                       `json:"mode"`
+	ResetAttempts             bool                         `json:"resetAttempts"`
+	DiscardWorktreeChanges    bool                         `json:"discardWorktreeChanges"`
+	ClearUnusableWorktreePath bool                         `json:"clearUnusableWorktreePath"`
+	WorktreeDiscard           *worktreeDiscardResult       `json:"worktreeDiscard,omitempty"`
+	WorktreeClearUnusable     *worktreeClearUnusableResult `json:"worktreeClearUnusable,omitempty"`
 }
 
 type activeRunTarget struct {
@@ -2303,10 +2449,11 @@ func (h *Handler) buildLoopsRouteResponse(r *http.Request) (any, error) {
 		}
 
 		responseItems := make([]loopResponse, 0, len(items))
+		now := h.now().UTC()
 		includeRelationships := strings.EqualFold(strings.TrimSpace(r.URL.Query().Get("include")), "relationships")
 		for _, item := range items {
 			view := serializeLoop(item)
-			decorateLoopDiagnostics(&view, latestQueueByLoopID[item.ID], latestRunByLoopID[item.ID])
+			decorateLoopDiagnostics(&view, latestQueueByLoopID[item.ID], latestRunByLoopID[item.ID], now)
 			if includeRelationships {
 				relationships := loopRelationshipsFromRecord(item)
 				view.Relationships = &relationships
@@ -2333,8 +2480,9 @@ func (h *Handler) buildLoopsRouteResponse(r *http.Request) (any, error) {
 
 func parseLoopsListOptions(r *http.Request) (storage.ListLoopsOptions, error) {
 	opts := storage.ListLoopsOptions{
-		Status:    strings.TrimSpace(r.URL.Query().Get("status")),
-		ProjectID: strings.TrimSpace(r.URL.Query().Get("projectId")),
+		Status:            strings.TrimSpace(r.URL.Query().Get("status")),
+		ProjectID:         strings.TrimSpace(r.URL.Query().Get("projectId")),
+		OrderByStatusTier: true, // dashboard list only; repository List() stays newest-first
 	}
 
 	if limitValue := strings.TrimSpace(r.URL.Query().Get("limit")); limitValue != "" {
@@ -3022,6 +3170,11 @@ func (h *Handler) buildActiveRunRouteResponse(r *http.Request, path string) (any
 		if err != nil {
 			return nil, err
 		}
+		if stopped, stopErr := h.applyReviewFixBudgetStopIfHeld(r.Context(), loop); stopErr != nil {
+			return nil, stopErr
+		} else if stopped != nil {
+			return stopped, nil
+		}
 		return h.context.StopLoop(r.Context(), loop.ID, fmt.Sprintf("Stopped by user via selector %s", selector))
 	case "close":
 		if r.Method != http.MethodPost {
@@ -3211,7 +3364,13 @@ func (h *Handler) buildActiveRunViews(ctx context.Context, includeRunningLoopsWi
 		if !ok {
 			continue
 		}
-		startedAt := firstNonEmptyString(loop.NextRunAt, stringPtrOrNil(loop.UpdatedAt), stringPtrOrNil(loop.CreatedAt))
+		// Queue creation measures this enqueue, even for an old loop or a
+		// debounce that keeps extending its eligibility time.
+		var startedAt, availableAt *string
+		if queue := latestQueueByLoopID[loop.ID]; queueIsActiveAutomation(queue) {
+			startedAt = stringPtrOrNil(queue.CreatedAt)
+			availableAt = stringPtrOrNil(queue.AvailableAt)
+		}
 		view := activeRunView{
 			Seq:         loop.Seq,
 			RunID:       nil,
@@ -3222,6 +3381,7 @@ func (h *Handler) buildActiveRunViews(ctx context.Context, includeRunningLoopsWi
 			LoopStatus:  loop.Status,
 			CurrentStep: nil,
 			StartedAt:   startedAt,
+			AvailableAt: availableAt,
 			Target:      target,
 			Agent:       nil,
 			Worktree:    nil,
@@ -3454,12 +3614,85 @@ func latestQueueItemByLoopID(items []storage.QueueItemRecord) map[string]*storag
 }
 
 func isManualInterventionQueue(item *storage.QueueItemRecord) bool {
-	return item != nil && (item.Status == "manual_intervention" || (item.LastErrorKind != nil && *item.LastErrorKind == "manual_intervention"))
+	if item == nil {
+		return false
+	}
+	// Parked MI status is always a hold.
+	if item.Status == "manual_intervention" {
+		return true
+	}
+	// Active automation must not be treated as a hold solely because recovery
+	// requeues preserve last_error_kind (RequeueRunningByLoop does not clear it).
+	if queueIsActiveAutomation(item) {
+		return false
+	}
+	return item.LastErrorKind != nil && strings.TrimSpace(*item.LastErrorKind) == "manual_intervention"
 }
 
 func hasManualInterventionResumePolicy(run *storage.RunRecord) bool {
 	policy := resumePolicyFromRun(run)
 	return policy != nil && *policy == loops.ResumePolicyManualIntervention
+}
+
+// queueIsActiveAutomation reports whether the latest queue item is live work
+// (queued/running). Active status supersedes stale holds from a retained
+// last_error_kind (startup recovery requeues) and from a prior run's
+// resumePolicy=manual_intervention after retry.
+func queueIsActiveAutomation(item *storage.QueueItemRecord) bool {
+	if item == nil {
+		return false
+	}
+	switch strings.TrimSpace(item.Status) {
+	case "queued", "running":
+		return true
+	default:
+		return false
+	}
+}
+
+// projectManualInterventionDisplayStatus chooses displayStatus using durable
+// queue facts. Active queued/running items win over a retained last_error_kind
+// and over a stale run resumePolicy; a newer non-MI queue event (including a
+// clean cancelled item after Pause of a post-retry queue) also supersedes
+// resumePolicy. resumePolicy is consulted only when there is no latest queue.
+// Closed loops, awaiting_human, and human_takeover keep their true status
+// (operator UX is authoritative even when CancelByLoop or safety-floor
+// quarantine left last_error_kind=manual_intervention on a retained queue item).
+func projectManualInterventionDisplayStatus(loopStatus string, latestQueue *storage.QueueItemRecord, latestRun *storage.RunRecord, now time.Time) string {
+	if isClosedLoopStatus(loopStatus) {
+		return ""
+	}
+	// HITL decision card and human takeover/handback own the operator UX. Do not
+	// re-project stale manual_intervention diagnostics from a retained queue
+	// item or an old checkpoint hold while those statuses are active.
+	switch domain.LoopStatus(strings.TrimSpace(loopStatus)) {
+	case domain.LoopStatusAwaitingHuman, domain.LoopStatusHumanTakeover:
+		return ""
+	}
+	// Prefer active queue (queued/running after recovery requeue or retry) over
+	// a retained last_error_kind or a stale checkpoint hold. Delayed retryable
+	// requeues still surface as backing_off.
+	if queueIsActiveAutomation(latestQueue) {
+		if isBackingOffQueue(latestQueue, now) {
+			return "backing_off"
+		}
+		return ""
+	}
+	if isManualInterventionQueue(latestQueue) {
+		return "manual_intervention"
+	}
+	if isBackingOffQueue(latestQueue, now) {
+		return "backing_off"
+	}
+	// Any other latest queue fact (e.g. clean cancelled after Pause of a
+	// post-retry item) supersedes a prior run's resumePolicy hold.
+	if latestQueue != nil {
+		return ""
+	}
+	if hasManualInterventionResumePolicy(latestRun) {
+		return "manual_intervention"
+	}
+	return ""
 }
 
 // isClosedLoopStatus reports loop statuses that are fully finished and must not
@@ -3503,19 +3736,19 @@ func decorateActiveRunView(view *activeRunView, loop storage.LoopRecord, latestQ
 	view.ResumePolicy = resumePolicyFromRun(latestRun)
 	// Do not override a closed loop's status with manual_intervention: the loop
 	// is no longer actionable even if the latest queue item still has that status.
-	if !isClosedLoopStatus(loop.Status) && (isManualInterventionQueue(latestQueue) || (view.ResumePolicy != nil && *view.ResumePolicy == loops.ResumePolicyManualIntervention)) {
-		view.DisplayStatus = "manual_intervention"
-	} else if isBackingOffQueue(latestQueue, now) {
-		view.DisplayStatus = "backing_off"
+	if projected := projectManualInterventionDisplayStatus(loop.Status, latestQueue, latestRun, now); projected != "" {
+		view.DisplayStatus = projected
 	}
 	if view.DisplayStatus == "" {
 		view.DisplayStatus = view.Status
 	}
 }
 
-// decorateLoopDiagnostics attaches latest-queue attempt counts and failure reason
-// (with the same run fallback as active-run views) for dashboard list/detail.
-func decorateLoopDiagnostics(view *loopResponse, latestQueue *storage.QueueItemRecord, latestRun *storage.RunRecord) {
+// decorateLoopDiagnostics attaches latest-queue attempt counts, failure reason,
+// and displayStatus (with the same run fallback and manual-intervention rules as
+// active-run views) for dashboard list/detail. now must be the handler clock so
+// backing_off matches /runs/active when Context.Now is injected.
+func decorateLoopDiagnostics(view *loopResponse, latestQueue *storage.QueueItemRecord, latestRun *storage.RunRecord, now time.Time) {
 	if view == nil {
 		return
 	}
@@ -3535,6 +3768,16 @@ func decorateLoopDiagnostics(view *loopResponse, latestQueue *storage.QueueItemR
 				view.LastFailureReason = latestRun.Summary
 			}
 		}
+	}
+	view.ResumePolicy = resumePolicyFromRun(latestRun)
+	// Same authority as decorateActiveRunView: durable queue/checkpoint facts only.
+	// Closed loops keep their true status (not re-projected as manual_intervention).
+	view.DisplayStatus = view.Status
+	if projected := projectManualInterventionDisplayStatus(view.Status, latestQueue, latestRun, now); projected != "" {
+		view.DisplayStatus = projected
+	}
+	if view.DisplayStatus == "" {
+		view.DisplayStatus = view.Status
 	}
 }
 
@@ -3907,6 +4150,11 @@ func (h *Handler) buildLoopRouteResponse(r *http.Request, path string) (any, err
 			return nil, apiError{code: pkgapi.ErrorCodeMethodNotAllowed, status: http.StatusMethodNotAllowed, message: fmt.Sprintf("Unsupported method for %s", path)}
 		}
 		return h.buildLoopLogsResponse(r.Context(), loop)
+	case "worktree":
+		if r.Method != http.MethodGet {
+			return nil, apiError{code: pkgapi.ErrorCodeMethodNotAllowed, status: http.StatusMethodNotAllowed, message: fmt.Sprintf("Unsupported method for %s", path)}
+		}
+		return h.loopWorktreeStatus(r.Context(), loop)
 	case "start":
 		if r.Method != http.MethodPost {
 			return nil, apiError{code: pkgapi.ErrorCodeMethodNotAllowed, status: http.StatusMethodNotAllowed, message: fmt.Sprintf("Unsupported method for %s", path)}
@@ -4723,36 +4971,71 @@ func (h *Handler) validateManualHoldBypassForLoopTarget(ctx context.Context, pro
 	if err != nil {
 		return err
 	}
-	// Hold preflight is best-effort at create time: when we cannot reliably talk to
-	// GitHub from this handler context (missing repo path, missing gh path, etc.) we
-	// skip validation rather than blocking manual creation for unrelated local setup.
-	if strings.TrimSpace(project.RepoPath) == "" {
+	if target.TargetType != domain.LoopTargetTypeIssue && target.TargetType != domain.LoopTargetTypePullRequest {
 		return nil
 	}
-	if _, err := os.Stat(project.RepoPath); err != nil {
-		return nil
+	cfg := h.effectiveConfig()
+	ctx, err = hostingidentity.Bind(ctx, cfg, projectID, string(loopType))
+	if err != nil {
+		return apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("resolve identity before manual loop create: %v", err)}
 	}
-	ghPath := strings.TrimSpace(derefString(h.context.Config.Tools.GHPath))
-	if ghPath == "" {
-		return nil
+	_, selectedIdentity := hostingidentity.FromContext(ctx)
+	provider, ok := resolveProjectProviderConfig(cfg, projectID, parseJSONObject(project.MetadataJSON))
+	if !ok {
+		return apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("refresh target before manual loop create: provider for project %q is not configured", projectID)}
 	}
-	gh := githubinfra.New(githubinfra.Options{GHPath: ghPath, CWD: project.RepoPath, GHRun: shell.Run})
 	labels := []string(nil)
-	switch target.TargetType {
-	case domain.LoopTargetTypeIssue:
-		detail, err := gh.ViewIssue(ctx, githubinfra.ViewIssueInput{Repo: target.Repo, IssueNumber: target.IssueNumber, CWD: project.RepoPath})
-		if err != nil {
-			return apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("refresh target before manual loop create: %v", err)}
+	if provider.Kind == config.ProviderKindForgejo {
+		client, clientErr := forge.NewForgejoClientForContext(ctx, provider, target.Repo)
+		err = clientErr
+		if err == nil {
+			switch target.TargetType {
+			case domain.LoopTargetTypeIssue:
+				var detail forge.Issue
+				detail, err = client.ViewIssue(ctx, target.IssueNumber)
+				for _, label := range detail.Labels {
+					labels = append(labels, label.Name)
+				}
+			case domain.LoopTargetTypePullRequest:
+				var detail forge.PullRequest
+				detail, err = client.ViewPullRequest(ctx, target.PRNumber)
+				for _, label := range detail.Labels {
+					labels = append(labels, label.Name)
+				}
+			}
 		}
-		labels = detail.Labels
-	case domain.LoopTargetTypePullRequest:
-		detail, err := gh.ViewPullRequest(ctx, githubinfra.ViewPullRequestInput{Repo: target.Repo, PRNumber: target.PRNumber, CWD: project.RepoPath})
-		if err != nil {
-			return apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("refresh target before manual loop create: %v", err)}
+	} else {
+		// Preserve the GitHub preflight's best-effort local setup behavior.
+		// Forgejo authenticates directly through its provider and does not need gh
+		// or a local checkout to read the target's current hold labels.
+		cwd := strings.TrimSpace(project.RepoPath)
+		if _, statErr := os.Stat(cwd); cwd == "" || statErr != nil {
+			if !selectedIdentity {
+				return nil
+			}
+			cwd = ""
 		}
-		labels = detail.Labels
-	default:
-		return nil
+		ghPath := strings.TrimSpace(derefString(cfg.Tools.GHPath))
+		if ghPath == "" {
+			if selectedIdentity {
+				return apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: "refresh target before manual loop create: bot GitHub operations require gh"}
+			}
+			return nil
+		}
+		gh := githubinfra.New(githubinfra.Options{GHPath: ghPath, CWD: cwd, GHRun: shell.Run})
+		switch target.TargetType {
+		case domain.LoopTargetTypeIssue:
+			var detail githubinfra.IssueDetail
+			detail, err = gh.ViewIssue(ctx, githubinfra.ViewIssueInput{Repo: target.Repo, IssueNumber: target.IssueNumber, CWD: cwd})
+			labels = detail.Labels
+		case domain.LoopTargetTypePullRequest:
+			var detail githubinfra.PullRequestDetail
+			detail, err = gh.ViewPullRequest(ctx, githubinfra.ViewPullRequestInput{Repo: target.Repo, PRNumber: target.PRNumber, CWD: cwd})
+			labels = detail.Labels
+		}
+	}
+	if err != nil {
+		return apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("refresh target before manual loop create: %v", err)}
 	}
 	if !domain.IsAutoLaneHeld(loopType, labels) {
 		return nil
@@ -5408,6 +5691,14 @@ func (h *Handler) mutateLoopStatus(ctx context.Context, loopID string, status do
 			}
 			unlockTarget := h.lockLoopTarget(preflightLoop.ProjectID, domain.LoopType(preflightLoop.Type), target)
 			defer unlockTarget()
+			// No-HITL budget hold: looper unpause must paired-Continue, not resume one role.
+			// Take the same-target lock first so Continue cannot publish claimable
+			// queue rows while a sibling discard+retry resets the shared worktree.
+			if continued, contErr := h.applyReviewFixBudgetContinueIfHeld(ctx, *preflightLoop); contErr != nil {
+				return loopResponse{}, contErr
+			} else if continued != nil {
+				return *continued, nil
+			}
 		}
 	}
 
@@ -5626,16 +5917,31 @@ func (h *Handler) takeoverLoop(ctx context.Context, loopID string) (takeoverLoop
 // THAT session and sees their turns), clears any queue item that survived the
 // takeover race, then re-arms via the shared retry path.
 func (h *Handler) handbackLoop(ctx context.Context, r *http.Request, loopID string) (any, error) {
-	// Reject discard before any handback mutation. retryLoop is shared with
-	// /retry, but handback must never wipe the human's interactive worktree edits
-	// even if an API client includes discardWorktreeChanges on the handback body.
-	if discardRequested, err := retryRequestRequestsDiscard(r); err != nil {
+	// Reject discard/clear/expected-path before any handback mutation. retryLoop
+	// is shared with /retry, but handback must never wipe the human's interactive
+	// worktree edits even if an API client includes destructive flags on the
+	// handback body. expectedWorktreePath alone must also fail here so a later
+	// retryLoop validation error cannot leave handback queue/session mutations
+	// already committed.
+	if destructive, err := retryRequestRequestsDestructiveWorktree(r); err != nil {
 		return nil, err
-	} else if discardRequested {
+	} else if destructive.discard {
 		return nil, apiError{
 			code:    pkgapi.ErrorCodeValidationFailed,
 			status:  http.StatusBadRequest,
 			message: "discardWorktreeChanges is not allowed on handback; human interactive worktree edits must be preserved (retry with --discard-worktree-changes after handback if needed)",
+		}
+	} else if destructive.clearUnusable {
+		return nil, apiError{
+			code:    pkgapi.ErrorCodeValidationFailed,
+			status:  http.StatusBadRequest,
+			message: "clearUnusableWorktreePath is not allowed on handback; human interactive worktree edits must be preserved",
+		}
+	} else if destructive.expectedWorktreePath {
+		return nil, apiError{
+			code:    pkgapi.ErrorCodeValidationFailed,
+			status:  http.StatusBadRequest,
+			message: "expectedWorktreePath is not allowed on handback; human interactive worktree edits must be preserved",
 		}
 	}
 
@@ -5650,7 +5956,7 @@ func (h *Handler) handbackLoop(ctx context.Context, r *http.Request, loopID stri
 		if loop == nil {
 			return struct{}{}, apiError{code: pkgapi.ErrorCodeLoopNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Loop not found: %s", loopID)}
 		}
-		if execution, err := repos.AgentExecutions.GetLatestByLoopID(ctx, loopID); err == nil && execution != nil && execution.NativeSessionID != nil && strings.TrimSpace(*execution.NativeSessionID) != "" {
+		if execution, err := repos.AgentExecutions.GetLatestByLoopIDExcludingPhase(ctx, loopID, "review-group"); err == nil && execution != nil && execution.NativeSessionID != nil && strings.TrimSpace(*execution.NativeSessionID) != "" {
 			meta, werr := loops.WriteTakeoverResume(loop.MetadataJSON, loops.TakeoverResume{SessionID: strings.TrimSpace(*execution.NativeSessionID)})
 			if werr == nil {
 				loop.MetadataJSON = &meta
@@ -5674,26 +5980,41 @@ func (h *Handler) handbackLoop(ctx context.Context, r *http.Request, loopID stri
 	return h.retryLoop(ctx, r, loopID, true)
 }
 
-// retryRequestRequestsDiscard peeks at a retry/handback JSON body for
-// discardWorktreeChanges without consuming the request for a later retryLoop decode.
-func retryRequestRequestsDiscard(r *http.Request) (bool, error) {
+type retryDestructiveWorktreeFlags struct {
+	discard              bool
+	clearUnusable        bool
+	expectedWorktreePath bool
+}
+
+// retryRequestRequestsDestructiveWorktree peeks at a retry/handback JSON body for
+// discardWorktreeChanges / clearUnusableWorktreePath / expectedWorktreePath
+// without consuming the request for a later retryLoop decode.
+func retryRequestRequestsDestructiveWorktree(r *http.Request) (retryDestructiveWorktreeFlags, error) {
 	if r == nil || r.Body == nil {
-		return false, nil
+		return retryDestructiveWorktreeFlags{}, nil
 	}
 	raw, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 	_ = r.Body.Close()
 	r.Body = io.NopCloser(strings.NewReader(string(raw)))
 	if err != nil {
-		return false, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("Invalid retry request: %v", err)}
+		return retryDestructiveWorktreeFlags{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("Invalid retry request: %v", err)}
 	}
 	if len(strings.TrimSpace(string(raw))) == 0 {
-		return false, nil
+		return retryDestructiveWorktreeFlags{}, nil
 	}
 	var body retryLoopRequest
 	if err := json.Unmarshal(raw, &body); err != nil {
-		return false, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("Invalid retry request: %v", err)}
+		return retryDestructiveWorktreeFlags{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("Invalid retry request: %v", err)}
 	}
-	return body.DiscardWorktreeChanges != nil && *body.DiscardWorktreeChanges, nil
+	expectedPath := ""
+	if body.ExpectedWorktreePath != nil {
+		expectedPath = strings.TrimSpace(*body.ExpectedWorktreePath)
+	}
+	return retryDestructiveWorktreeFlags{
+		discard:              body.DiscardWorktreeChanges != nil && *body.DiscardWorktreeChanges,
+		clearUnusable:        body.ClearUnusableWorktreePath != nil && *body.ClearUnusableWorktreePath,
+		expectedWorktreePath: expectedPath != "",
+	}, nil
 }
 
 type respondLoopRequest struct {
@@ -5717,6 +6038,300 @@ func (h *Handler) respondToLoop(ctx context.Context, r *http.Request, loopID str
 	return h.deliverHumanAnswer(ctx, loopID, body.Answer)
 }
 
+func (h *Handler) reviewFixBudgetLiveCaps(projectID string) loops.ReviewFixBudgetLiveCaps {
+	roles := config.ProjectRoleConfigs(h.effectiveConfig(), projectID)
+	return loops.ReviewFixBudgetLiveCaps{
+		ReviewerMaxPublishes: roles.Reviewer.Behavior.Loop.MaxPublishesPerPR,
+		FixerMaxPushes:       roles.Fixer.Behavior.Loop.MaxPushesPerPR,
+	}
+}
+
+// applyReviewFixBudgetContinueIfHeld delegates looper unpause /start on a
+// budget-held or scope-held role to paired Continue. Scope-only holds release
+// without resetting meters; budget holds keep existing refill semantics.
+// Returns nil response when not a pair hold.
+func (h *Handler) applyReviewFixBudgetContinueIfHeld(ctx context.Context, loop storage.LoopRecord) (*loopResponse, error) {
+	if !loops.IsReviewFixPairHold(loop) {
+		return nil, nil
+	}
+	services := h.context.Runtime.Services()
+	if services.Repositories == nil || services.Coordinator == nil {
+		return nil, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: "Storage is not configured"}
+	}
+	nowISO := eventlog.FormatJavaScriptISOString(h.now().UTC())
+	caps := h.reviewFixBudgetLiveCaps(loop.ProjectID)
+	updated, err := storage.WithTransactionValue(ctx, services.Coordinator.DB(), nil, func(tx *sql.Tx) (reviewFixContinueOutcome, error) {
+		repos := storage.NewRepositories(tx)
+		fresh, getErr := repos.Loops.GetByID(ctx, loop.ID)
+		if getErr != nil {
+			return reviewFixContinueOutcome{}, getErr
+		}
+		if fresh == nil {
+			return reviewFixContinueOutcome{}, apiError{code: pkgapi.ErrorCodeLoopNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Loop not found: %s", loop.ID)}
+		}
+		// Budget hold (including combined with scope) uses meter-aware Continue.
+		if loops.IsReviewFixBudgetHold(*fresh) {
+			result, applyErr := loops.ApplyReviewFixBudgetAnswer(ctx, repos, *fresh, loops.ReviewFixBudgetAnswerContinue, nowISO, caps)
+			if applyErr != nil {
+				return reviewFixContinueOutcome{}, applyErr
+			}
+			if !result.Applied {
+				return reviewFixContinueOutcome{}, nil
+			}
+			return reviewFixContinueOutcome{loop: result.Loop, fallbackID: promotedScopeHoldFallbackID(ctx, repos, result.Loop)}, nil
+		}
+		if loops.IsReviewScopeHumanHold(*fresh) {
+			result, applyErr := loops.ApplyReviewScopeHumanAnswer(ctx, repos, *fresh, loops.ReviewFixBudgetAnswerContinue, nowISO)
+			if applyErr != nil {
+				return reviewFixContinueOutcome{}, applyErr
+			}
+			if !result.Applied {
+				return reviewFixContinueOutcome{}, nil
+			}
+			return reviewFixContinueOutcome{loop: result.Loop, fallbackID: promotedScopeHoldFallbackID(ctx, repos, result.Loop)}, nil
+		}
+		return reviewFixContinueOutcome{}, nil
+	})
+	if err != nil {
+		var typed apiError
+		if asAPIError(err, &typed) {
+			return nil, typed
+		}
+		return nil, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
+	}
+	if updated.loop.ID == "" {
+		return nil, nil
+	}
+	if h.context.TriggerSchedulerTick != nil {
+		h.context.TriggerSchedulerTick()
+	}
+	h.observePromotedScopeHolds(ctx, updated.loop, updated.fallbackID)
+	resp, serErr := h.serializeLoopWithDiagnostics(ctx, updated.loop)
+	if serErr != nil {
+		return nil, serErr
+	}
+	return &resp, nil
+}
+
+func (h *Handler) humanAttentionObserver() func(context.Context, string) {
+	if h.context.NotifyHumanAttention != nil {
+		return h.context.NotifyHumanAttention
+	}
+	if rt, ok := h.context.Runtime.(*looperdruntime.Runtime); ok {
+		return rt.NotifyHumanAttention
+	}
+	return nil
+}
+
+// observePromotedScopeHolds notifies after budget Continue may have created a
+// fresh no-HITL scope park. That path never finishes a claim, so the scheduler
+// observer would otherwise miss it until daemon restart.
+// fallbackID is the notification-owning primary captured inside the Continue
+// transaction. Durable attention ignores sibling-only pauses, so a later List
+// failure must not fall back to the answered sibling.
+func (h *Handler) observePromotedScopeHolds(ctx context.Context, loop storage.LoopRecord, fallbackID string) {
+	notify := h.humanAttentionObserver()
+	if notify == nil {
+		return
+	}
+	fallback := func() {
+		if id := strings.TrimSpace(fallbackID); id != "" {
+			notify(ctx, id)
+			return
+		}
+		if id := reviewScopeHumanNotifyLoopID(loop); id != "" {
+			notify(ctx, id)
+		}
+	}
+	if h.context.Runtime == nil {
+		fallback()
+		return
+	}
+	services := h.context.Runtime.Services()
+	if services.Repositories == nil || services.Repositories.Loops == nil {
+		fallback()
+		return
+	}
+	all, err := services.Repositories.Loops.List(ctx)
+	if err != nil {
+		fallback()
+		return
+	}
+	seen := make(map[string]struct{})
+	for _, member := range append(loops.FindSiblingReviewFixLoops(all, loop), loop) {
+		if _, ok := seen[member.ID]; ok {
+			continue
+		}
+		seen[member.ID] = struct{}{}
+		if loops.IsReviewScopeHumanHold(member) {
+			notify(ctx, member.ID)
+		}
+	}
+}
+
+type reviewFixContinueOutcome struct {
+	loop       storage.LoopRecord
+	fallbackID string
+}
+
+func promotedScopeHoldFallbackID(ctx context.Context, repos *storage.Repositories, loop storage.LoopRecord) string {
+	if repos != nil && repos.Loops != nil {
+		if all, err := repos.Loops.List(ctx); err == nil {
+			for _, member := range append(loops.FindSiblingReviewFixLoops(all, loop), loop) {
+				if id := reviewScopeHumanNotifyLoopID(member); id != "" {
+					return id
+				}
+			}
+		}
+	}
+	return reviewScopeHumanNotifyLoopID(loop)
+}
+
+func reviewScopeHumanNotifyLoopID(loop storage.LoopRecord) string {
+	if loops.IsReviewScopeHumanRequiredPause(loop.MetadataJSON) && !loops.IsSiblingReviewScopeHumanPause(loop.MetadataJSON) {
+		return loop.ID
+	}
+	ask, ok := loops.ReadHITLAsk(loop.MetadataJSON)
+	if ok && loops.IsReviewScopeHumanAsk(ask) && strings.TrimSpace(loop.Status) == "awaiting_human" {
+		return loop.ID
+	}
+	return ""
+}
+
+// drainReviewFixBudgetPair stops live agents on both pair members before
+// paired terminalize. A sibling park can leave a run running after the loop
+// record is paused; generic StopLoop is the daemon drain path.
+func (h *Handler) drainReviewFixBudgetPair(ctx context.Context, loop storage.LoopRecord) error {
+	if h.context.StopLoop == nil {
+		return nil
+	}
+	services := h.context.Runtime.Services()
+	if services.Repositories == nil || services.Repositories.Loops == nil {
+		return nil
+	}
+	all, err := services.Repositories.Loops.List(ctx)
+	if err != nil {
+		return apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
+	}
+	members := append(loops.FindSiblingReviewFixLoops(all, loop), loop)
+	seen := make(map[string]struct{}, len(members))
+	for _, member := range members {
+		if _, ok := seen[member.ID]; ok {
+			continue
+		}
+		seen[member.ID] = struct{}{}
+		if member.ID != loop.ID && !loops.IsReviewFixPairHold(member) {
+			continue
+		}
+		switch strings.TrimSpace(member.Status) {
+		case "terminated", "stopped", "completed":
+			continue
+		}
+		if _, err := h.context.StopLoop(ctx, member.ID, "Stopped by review-fix budget pair"); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// drainScopeHoldBeforeRespond looks up the loop before a HITL Stop mutation.
+// A lookup error must fail closed so ApplyReviewScopeHumanAnswer cannot
+// terminalize the pair without draining a live sibling.
+func drainScopeHoldBeforeRespond(ctx context.Context, repos *storage.Repositories, loopID, answer string, drain func(context.Context, storage.LoopRecord) error) (bool, error) {
+	if repos == nil || repos.Loops == nil || !loops.IsReviewFixBudgetStop(answer) {
+		return false, nil
+	}
+	peek, err := repos.Loops.GetByID(ctx, loopID)
+	if err != nil {
+		return false, err
+	}
+	if peek == nil {
+		return false, nil
+	}
+	ask, _ := loops.ReadHITLAsk(peek.MetadataJSON)
+	if !(loops.IsReviewScopeHumanAsk(ask) || loops.IsReviewScopeHumanHold(*peek)) {
+		return false, nil
+	}
+	if drain == nil {
+		return false, nil
+	}
+	if err := drain(ctx, *peek); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// applyReviewFixBudgetStopIfHeld delegates looper stop on a budget-held or
+// scope-held role to paired Stop (terminate both). Returns nil when not a hold.
+func (h *Handler) applyReviewFixBudgetStopIfHeld(ctx context.Context, loop storage.LoopRecord) (any, error) {
+	if !loops.IsReviewFixPairHold(loop) {
+		return nil, nil
+	}
+	if err := h.drainReviewFixBudgetPair(ctx, loop); err != nil {
+		return nil, err
+	}
+	services := h.context.Runtime.Services()
+	if services.Repositories == nil || services.Coordinator == nil {
+		return nil, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: "Storage is not configured"}
+	}
+	nowISO := eventlog.FormatJavaScriptISOString(h.now().UTC())
+	caps := h.reviewFixBudgetLiveCaps(loop.ProjectID)
+	updated, err := storage.WithTransactionValue(ctx, services.Coordinator.DB(), nil, func(tx *sql.Tx) (storage.LoopRecord, error) {
+		repos := storage.NewRepositories(tx)
+		fresh, getErr := repos.Loops.GetByID(ctx, loop.ID)
+		if getErr != nil {
+			return storage.LoopRecord{}, getErr
+		}
+		if fresh == nil {
+			return storage.LoopRecord{}, apiError{code: pkgapi.ErrorCodeLoopNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Loop not found: %s", loop.ID)}
+		}
+		if loops.IsReviewFixBudgetHold(*fresh) {
+			result, applyErr := loops.ApplyReviewFixBudgetAnswer(ctx, repos, *fresh, loops.ReviewFixBudgetAnswerStop, nowISO, caps)
+			if applyErr != nil {
+				return storage.LoopRecord{}, applyErr
+			}
+			if !result.Applied {
+				return storage.LoopRecord{}, nil
+			}
+			return result.Loop, nil
+		}
+		if loops.IsReviewScopeHumanHold(*fresh) {
+			result, applyErr := loops.ApplyReviewScopeHumanAnswer(ctx, repos, *fresh, loops.ReviewFixBudgetAnswerStop, nowISO)
+			if applyErr != nil {
+				return storage.LoopRecord{}, applyErr
+			}
+			if !result.Applied {
+				return storage.LoopRecord{}, nil
+			}
+			return result.Loop, nil
+		}
+		return storage.LoopRecord{}, nil
+	})
+	if err != nil {
+		var typed apiError
+		if asAPIError(err, &typed) {
+			return nil, typed
+		}
+		return nil, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
+	}
+	if updated.ID == "" {
+		// Continue already released the hold after drain. Reopen sibling
+		// gates before the route falls through to single-loop StopLoop.
+		looperdruntime.ReopenUnappliedScopeStopGates(ctx, services.Repositories, services.ActiveExecutions, loop.ID)
+		return nil, nil
+	}
+	outcome := "review_fix_budget_stop"
+	if loops.IsReviewScopeHumanHold(loop) && !loops.IsReviewFixBudgetHold(loop) {
+		outcome = "review_scope_human_stop"
+	}
+	return map[string]any{
+		"stopped": true,
+		"loopId":  updated.ID,
+		"status":  updated.Status,
+		"outcome": outcome,
+	}, nil
+}
+
 // deliverHumanAnswer is the shared core of the HITL respond path: it validates
 // the loop is awaiting_human, stores the answer on the loop's HITL metadata, and
 // transitions the loop back to running (requeue + scheduler tick). Both the
@@ -5729,7 +6344,16 @@ func (h *Handler) deliverHumanAnswer(ctx context.Context, loopID string, rawAnsw
 
 	services := h.context.Runtime.Services()
 	nowISO := eventlog.FormatJavaScriptISOString(h.now().UTC())
-	_, err := storage.WithTransactionValue(ctx, services.Coordinator.DB(), nil, func(tx *sql.Tx) (storage.LoopRecord, error) {
+	drained, err := drainScopeHoldBeforeRespond(ctx, services.Repositories, loopID, answer, h.drainReviewFixBudgetPair)
+	if err != nil {
+		var typed apiError
+		if asAPIError(err, &typed) {
+			return loopResponse{}, typed
+		}
+		return loopResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
+	}
+
+	updated, err := storage.WithTransactionValue(ctx, services.Coordinator.DB(), nil, func(tx *sql.Tx) (storage.LoopRecord, error) {
 		repos := storage.NewRepositories(tx)
 		loop, err := repos.Loops.GetByID(ctx, loopID)
 		if err != nil {
@@ -5738,10 +6362,44 @@ func (h *Handler) deliverHumanAnswer(ctx context.Context, loopID string, rawAnsw
 		if loop == nil {
 			return storage.LoopRecord{}, apiError{code: pkgapi.ErrorCodeLoopNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Loop not found: %s", loopID)}
 		}
-		if loop.Status != string(domain.LoopStatusAwaitingHuman) {
-			return storage.LoopRecord{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("Loop %s is not awaiting a human (status: %s)", loopID, loop.Status)}
-		}
 		ask, _ := loops.ReadHITLAsk(loop.MetadataJSON)
+		if loop.Status != string(domain.LoopStatusAwaitingHuman) {
+			// Production StopLoop pauses awaiting_human during drain.
+			// Scope Stop must still terminalize a still-held paused record.
+			if loop.Status != string(domain.LoopStatusPaused) || !loops.IsReviewFixBudgetStop(answer) || !(loops.IsReviewScopeHumanAsk(ask) || loops.IsReviewScopeHumanHold(*loop)) {
+				if drained && loops.IsReviewFixBudgetStop(answer) && !loops.IsReviewScopeHumanHold(*loop) && !loops.IsReviewFixBudgetHold(*loop) {
+					switch strings.TrimSpace(loop.Status) {
+					case "queued", "running":
+						return *loop, nil
+					}
+				}
+				return storage.LoopRecord{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("Loop %s is not awaiting a human (status: %s)", loopID, loop.Status)}
+			}
+		}
+		if loops.IsReviewFixBudgetAsk(ask) {
+			result, applyErr := loops.ApplyReviewFixBudgetAnswer(ctx, repos, *loop, answer, nowISO, h.reviewFixBudgetLiveCaps(loop.ProjectID))
+			if applyErr != nil {
+				if errors.Is(applyErr, loops.ErrReviewFixBudgetInvalidAnswer) {
+					return storage.LoopRecord{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: applyErr.Error()}
+				}
+				return storage.LoopRecord{}, applyErr
+			}
+			if result.Applied {
+				return result.Loop, nil
+			}
+		}
+		if loops.IsReviewScopeHumanAsk(ask) || loops.IsReviewScopeHumanHold(*loop) {
+			result, applyErr := loops.ApplyReviewScopeHumanAnswer(ctx, repos, *loop, answer, nowISO)
+			if applyErr != nil {
+				if errors.Is(applyErr, loops.ErrReviewScopeHumanInvalidAnswer) {
+					return storage.LoopRecord{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: applyErr.Error()}
+				}
+				return storage.LoopRecord{}, applyErr
+			}
+			if result.Applied {
+				return result.Loop, nil
+			}
+		}
 		ask.Answer = answer
 		ask.Status = "answered"
 		ask.AnsweredAt = nowISO
@@ -5761,12 +6419,29 @@ func (h *Handler) deliverHumanAnswer(ctx context.Context, loopID string, rawAnsw
 		}
 		return updated, nil
 	})
+	if drained {
+		looperdruntime.ReopenUnappliedScopeStopGates(ctx, services.Repositories, services.ActiveExecutions, loopID)
+	}
 	if err != nil {
 		var typed apiError
 		if asAPIError(err, &typed) {
 			return loopResponse{}, typed
 		}
 		return loopResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
+	}
+
+	// Budget Continue may promote deferred needs_human into a fresh scope hold
+	// that is still awaiting_human. Overlay Continue can also release the pair
+	// hold while a residual ordinary agent ask remains awaiting. Return that
+	// park; do not treat it as the just-answered ask and implicitly Continue
+	// via mutateLoopStatus.
+	residualAsk, hasResidualAsk := loops.ReadHITLAsk(updated.MetadataJSON)
+	residualAwaiting := hasResidualAsk && strings.EqualFold(strings.TrimSpace(residualAsk.Status), "awaiting")
+	if updated.Status != string(domain.LoopStatusAwaitingHuman) || loops.IsReviewFixPairHold(updated) || residualAwaiting {
+		if h.context.TriggerSchedulerTick != nil {
+			h.context.TriggerSchedulerTick()
+		}
+		return h.serializeLoopWithDiagnostics(ctx, updated)
 	}
 
 	// Transition awaiting_human -> running (requeues + triggers a scheduler tick)
@@ -5804,6 +6479,32 @@ func (h *Handler) retryLoop(ctx context.Context, r *http.Request, loopID string,
 		return retryLoopResponse{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: "resetAttempts=false is not supported for explicit operator retry"}
 	}
 	discardWorktreeChanges := body.DiscardWorktreeChanges != nil && *body.DiscardWorktreeChanges
+	clearUnusableWorktreePath := body.ClearUnusableWorktreePath != nil && *body.ClearUnusableWorktreePath
+	expectedWorktreePath := ""
+	if body.ExpectedWorktreePath != nil {
+		expectedWorktreePath = strings.TrimSpace(*body.ExpectedWorktreePath)
+	}
+	if discardWorktreeChanges && clearUnusableWorktreePath {
+		return retryLoopResponse{}, apiError{
+			code:    pkgapi.ErrorCodeValidationFailed,
+			status:  http.StatusBadRequest,
+			message: "discardWorktreeChanges and clearUnusableWorktreePath are mutually exclusive",
+		}
+	}
+	if clearUnusableWorktreePath && expectedWorktreePath == "" {
+		return retryLoopResponse{}, apiError{
+			code:    pkgapi.ErrorCodeValidationFailed,
+			status:  http.StatusBadRequest,
+			message: "expectedWorktreePath is required when clearUnusableWorktreePath is true (bind clear to the path shown by GET /worktree)",
+		}
+	}
+	if !clearUnusableWorktreePath && expectedWorktreePath != "" {
+		return retryLoopResponse{}, apiError{
+			code:    pkgapi.ErrorCodeValidationFailed,
+			status:  http.StatusBadRequest,
+			message: "expectedWorktreePath is only valid with clearUnusableWorktreePath=true",
+		}
+	}
 	if discardWorktreeChanges && fromHandback {
 		return retryLoopResponse{}, apiError{
 			code:    pkgapi.ErrorCodeValidationFailed,
@@ -5811,10 +6512,17 @@ func (h *Handler) retryLoop(ctx context.Context, r *http.Request, loopID string,
 			message: "discardWorktreeChanges is not allowed on handback; human interactive worktree edits must be preserved (retry with --discard-worktree-changes after handback if needed)",
 		}
 	}
+	if clearUnusableWorktreePath && fromHandback {
+		return retryLoopResponse{}, apiError{
+			code:    pkgapi.ErrorCodeValidationFailed,
+			status:  http.StatusBadRequest,
+			message: "clearUnusableWorktreePath is not allowed on handback; human interactive worktree edits must be preserved",
+		}
+	}
 
-	// Serialize per-loop retry with start/requeue so discard cannot race another
-	// retry or /loops/{id}/start that enqueues replacement work between preflight
-	// and reset (or a scheduler-started run for that replacement).
+	// Serialize per-loop retry with start/requeue so discard/clear cannot race
+	// another retry or /loops/{id}/start that enqueues replacement work between
+	// preflight and mutation (or a scheduler-started run for that replacement).
 	unlock := h.lockLoopRetry(loopID)
 	defer unlock()
 
@@ -5843,18 +6551,19 @@ func (h *Handler) retryLoop(ctx context.Context, r *http.Request, loopID string,
 	unlockTarget := h.lockLoopTarget(preflightLoop.ProjectID, domain.LoopType(preflightLoop.Type), target)
 	defer unlockTarget()
 
-	// Opt-in discard runs before requeue so git mutation stays outside the
-	// queue transaction. Every non-mutating retry blocker must pass first so a
-	// later precondition failure never leaves discarded worktree changes
+	// Opt-in discard/clear runs before requeue so filesystem mutation stays
+	// outside the queue transaction. Every non-mutating retry blocker must pass
+	// first so a later precondition failure never leaves a wiped worktree
 	// without creating a replacement queue item.
 	var worktreeDiscard *worktreeDiscardResult
-	if discardWorktreeChanges {
+	var worktreeClearUnusable *worktreeClearUnusableResult
+	destructiveWorktree := discardWorktreeChanges || clearUnusableWorktreePath
+	if destructiveWorktree {
 		// Runtime HITL poll requeues awaiting_human loops without the API lock
-		// (hitl_github_poll / Feishu helpers). Refuse discard so a poll-delivered
-		// answer cannot requeue between preflight and git reset, wiping the
-		// worktree for the answered continuation when the retry TX then conflicts.
+		// (hitl_github_poll / Feishu helpers). Refuse discard/clear so a poll-
+		// delivered answer cannot requeue between preflight and mutation.
 		// human_takeover pins the same worktree for interactive human edits;
-		// /handback already rejects discard, and direct /retry must match that.
+		// /handback already rejects destructive flags, and direct /retry must match.
 		if err := rejectDiscardWhileParkedForHuman(preflightLoop.Status, loopID); err != nil {
 			return retryLoopResponse{}, err
 		}
@@ -5866,11 +6575,11 @@ func (h *Handler) retryLoop(ctx context.Context, r *http.Request, loopID string,
 			}
 			return retryLoopResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
 		}
-		// Same-type uniqueness is not enough for discard: PR worktrees are shared
-		// across fixer/reviewer/worker. An already queued/running/waiting/
+		// Same-type uniqueness is not enough for discard/clear: PR worktrees are
+		// shared across fixer/reviewer/worker. An already queued/running/waiting/
 		// human_takeover sibling is not held by the target mutex (that only
-		// serializes mutations), so refuse git reset/clean while any worktree-
-		// owning sibling holds the PR checkout.
+		// serializes mutations), so refuse mutation while any worktree-owning
+		// sibling holds the PR checkout.
 		if err := h.assertDiscardSharedPRWorktreeClear(ctx, services.Repositories, *preflightLoop); err != nil {
 			var typed apiError
 			if asAPIError(err, &typed) {
@@ -5879,11 +6588,10 @@ func (h *Handler) retryLoop(ctx context.Context, r *http.Request, loopID string,
 			return retryLoopResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
 		}
 
-		// Recheck immediately before git mutation as defense in depth. Runtime
-		// free-text enqueue now shares LockLoopRequeue with this path, so the
-		// common race is serialized; this snapshot still catches any unlocked
-		// requeue injected under discardBeforeGitHook in tests (or future
-		// callers that forget the shared guard).
+		// Recheck immediately before filesystem mutation as defense in depth.
+		// Runtime free-text enqueue now shares LockLoopRequeue with this path,
+		// so the common race is serialized; this snapshot still catches any
+		// unlocked requeue injected under discardBeforeGitHook in tests.
 		if h.discardBeforeGitHook != nil {
 			h.discardBeforeGitHook(loopID)
 		}
@@ -5913,15 +6621,27 @@ func (h *Handler) retryLoop(ctx context.Context, r *http.Request, loopID string,
 		}
 		preflightLoop = freshLoop
 
-		discardResult, discardErr := h.discardLoopWorktreeChanges(ctx, services, *preflightLoop)
-		if discardErr != nil {
-			var typed apiError
-			if asAPIError(discardErr, &typed) {
-				return retryLoopResponse{}, typed
+		if discardWorktreeChanges {
+			discardResult, discardErr := h.discardLoopWorktreeChanges(ctx, services, *preflightLoop)
+			if discardErr != nil {
+				var typed apiError
+				if asAPIError(discardErr, &typed) {
+					return retryLoopResponse{}, typed
+				}
+				return retryLoopResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: discardErr.Error()}
 			}
-			return retryLoopResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: discardErr.Error()}
+			worktreeDiscard = &discardResult
+		} else {
+			clearResult, clearErr := h.clearLoopUnusableWorktreePath(ctx, services, *preflightLoop, expectedWorktreePath)
+			if clearErr != nil {
+				var typed apiError
+				if asAPIError(clearErr, &typed) {
+					return retryLoopResponse{}, typed
+				}
+				return retryLoopResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: clearErr.Error()}
+			}
+			worktreeClearUnusable = &clearResult
 		}
-		worktreeDiscard = &discardResult
 	}
 
 	type retryResult struct {
@@ -5961,10 +6681,11 @@ func (h *Handler) retryLoop(ctx context.Context, r *http.Request, loopID string,
 		if err := h.assertLoopRetryPreconditions(ctx, repos, *loop, nowISO); err != nil {
 			return retryResult{}, err
 		}
-		// When discard already mutated the worktree, re-check shared-PR siblings
-		// inside the TX so a concurrent runtime requeue/create that raced past
-		// preflight cannot leave both an active sibling and a successful retry.
-		if discardWorktreeChanges {
+		// When discard/clear already mutated the worktree, re-check shared-PR
+		// siblings inside the TX so a concurrent runtime requeue/create that
+		// raced past preflight cannot leave both an active sibling and a
+		// successful retry.
+		if destructiveWorktree {
 			if err := h.assertDiscardSharedPRWorktreeClear(ctx, repos, *loop); err != nil {
 				return retryResult{}, err
 			}
@@ -6067,12 +6788,14 @@ func (h *Handler) retryLoop(ctx context.Context, r *http.Request, loopID string,
 		h.context.TriggerSchedulerTick()
 	}
 	return retryLoopResponse{
-		Loop:                   serializeLoop(result.loop),
-		QueueItemID:            result.queueItemID,
-		Mode:                   mode,
-		ResetAttempts:          resetAttempts,
-		DiscardWorktreeChanges: discardWorktreeChanges,
-		WorktreeDiscard:        worktreeDiscard,
+		Loop:                      serializeLoop(result.loop),
+		QueueItemID:               result.queueItemID,
+		Mode:                      mode,
+		ResetAttempts:             resetAttempts,
+		DiscardWorktreeChanges:    discardWorktreeChanges,
+		ClearUnusableWorktreePath: clearUnusableWorktreePath,
+		WorktreeDiscard:           worktreeDiscard,
+		WorktreeClearUnusable:     worktreeClearUnusable,
 	}, nil
 }
 
@@ -6239,7 +6962,7 @@ func (h *Handler) serializeLoopWithDiagnostics(ctx context.Context, loop storage
 		}
 		latestRun = run
 	}
-	decorateLoopDiagnostics(&view, latestQueue, latestRun)
+	decorateLoopDiagnostics(&view, latestQueue, latestRun, h.now().UTC())
 	return view, nil
 }
 
@@ -6605,6 +7328,18 @@ func (h *Handler) assertLoopRetryPreconditions(ctx context.Context, repos *stora
 	if strings.TrimSpace(loop.ProjectID) != "" {
 		if _, err := requireActiveProjectRecord(ctx, repos.Projects, loop.ProjectID); err != nil {
 			return err
+		}
+	}
+	// Budget/scope pair holds require paired Continue (looper unpause) or Stop — not single-role retry.
+	if loops.IsReviewFixPairHold(loop) {
+		kind := "budget"
+		if loops.IsReviewScopeHumanHold(loop) && !loops.IsReviewFixBudgetHold(loop) {
+			kind = "scope"
+		}
+		return apiError{
+			code:    pkgapi.ErrorCodeValidationFailed,
+			status:  http.StatusBadRequest,
+			message: fmt.Sprintf("Cannot retry review-fix %s hold on loop %s; use looper unpause (Continue) or looper stop", kind, loop.ID),
 		}
 	}
 	if loop.Status == string(domain.LoopStatusStopped) || loop.Status == string(domain.LoopStatusTerminated) || loop.Status == string(domain.LoopStatusCompleted) {
@@ -7121,6 +7856,7 @@ func urlPathSegment(parts []string, index int) (string, error) {
 }
 
 type createProjectRequest struct {
+	Identity     *string `json:"identity"`
 	RepoPath     *string `json:"repoPath"`
 	ID           *string `json:"id"`
 	Name         *string `json:"name"`
@@ -7169,6 +7905,7 @@ func (h *Handler) buildCreateProjectResponse(r *http.Request, service projectSer
 	}
 
 	result, err := service.AddProject(r.Context(), projects.AddInput{
+		Identity:     body.Identity,
 		ID:           projectID,
 		Name:         name,
 		RepoPath:     repoPath,
@@ -7212,14 +7949,30 @@ func serializeProject(project storage.ProjectRecord, cfg config.Config, defaultB
 		baseBranch = *project.BaseBranch
 	}
 
+	repo := stringMetadataPtr(metadata, "repo")
+	// Prefer config project.Repo when metadata lacks it (configured projects).
+	if repo == nil {
+		for _, configured := range cfg.Projects {
+			if configured.ID != project.ID {
+				continue
+			}
+			if trimmed := strings.TrimSpace(configured.Repo); trimmed != "" {
+				repo = &trimmed
+			}
+			break
+		}
+	}
+
+	providerKind := resolveProjectProviderKind(cfg, project.ID, metadata)
 	return projectResponse{
 		ID:           project.ID,
 		Name:         project.Name,
 		RepoPath:     project.RepoPath,
 		BaseBranch:   baseBranch,
 		Archived:     project.Archived,
-		Provider:     resolveProjectProviderKind(cfg, project.ID, metadata),
-		Repo:         stringMetadataPtr(metadata, "repo"),
+		Provider:     providerKind,
+		Repo:         repo,
+		RepoURL:      resolveProjectRepoURL(cfg, project.ID, metadata, repo),
 		WorktreeRoot: stringMetadataPtr(metadata, "worktreeRoot"),
 		CreatedAt:    project.CreatedAt,
 		UpdatedAt:    project.UpdatedAt,
@@ -7229,24 +7982,74 @@ func serializeProject(project storage.ProjectRecord, cfg config.Config, defaultB
 // resolveProjectProviderKind returns the display provider kind for a project:
 // config binding first, then API metadata provider id, else github.
 func resolveProjectProviderKind(cfg config.Config, projectID string, metadata map[string]any) string {
+	if kind, _, ok := resolveProjectProvider(cfg, projectID, metadata); ok && kind != "" {
+		return string(kind)
+	}
+	return string(config.ProviderKindGitHub)
+}
+
+// resolveProjectProvider returns kind + base URL from config project binding or
+// metadata provider id. Base URL is empty for unknown providers; GitHub defaults
+// to https://github.com when kind is github and base is unset.
+func resolveProjectProvider(cfg config.Config, projectID string, metadata map[string]any) (kind config.ProviderKind, baseURL string, ok bool) {
+	provider, ok := resolveProjectProviderConfig(cfg, projectID, metadata)
+	if !ok {
+		return "", "", false
+	}
+	if provider.Kind == config.ProviderKindPlane {
+		// Plane remains the reported task-source provider; code hosting is GitHub.
+		return config.ProviderKindPlane, "https://github.com", true
+	}
+	kind = provider.Kind
+	if kind == "" {
+		kind = config.ProviderKindGitHub
+	}
+	base := strings.TrimRight(strings.TrimSpace(provider.BaseURL), "/")
+	if kind == config.ProviderKindGitHub && base == "" {
+		base = "https://github.com"
+	}
+	return kind, base, true
+}
+
+// The request's runtime config includes the live project catalog. Fall back to
+// record metadata for API-registered projects absent from a caller's snapshot.
+func resolveProjectProviderConfig(cfg config.Config, projectID string, metadata map[string]any) (config.ProviderConfig, bool) {
+	providerID := strings.TrimSpace(stringMetadataValue(metadata, "provider"))
 	for _, configured := range cfg.Projects {
 		if configured.ID != projectID {
 			continue
 		}
-		kind := config.ResolvedProjectProviderKind(cfg, configured)
-		if kind != "" {
-			return string(kind)
-		}
+		providerID = strings.TrimSpace(configured.Provider)
 		break
 	}
-	if providerID := strings.TrimSpace(stringMetadataValue(metadata, "provider")); providerID != "" {
-		for _, provider := range cfg.Providers {
-			if provider.ID == providerID && provider.Kind != "" {
-				return string(provider.Kind)
-			}
+	if providerID == "" {
+		return config.ProviderConfig{Kind: config.ProviderKindGitHub, BaseURL: "https://github.com"}, true
+	}
+	for _, provider := range cfg.Providers {
+		if provider.ID == providerID {
+			return provider, true
 		}
 	}
-	return string(config.ProviderKindGitHub)
+	return config.ProviderConfig{}, false
+}
+
+// resolveProjectRepoURL builds the forge HTML URL for owner/repo using the
+// configured provider base (Forgejo host, github.com, …). Returns nil when the
+// slug or base cannot be resolved — callers should not invent github.com.
+func resolveProjectRepoURL(cfg config.Config, projectID string, metadata map[string]any, repo *string) *string {
+	if repo == nil {
+		return nil
+	}
+	slug := strings.TrimSpace(*repo)
+	if slug == "" || strings.Contains(slug, "://") || strings.Count(slug, "/") != 1 {
+		return nil
+	}
+	_, baseURL, ok := resolveProjectProvider(cfg, projectID, metadata)
+	if !ok || strings.TrimSpace(baseURL) == "" {
+		return nil
+	}
+	url := strings.TrimRight(baseURL, "/") + "/" + slug
+	return &url
 }
 
 func stringMetadataValue(metadata map[string]any, key string) string {
@@ -7359,6 +8162,7 @@ func looperdArtifactName(target string) *string {
 	supported := map[string]struct{}{
 		"darwin-arm64": {},
 		"linux-amd64":  {},
+		"linux-arm64":  {},
 	}
 
 	if _, ok := supported[target]; !ok {
@@ -7367,4 +8171,187 @@ func looperdArtifactName(target string) *string {
 
 	value := "looperd-" + target
 	return &value
+}
+
+func (h *Handler) handleFeishuCardActionRoute(w http.ResponseWriter, r *http.Request, requestID string) {
+	if r.Method != http.MethodPost {
+		h.writeError(w, requestID, apiError{code: pkgapi.ErrorCodeMethodNotAllowed, status: http.StatusMethodNotAllowed, message: "Feishu card-action route requires POST"})
+		return
+	}
+	var raw []byte
+	if r.Body != nil {
+		defer r.Body.Close()
+		raw, _ = io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	}
+	var envelope feishuCardActionEnvelope
+	if err := json.Unmarshal(raw, &envelope); err != nil {
+		h.writeError(w, requestID, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: "invalid Feishu callback body"})
+		return
+	}
+	// Resolve the configured Feishu Verification Token (a shared secret Feishu
+	// echoes in every callback). This is the ONLY origin check on this route, and
+	// it is independent of authMode because Feishu's servers cannot send a looper
+	// Bearer token.
+	expectedToken := ""
+	if envName := strings.TrimSpace(h.context.Config.Notifications.Webhook.VerificationTokenEnv); envName != "" {
+		expectedToken = strings.TrimSpace(os.Getenv(envName))
+	}
+	// v1 card-action / url_verification carry the token at the top level; v2 events
+	// carry it in header.token.
+	presentedToken := strings.TrimSpace(envelope.Token)
+	if presentedToken == "" {
+		presentedToken = strings.TrimSpace(envelope.Header.Token)
+	}
+	tokenMatches := expectedToken != "" && subtle.ConstantTimeCompare([]byte(presentedToken), []byte(expectedToken)) == 1
+
+	// Feishu URL-verification handshake: echo the challenge verbatim. When a token
+	// is configured, require it to match even for the handshake. This path produces
+	// no work and must succeed while admission is starting/stopping/degraded so
+	// Feishu can register or revalidate the callback URL.
+	if envelope.Type == "url_verification" {
+		if expectedToken != "" && !tokenMatches {
+			h.writeError(w, requestID, apiError{code: pkgapi.ErrorCodeUnauthorized, status: http.StatusUnauthorized, message: "Feishu verification token mismatch"})
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{"challenge": envelope.Challenge})
+		return
+	}
+	// Real card actions and thread replies mutate HITL state; require admission.
+	if typed, denied := h.admissionMutationDenial(); denied {
+		h.writeError(w, requestID, typed)
+		return
+	}
+	if !h.context.Config.HITL.Enabled {
+		h.writeError(w, requestID, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusForbidden, message: "hitl.enabled is false"})
+		return
+	}
+	// A card action delivers human-authored text into an agent's coding session, so
+	// it MUST be authenticated. Fail closed: require a configured, matching
+	// verification token — otherwise any client that can reach this route could
+	// inject arbitrary answers into any awaiting_human loop.
+	if expectedToken == "" {
+		h.writeError(w, requestID, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusForbidden, message: "Feishu card-action callback requires notifications.webhook.verificationTokenEnv to be configured"})
+		return
+	}
+	if !tokenMatches {
+		h.writeError(w, requestID, apiError{code: pkgapi.ErrorCodeUnauthorized, status: http.StatusUnauthorized, message: "Feishu verification token mismatch"})
+		return
+	}
+	// A human typing a free-text reply in the ask thread arrives as a message event
+	// rather than a card action — route it to the free-text handler.
+	if envelope.Header.EventType == "im.message.receive_v1" {
+		h.handleFeishuThreadReply(w, r, requestID, envelope)
+		return
+	}
+	var value struct {
+		LoopSeq string `json:"loopSeq"`
+		Answer  string `json:"answer"`
+	}
+	if len(envelope.Action.Value) > 0 {
+		_ = json.Unmarshal(envelope.Action.Value, &value)
+	}
+	loopSeq := strings.TrimSpace(value.LoopSeq)
+	answer := strings.TrimSpace(value.Answer)
+	if loopSeq == "" || answer == "" {
+		h.writeError(w, requestID, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: "card action must carry value.loopSeq and value.answer"})
+		return
+	}
+	loop, err := h.resolveLoop(r.Context(), loopSeq)
+	if err != nil {
+		var typed apiError
+		if !asAPIError(err, &typed) {
+			typed = internalServerError(err)
+		}
+		h.writeError(w, requestID, typed)
+		return
+	}
+	if _, err := h.deliverHumanAnswer(r.Context(), loop.ID, answer); err != nil {
+		var typed apiError
+		if !asAPIError(err, &typed) {
+			typed = internalServerError(err)
+		}
+		h.writeError(w, requestID, typed)
+		return
+	}
+	h.writeSuccess(w, requestID, map[string]any{"loopSeq": loopSeq, "delivered": true})
+}
+
+func (h *Handler) handleFeishuThreadReply(w http.ResponseWriter, r *http.Request, requestID string, envelope feishuCardActionEnvelope) {
+	msg := envelope.Event.Message
+	if msg.MessageType != "text" {
+		h.writeSuccess(w, requestID, map[string]any{"delivered": false, "reason": "non-text message"})
+		return
+	}
+	rootID := strings.TrimSpace(msg.RootID)
+	if rootID == "" {
+		rootID = strings.TrimSpace(msg.ThreadID)
+	}
+	if rootID == "" {
+		h.writeSuccess(w, requestID, map[string]any{"delivered": false, "reason": "not a thread reply"})
+		return
+	}
+	var textContent struct {
+		Text string `json:"text"`
+	}
+	_ = json.Unmarshal([]byte(msg.Content), &textContent)
+	answer := strings.TrimSpace(textContent.Text)
+	if answer == "" {
+		h.writeSuccess(w, requestID, map[string]any{"delivered": false, "reason": "empty text"})
+		return
+	}
+	services := h.context.Runtime.Services()
+	if services.Repositories == nil || services.Repositories.FeishuThreads == nil {
+		h.writeSuccess(w, requestID, map[string]any{"delivered": false, "reason": "thread mapping unavailable"})
+		return
+	}
+	loopID, err := services.Repositories.FeishuThreads.LoopByRoot(r.Context(), rootID)
+	if err != nil || strings.TrimSpace(loopID) == "" {
+		h.writeSuccess(w, requestID, map[string]any{"delivered": false, "reason": "no loop for thread"})
+		return
+	}
+	// deliverHumanAnswer only accepts an awaiting_human loop, so this naturally
+	// drops the bot's own thread posts, replies after the loop resumed, and any
+	// duplicate Feishu retries.
+	if _, err := h.deliverHumanAnswer(r.Context(), loopID, answer); err != nil {
+		h.writeSuccess(w, requestID, map[string]any{"loopId": loopID, "delivered": false, "reason": "loop not awaiting a human"})
+		return
+	}
+	h.writeSuccess(w, requestID, map[string]any{"loopId": loopID, "delivered": true})
+}
+
+type feishuCardActionEnvelope struct {
+	Type      string `json:"type"`
+	Challenge string `json:"challenge"`
+	// Token is the Feishu app Verification Token, echoed by Feishu in every event
+	// and card-action callback. It is the shared secret that proves the request
+	// originated from Feishu rather than an arbitrary client. (v1 card-action /
+	// url_verification carry it at top level; v2 events carry it in header.token.)
+	Token  string `json:"token"`
+	Action struct {
+		Tag   string          `json:"tag"`
+		Value json.RawMessage `json:"value"`
+	} `json:"action"`
+	// v2 event envelope, used for im.message.receive_v1 (a human typing a free-text
+	// reply in the ask thread).
+	Header struct {
+		EventType string `json:"event_type"`
+		Token     string `json:"token"`
+	} `json:"header"`
+	Event struct {
+		Message struct {
+			MessageID   string `json:"message_id"`
+			RootID      string `json:"root_id"`
+			ThreadID    string `json:"thread_id"`
+			ChatID      string `json:"chat_id"`
+			MessageType string `json:"message_type"`
+			Content     string `json:"content"`
+		} `json:"message"`
+		Sender struct {
+			SenderType string `json:"sender_type"`
+			SenderID   struct {
+				OpenID string `json:"open_id"`
+			} `json:"sender_id"`
+		} `json:"sender"`
+	} `json:"event"`
 }

@@ -493,6 +493,72 @@ func TestForwardRoutesPullRequestLabelChangesToFixerOnly(t *testing.T) {
 	fixerRunner.assertPRCount(t, 43, 1)
 }
 
+func TestForwardRoutesReviewCommentToReviewerAndFixer(t *testing.T) {
+	repos := newTestRepositories(t)
+	seedProject(t, repos, "project_1", "acme/looper")
+	reviewerRunner := newFakeTargetedRunner(nil)
+	fixerRunner := newFakeTargetedRunner(nil)
+	forwarder := New(Options{Repos: repos, Config: testConfig(t), Reviewer: reviewerRunner, Fixer: targetedFixerAdapter{runner: fixerRunner}, MaxConcurrent: 1, QueueCapacity: 8})
+	defer forwarder.Close()
+
+	for i, action := range []string{"created", "edited", "deleted"} {
+		if _, err := forwarder.Forward(context.Background(), DeliveryRequest{
+			DeliveryID: "review-comment-" + action,
+			EventType:  "pull_request_review_comment",
+			Payload:    pullRequestPayload(action, "acme/looper", int64(50+i)),
+		}); err != nil {
+			t.Fatalf("Forward(%s) error = %v", action, err)
+		}
+	}
+
+	reviewerRunner.waitForCalls(t, 3)
+	fixerRunner.waitForCalls(t, 3)
+	for _, pr := range []int64{50, 51, 52} {
+		reviewerRunner.assertPRCount(t, pr, 1)
+		fixerRunner.assertPRCount(t, pr, 1)
+	}
+}
+
+func TestForwardRoutesReviewThreadResolvedToReviewerAndFixer(t *testing.T) {
+	repos := newTestRepositories(t)
+	seedProject(t, repos, "project_1", "acme/looper")
+	reviewerRunner := newFakeTargetedRunner(nil)
+	fixerRunner := newFakeTargetedRunner(nil)
+	forwarder := New(Options{Repos: repos, Config: testConfig(t), Reviewer: reviewerRunner, Fixer: targetedFixerAdapter{runner: fixerRunner}, MaxConcurrent: 1, QueueCapacity: 8})
+	defer forwarder.Close()
+
+	result, err := forwarder.Forward(context.Background(), DeliveryRequest{
+		DeliveryID: "thread-resolved",
+		EventType:  "pull_request_review_thread",
+		Payload:    pullRequestPayload("resolved", "acme/looper", 60),
+	})
+	if err != nil {
+		t.Fatalf("Forward(resolved) error = %v", err)
+	}
+	if result.Status != "accepted" {
+		t.Fatalf("Forward(resolved) status = %q, want accepted", result.Status)
+	}
+
+	ignored, err := forwarder.Forward(context.Background(), DeliveryRequest{
+		DeliveryID: "thread-unresolved",
+		EventType:  "pull_request_review_thread",
+		Payload:    pullRequestPayload("unresolved", "acme/looper", 61),
+	})
+	if err != nil {
+		t.Fatalf("Forward(unresolved) error = %v", err)
+	}
+	if ignored.Status != "ignored" {
+		t.Fatalf("Forward(unresolved) status = %q, want ignored", ignored.Status)
+	}
+
+	reviewerRunner.waitForCalls(t, 1)
+	fixerRunner.waitForCalls(t, 1)
+	reviewerRunner.assertPRCount(t, 60, 1)
+	fixerRunner.assertPRCount(t, 60, 1)
+	reviewerRunner.assertPRCount(t, 61, 0)
+	fixerRunner.assertPRCount(t, 61, 0)
+}
+
 func TestForwardTriggersFixerForFailedCheckWebhookEvents(t *testing.T) {
 	repos := newTestRepositories(t)
 	seedProject(t, repos, "project_1", "acme/looper")

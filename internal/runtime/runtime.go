@@ -2,13 +2,10 @@ package runtime
 
 import (
 	"context"
-	"github.com/nexu-io/looper/internal/executionhost"
-
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
-
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -19,6 +16,8 @@ import (
 	"github.com/nexu-io/looper/internal/bootstrap"
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/domain"
+	"github.com/nexu-io/looper/internal/executionhost"
+	"github.com/nexu-io/looper/internal/hostingidentity"
 	gitinfra "github.com/nexu-io/looper/internal/infra/git"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/infra/specpr"
@@ -162,16 +161,29 @@ type Runtime struct {
 	worktreeCleanupStatus       WorktreeCleanupStatus
 	recoveryCancel              context.CancelFunc
 	recoveryDone                chan struct{}
-	activeExecutions            *ActiveExecutionRegistry
-	projectCatalog              *projects.Catalog
-	githubGateway               *githubinfra.Gateway
-	webhook                     *webhookRuntime
-	webhookDaemonLock           *daemonLock
-	webhookForwarder            WebhookForwarder
-	networkManager              runtimeNetworkManager
-	schedulerDisabled           bool
-	startupReadyOnce            sync.Once
-	startupReadyErr             error
+	// humanAttentionNotifyCancel/Ctx are the shared cancelable parent for all
+	// best-effort human-attention delivery (post-claim + recovery rescan).
+	// humanAttentionNotifyWG drains those goroutines before SQLite close so
+	// notification transports and persistence cannot race coordinator.Close.
+	// humanAttentionNotifyDone is the latest recovery-rescan generation only
+	// (WaitForHumanAttentionRecoveryNotify / API fixtures).
+	humanAttentionNotifyCancel context.CancelFunc
+	humanAttentionNotifyCtx    context.Context
+	humanAttentionNotifyWG     sync.WaitGroup
+	humanAttentionNotifyDone   chan struct{}
+	activeExecutions           *ActiveExecutionRegistry
+	// beginShutdownHooks run during BeginShutdown after admission flips to
+	// stopping and before non-agent drain waits (cancel producers first).
+	beginShutdownHooks []func()
+	projectCatalog     *projects.Catalog
+	githubGateway      *githubinfra.Gateway
+	webhook            *webhookRuntime
+	webhookDaemonLock  *daemonLock
+	webhookForwarder   WebhookForwarder
+	networkManager     runtimeNetworkManager
+	schedulerDisabled  bool
+	startupReadyOnce   sync.Once
+	startupReadyErr    error
 	// ownershipAcquired remains true after CompleteStartup succeeds so stop
 	// still writes looperd.stopped. Admission is the sole ready Authority;
 	// this flag is not a mutation/claim gate.
@@ -338,6 +350,7 @@ func (r *Runtime) Stop(reason string) {
 
 		r.stopConfigReloadLoop()
 		r.stopDeferredReviewerRecovery()
+		r.stopHumanAttentionRecoveryNotify()
 		r.stopWorktreeCleanupLoop()
 		r.stopSchedulerLoop()
 		r.stopWebhookRuntime()
@@ -443,7 +456,15 @@ func (r *Runtime) BeginShutdown(reason string) {
 	// cancels under admission.mu. Do not take r.mu while holding admission.mu
 	// (other paths lock r.mu then read admission — that order would deadlock).
 	cancels := r.snapshotWorkProducerCancels()
-	_ = r.admission.BeginShutdownThen(reason, cancels.invokeForShutdown)
+	hooks := r.snapshotBeginShutdownHooks()
+	_ = r.admission.BeginShutdownThen(reason, func() {
+		cancels.invokeForShutdown()
+		for _, hook := range hooks {
+			if hook != nil {
+				hook()
+			}
+		}
+	})
 	// Close agent spawn admission and confirmed-drain live handles — agents and
 	// tracked Supervisor-owned non-agents (#576/#577). Agent leases cancel via
 	// registry; non-agent owners were canceled above.
@@ -456,19 +477,50 @@ func (r *Runtime) BeginShutdown(reason string) {
 	}
 }
 
+// OnBeginShutdown registers a hook invoked during BeginShutdown after admission
+// flips to stopping and work-producer cancels run, but before the registry
+// waits on tracked non-agent handles. Used for Supervisor-owned non-agent
+// work that is not scheduler/recovery (e.g. model catalog shared probes).
+// Hooks must be safe to call more than once (idempotent cancel).
+func (r *Runtime) OnBeginShutdown(hook func()) {
+	if r == nil || hook == nil {
+		return
+	}
+	r.mu.Lock()
+	r.beginShutdownHooks = append(r.beginShutdownHooks, hook)
+	r.mu.Unlock()
+}
+
+func (r *Runtime) snapshotBeginShutdownHooks() []func() {
+	if r == nil {
+		return nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(r.beginShutdownHooks) == 0 {
+		return nil
+	}
+	out := make([]func(), len(r.beginShutdownHooks))
+	copy(out, r.beginShutdownHooks)
+	return out
+}
+
 // workProducerCancels is a lock-free snapshot of cancel targets so
 // MarkDegraded/BeginShutdown can invoke them while holding admission.mu
 // without re-entering r.mu (lock-order safety).
 type workProducerCancels struct {
-	scheduler context.CancelFunc
-	recovery  context.CancelFunc
-	cleanup   context.CancelFunc
-	forwarder interface{ CancelExecute() }
+	scheduler      context.CancelFunc
+	recovery       context.CancelFunc
+	cleanup        context.CancelFunc
+	humanAttention context.CancelFunc
+	forwarder      interface{ CancelExecute() }
 }
 
 // invokeForDegrade cancels sticky-degrade producers but leaves webhook execute
 // live: Forward may already have returned accepted/202 for queued discovery,
 // and GitHub will not retry that delivery while the daemon stays up.
+// Human-attention recovery rescan is left running on sticky degrade so an
+// already-scheduled post-recovery alert can still deliver while the daemon stays up.
 func (c workProducerCancels) invokeForDegrade() {
 	if c.scheduler != nil {
 		c.scheduler()
@@ -483,8 +535,14 @@ func (c workProducerCancels) invokeForDegrade() {
 
 // invokeForShutdown cancels all work producers including webhook discovery so
 // process exit can abort in-flight CreateOrGetActiveByDedupe promptly.
+// Also cancels human-attention delivery (recovery rescan + post-claim) so
+// a slow notification transport cannot block process exit beyond
+// stopHumanAttentionRecoveryNotify's wait budget.
 func (c workProducerCancels) invokeForShutdown() {
 	c.invokeForDegrade()
+	if c.humanAttention != nil {
+		c.humanAttention()
+	}
 	if c.forwarder != nil {
 		c.forwarder.CancelExecute()
 	}
@@ -497,10 +555,11 @@ func (r *Runtime) snapshotWorkProducerCancels() workProducerCancels {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return workProducerCancels{
-		scheduler: r.schedulerCancel,
-		recovery:  r.recoveryCancel,
-		cleanup:   r.worktreeCleanupCancel,
-		forwarder: r.webhookForwarder,
+		scheduler:      r.schedulerCancel,
+		recovery:       r.recoveryCancel,
+		cleanup:        r.worktreeCleanupCancel,
+		humanAttention: r.humanAttentionNotifyCancel,
+		forwarder:      r.webhookForwarder,
 	}
 }
 
@@ -745,6 +804,16 @@ func (r *Runtime) ReconcileWebhookForwarders() {
 	}
 }
 
+func (r *Runtime) scheduleWebhookForwarderReconcile() {
+	r.mu.RLock()
+	webhook := r.webhook
+	repositories := r.services.Repositories
+	r.mu.RUnlock()
+	if webhook != nil {
+		webhook.ScheduleReconcile(repositories)
+	}
+}
+
 func (r *Runtime) RefreshWebhookForwarders() error {
 	r.ReconcileWebhookForwarders()
 	return nil
@@ -853,12 +922,22 @@ func (r *Runtime) start(ctx context.Context) error {
 			return detectProjectRepo(ctx, gitGateway, r.projectCatalog.Snapshot(), repoPath)
 		},
 		GetRepositorySettings: func(ctx context.Context, input githubinfra.RepositorySettingsInput) (githubinfra.RepositorySettings, error) {
+			bound, err := bindProjectHostingOperation(ctx, r.projectCatalog.Snapshot(), "", input.Repo, "", "worker")
+			if err != nil {
+				return githubinfra.RepositorySettings{}, err
+			}
+			ctx = bound
 			if githubGateway == nil {
 				return githubinfra.RepositorySettings{}, fmt.Errorf("github gateway is not configured")
 			}
 			return githubGateway.GetRepositorySettings(ctx, input)
 		},
 		GetBranchProtection: func(ctx context.Context, input githubinfra.BranchProtectionInput) (githubinfra.BranchProtection, error) {
+			bound, err := bindProjectHostingOperation(ctx, r.projectCatalog.Snapshot(), "", input.Repo, "", "worker")
+			if err != nil {
+				return githubinfra.BranchProtection{}, err
+			}
+			ctx = bound
 			if githubGateway == nil {
 				return githubinfra.BranchProtection{}, fmt.Errorf("github gateway is not configured")
 			}
@@ -876,6 +955,11 @@ func (r *Runtime) start(ctx context.Context) error {
 			return items, nil
 		},
 		ListOpenPullRequests: func(ctx context.Context, input projects.ListOpenPullRequestsInput) ([]projects.PullRequestSummary, error) {
+			bound, err := bindProjectHostingOperation(ctx, r.projectCatalog.Snapshot(), "", input.Repo, input.CWD, "worker")
+			if err != nil {
+				return nil, err
+			}
+			ctx = bound
 			if githubGateway == nil {
 				return nil, fmt.Errorf("github gateway is not configured")
 			}
@@ -890,6 +974,11 @@ func (r *Runtime) start(ctx context.Context) error {
 			return items, nil
 		},
 		CapturePullRequestSnapshot: func(ctx context.Context, input projects.CapturePullRequestSnapshotInput) (storage.PullRequestSnapshotRecord, error) {
+			bound, err := bindProjectHostingOperation(ctx, r.projectCatalog.Snapshot(), input.ProjectID, input.Repo, input.CWD, "reviewer")
+			if err != nil {
+				return storage.PullRequestSnapshotRecord{}, err
+			}
+			ctx = bound
 			if githubGateway == nil {
 				return storage.PullRequestSnapshotRecord{}, fmt.Errorf("github gateway is not configured")
 			}
@@ -942,7 +1031,7 @@ func (r *Runtime) start(ctx context.Context) error {
 			r.mu.RLock()
 			defer r.mu.RUnlock()
 			return r.schedulerTasks
-		}, r.TriggerSchedulerClaim, r.now, r.reconcileLiveStaleRunningRuns, r.AllowClaim, r.WithAllowClaim, r)
+		}, r.TriggerSchedulerClaim, r.now, r.reconcileLiveStaleRunningRuns, r.AllowClaim, r.WithAllowClaim, r.notifyHumanAttentionPostClaim, r)
 		r.defaultSchedulerTick = handlers.tick
 		r.defaultSchedulerClaim = handlers.claim
 		r.webhookForwarder = handlers.webhook
@@ -1046,6 +1135,12 @@ func (r *Runtime) CompleteStartup(ctx context.Context) error {
 		// the shutdown race where BeginShutdown may have already missed a nil
 		// recoveryCancel between MarkReady and registration).
 		r.startDeferredReviewerRecovery(githubGateway)
+		// Rescan durable human-attention parks only after startup is committed
+		// (admission ready). Launching earlier races Start's failure cleanup,
+		// which closes SQLite while this goroutine still queries/persists or
+		// waits on a notification transport. Delivery stays async so notification
+		// dispatch cannot delay MarkReady / admission.
+		r.scheduleHumanAttentionRecoveryNotify(repositories)
 		// startSchedulerLoop already fired an immediate full tick while admission
 		// was still starting (gate no-op). Wake full + claim pumps now that
 		// admission is ready so discovery/HITL do not wait a full poll interval.
@@ -1077,6 +1172,8 @@ func (r *Runtime) validateCoordinatorDependencyGates(ctx context.Context, reposi
 		return err
 	}
 	catalog := r.Config()
+	botProbeCtx, cancelBotProbes := context.WithTimeout(ctx, 3*time.Second)
+	defer cancelBotProbes()
 	for _, project := range projectsList {
 		if project.Archived {
 			continue
@@ -1089,14 +1186,36 @@ func (r *Runtime) validateCoordinatorDependencyGates(ctx context.Context, reposi
 		if repo == "" {
 			return fmt.Errorf("coordinator dependency gate enabled but repository metadata unavailable for project %s", project.ID)
 		}
-		issueNumber, err := r.firstDependencyProbeIssue(ctx, githubGateway, repo, project.RepoPath)
+		probeCtx := ctx
+		if _, selected, resolveErr := config.ResolveHostingIdentity(catalog, project.ID, "coordinator"); resolveErr != nil {
+			return resolveErr
+		} else if selected {
+			probeCtx = botProbeCtx
+		}
+		bound, err := hostingidentity.Bind(probeCtx, catalog, project.ID, "coordinator")
 		if err != nil {
+			return err
+		}
+		issueNumber, err := r.firstDependencyProbeIssue(bound, githubGateway, repo, project.RepoPath)
+		if err != nil {
+			if session, selected := hostingidentity.FromContext(bound); selected {
+				if r.logger != nil {
+					r.logger.Warn("coordinator hosting identity probe failed", map[string]any{"identity": session.Name(), "projectId": project.ID, "error": err.Error()})
+				}
+				continue
+			}
 			return err
 		}
 		if issueNumber == 0 {
 			continue
 		}
-		if err := r.probeDependencyAPI(ctx, githubGateway, repo, project.RepoPath, issueNumber, roleCfg.Dependencies); err != nil {
+		if err := r.probeDependencyAPI(bound, githubGateway, repo, project.RepoPath, issueNumber, roleCfg.Dependencies); err != nil {
+			if session, selected := hostingidentity.FromContext(bound); selected {
+				if r.logger != nil {
+					r.logger.Warn("coordinator hosting identity capability probe failed", map[string]any{"identity": session.Name(), "projectId": project.ID, "error": err.Error()})
+				}
+				continue
+			}
 			return err
 		}
 	}
@@ -1265,7 +1384,7 @@ func (r *Runtime) afterProjectsPublished() {
 	if started {
 		r.TriggerSchedulerTick()
 		r.TriggerSchedulerClaim()
-		r.ReconcileWebhookForwarders()
+		r.scheduleWebhookForwarderReconcile()
 	}
 }
 
@@ -1308,6 +1427,11 @@ func (r *Runtime) startSchedulerLoop() {
 	r.schedulerCancel = schedulerCancel
 	r.schedulerTasks = taskTracker
 	r.mu.Unlock()
+
+	if len(r.config.Identities) > 0 {
+		probeConfig := r.Config()
+		taskTracker.Go(func() { r.probeHostingIdentities(schedulerCtx, probeConfig) })
+	}
 
 	if r.defaultSchedulerClaim != nil {
 		taskTracker.Go(func() {
@@ -2506,7 +2630,11 @@ func (r *Runtime) currentReviewerLoginForRecovery(ctx context.Context, repositor
 	if project == nil || strings.TrimSpace(project.RepoPath) == "" {
 		return "", false
 	}
-	loginCtx, cancel := context.WithTimeout(ctx, reviewerRecoveryLoginTimeout)
+	bound, bindErr := hostingidentity.Bind(ctx, r.Config(), loop.ProjectID, "reviewer")
+	if bindErr != nil {
+		return "", false
+	}
+	loginCtx, cancel := context.WithTimeout(bound, reviewerRecoveryLoginTimeout)
 	defer cancel()
 	login, err := githubGateway.GetCurrentUserLogin(loginCtx, project.RepoPath)
 	if err != nil {

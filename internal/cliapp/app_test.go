@@ -1171,6 +1171,9 @@ func TestExtractConfigArgsForwardsCanonicalConfigFlags(t *testing.T) {
 		"--roles-reviewer-discovery-triggers-enable-self-review",
 		"true",
 		"--roles-reviewer-behavior-loop-enabled-by-default=false",
+		"--defaults-loop-quiet-period-seconds",
+		"90",
+		"--roles-fixer-behavior-loop-quiet-period-seconds=30",
 		"--instructions-enabled=true",
 		"--project",
 		"demo",
@@ -1184,6 +1187,9 @@ func TestExtractConfigArgsForwardsCanonicalConfigFlags(t *testing.T) {
 		"--roles-reviewer-discovery-triggers-enable-self-review",
 		"true",
 		"--roles-reviewer-behavior-loop-enabled-by-default=false",
+		"--defaults-loop-quiet-period-seconds",
+		"90",
+		"--roles-fixer-behavior-loop-quiet-period-seconds=30",
 		"--instructions-enabled=true",
 	}
 
@@ -2389,6 +2395,77 @@ func TestConfigShowSourceDetectsFixerAuthorFilterCLIOverride(t *testing.T) {
 	assertConfigFieldSource(t, stdout, "roles.fixer.triggers.authorFilter", "cli")
 }
 
+func TestConfigShowSourceDetectsQuietPeriodConfigFileAndCLI(t *testing.T) {
+	configPath := writeEditableCLIConfigWithPayload(t, map[string]any{
+		"notifications": map[string]any{
+			"osascript": map[string]any{"enabled": false},
+		},
+		"defaults": map[string]any{
+			"loop": map[string]any{
+				"quietPeriodSeconds": 90,
+			},
+		},
+		"roles": map[string]any{
+			"fixer": map[string]any{
+				"behavior": map[string]any{
+					"loop": map[string]any{
+						"quietPeriodSeconds": 15,
+					},
+				},
+			},
+		},
+	})
+
+	exitCode, stdout, stderr := runApp(t, "config", "show", "--source", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([config show --source]) exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	assertConfigFieldSource(t, stdout, "defaults.loop.quietPeriodSeconds", "config-file")
+	assertConfigFieldSource(t, stdout, "roles.fixer.behavior.loop.quietPeriodSeconds", "config-file")
+
+	exitCode, stdout, stderr = runApp(t, "config", "show", "--source",
+		"--defaults-loop-quiet-period-seconds=120",
+		"--roles-fixer-behavior-loop-quiet-period-seconds=45",
+		"--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([config show --source with quiet-period flags]) exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	assertConfigFieldSource(t, stdout, "defaults.loop.quietPeriodSeconds", "cli")
+	assertConfigFieldSource(t, stdout, "roles.fixer.behavior.loop.quietPeriodSeconds", "cli")
+}
+
+func TestConfigShowSourceAttributesInheritedFixerQuietPeriod(t *testing.T) {
+	// Only defaults.loop is set; fixer inherits 120 but must report the shared source.
+	configPath := writeEditableCLIConfigWithPayload(t, map[string]any{
+		"notifications": map[string]any{
+			"osascript": map[string]any{"enabled": false},
+		},
+		"defaults": map[string]any{
+			"loop": map[string]any{
+				"quietPeriodSeconds": 120,
+			},
+		},
+	})
+
+	exitCode, stdout, stderr := runApp(t, "config", "show", "--source", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([config show --source]) exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	assertConfigFieldSource(t, stdout, "defaults.loop.quietPeriodSeconds", "config-file")
+	assertConfigFieldSource(t, stdout, "roles.fixer.behavior.loop.quietPeriodSeconds", "config-file")
+	assertConfigFieldValue(t, stdout, "roles.fixer.behavior.loop.quietPeriodSeconds", float64(120))
+
+	exitCode, stdout, stderr = runApp(t, "config", "show", "--source",
+		"--defaults-loop-quiet-period-seconds=45",
+		"--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([config show --source with defaults quiet flag]) exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	assertConfigFieldSource(t, stdout, "defaults.loop.quietPeriodSeconds", "cli")
+	assertConfigFieldSource(t, stdout, "roles.fixer.behavior.loop.quietPeriodSeconds", "cli")
+	assertConfigFieldValue(t, stdout, "roles.fixer.behavior.loop.quietPeriodSeconds", float64(45))
+}
+
 func TestConfigShowSourceDetectsCanonicalReviewerDiscoveryEnvOverrides(t *testing.T) {
 	configPath := writeEditableCLIConfigWithPayload(t, map[string]any{
 		"notifications": map[string]any{
@@ -2732,6 +2809,22 @@ func TestConfigSetWarnsWhenFlagOverridesWrittenValue(t *testing.T) {
 
 func assertConfigFieldSource(t *testing.T, stdout, key, wantSource string) {
 	t.Helper()
+	field := configShowSourceField(t, stdout, key)
+	if got := field["source"]; got != wantSource {
+		t.Fatalf("%s source = %#v, want %#v", key, got, wantSource)
+	}
+}
+
+func assertConfigFieldValue(t *testing.T, stdout, key string, wantValue any) {
+	t.Helper()
+	field := configShowSourceField(t, stdout, key)
+	if got := field["value"]; got != wantValue {
+		t.Fatalf("%s value = %#v, want %#v", key, got, wantValue)
+	}
+}
+
+func configShowSourceField(t *testing.T, stdout, key string) map[string]any {
+	t.Helper()
 	var decoded map[string]any
 	if err := json.Unmarshal([]byte(stdout), &decoded); err != nil {
 		t.Fatalf("unmarshal source output: %v", err)
@@ -2744,9 +2837,7 @@ func assertConfigFieldSource(t *testing.T, stdout, key, wantSource string) {
 	if !ok {
 		t.Fatalf("%s = %#v, want object", key, fields[key])
 	}
-	if got := field["source"]; got != wantSource {
-		t.Fatalf("%s source = %#v, want %#v", key, got, wantSource)
-	}
+	return field
 }
 
 func TestConfigValidatePrintsLegacyDefaultConfigMigrationNote(t *testing.T) {
@@ -4127,11 +4218,12 @@ func TestLogsHelpIncludesFollowFlag(t *testing.T) {
 func TestJumpWithoutJSONPrintsShellChangeDir(t *testing.T) {
 	t.Parallel()
 
+	worktreePath := t.TempDir()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if got, want := r.URL.Path, "/api/v1/runs/active/12"; got != want {
 			t.Fatalf("request path = %q, want %q", got, want)
 		}
-		writeEnvelope(t, w, pkgapi.Success("req_active_run", map[string]any{"seq": 12, "loopId": "loop_12", "projectId": "project_1", "worktree": map[string]any{"path": "/tmp/worktree"}}))
+		writeEnvelope(t, w, pkgapi.Success("req_active_run", map[string]any{"seq": 12, "loopId": "loop_12", "projectId": "project_1", "worktree": map[string]any{"path": worktreePath}}))
 	}))
 	defer server.Close()
 
@@ -4143,7 +4235,7 @@ func TestJumpWithoutJSONPrintsShellChangeDir(t *testing.T) {
 	if stderr != "" {
 		t.Fatalf("Run([jump 12]) stderr = %q, want empty string", stderr)
 	}
-	if got, want := stdout, "cd -- '/tmp/worktree'\n"; got != want {
+	if got, want := stdout, "cd -- "+quoteShellArg(worktreePath)+"\n"; got != want {
 		t.Fatalf("Run([jump 12]) stdout = %q, want %q", got, want)
 	}
 }
@@ -4151,11 +4243,12 @@ func TestJumpWithoutJSONPrintsShellChangeDir(t *testing.T) {
 func TestJumpWithPrintPathPrintsWorktreePath(t *testing.T) {
 	t.Parallel()
 
+	worktreePath := t.TempDir()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if got, want := r.URL.Path, "/api/v1/runs/active/12"; got != want {
 			t.Fatalf("request path = %q, want %q", got, want)
 		}
-		writeEnvelope(t, w, pkgapi.Success("req_active_run", map[string]any{"seq": 12, "loopId": "loop_12", "projectId": "project_1", "worktree": map[string]any{"path": "/tmp/worktree"}}))
+		writeEnvelope(t, w, pkgapi.Success("req_active_run", map[string]any{"seq": 12, "loopId": "loop_12", "projectId": "project_1", "worktree": map[string]any{"path": worktreePath}}))
 	}))
 	defer server.Close()
 
@@ -4167,7 +4260,7 @@ func TestJumpWithPrintPathPrintsWorktreePath(t *testing.T) {
 	if stderr != "" {
 		t.Fatalf("Run([jump 12 --print-path]) stderr = %q, want empty string", stderr)
 	}
-	if got, want := stdout, "/tmp/worktree\n"; got != want {
+	if got, want := stdout, worktreePath+"\n"; got != want {
 		t.Fatalf("Run([jump 12 --print-path]) stdout = %q, want %q", got, want)
 	}
 }

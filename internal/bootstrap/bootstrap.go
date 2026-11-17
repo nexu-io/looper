@@ -192,6 +192,14 @@ func signalNotifierOrDefault(notifier SignalNotifier) SignalNotifier {
 }
 
 func validateConfiguredToolPaths(cfg config.Config, detection map[string]config.ToolDetectionStatus) error {
+	// Bot agents need the trusted hosting CLI even when the daemon itself is
+	// launched with go run. Check this before readiness and on config reload.
+	if len(cfg.Identities) > 0 && (cfg.Tools.LooperPath == nil || strings.TrimSpace(*cfg.Tools.LooperPath) == "") {
+		return &config.ConfigValidationError{Issues: []config.ValidationIssue{{
+			Path:    "tools.looperPath",
+			Message: "hosting bot identities require the looper CLI; build it with go build -o dist/looper ./cmd/looper and set tools.looperPath to its absolute path, or install looper on PATH",
+		}}}
+	}
 	checks := []struct {
 		statusKey string
 		field     string

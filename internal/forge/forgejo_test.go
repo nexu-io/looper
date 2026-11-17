@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/nexu-io/looper/internal/config"
+	"github.com/nexu-io/looper/internal/hostingidentity"
 )
 
 type recordedRequest struct {
@@ -211,6 +212,240 @@ func TestForgejoClientContract(t *testing.T) {
 	}
 }
 
+func TestForgejoIssueReactions(t *testing.T) {
+	t.Parallel()
+
+	var requests []recordedRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		requests = append(requests, recordedRequest{Method: r.Method, Path: r.URL.Path, Body: string(body)})
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/repos/acme/looper/issues/54/reactions":
+			writeJSON(t, w, http.StatusOK, map[string]any{"content": "+1", "user": map[string]any{"login": "looper-reviewer"}})
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/repos/acme/looper/issues/55/reactions":
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte(`{"message":"reaction already exists"}`))
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/repos/acme/looper/issues/56/reactions":
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte(`{"message":"user should have write access"}`))
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/repos/acme/looper/issues/58/reactions":
+			w.WriteHeader(http.StatusConflict)
+			_, _ = w.Write([]byte(`{"message":"conflict"}`))
+		case r.Method == http.MethodDelete && r.URL.Path == "/api/v1/repos/acme/looper/issues/54/reactions":
+			w.WriteHeader(http.StatusNoContent)
+		case r.Method == http.MethodDelete && r.URL.Path == "/api/v1/repos/acme/looper/issues/57/reactions":
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"message":"not found"}`))
+		default:
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	client, err := NewForgejoClient(RepositoryRef{ProviderID: "fj", Kind: ProviderKindForgejo, BaseURL: server.URL, Repo: "acme/looper"}, "token")
+	if err != nil {
+		t.Fatalf("NewForgejoClient() error = %v", err)
+	}
+	ctx := context.Background()
+	if err := client.AddIssueReaction(ctx, 54, " +1 "); err != nil {
+		t.Fatalf("AddIssueReaction(54) error = %v", err)
+	}
+	if err := client.AddIssueReaction(ctx, 55, "+1"); err != nil {
+		t.Fatalf("AddIssueReaction(already exists) error = %v", err)
+	}
+	if err := client.AddIssueReaction(ctx, 58, "+1"); err != nil {
+		t.Fatalf("AddIssueReaction(conflict) error = %v", err)
+	}
+	if err := client.AddIssueReaction(ctx, 56, "+1"); err == nil || !strings.Contains(err.Error(), "403") {
+		t.Fatalf("AddIssueReaction(forbidden) error = %v, want HTTP 403", err)
+	}
+	beforeEmpty := len(requests)
+	if err := client.AddIssueReaction(ctx, 54, "  "); err != nil {
+		t.Fatalf("AddIssueReaction(empty) error = %v", err)
+	}
+	if err := client.RemoveIssueReaction(ctx, 54, ""); err != nil {
+		t.Fatalf("RemoveIssueReaction(empty) error = %v", err)
+	}
+	if len(requests) != beforeEmpty {
+		t.Fatalf("empty content sent %d extra requests", len(requests)-beforeEmpty)
+	}
+	if err := client.RemoveIssueReaction(ctx, 54, "+1"); err != nil {
+		t.Fatalf("RemoveIssueReaction(54) error = %v", err)
+	}
+	if err := client.RemoveIssueReaction(ctx, 57, "+1"); err != nil {
+		t.Fatalf("RemoveIssueReaction(missing) error = %v", err)
+	}
+
+	if !containsRequest(requests, http.MethodPost, "/api/v1/repos/acme/looper/issues/54/reactions", `{"content":"+1"}`) {
+		t.Fatalf("requests = %#v, want add +1 payload", requests)
+	}
+	if !containsRequest(requests, http.MethodDelete, "/api/v1/repos/acme/looper/issues/54/reactions", `{"content":"+1"}`) {
+		t.Fatalf("requests = %#v, want remove +1 payload", requests)
+	}
+}
+
+func TestForgejoAddIssueReactionReconcilesServerError(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name       string
+		postStatus int
+		userStatus int
+		listStatus int
+		userID     int64
+		reactionID int64
+		content    string
+		secondPage bool
+		wantErr    bool
+	}{
+		{name: "own reaction exists", reactionID: 77, content: "+1"},
+		{name: "own reaction on next page", reactionID: 77, content: "+1", secondPage: true},
+		{name: "other account", reactionID: 78, content: "+1", wantErr: true},
+		{name: "other content", reactionID: 77, content: "eyes", wantErr: true},
+		{name: "missing reaction", wantErr: true},
+		{name: "identity unavailable", userStatus: 503, wantErr: true},
+		{name: "identity has no id", userID: -1, reactionID: 77, content: "+1", wantErr: true},
+		{name: "reactions unavailable", listStatus: 503, wantErr: true},
+		{name: "permission denied", postStatus: 403, reactionID: 77, content: "+1", wantErr: true},
+		{name: "success needs no reads", postStatus: 201},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			postStatus := test.postStatus
+			if postStatus == 0 {
+				postStatus = 500
+			}
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodPost {
+					w.WriteHeader(postStatus)
+					_, _ = io.WriteString(w, "<html>original failure</html>")
+					return
+				}
+				if postStatus < 500 {
+					t.Errorf("unexpected reconciliation after HTTP %d", postStatus)
+				}
+				if r.URL.Path == "/api/v1/user" {
+					if test.userStatus != 0 {
+						w.WriteHeader(test.userStatus)
+						return
+					}
+					id := int64(77)
+					if test.userID != 0 {
+						id = test.userID
+					}
+					writeJSON(t, w, 200, map[string]any{"id": id, "login": "looper-reviewer"})
+					return
+				}
+				if test.listStatus != 0 {
+					w.WriteHeader(test.listStatus)
+					return
+				}
+				if test.secondPage && r.URL.Query().Get("page") == "1" {
+					w.Header().Set("X-Total-Pages", "2")
+					writeJSON(t, w, 200, []any{})
+					return
+				}
+				writeJSON(t, w, 200, []map[string]any{{"content": test.content, "user": map[string]any{"id": test.reactionID, "login": "looper-reviewer"}}})
+			}))
+			defer server.Close()
+			client, err := NewForgejoClient(RepositoryRef{ProviderID: "fj", Kind: ProviderKindForgejo, BaseURL: server.URL, Repo: "acme/looper"}, "token")
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = client.AddIssueReaction(context.Background(), 54, "+1")
+			if !test.wantErr {
+				if err != nil {
+					t.Fatal(err)
+				}
+				return
+			}
+			var httpErr *ForgejoHTTPError
+			if !errors.As(err, &httpErr) || httpErr.StatusCode != postStatus || !strings.Contains(httpErr.responseBody(), "original failure") {
+				t.Fatalf("error = %v, want original HTTP %d", err, postStatus)
+			}
+		})
+	}
+}
+
+func TestForgejoAddIssueReactionSessionBoundDuplicate(t *testing.T) {
+	t.Parallel()
+
+	for _, test := range []struct {
+		name     string
+		identity string
+		message  string
+		status   int
+		reactor  int64
+		wantErr  bool
+	}{
+		{name: "duplicate", identity: "review", message: "reaction already exists"},
+		{name: "permission with already in identity", identity: "already-reviewer", message: "user should have write access", wantErr: true},
+		{name: "server error with own reaction", identity: "review", message: "internal error", status: 500, reactor: 77},
+		{name: "server error with other reaction", identity: "review", message: "internal error", status: 500, reactor: 78, wantErr: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			status := test.status
+			if status == 0 {
+				status = http.StatusForbidden
+			}
+			userHits := 0
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case r.Method == http.MethodGet && r.URL.Path == "/api/v1/user":
+					userHits++
+					writeJSON(t, w, http.StatusOK, map[string]any{"id": 77, "login": "looper-bot", "full_name": "Loop Bot", "email": "bot@example.test"})
+				case r.Method == http.MethodGet && r.URL.Path == "/api/v1/repos/acme/looper":
+					writeJSON(t, w, http.StatusOK, map[string]any{"full_name": "acme/looper"})
+				case r.Method == http.MethodPost && r.URL.Path == "/api/v1/repos/acme/looper/issues/54/reactions":
+					w.WriteHeader(status)
+					_, _ = w.Write([]byte(`{"message":"` + test.message + `"}`))
+				case r.Method == http.MethodGet && r.URL.Path == "/api/v1/repos/acme/looper/issues/54/reactions":
+					writeJSON(t, w, http.StatusOK, []map[string]any{{"content": "+1", "user": map[string]any{"id": test.reactor, "login": "looper-bot"}}})
+				default:
+					t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+				}
+			}))
+			t.Cleanup(server.Close)
+
+			options := hostingidentity.Options{
+				HTTPClient: server.Client(),
+				LookupEnv:  func(string) (string, bool) { return "host-test-token", true },
+			}
+			ctx := hostingidentity.WithManager(context.Background(), hostingidentity.NewManager(options))
+			bound, err := hostingidentity.BindResolved(ctx, config.ResolvedHostingIdentity{
+				Name:       test.identity,
+				Definition: config.HostingIdentityConfig{Kind: config.HostingIdentityForgejoToken, BaseURL: server.URL, TokenEnv: "HOST_TEST_TOKEN"},
+				Target:     config.RepositoryIdentity{Kind: config.ProviderKindForgejo, ProviderID: "fj", BaseURL: server.URL, Repo: "acme/looper"},
+				ProjectID:  "project",
+				Role:       "reviewer",
+			})
+			if err != nil {
+				t.Fatalf("BindResolved() error = %v", err)
+			}
+			client, err := NewForgejoClientForContext(bound, config.ProviderConfig{ID: "fj", Kind: config.ProviderKindForgejo, BaseURL: server.URL}, "acme/looper", WithHTTPClient(server.Client()))
+			if err != nil {
+				t.Fatalf("NewForgejoClientForContext() error = %v", err)
+			}
+			err = client.AddIssueReaction(bound, 54, "+1")
+			if test.wantErr {
+				if err == nil || !strings.Contains(err.Error(), fmt.Sprint(status)) || !strings.Contains(err.Error(), test.identity) {
+					t.Fatalf("AddIssueReaction() error = %v, want redacted %d for %s", err, status, test.identity)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("AddIssueReaction() error = %v, want duplicate treated as success", err)
+			}
+			if err := client.AddIssueReaction(bound, 54, "+1"); err != nil {
+				t.Fatalf("AddIssueReaction(repeat) error = %v", err)
+			}
+			if userHits != 1 {
+				t.Fatalf("user probes = %d, want cached credential", userHits)
+			}
+		})
+	}
+}
+
 func TestNewForgejoClientFromConfigReadsTokenEnv(t *testing.T) {
 	t.Setenv("FORGEJO_TOKEN", "token-value")
 	client, err := NewForgejoClientFromConfig(config.ProviderConfig{ID: "fj", Kind: config.ProviderKindForgejo, BaseURL: "https://forgejo.example.test", TokenEnv: stringPtr("FORGEJO_TOKEN")}, "acme/looper")
@@ -395,7 +630,7 @@ func TestForgejoClientTimeoutOption(t *testing.T) {
 	}
 }
 
-func TestForgejoPullRequestDiffRejectsOversizedResponses(t *testing.T) {
+func TestForgejoPullRequestDiffAllowsResponsesOverOneMiBByDefault(t *testing.T) {
 	t.Parallel()
 
 	diffPayload := strings.Repeat("d", maxForgejoResponseBodyBytes+1)
@@ -412,10 +647,12 @@ func TestForgejoPullRequestDiffRejectsOversizedResponses(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewForgejoClient() error = %v", err)
 	}
-
-	_, err = client.PullRequestDiff(context.Background(), 9)
-	if err == nil || !strings.Contains(err.Error(), "response exceeds") {
-		t.Fatalf("PullRequestDiff() error = %v, want oversized response failure", err)
+	diff, err := client.PullRequestDiff(context.Background(), 9)
+	if err != nil {
+		t.Fatalf("PullRequestDiff() error = %v, want unlimited default to accept 1MiB+1", err)
+	}
+	if diff != diffPayload {
+		t.Fatalf("PullRequestDiff() length = %d, want %d", len(diff), len(diffPayload))
 	}
 }
 

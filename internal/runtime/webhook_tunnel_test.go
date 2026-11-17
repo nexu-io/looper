@@ -110,12 +110,15 @@ type fakeWebhookTunnelGitHubClient struct {
 	getDeadline    bool
 	createDeadline bool
 	updateDeadline bool
+	deleteDeadline bool
+	deleteCtxErr   error
 	getCalls       int
 	createCalls    int
 	updateCalls    int
 	deleteCalls    int
 	lastUpdate     fakeWebhookTunnelUpdateCall
 	deletedHooks   []int64
+	createCtxErr   error
 }
 
 type fakeWebhookTunnelUpdateCall struct {
@@ -135,6 +138,7 @@ func (f *fakeWebhookTunnelGitHubClient) GetHook(ctx context.Context, _ string, _
 func (f *fakeWebhookTunnelGitHubClient) CreateHook(ctx context.Context, _ string, _ string, _ string, _ []string) (webhookTunnelGitHubHook, error) {
 	f.createCalls++
 	_, f.createDeadline = ctx.Deadline()
+	f.createCtxErr = ctx.Err()
 	if f.createHook.ID == 0 {
 		f.createHook.ID = 999
 	}
@@ -148,9 +152,11 @@ func (f *fakeWebhookTunnelGitHubClient) UpdateHook(ctx context.Context, repo str
 	return f.updateHook, f.updateErr
 }
 
-func (f *fakeWebhookTunnelGitHubClient) DeleteHook(_ context.Context, _ string, id int64) error {
+func (f *fakeWebhookTunnelGitHubClient) DeleteHook(ctx context.Context, _ string, id int64) error {
 	f.deleteCalls++
 	f.deletedHooks = append(f.deletedHooks, id)
+	_, f.deleteDeadline = ctx.Deadline()
+	f.deleteCtxErr = ctx.Err()
 	return f.deleteErr
 }
 

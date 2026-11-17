@@ -43,13 +43,14 @@ Use this when the user wants Looper installed, configured, and running end-to-en
 
 ### Step 0 — Preflight (read-only)
 
-Looper currently supports macOS (`darwin-arm64`) and Linux (`linux-amd64`). Stop and ask the user how to proceed if the host is not supported:
+Looper currently supports macOS (`darwin-arm64`) and Linux (`linux-amd64`, `linux-arm64`). Stop and ask the user how to proceed if the host is not supported:
 
 ```bash
 case "$(uname -s)-$(uname -m)" in
   Darwin-arm64|Darwin-aarch64) ;;
   Linux-x86_64|Linux-amd64) ;;
-  *) echo "Looper supports macOS arm64 and Linux x64 only; stop and confirm with the user before continuing." >&2 ;;
+  Linux-aarch64|Linux-arm64) ;;
+  *) echo "Looper supports macOS arm64 and Linux x64/arm64 only; stop and confirm with the user before continuing." >&2 ;;
 esac
 ```
 

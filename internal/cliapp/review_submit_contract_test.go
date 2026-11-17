@@ -22,12 +22,7 @@ func TestReviewSubmitOrchestrationPreservesInlineCommentsWhenFullDiffExceedsCapt
 	payload := map[string]any{
 		"body": "Actionable review\n<!-- looper:review id=review-large head=" + headSHA + " outcome=actionable -->",
 		"comments": []map[string]any{
-			{
-				"body": "late change needs attention",
-				"path": "target/late.go",
-				"line": targetLine,
-				"side": "RIGHT",
-			},
+			reviewSubmitMustFixComment("late change needs attention", "target/late.go", targetLine, "RIGHT"),
 		},
 	}
 	raw, err := json.Marshal(payload)
@@ -77,6 +72,11 @@ func TestReviewSubmitOrchestrationPreservesInlineCommentsWhenFullDiffExceedsCapt
 	if comment["path"] != "target/late.go" || int64(comment["line"].(float64)) != targetLine || comment["side"] != "RIGHT" {
 		t.Fatalf("comment = %#v, want resolvable target/late.go RIGHT %d", comment, targetLine)
 	}
+	for _, forbidden := range []string{"disposition", "scopeBasis", "scopeEvidence", "severity"} {
+		if _, ok := comment[forbidden]; ok {
+			t.Fatalf("provider comment retained Looper-only field %q: %#v", forbidden, comment)
+		}
+	}
 	// A non-empty comments[] entry is the GitHub contract for a resolvable review thread.
 	if submitted["commit_id"] != headSHA {
 		t.Fatalf("commit_id = %#v, want %s", submitted["commit_id"], headSHA)
@@ -94,7 +94,7 @@ func TestReviewSubmitOrchestrationPreservesLeftDeletedInlineComment(t *testing.T
 	payload := map[string]any{
 		"body": "Actionable review\n<!-- looper:review id=review-left head=" + headSHA + " outcome=actionable -->",
 		"comments": []map[string]any{
-			{"body": "deleted line issue", "path": "removed.go", "line": deletedLine, "side": "LEFT"},
+			reviewSubmitMustFixComment("deleted line issue", "removed.go", deletedLine, "LEFT"),
 		},
 	}
 	raw, _ := json.Marshal(payload)

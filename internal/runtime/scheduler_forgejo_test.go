@@ -3,17 +3,24 @@ package runtime
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"github.com/nexu-io/looper/internal/workerhost"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/disclosure"
 	"github.com/nexu-io/looper/internal/fixer"
+	githubinfra "github.com/nexu-io/looper/internal/infra/github"
+	"github.com/nexu-io/looper/internal/infra/shell"
+	"github.com/nexu-io/looper/internal/loops/failureclass"
 	"github.com/nexu-io/looper/internal/planner"
 	"github.com/nexu-io/looper/internal/reviewer"
 	"github.com/nexu-io/looper/internal/worker"
@@ -376,6 +383,10 @@ func TestReviewerGitHubAdapterForgejoCommentOnlyFlow(t *testing.T) {
 	var comparePath string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
+		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/statuses/"):
+			_ = json.NewEncoder(w).Encode([]any{})
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/actions/runs"):
+			_ = json.NewEncoder(w).Encode(map[string]any{"workflow_runs": []any{}})
 		case r.Method == http.MethodGet && r.URL.Path == "/swagger.v1.json":
 			_, _ = w.Write([]byte(`{"paths":{}}`))
 		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/repos/acme/looper/pulls":
@@ -402,7 +413,8 @@ func TestReviewerGitHubAdapterForgejoCommentOnlyFlow(t *testing.T) {
 				"labels": []map[string]any{{"id": 1, "name": "looper:review"}},
 			})
 		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/repos/acme/looper/pulls/42.diff":
-			_, _ = w.Write([]byte("diff --git a/a.go b/a.go\n@@ -1 +1 @@\n-old\n+new\n"))
+			t.Error("reviewer must not request remote diff")
+			http.Error(w, "diff unavailable", http.StatusRequestEntityTooLarge)
 		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/repos/acme/looper/issues/42/comments":
 			_ = json.NewEncoder(w).Encode([]map[string]any{{
 				"id":         77,
@@ -447,9 +459,6 @@ func TestReviewerGitHubAdapterForgejoCommentOnlyFlow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ViewPullRequest() error = %v", err)
 	}
-	if !strings.Contains(detail.Diff, "diff --git") {
-		t.Fatalf("detail.Diff = %q, want fetched Forgejo diff", detail.Diff)
-	}
 	if !detail.IsDraft {
 		t.Fatalf("detail = %#v, want draft preserved", detail)
 	}
@@ -463,8 +472,8 @@ func TestReviewerGitHubAdapterForgejoCommentOnlyFlow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CapturePullRequestSnapshot() error = %v", err)
 	}
-	if snapshot.HeadSHA != "abc123" || snapshot.PayloadJSON == nil || !strings.Contains(*snapshot.PayloadJSON, "diff --git") {
-		t.Fatalf("snapshot = %#v, want captured Forgejo diff payload", snapshot)
+	if snapshot.HeadSHA != "abc123" || snapshot.PayloadJSON == nil || strings.Contains(*snapshot.PayloadJSON, "diff") {
+		t.Fatalf("snapshot = %#v, want metadata-only Forgejo snapshot", snapshot)
 	}
 	comment, err := adapter.CreateIssueComment(context.Background(), reviewer.IssueCommentInput{Repo: "acme/looper", IssueNumber: 42, Body: "Needs a test", CWD: repoPath})
 	if err != nil {
@@ -495,6 +504,49 @@ func TestReviewerGitHubAdapterForgejoCommentOnlyFlow(t *testing.T) {
 	}
 	if comparePath != "/api/v1/repos/acme/looper/compare/main...feature%2Freview-me" {
 		t.Fatalf("comparePath = %q, want encoded Forgejo compare path", comparePath)
+	}
+}
+
+func TestReviewerGitHubAdapterForgejoPullRequestReactions(t *testing.T) {
+	t.Setenv("FORGEJO_TOKEN", "secret")
+	var added map[string]string
+	var removed map[string]string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/repos/acme/looper/issues/54/reactions":
+			if err := json.NewDecoder(r.Body).Decode(&added); err != nil {
+				t.Fatalf("decode add reaction: %v", err)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"content": "+1"})
+		case r.Method == http.MethodDelete && r.URL.Path == "/api/v1/repos/acme/looper/issues/54/reactions":
+			if err := json.NewDecoder(r.Body).Decode(&removed); err != nil {
+				t.Fatalf("decode remove reaction: %v", err)
+			}
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	repoPath := filepath.Join(t.TempDir(), "repo")
+	cfg := config.Config{
+		Providers: []config.ProviderConfig{{ID: "forgejo-main", Kind: config.ProviderKindForgejo, BaseURL: server.URL, TokenEnv: stringPtr("FORGEJO_TOKEN")}},
+		Projects:  []config.ProjectRefConfig{{ID: "project_1", Provider: "forgejo-main", Repo: "acme/looper", RepoPath: repoPath}},
+	}
+	adapter := reviewerGitHubAdapter{stamper: disclosure.FromConfig(cfg), config: &cfg}
+	ctx := context.Background()
+	if err := adapter.AddPullRequestReaction(ctx, reviewer.PullRequestReactionInput{Repo: "acme/looper", PRNumber: 54, Content: "+1", CWD: repoPath}); err != nil {
+		t.Fatalf("AddPullRequestReaction() error = %v", err)
+	}
+	if added["content"] != "+1" {
+		t.Fatalf("added = %#v, want +1", added)
+	}
+	if err := adapter.RemovePullRequestReaction(ctx, reviewer.PullRequestReactionInput{Repo: "acme/looper", PRNumber: 54, Content: "+1", CWD: repoPath}); err != nil {
+		t.Fatalf("RemovePullRequestReaction() error = %v", err)
+	}
+	if removed["content"] != "+1" {
+		t.Fatalf("removed = %#v, want +1", removed)
 	}
 }
 
@@ -575,6 +627,10 @@ func TestFixerGitHubAdapterForgejoSummaryCommentNoResolveFlow(t *testing.T) {
 	var removedLabelPath string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
+		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/statuses/"):
+			_ = json.NewEncoder(w).Encode([]any{})
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/actions/runs"):
+			_ = json.NewEncoder(w).Encode(map[string]any{"workflow_runs": []any{}})
 		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/user":
 			_ = json.NewEncoder(w).Encode(map[string]any{"id": 7, "login": "fixer-bot"})
 		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/repos/acme/looper/pulls":
@@ -669,9 +725,9 @@ func TestFixerGitHubAdapterForgejoSummaryCommentNoResolveFlow(t *testing.T) {
 	if err := adapter.RemovePullRequestLabels(ctx, fixer.PullRequestLabelsInput{Repo: "acme/looper", PRNumber: 42, Labels: []string{"looper:fix"}, CWD: repoPath}); err != nil {
 		t.Fatalf("RemovePullRequestLabels() error = %v", err)
 	}
-	compare, err := adapter.CompareCommits(ctx, fixer.CompareCommitsInput{Repo: "acme/looper", Base: "base123", Head: "abc123", CWD: repoPath})
-	if err != nil || compare.Status != "ahead" {
-		t.Fatalf("CompareCommits() = %#v, %v; want ahead", compare, err)
+	compare, err := adapter.CompareCommits(ctx, fixer.CompareCommitsInput{Repo: "acme/looper", Base: "abc123", Head: "abc123", CWD: repoPath})
+	if err != nil || compare.Status != "identical" {
+		t.Fatalf("CompareCommits() = %#v, %v; want identical", compare, err)
 	}
 	if _, err := adapter.ListReviewThreads(ctx, fixer.ListReviewThreadsInput{Repo: "acme/looper", PRNumber: 42, CWD: repoPath}); err == nil || !strings.Contains(err.Error(), "does not support native review threads") {
 		t.Fatalf("ListReviewThreads() error = %v, want Forgejo unsupported native review threads", err)
@@ -734,7 +790,7 @@ func TestFixerGitHubAdapterForgejoListNativeReviewComments(t *testing.T) {
 	if len(comments) != 3 {
 		t.Fatalf("comments = %#v, want 3", comments)
 	}
-	if got := comments[0]; got.ObservedFingerprint != fixer.NativeReviewCommentFingerprint(101, "2026-07-01T00:00:00Z") || got.ResolverPresent || got.IsResolved {
+	if got := comments[0]; got.ObservedFingerprint != fixer.NativeReviewCommentFingerprint(101, "Open comment") || got.ResolverPresent || got.IsResolved {
 		t.Fatalf("comments[0] = %#v, want absent resolver preserved as open", got)
 	}
 	if got := comments[1]; !got.ResolverPresent || got.IsResolved {
@@ -742,6 +798,57 @@ func TestFixerGitHubAdapterForgejoListNativeReviewComments(t *testing.T) {
 	}
 	if got := comments[2]; !got.ResolverPresent || !got.IsResolved || got.Author != "carol" {
 		t.Fatalf("comments[2] = %#v, want resolved comment with author preserved", got)
+	}
+}
+
+func TestFixerGitHubAdapterForgejoNativeFingerprintTracksBodyInsteadOfPushTimestamp(t *testing.T) {
+	t.Setenv("FORGEJO_TOKEN", "secret")
+	// Forgejo 16 live PR 25/comment 2433 changed only updated_at after a
+	// fixer push. The comment body and original review anchors stayed unchanged.
+	comment := map[string]any{
+		"id": 2433, "body": "Return the final price after subtracting the discount.\n\n<!-- looper:stamp v=1 -->",
+		"user": map[string]any{"login": "reviewer", "id": 1}, "resolver": nil,
+		"pull_request_review_id": 41, "created_at": "2026-09-06T11:09:23Z", "updated_at": "2026-09-06T11:09:23Z",
+		"path": "price.py", "commit_id": "0168818d2a7e524c3204841196c7f05ccf6e8787", "original_commit_id": "",
+		"diff_hunk": "@@ -0,0 +1,3 @@\n+def discounted_price(price, discount_percent):\n+    return price * discount_percent / 100",
+		"position":  3, "original_position": 0, "extra_lines_count": 0,
+		"html_url": "https://forge.example/acme/looper/pulls/25#issuecomment-2433", "pull_request_url": "https://forge.example/acme/looper/pulls/25",
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/repos/acme/looper/pulls/25/reviews":
+			_ = json.NewEncoder(w).Encode([]map[string]any{{"id": 41, "state": "COMMENT", "comments_count": 1, "commit_id": comment["commit_id"], "user": comment["user"]}})
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/repos/acme/looper/pulls/25/reviews/41/comments":
+			_ = json.NewEncoder(w).Encode([]map[string]any{comment})
+		default:
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+	cfg := config.Config{
+		Providers: []config.ProviderConfig{{ID: "forgejo", Kind: config.ProviderKindForgejo, BaseURL: server.URL, TokenEnv: stringPtr("FORGEJO_TOKEN")}},
+		Projects:  []config.ProjectRefConfig{{ID: "project", Provider: "forgejo", Repo: "acme/looper", RepoPath: t.TempDir()}},
+	}
+	adapter := fixerGitHubAdapter{config: &cfg}
+	read := func() fixer.NativeReviewComment {
+		t.Helper()
+		comments, err := adapter.ListNativeReviewComments(context.Background(), fixer.ListNativeReviewCommentsInput{Repo: "acme/looper", PRNumber: 25})
+		if err != nil || len(comments) != 1 {
+			t.Fatalf("native REST comment: count=%d err=%v", len(comments), err)
+		}
+		return comments[0]
+	}
+	beforePush := read()
+	comment["updated_at"] = "2026-09-06T11:12:03Z"
+	afterPush := read()
+	if afterPush.UpdatedAt == beforePush.UpdatedAt || afterPush.Body != beforePush.Body || afterPush.ObservedFingerprint != beforePush.ObservedFingerprint {
+		t.Fatalf("push-only metadata caused content drift: before=%+v after=%+v", beforePush, afterPush)
+	}
+	comment["body"] = beforePush.Body + "\nAlso preserve decimal prices."
+	afterEdit := read()
+	if afterEdit.UpdatedAt != afterPush.UpdatedAt || afterEdit.ObservedFingerprint == afterPush.ObservedFingerprint {
+		t.Fatalf("body edit with unchanged timestamp did not cause content drift: before=%+v after=%+v", afterPush, afterEdit)
 	}
 }
 
@@ -818,6 +925,305 @@ func TestForgejoSupportsFixerDiscoveryWithoutOpeningCoordinatorLane(t *testing.T
 	}
 	if providerHasGitHubPullRequests(config.ProviderKindForgejo) {
 		t.Fatal("providerHasGitHubPullRequests(forgejo) = true, coordinator lane must remain disabled")
+	}
+}
+
+// assertHostingBoundary checks adapter/withHostingAPIBoundary classification and
+// that a later BoundaryGitHubAPI re-wrap preserves an existing local boundary.
+func assertHostingBoundary(t *testing.T, name string, err error, wantBoundary failureclass.Boundary, wantKind failureclass.Kind) {
+	t.Helper()
+	if err == nil {
+		t.Fatalf("%s error = nil, want %s", name, wantBoundary)
+	}
+	var boundaryErr *failureclass.BoundaryError
+	if !errors.As(err, &boundaryErr) || boundaryErr.Boundary != wantBoundary {
+		t.Fatalf("%s boundary = %#v, want %s", name, err, wantBoundary)
+	}
+	if kind := failureclass.Classify(err, failureclass.Context{Runner: failureclass.RunnerFixer, Boundary: failureclass.BoundaryUnknown}); kind != wantKind {
+		t.Fatalf("%s Classify() = %s, want %s", name, kind, wantKind)
+	}
+	if wantBoundary == failureclass.BoundaryConfig {
+		preserved := failureclass.WithBoundary(err, failureclass.BoundaryGitHubAPI)
+		if !errors.As(preserved, &boundaryErr) || boundaryErr.Boundary != failureclass.BoundaryConfig {
+			t.Fatalf("%s re-wrap promoted local boundary: %#v", name, preserved)
+		}
+		if kind := failureclass.Classify(preserved, failureclass.Context{Runner: failureclass.RunnerFixer, Boundary: failureclass.BoundaryUnknown}); kind != failureclass.NonRetryable {
+			t.Fatalf("%s re-wrapped Classify() = %s, want non_retryable", name, kind)
+		}
+	}
+}
+
+func writeFakeGH(t *testing.T, script string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "gh")
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake gh: %v", err)
+	}
+	return path
+}
+
+func TestWithHostingAPIBoundaryClassification(t *testing.T) {
+	// Unit table for the adapter boundary helper: local contract/config parks,
+	// host-pressure launch and remote transport stay retryable GitHubAPI.
+	cases := []struct {
+		name     string
+		err      error
+		boundary failureclass.Boundary
+		kind     failureclass.Kind
+	}{
+		{"missing binary", fmt.Errorf("start command: %w", exec.ErrNotFound), failureclass.BoundaryConfig, failureclass.NonRetryable},
+		{"EAGAIN", fmt.Errorf("start command: %w", syscall.EAGAIN), failureclass.BoundaryGitHubAPI, failureclass.RetryableTransient},
+		{"ENOMEM", fmt.Errorf("start command: %w", syscall.ENOMEM), failureclass.BoundaryGitHubAPI, failureclass.RetryableTransient},
+		{"ETXTBSY", fmt.Errorf("start command: %w", syscall.ETXTBSY), failureclass.BoundaryGitHubAPI, failureclass.RetryableTransient},
+		{"EMFILE", fmt.Errorf("start command: %w", syscall.EMFILE), failureclass.BoundaryGitHubAPI, failureclass.RetryableTransient},
+		{"ENFILE", fmt.Errorf("start command: %w", syscall.ENFILE), failureclass.BoundaryGitHubAPI, failureclass.RetryableTransient},
+		{"unknown json field", &shell.CommandExecutionError{Message: "Command exited with code 1", Result: shell.Result{ExitCode: 1, Stderr: `unknown JSON field: "statusCheckRollup"`}}, failureclass.BoundaryConfig, failureclass.NonRetryable},
+		{"unknown flag", &shell.CommandExecutionError{Message: "Command exited with code 1", Result: shell.Result{ExitCode: 1, Stderr: "unknown flag: --not-a-real-flag"}}, failureclass.BoundaryConfig, failureclass.NonRetryable},
+		// Zero-exit decode failures from invalidJSONError must not become endless API retries.
+		{"invalid gh json payload", &shell.CommandExecutionError{Message: "Invalid gh JSON payload: unexpected end of JSON input; stdoutBytes=0", Result: shell.Result{ExitCode: 0, Stdout: "", Stderr: "unexpected end of JSON input"}}, failureclass.BoundaryConfig, failureclass.NonRetryable},
+		// Local shell capture truncation (256 KiB) must park as BoundaryConfig, not
+		// BoundaryGitHubAPI — oversized PR status/review payloads cannot be fixed by retry.
+		{"truncated stdout flags", &shell.CommandExecutionError{Message: "GitHub command output truncated: stdout after 262144 bytes", Result: shell.Result{ExitCode: 0, Stdout: strings.Repeat("x", 64), StdoutTruncated: true}}, failureclass.BoundaryConfig, failureclass.NonRetryable},
+		{"truncated stderr flags", &shell.CommandExecutionError{Message: "GitHub command output truncated: stderr after 262144 bytes", Result: shell.Result{ExitCode: 1, Stderr: strings.Repeat("e", 64), StderrTruncated: true}}, failureclass.BoundaryConfig, failureclass.NonRetryable},
+		{"truncated message only", &shell.CommandExecutionError{Message: "GitHub command output truncated: stdout after 262144 bytes", Result: shell.Result{ExitCode: 0}}, failureclass.BoundaryConfig, failureclass.NonRetryable},
+		{"remote EOF", &shell.CommandExecutionError{Message: "Command exited with code 1", Result: shell.Result{ExitCode: 1, Stderr: `Post "https://api.github.com/graphql": unexpected EOF`}}, failureclass.BoundaryGitHubAPI, failureclass.RetryableTransient},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assertHostingBoundary(t, tc.name, withHostingAPIBoundary(tc.err), tc.boundary, tc.kind)
+		})
+	}
+}
+
+func TestFixerGitHubAdapterBoundaryContracts(t *testing.T) {
+	// Cross-component contracts for fixerGitHubAdapter: construction, remote
+	// HTTP, real gateway/shell launch, CLI schema, and zero-exit invalid JSON.
+	repoPath := filepath.Join(t.TempDir(), "repo")
+	input := fixer.ViewPullRequestInput{Repo: "acme/looper", PRNumber: 42, CWD: repoPath}
+
+	t.Run("local construction", func(t *testing.T) {
+		t.Setenv("FORGEJO_TOKEN", "")
+		cfg := config.Config{
+			Providers: []config.ProviderConfig{{ID: "forgejo-main", Kind: config.ProviderKindForgejo, BaseURL: "https://forge.example", TokenEnv: stringPtr("FORGEJO_TOKEN")}},
+			Projects:  []config.ProjectRefConfig{{ID: "project_1", Provider: "forgejo-main", Repo: "acme/looper", RepoPath: repoPath}},
+		}
+		adapter := fixerGitHubAdapter{config: &cfg}
+		_, err := adapter.GetCurrentUserLogin(context.Background(), repoPath)
+		assertHostingBoundary(t, "GetCurrentUserLogin", err, failureclass.BoundaryConfig, failureclass.NonRetryable)
+		_, err = adapter.GetPullRequestAuthor(context.Background(), input)
+		assertHostingBoundary(t, "GetPullRequestAuthor", err, failureclass.BoundaryConfig, failureclass.NonRetryable)
+		_, err = adapter.ViewPullRequest(context.Background(), input)
+		assertHostingBoundary(t, "ViewPullRequest", err, failureclass.BoundaryConfig, failureclass.NonRetryable)
+	})
+
+	t.Run("remote 502 retryable", func(t *testing.T) {
+		t.Setenv("FORGEJO_TOKEN", "secret")
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusBadGateway)
+			_, _ = w.Write([]byte("bad gateway"))
+		}))
+		t.Cleanup(server.Close)
+		cfg := config.Config{
+			Providers: []config.ProviderConfig{{ID: "forgejo-main", Kind: config.ProviderKindForgejo, BaseURL: server.URL, TokenEnv: stringPtr("FORGEJO_TOKEN")}},
+			Projects:  []config.ProjectRefConfig{{ID: "project_1", Provider: "forgejo-main", Repo: "acme/looper", RepoPath: repoPath}},
+		}
+		_, err := fixerGitHubAdapter{config: &cfg}.GetCurrentUserLogin(context.Background(), repoPath)
+		assertHostingBoundary(t, "GetCurrentUserLogin", err, failureclass.BoundaryGitHubAPI, failureclass.RetryableTransient)
+	})
+
+	t.Run("forgejo PR 404 terminal", func(t *testing.T) {
+		t.Setenv("FORGEJO_TOKEN", "secret")
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"message":"Not Found"}`))
+		}))
+		t.Cleanup(server.Close)
+		cfg := config.Config{
+			Providers: []config.ProviderConfig{{ID: "forgejo-main", Kind: config.ProviderKindForgejo, BaseURL: server.URL, TokenEnv: stringPtr("FORGEJO_TOKEN")}},
+			Projects:  []config.ProjectRefConfig{{ID: "project_1", Provider: "forgejo-main", Repo: "acme/looper", RepoPath: repoPath}},
+		}
+		adapter := fixerGitHubAdapter{config: &cfg}
+		_, err := adapter.GetPullRequestAuthor(context.Background(), input)
+		assertHostingBoundary(t, "GetPullRequestAuthor", err, failureclass.BoundaryGitHubAPI, failureclass.NonRetryable)
+		_, err = adapter.ViewPullRequest(context.Background(), input)
+		assertHostingBoundary(t, "ViewPullRequest", err, failureclass.BoundaryGitHubAPI, failureclass.NonRetryable)
+	})
+
+	t.Run("missing gh launch", func(t *testing.T) {
+		adapter := fixerGitHubAdapter{gateway: githubinfra.New(githubinfra.Options{GHPath: filepath.Join(t.TempDir(), "no-such-gh")})}
+		cwd := t.TempDir()
+		in := fixer.ViewPullRequestInput{Repo: "acme/looper", PRNumber: 42, CWD: cwd}
+		_, err := adapter.GetCurrentUserLogin(context.Background(), cwd)
+		assertHostingBoundary(t, "GetCurrentUserLogin", err, failureclass.BoundaryConfig, failureclass.NonRetryable)
+		_, err = adapter.GetPullRequestAuthor(context.Background(), in)
+		assertHostingBoundary(t, "GetPullRequestAuthor", err, failureclass.BoundaryConfig, failureclass.NonRetryable)
+		_, err = adapter.ViewPullRequest(context.Background(), in)
+		assertHostingBoundary(t, "ViewPullRequest", err, failureclass.BoundaryConfig, failureclass.NonRetryable)
+	})
+
+	t.Run("inaccessible CWD launch", func(t *testing.T) {
+		ghPath := "gh"
+		if resolved, err := exec.LookPath("gh"); err == nil {
+			ghPath = resolved
+		}
+		adapter := fixerGitHubAdapter{gateway: githubinfra.New(githubinfra.Options{GHPath: ghPath})}
+		missingCWD := filepath.Join(t.TempDir(), "missing-worktree")
+		_, err := adapter.GetCurrentUserLogin(context.Background(), missingCWD)
+		assertHostingBoundary(t, "GetCurrentUserLogin", err, failureclass.BoundaryConfig, failureclass.NonRetryable)
+	})
+
+	t.Run("CLI schema failure", func(t *testing.T) {
+		// Real gateway + shell: gh launches and exits nonzero for bad --json field.
+		adapter := fixerGitHubAdapter{gateway: githubinfra.New(githubinfra.Options{
+			GHPath: writeFakeGH(t, "#!/bin/sh\nprintf '%s\\n' 'unknown JSON field: \"statusCheckRollup\"' >&2\nexit 1\n"),
+		})}
+		cwd := t.TempDir()
+		in := fixer.ViewPullRequestInput{Repo: "acme/looper", PRNumber: 42, CWD: cwd}
+		for _, name := range []string{"GetCurrentUserLogin", "GetPullRequestAuthor", "ViewPullRequest"} {
+			var err error
+			switch name {
+			case "GetCurrentUserLogin":
+				_, err = adapter.GetCurrentUserLogin(context.Background(), cwd)
+			case "GetPullRequestAuthor":
+				_, err = adapter.GetPullRequestAuthor(context.Background(), in)
+			case "ViewPullRequest":
+				_, err = adapter.ViewPullRequest(context.Background(), in)
+			}
+			if shell.IsStartFailure(err) {
+				t.Fatalf("%s IsStartFailure = true, want completed CLI contract failure", name)
+			}
+			assertHostingBoundary(t, name, err, failureclass.BoundaryConfig, failureclass.NonRetryable)
+		}
+	})
+
+	t.Run("invalid JSON zero-exit", func(t *testing.T) {
+		// Real gateway contract: gh exits 0 with malformed stdout; invalidJSONError
+		// emits "Invalid gh JSON payload" and must park as BoundaryConfig.
+		// GetCurrentUserLogin uses `gh api user --jq .login` (raw text), so cover
+		// the JSON-decoding entrypoints that surface invalidJSONError.
+		adapter := fixerGitHubAdapter{gateway: githubinfra.New(githubinfra.Options{
+			GHPath: writeFakeGH(t, "#!/bin/sh\nprintf '%s\\n' 'not-json-at-all'\nexit 0\n"),
+		})}
+		cwd := t.TempDir()
+		in := fixer.ViewPullRequestInput{Repo: "acme/looper", PRNumber: 42, CWD: cwd}
+		for _, name := range []string{"GetPullRequestAuthor", "ViewPullRequest"} {
+			var err error
+			switch name {
+			case "GetPullRequestAuthor":
+				_, err = adapter.GetPullRequestAuthor(context.Background(), in)
+			case "ViewPullRequest":
+				_, err = adapter.ViewPullRequest(context.Background(), in)
+			}
+			if err == nil {
+				t.Fatalf("%s error = nil, want invalid JSON payload failure", name)
+			}
+			if shell.IsStartFailure(err) {
+				t.Fatalf("%s IsStartFailure = true, want completed zero-exit decode failure", name)
+			}
+			if !strings.Contains(err.Error(), "Invalid gh JSON payload") {
+				t.Fatalf("%s error = %v, want Invalid gh JSON payload", name, err)
+			}
+			assertHostingBoundary(t, name, err, failureclass.BoundaryConfig, failureclass.NonRetryable)
+		}
+	})
+
+	t.Run("truncated shell capture", func(t *testing.T) {
+		// Real gateway + shell path: gh writes past shell's 256 KiB capture limit.
+		// runGhWithTimeout must surface truncation; withHostingAPIBoundary must park
+		// it as BoundaryConfig so unlimited fixer queues request intervention.
+		adapter := fixerGitHubAdapter{gateway: githubinfra.New(githubinfra.Options{
+			GHPath: writeFakeGH(t, "#!/bin/sh\n# Exceed shell defaultMaxOutputBytes (256 KiB).\ndd if=/dev/zero bs=1024 count=260 2>/dev/null | tr '\\0' 'x'\nexit 0\n"),
+		})}
+		cwd := t.TempDir()
+		in := fixer.ViewPullRequestInput{Repo: "acme/looper", PRNumber: 42, CWD: cwd}
+		for _, name := range []string{"GetCurrentUserLogin", "GetPullRequestAuthor", "ViewPullRequest"} {
+			var err error
+			switch name {
+			case "GetCurrentUserLogin":
+				_, err = adapter.GetCurrentUserLogin(context.Background(), cwd)
+			case "GetPullRequestAuthor":
+				_, err = adapter.GetPullRequestAuthor(context.Background(), in)
+			case "ViewPullRequest":
+				_, err = adapter.ViewPullRequest(context.Background(), in)
+			}
+			if err == nil {
+				t.Fatalf("%s error = nil, want truncated capture failure", name)
+			}
+			if shell.IsStartFailure(err) {
+				t.Fatalf("%s IsStartFailure = true, want completed truncation contract failure", name)
+			}
+			if !strings.Contains(err.Error(), "GitHub command output truncated") {
+				t.Fatalf("%s error = %v, want GitHub command output truncated", name, err)
+			}
+			var commandErr *shell.CommandExecutionError
+			if !errors.As(err, &commandErr) {
+				t.Fatalf("%s error type = %T, want *shell.CommandExecutionError", name, err)
+			}
+			if !commandErr.Result.StdoutTruncated && !commandErr.Result.StderrTruncated {
+				t.Fatalf("%s truncation flags unset on Result: %#v", name, commandErr.Result)
+			}
+			assertHostingBoundary(t, name, err, failureclass.BoundaryConfig, failureclass.NonRetryable)
+		}
+	})
+}
+
+func TestFixerGitHubAdapterResolvesIntegrationTokenIdentity(t *testing.T) {
+	t.Parallel()
+	integrationErr := func() (shell.Result, error) {
+		result := shell.Result{ExitCode: 1, Stderr: "HTTP 403: Resource not accessible by integration"}
+		return result, &shell.CommandExecutionError{Message: "Command exited with code 1", Result: result}
+	}
+	gateway := githubinfra.New(githubinfra.Options{
+		GHPath: "gh",
+		CWD:    t.TempDir(),
+		GHRun: func(_ context.Context, options shell.Options) (shell.Result, error) {
+			switch strings.Join(options.Args, " ") {
+			case "api user --jq .login", "api user --jq {login: .login, id: .id}":
+				return integrationErr()
+			case "api graphql -f query=query { viewer { login } }":
+				return shell.Result{Stdout: `{"data":{"viewer":{"login":"looper-app[bot]"}}}`}, nil
+			default:
+				t.Fatalf("unexpected gh args: %q", strings.Join(options.Args, " "))
+				return shell.Result{}, nil
+			}
+		},
+	})
+	login, err := fixerGitHubAdapter{gateway: gateway}.GetCurrentUserLogin(context.Background(), t.TempDir())
+	if err != nil {
+		t.Fatalf("GetCurrentUserLogin() error = %v", err)
+	}
+	if login != "looper-app[bot]" {
+		t.Fatalf("GetCurrentUserLogin() = %q, want looper-app[bot]", login)
+	}
+}
+
+func TestReviewerGitHubAdapterResolvesIntegrationTokenIdentity(t *testing.T) {
+	t.Parallel()
+	integrationErr := func() (shell.Result, error) {
+		result := shell.Result{ExitCode: 1, Stderr: "HTTP 403: Resource not accessible by integration"}
+		return result, &shell.CommandExecutionError{Message: "Command exited with code 1", Result: result}
+	}
+	gateway := githubinfra.New(githubinfra.Options{
+		GHPath: "gh",
+		CWD:    t.TempDir(),
+		GHRun: func(_ context.Context, options shell.Options) (shell.Result, error) {
+			switch strings.Join(options.Args, " ") {
+			case "api user --jq .login", "api user --jq {login: .login, id: .id}":
+				return integrationErr()
+			case "api graphql -f query=query { viewer { login } }":
+				return shell.Result{Stdout: `{"data":{"viewer":{"login":"looper-app[bot]"}}}`}, nil
+			default:
+				t.Fatalf("unexpected gh args: %q", strings.Join(options.Args, " "))
+				return shell.Result{}, nil
+			}
+		},
+	})
+	login, err := reviewerGitHubAdapter{gateway: gateway}.GetCurrentUserLogin(context.Background(), t.TempDir())
+	if err != nil {
+		t.Fatalf("GetCurrentUserLogin() error = %v", err)
+	}
+	if login != "looper-app[bot]" {
+		t.Fatalf("GetCurrentUserLogin() = %q, want looper-app[bot]", login)
 	}
 }
 

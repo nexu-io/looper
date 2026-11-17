@@ -443,6 +443,101 @@ func TestExecutorResumesPersistedNativeSession(t *testing.T) {
 	}
 }
 
+func TestGroupedExecutionsPreserveNativeResumeAcrossRestart(t *testing.T) {
+	coordinator := openAgentCoordinator(t)
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.April, 20, 12, 0, 0, 0, time.UTC)
+	nowISO := now.Format("2006-01-02T15:04:05.000Z")
+	sessionID := "codex-session-1"
+	mode := "native_resume"
+	status := "pending"
+	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Project", RepoPath: t.TempDir(), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_1", Seq: 1, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	if err := repos.AgentExecutions.Upsert(context.Background(), storage.AgentExecutionRecord{
+		ID:                 "agent_previous",
+		ProjectID:          strPtr("project_1"),
+		LoopID:             strPtr("loop_1"),
+		Vendor:             string(config.AgentVendorCodex),
+		Status:             "killed",
+		NativeSessionID:    &sessionID,
+		NativeResumeMode:   &mode,
+		NativeResumeStatus: &status,
+		StartedAt:          nowISO,
+		CreatedAt:          nowISO,
+		UpdatedAt:          nowISO,
+	}); err != nil {
+		t.Fatalf("AgentExecutions.Upsert() error = %v", err)
+	}
+
+	scriptDir := t.TempDir()
+	groupedArgsPath := filepath.Join(scriptDir, "grouped-args.txt")
+	finalArgsPath := filepath.Join(scriptDir, "final-args.txt")
+	scriptPath := filepath.Join(scriptDir, "mock-codex")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$*\" > \"$ARGS_PATH\"\nprintf '%s\\n' '{\"session_id\":\"grouped-session\"}'\nprintf '%s\\n' '__LOOPER_RESULT__={\"summary\":\"done\"}'\n"
+	if err := os.WriteFile(scriptPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("WriteFile(scriptPath) error = %v", err)
+	}
+	options := ExecutorOptions{
+		Config: ExecutorConfig{Vendor: config.AgentVendorCodex, Params: map[string]any{"command": scriptPath}, NativeResumeEnabled: true},
+		Repos:  repos,
+		Now: func() time.Time {
+			now = now.Add(10 * time.Millisecond)
+			return now
+		},
+		ParamsOwnerVendor: codexOwner(),
+	}
+	executor := New(options)
+
+	grouped, err := executor.Start(context.Background(), RunInput{ExecutionID: "agent_group", LoopID: "loop_1", WorkingDirectory: t.TempDir(), Prompt: "grouped findings", DisableNativeResume: true, Metadata: map[string]any{"phase": "review-group"}, Timeout: 15 * time.Second, Env: map[string]string{"ARGS_PATH": groupedArgsPath}})
+	if err != nil {
+		t.Fatalf("Start(group) error = %v", err)
+	}
+	if _, err := grouped.Wait(context.Background()); err != nil {
+		t.Fatalf("Wait(group) error = %v", err)
+	}
+	groupedArgs, err := os.ReadFile(groupedArgsPath)
+	if err != nil {
+		t.Fatalf("ReadFile(groupedArgsPath) error = %v", err)
+	}
+	if strings.Contains(string(groupedArgs), sessionID) {
+		t.Fatalf("grouped args = %q, want fresh start without pending session", groupedArgs)
+	}
+	latest, err := repos.AgentExecutions.GetLatestByLoopID(context.Background(), "loop_1")
+	if err != nil || latest == nil || latest.ID != "agent_group" {
+		t.Fatalf("GetLatestByLoopID() = %#v, %v, want grouped execution", latest, err)
+	}
+
+	// Reconstruct the executor after the group has been persisted. Resume must
+	// work from durable records without a captured session ID in memory.
+	executor = New(options)
+	foreignResume, err := executor.resolveNativeResume(context.Background(), RunInput{LoopID: "loop_1", UseSnapshot: true, SnapshotVendor: string(config.AgentVendorOpenCode)})
+	if err != nil || foreignResume.Enabled {
+		t.Fatalf("resume after vendor change = %#v, %v", foreignResume, err)
+	}
+	finalExec, err := executor.Start(context.Background(), RunInput{ExecutionID: "agent_final", LoopID: "loop_1", WorkingDirectory: t.TempDir(), Prompt: "full checkpoint prompt", NativeResumePrompt: "continue work with grouped finding", Timeout: 15 * time.Second, Env: map[string]string{"ARGS_PATH": finalArgsPath}})
+	if err != nil {
+		t.Fatalf("Start(final) error = %v", err)
+	}
+	if _, err := finalExec.Wait(context.Background()); err != nil {
+		t.Fatalf("Wait(final) error = %v", err)
+	}
+	finalArgs, err := os.ReadFile(finalArgsPath)
+	if err != nil {
+		t.Fatalf("ReadFile(finalArgsPath) error = %v", err)
+	}
+	if got, want := strings.TrimSpace(string(finalArgs)), "exec resume codex-session-1 continue work with grouped finding"; got != want {
+		t.Fatalf("final resume args = %q, want %q", got, want)
+	}
+	nextResume, err := executor.resolveNativeResume(context.Background(), RunInput{LoopID: "loop_1"})
+	if err != nil || nextResume.Enabled {
+		t.Fatalf("completed final review must supersede older pending sessions: %#v, %v", nextResume, err)
+	}
+}
+
 func TestExecutorFallsBackAfterFailedNativeResumeAttempt(t *testing.T) {
 
 	coordinator := openAgentCoordinator(t)
@@ -1512,20 +1607,37 @@ func TestExecutorStartFailsAndReapsProcessWhenInitialPersistenceFails(t *testing
 	if handle != nil {
 		t.Fatalf("Start() handle = %#v, want nil", handle)
 	}
-	if data, readErr := os.ReadFile(pidPath); readErr == nil {
-		pid, parseErr := strconv.Atoi(strings.TrimSpace(string(data)))
-		if parseErr != nil {
-			t.Fatalf("parse pid: %v", parseErr)
+	deadline := time.Now().Add(2 * time.Second)
+	var pid int
+	for {
+		data, readErr := os.ReadFile(pidPath)
+		if readErr != nil {
+			// Process died before creating the pid file.
+			return
 		}
-		deadline := time.Now().Add(2 * time.Second)
-		for time.Now().Before(deadline) {
-			if killErr := syscall.Kill(pid, 0); killErr == syscall.ESRCH {
+		pidStr := strings.TrimSpace(string(data))
+		if pidStr == "" {
+			// Redirection created the file; Start reaped the child before echo flushed.
+			if time.Now().After(deadline) {
 				return
 			}
 			time.Sleep(10 * time.Millisecond)
+			continue
 		}
-		t.Fatalf("spawned process %d survived failed Start", pid)
+		parsed, parseErr := strconv.Atoi(pidStr)
+		if parseErr != nil {
+			t.Fatalf("parse pid: %v", parseErr)
+		}
+		pid = parsed
+		break
 	}
+	for time.Now().Before(deadline) {
+		if killErr := syscall.Kill(pid, 0); killErr == syscall.ESRCH {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("spawned process %d survived failed Start", pid)
 }
 
 func TestExecutorWaitSurfacesTerminalPersistenceFailure(t *testing.T) {

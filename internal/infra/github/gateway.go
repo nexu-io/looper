@@ -18,6 +18,7 @@ import (
 	"github.com/nexu-io/looper/internal/diffanchor"
 	"github.com/nexu-io/looper/internal/disclosure"
 	"github.com/nexu-io/looper/internal/domain"
+	"github.com/nexu-io/looper/internal/hostingidentity"
 	"github.com/nexu-io/looper/internal/infra/shell"
 	"github.com/nexu-io/looper/internal/infra/specpr"
 	"github.com/nexu-io/looper/internal/outboundguard"
@@ -42,6 +43,7 @@ var (
 )
 
 var prNumberURLPattern = regexp.MustCompile(`/pull/(\d+)(?:/|$)`)
+var fixerDeclinedReplyMarkerRE = regexp.MustCompile(`(?is)<!--\s*looper-fixer-reply-declined\s+thread:(\S+)\s+fingerprint:(\S+)(?:\s+[^>]*)?-->`)
 
 var (
 	// ErrDiffTooLarge is returned when GitHub itself refuses a PR diff as oversized
@@ -578,6 +580,10 @@ type ListReviewThreadsInput struct {
 	PRNumber int64
 	CWD      string
 	Limit    int
+	// AllPages fetches every review-thread page for authority reads. When true,
+	// Limit is not used as a stop condition. Limit<=0 without AllPages still
+	// defaults to 100 so existing callers are unchanged.
+	AllPages bool
 }
 
 type ViewReviewThreadInput struct {
@@ -712,8 +718,12 @@ func New(options Options) *Gateway {
 		discoveryPRCache:       map[string]discoveryPullRequestListCacheEntry{},
 		discoveryReviewPRCache: map[string]discoveryPullRequestListCacheEntry{},
 		discoveryIssueCache:    map[string]discoveryIssueListCacheEntry{},
-		ghRun:                  ghRun,
-		gitRun:                 gitRun,
+		ghRun: func(ctx context.Context, input shell.Options) (shell.Result, error) {
+			return hostingidentity.RunGH(ctx, input, ghRun)
+		},
+		gitRun: func(ctx context.Context, input shell.Options) (shell.Result, error) {
+			return hostingidentity.RunGit(ctx, input, gitRun)
+		},
 		reviewSubmitDiagnostic: options.ReviewSubmitDiagnostic,
 	}
 }
@@ -1829,18 +1839,31 @@ func (g *Gateway) ViewReviewThread(ctx context.Context, input ViewReviewThreadIn
 }
 
 func (g *Gateway) ListReviewThreads(ctx context.Context, input ListReviewThreadsInput) ([]ReviewThread, error) {
+	unlimited := input.AllPages
 	limit := input.Limit
-	if limit <= 0 {
-		limit = 100
+	if !unlimited {
+		if limit <= 0 {
+			limit = 100
+		}
 	}
 	owner, name, err := parseRepo(input.Repo)
 	if err != nil {
 		return nil, err
 	}
-	out := make([]ReviewThread, 0, min(limit, 100))
+	capHint := 100
+	if !unlimited && limit > 0 {
+		capHint = min(limit, 100)
+	}
+	out := make([]ReviewThread, 0, capHint)
 	threadsCursor := ""
-	for len(out) < limit {
-		pageSize := min(100, limit-len(out))
+	for unlimited || len(out) < limit {
+		pageSize := 100
+		if !unlimited {
+			pageSize = min(100, limit-len(out))
+			if pageSize <= 0 {
+				break
+			}
+		}
 		nodes, nextCursor, hasNextPage, err := g.fetchReviewThreadPage(ctx, input.CWD, owner, name, input.PRNumber, pageSize, threadsCursor)
 		if err != nil {
 			return nil, err
@@ -1870,7 +1893,7 @@ func (g *Gateway) ListReviewThreads(ctx context.Context, input ListReviewThreads
 				thread.URL = thread.Comments[0].URL
 			}
 			out = append(out, thread)
-			if len(out) == limit {
+			if !unlimited && len(out) == limit {
 				break
 			}
 		}
@@ -2522,6 +2545,56 @@ type reviewIdempotencyMarker struct {
 
 var reviewMarkerRE = regexp.MustCompile(`<!--\s*looper:review\s+([^>]*)-->`)
 
+// ReviewEngagementHead recovers a loop's previous publication using the same
+// marker grammar and event policy as publish verification. Both GitHub GraphQL
+// and native review payloads are accepted. A valid review of the current head
+// prevents an older review from authorizing another full pass on that head.
+// allowBlockingComment is exclusively the Forgejo self-review transport fallback;
+// GitHub callers leave it false and retain their existing outcome/event policy.
+func ReviewEngagementHead(reviews []map[string]any, loopID, headSHA, login string, allowed []string, allowCleanComment, allowBlockingComment bool) string {
+	login = normalizeReviewMarkerLogin(strings.TrimPrefix(strings.TrimSpace(login), "@"))
+	if login == "" || strings.TrimSpace(loopID) == "" || strings.TrimSpace(headSHA) == "" {
+		return ""
+	}
+	wantID := "reviewer:" + strings.TrimSpace(loopID)
+	previous := ""
+	for _, review := range reviews {
+		author, _ := review["author"].(map[string]any)
+		if author == nil {
+			author, _ = review["user"].(map[string]any)
+		}
+		if normalizeReviewMarkerLogin(asString(author["login"])) != login {
+			continue
+		}
+		event := reviewEventFromState(asString(review["state"]))
+		commit, _ := review["commit"].(map[string]any)
+		sha := strings.TrimSpace(asString(commit["oid"]))
+		if sha == "" {
+			sha = strings.TrimSpace(asString(review["commit_id"]))
+		}
+		if sha == "" {
+			continue
+		}
+		for _, marker := range parseReviewIdempotencyMarkers(asString(review["body"])) {
+			if marker.ID != wantID && !strings.HasPrefix(marker.ID, wantID+":") {
+				continue
+			}
+			eventAllowed := reviewMarkerEventAllowedForOutcome(marker.Outcome, event, allowed, allowCleanComment)
+			if allowBlockingComment && marker.Outcome == "blocking" && event == "COMMENT" && reviewEventAllowed(event, allowed) {
+				eventAllowed = true
+			}
+			if marker.Head != sha || !eventAllowed {
+				continue
+			}
+			if sha == strings.TrimSpace(headSHA) {
+				return ""
+			}
+			previous = sha
+		}
+	}
+	return previous
+}
+
 func findReviewIdempotencyMarker(body string, marker string) (reviewIdempotencyMarker, bool) {
 	marker = strings.TrimSpace(marker)
 	for _, parsedMarker := range parseReviewIdempotencyMarkers(body) {
@@ -2860,6 +2933,10 @@ func (g *Gateway) UpdatePullRequestBody(ctx context.Context, input UpdatePullReq
 }
 
 func (g *Gateway) IsAuthenticated(ctx context.Context, cwd, hostname string) (bool, error) {
+	if session, selected := hostingidentity.FromContext(ctx); selected {
+		_, err := session.Credentials(ctx)
+		return err == nil, err
+	}
 	args := []string{"auth", "status"}
 	if strings.TrimSpace(hostname) != "" {
 		args = append(args, "--hostname", strings.TrimSpace(hostname))
@@ -2883,6 +2960,10 @@ func (g *Gateway) GetCurrentUserLogin(ctx context.Context, cwd string) (string, 
 }
 
 func (g *Gateway) GetCurrentUserIdentity(ctx context.Context, cwd string) (CurrentUserIdentity, error) {
+	if session, ok := hostingidentity.FromContext(ctx); ok {
+		credential, err := session.Credentials(ctx)
+		return CurrentUserIdentity{Login: credential.Login, NumericID: credential.NumericID}, err
+	}
 	result, err := g.runGh(ctx, cwd, "", "api", "user", "--jq", `{login: .login, id: .id}`)
 	if err != nil {
 		if isUserLoginUnsupportedForCurrentToken(err) {
@@ -2902,6 +2983,10 @@ func (g *Gateway) GetCurrentUserIdentity(ctx context.Context, cwd string) (Curre
 }
 
 func (g *Gateway) getCurrentUserLoginRaw(ctx context.Context, cwd string) (string, error) {
+	if session, ok := hostingidentity.FromContext(ctx); ok {
+		credential, err := session.Credentials(ctx)
+		return credential.Login, err
+	}
 	result, err := g.runGh(ctx, cwd, "", "api", "user", "--jq", ".login")
 	if err != nil {
 		if isUserLoginUnsupportedForCurrentToken(err) {
@@ -2913,6 +2998,18 @@ func (g *Gateway) getCurrentUserLoginRaw(ctx context.Context, cwd string) (strin
 }
 
 func (g *Gateway) GetCurrentUserLoginForRepo(ctx context.Context, repo string, cwd string) (string, error) {
+	if session, ok := hostingidentity.FromContext(ctx); ok {
+		hostname, targetRepo := splitRepoHostname(repo)
+		base, _ := url.Parse(session.Target().BaseURL)
+		if hostname != "" && !strings.EqualFold(hostname, base.Host) {
+			return "", fmt.Errorf("hosting identity %q: repository host differs from the bound target", session.Name())
+		}
+		if err := session.CheckRepository(targetRepo); err != nil {
+			return "", err
+		}
+		credential, err := session.Credentials(ctx)
+		return credential.Login, err
+	}
 	hostname, _ := splitRepoHostname(repo)
 	args := []string{"api", "user", "--jq", ".login"}
 	if hostname != "" {
@@ -3021,25 +3118,11 @@ func (g *Gateway) CapturePullRequestSnapshot(ctx context.Context, input CaptureP
 	if err != nil {
 		return storage.PullRequestSnapshotRecord{}, err
 	}
-	diff, err := g.GetPullRequestDiff(ctx, GetPullRequestDiffInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD})
-	if err != nil {
-		if !errors.Is(err, ErrDiffTooLarge) && !errors.Is(err, ErrLocalCaptureTruncated) {
-			return storage.PullRequestSnapshotRecord{}, err
-		}
-	}
 	capturedAt := strings.TrimSpace(input.CapturedAt)
 	if capturedAt == "" {
 		capturedAt = g.now().UTC().Format(javaScriptISOStringLayout)
 	}
-	payloadMap := map[string]any{"detail": detail, "diff": diff}
-	if errors.Is(err, ErrDiffTooLarge) {
-		payloadMap["diffTruncated"] = true
-		payloadMap["diffTruncationReason"] = DiffTruncationReasonGitHubTooLarge
-	}
-	if errors.Is(err, ErrLocalCaptureTruncated) {
-		payloadMap["diffTruncated"] = true
-		payloadMap["diffTruncationReason"] = DiffTruncationReasonLocalCapture
-	}
+	payloadMap := map[string]any{"detail": map[string]any{"state": detail.State, "isDraft": detail.IsDraft, "hasConflicts": detail.HasConflicts}}
 	payload, err := json.Marshal(payloadMap)
 	if err != nil {
 		return storage.PullRequestSnapshotRecord{}, fmt.Errorf("marshal pull request snapshot payload: %w", err)
@@ -3055,7 +3138,6 @@ func (g *Gateway) CapturePullRequestSnapshot(ctx context.Context, input CaptureP
 		Title:                 stringPtrIfNotEmpty(detail.Title),
 		Body:                  stringPtrIfNotEmpty(detail.Body),
 		Author:                stringPtrIfNotEmpty(detail.Author),
-		DiffRef:               stringPtr(fmt.Sprintf("gh:pr-diff:%s:%d", input.Repo, input.PRNumber)),
 		ChecksSummary:         stringPtrIfNotEmpty(summarizeChecks(detail.Checks)),
 		UnresolvedThreadCount: &unresolvedCount,
 		ReviewState:           stringPtrIfNotEmpty(detail.ReviewDecision),
@@ -3120,6 +3202,14 @@ func (g *Gateway) fetchReviewThreads(ctx context.Context, repo string, prNumber 
 	if err != nil {
 		return nil, err
 	}
+	login, err := g.GetCurrentUserLogin(ctx, cwd)
+	if err != nil || strings.TrimSpace(login) == "" {
+		login, err = g.GetCurrentUserLoginForRepo(ctx, repo, cwd)
+		if err != nil {
+			return nil, err
+		}
+	}
+	looperLogin := strings.TrimSpace(login)
 	out := make([]map[string]any, 0, 100)
 	cursor := ""
 	for {
@@ -3128,7 +3218,7 @@ func (g *Gateway) fetchReviewThreads(ctx context.Context, repo string, prNumber 
 			return nil, err
 		}
 		for _, node := range nodes {
-			normalized, ok := normalizeReviewThread(node)
+			normalized, ok := normalizeReviewThread(node, looperLogin)
 			if ok {
 				threadRow, _ := node.(map[string]any)
 				commentsRow, _ := threadRow["comments"].(map[string]any)
@@ -3146,7 +3236,7 @@ func (g *Gateway) fetchReviewThreads(ctx context.Context, repo string, prNumber 
 					commentCursor = nextCommentCursor
 					hasMoreComments = hasMore
 				}
-				if fingerprint := reviewThreadFingerprintFromNodes(allCommentNodes); fingerprint != "" {
+				if fingerprint := reviewThreadFingerprintFromNodes(asString(normalized["threadId"]), allCommentNodes, looperLogin); fingerprint != "" {
 					normalized["threadFingerprint"] = fingerprint
 				}
 				out = append(out, normalized)
@@ -3547,7 +3637,7 @@ func countUnresolvedThreads(comments []map[string]any) int {
 	return count
 }
 
-func normalizeReviewThread(value any) (map[string]any, bool) {
+func normalizeReviewThread(value any, looperLogin string) (map[string]any, bool) {
 	row, ok := value.(map[string]any)
 	if !ok {
 		return nil, false
@@ -3592,20 +3682,25 @@ func normalizeReviewThread(value any) (map[string]any, bool) {
 	} else if line := asInt64(row["line"]); line > 0 {
 		out["line"] = line
 	}
-	if fingerprint := reviewThreadFingerprintFromNodes(nodes); fingerprint != "" {
+	if fingerprint := reviewThreadFingerprintFromNodes(threadID, nodes, looperLogin); fingerprint != "" {
 		out["threadFingerprint"] = fingerprint
 	}
 	return out, true
 }
 
-func reviewThreadFingerprintFromNodes(nodes []any) string {
+func reviewThreadFingerprintFromNodes(threadID string, nodes []any, looperLogin string) string {
 	parts := make([]string, 0, len(nodes))
+	threadID = strings.TrimSpace(threadID)
 	for _, node := range nodes {
 		comment, _ := node.(map[string]any)
 		if comment == nil {
 			continue
 		}
-		if strings.Contains(asString(comment["body"]), "<!-- looper-fixer-reply ") {
+		body := asString(comment["body"])
+		if strings.Contains(body, "<!-- looper-fixer-reply ") {
+			continue
+		}
+		if isAuthenticatedFixerDeclinedReply(threadID, comment, looperLogin) {
 			continue
 		}
 		id := strings.TrimSpace(asString(comment["id"]))
@@ -3619,6 +3714,35 @@ func reviewThreadFingerprintFromNodes(nodes []any) string {
 		return ""
 	}
 	return strings.Join(parts, "|")
+}
+
+func isAuthenticatedFixerDeclinedReply(threadID string, comment map[string]any, looperLogin string) bool {
+	if threadID == "" || comment == nil {
+		return false
+	}
+	looperLogin = strings.TrimSpace(looperLogin)
+	if looperLogin == "" {
+		return false
+	}
+	author := strings.TrimSpace(extractAuthor(comment["author"]))
+	if author == "" || !strings.EqualFold(author, looperLogin) {
+		return false
+	}
+	gotThread, fingerprint, ok := parseFixerDeclinedReplyMarker(asString(comment["body"]))
+	return ok && fingerprint != "" && gotThread == threadID
+}
+
+func parseFixerDeclinedReplyMarker(body string) (threadID, fingerprint string, ok bool) {
+	m := fixerDeclinedReplyMarkerRE.FindStringSubmatch(body)
+	if len(m) < 3 {
+		return "", "", false
+	}
+	threadID = strings.TrimSpace(m[1])
+	fingerprint = strings.TrimSpace(m[2])
+	if threadID == "" || fingerprint == "" {
+		return "", "", false
+	}
+	return threadID, fingerprint, true
 }
 
 func validateCloseIssueStateReason(value string) (string, error) {
@@ -4007,7 +4131,7 @@ func extractReviewRequestUser(value any) (GitHubUser, bool) {
 	if !ok {
 		return GitHubUser{}, false
 	}
-	if asString(row["__typename"]) == "User" {
+	if kind := asString(row["__typename"]); kind == "User" || kind == "Bot" {
 		login := asString(row["login"])
 		if login == "" {
 			return GitHubUser{}, false
@@ -4015,7 +4139,7 @@ func extractReviewRequestUser(value any) (GitHubUser, bool) {
 		return GitHubUser{Login: login, ID: asInt64(firstNonNil(row["databaseId"], row["id"]))}, true
 	}
 	reviewer, _ := row["requestedReviewer"].(map[string]any)
-	if asString(reviewer["__typename"]) == "User" {
+	if kind := asString(reviewer["__typename"]); kind == "User" || kind == "Bot" {
 		login := asString(reviewer["login"])
 		if login == "" {
 			return GitHubUser{}, false

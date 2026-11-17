@@ -1,7 +1,9 @@
 package diffanchor
 
 import (
+	"bufio"
 	"fmt"
+	"io"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -52,6 +54,13 @@ type ValidationResult struct {
 var hunkRE = regexp.MustCompile(`^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@`)
 
 func Parse(diff string) Index {
+	idx, _ := ParseReader(strings.NewReader(diff))
+	return idx
+}
+
+// ParseReader indexes a complete patch without retaining its content. ReadString
+// deliberately has no Scanner token cap: generated files may have very long lines.
+func ParseReader(input io.Reader) (Index, error) {
 	var idx Index
 	var path string
 	var oldLine, newLine int64
@@ -100,7 +109,16 @@ func Parse(diff string) Index {
 			openLeft.Excerpt = text
 		}
 	}
-	for _, line := range strings.Split(diff, "\n") {
+	reader := bufio.NewReader(input)
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil && err != io.EOF {
+			return Index{}, err
+		}
+		if len(line) == 0 && err == io.EOF {
+			break
+		}
+		line = strings.TrimSuffix(line, "\n")
 		if strings.HasPrefix(line, "diff --git ") {
 			flush()
 			path = gitDiffPath(line)
@@ -159,7 +177,7 @@ func Parse(diff string) Index {
 		}
 		return idx.Ranges[i].Start < idx.Ranges[j].Start
 	})
-	return idx
+	return idx, nil
 }
 
 func (idx Index) FormatPromptSection(limit int) string {

@@ -79,7 +79,8 @@
               "artifactName": "<artifact-name>",
               "supportedTargets": [
                 "darwin-arm64",
-                "linux-amd64"
+                "linux-amd64",
+                "linux-arm64"
               ]
             }
           },
@@ -351,6 +352,9 @@
             "fixAllPullRequests": false,
             "openPrStrategy": "all_done",
             "addSnapshotMode": "async",
+            "loop": {
+              "quietPeriodSeconds": 60
+            },
             "workerShepherd": false
           },
           "instructions": {
@@ -424,6 +428,7 @@
                   "minPublishIntervalSeconds": 300,
                   "maxIterationsPerPR": 20,
                   "maxIterationsPerHead": 1,
+                  "maxPublishesPerPR": 3,
                   "maxWallClockSeconds": 0,
                   "maxConsecutiveFailures": 3,
                   "maxAgentExecutionsPerPR": 25,
@@ -458,6 +463,10 @@
                   "requireCurrentReviewRequest": true,
                   "requireNewHeadSinceThread": true,
                   "scope": "looper_authored_only"
+                },
+                "relatedFileGroups": {
+                  "enabled": false,
+                  "minChangedFiles": 24
                 }
               },
               "discovery": {
@@ -473,6 +482,11 @@
                   "reviewingLabel": "looper:spec-reviewing",
                   "requireHumanApproval": false
                 }
+              },
+              "skills": {
+                "mode": "extend",
+                "required": [],
+                "optional": []
               }
             },
             "fixer": {
@@ -482,6 +496,12 @@
                 "labels": [],
                 "labelMode": "all",
                 "authorFilter": "current_user"
+              },
+              "behavior": {
+                "loop": {
+                  "quietPeriodSeconds": 0,
+                  "maxPushesPerPR": 3
+                }
               }
             },
             "worker": {
@@ -682,6 +702,7 @@
               "repo": "acme/looper",
               "prNumber": 42,
               "status": "running",
+              "displayStatus": "manual_intervention",
               "configJson": null,
               "metadataJson": null,
               "lastRunAt": "2026-04-11T12:00:00.000Z",
@@ -740,6 +761,7 @@
           "repo": "acme/looper",
           "prNumber": 42,
           "status": "running",
+          "displayStatus": "manual_intervention",
           "configJson": null,
           "metadataJson": null,
           "lastRunAt": "2026-04-11T12:00:00.000Z",
@@ -906,7 +928,8 @@
           "queueItemId": "<uuid>",
           "mode": "auto",
           "resetAttempts": true,
-          "discardWorktreeChanges": false
+          "discardWorktreeChanges": false,
+          "clearUnusableWorktreePath": false
         },
         "requestId": "fixture-request-id"
       }
@@ -953,7 +976,8 @@
           "queueItemId": "<uuid>",
           "mode": "auto",
           "resetAttempts": true,
-          "discardWorktreeChanges": false
+          "discardWorktreeChanges": false,
+          "clearUnusableWorktreePath": false
         },
         "requestId": "fixture-request-id"
       }

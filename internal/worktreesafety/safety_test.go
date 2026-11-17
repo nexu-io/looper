@@ -55,6 +55,21 @@ func TestValidateRejectsRepoPathThroughSymlink(t *testing.T) {
 	}
 }
 
+func TestIsProjectRepoPath(t *testing.T) {
+	t.Parallel()
+
+	repoPath := t.TempDir()
+	if !IsProjectRepoPath(repoPath, repoPath) {
+		t.Fatal("IsProjectRepoPath(same) = false, want true")
+	}
+	if IsProjectRepoPath(filepath.Join(repoPath, "worktree"), repoPath) {
+		t.Fatal("IsProjectRepoPath(child) = true, want false")
+	}
+	if IsProjectRepoPath("", repoPath) || IsProjectRepoPath(repoPath, "") {
+		t.Fatal("IsProjectRepoPath(empty) = true, want false")
+	}
+}
+
 func TestValidateAllowsExistingWorktreeUnderSymlinkedRoot(t *testing.T) {
 	t.Parallel()
 

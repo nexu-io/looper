@@ -145,6 +145,7 @@ type SystemNotificationPayload struct {
 	EntityType string
 	EntityID   string
 	DedupeKey  string
+	LocalOnly  bool
 	// MentionOpenIds @-mentions these Feishu open_ids in the thread message — set only
 	// for milestones a human should see (e.g. the impl PR is ready), not routine updates.
 	MentionOpenIds []string
@@ -236,12 +237,14 @@ func (g *Gateway) Notify(ctx context.Context, payload SystemNotificationPayload)
 		records = append(records, record)
 	}
 
-	if strings.EqualFold(strings.TrimSpace(g.config.Webhook.Mode), "app") {
-		if record, ok := g.recordFeishuApp(ctx, payload); ok {
+	if !payload.LocalOnly {
+		if strings.EqualFold(strings.TrimSpace(g.config.Webhook.Mode), "app") {
+			if record, ok := g.recordFeishuApp(ctx, payload); ok {
+				records = append(records, record)
+			}
+		} else if record, ok := g.recordWebhook(ctx, payload); ok {
 			records = append(records, record)
 		}
-	} else if record, ok := g.recordWebhook(ctx, payload); ok {
-		records = append(records, record)
 	}
 
 	return records
@@ -344,7 +347,7 @@ func (g *Gateway) recordOsascript(ctx context.Context, payload SystemNotificatio
 
 	_, err := g.runCommand(ctx, shell.Options{
 		Command: g.osascriptPath,
-		Args:    []string{"-e", buildAppleScript(payload, g.config, g.logFilePath)},
+		Args:    []string{"-e", buildAppleScript(payload, g.config)},
 		Timeout: osascriptTimeout,
 	})
 	if err != nil {
@@ -642,7 +645,7 @@ func feishuMentionMarkup(openIDs []string) string {
 // the app-bot credentials in notifications.webhook (appIdEnv/appSecretEnv/chatId)
 // and is a no-op error when they are not configured. Best-effort; caller logs.
 func (g *Gateway) SendHITLAsk(ctx context.Context, card HITLAskCard) error {
-	if card.Transport != "feishu" && strings.TrimSpace(card.SourceURL) == "" {
+	if card.Transport != "feishu" && card.Transport != "feishu-callback" && strings.TrimSpace(card.SourceURL) == "" {
 		return fmt.Errorf("decision notification requires an exact source-of-truth URL")
 	}
 	return g.enqueueFeishuCard(ctx, "Decision needed", card.Question, card.LoopID, feishuCardIntent{Kind: "hitl", HITL: &card})
@@ -678,7 +681,7 @@ func (g *Gateway) deliverHITLAsk(ctx context.Context, card HITLAskCard) error {
 	if len(card.MentionOpenIds) == 0 {
 		card.MentionOpenIds = cfg.MentionOpenIds
 	}
-	if card.Transport != "feishu" {
+	if card.Transport != "feishu" && card.Transport != "feishu-callback" {
 		card.MentionOpenIds = firstFeishuOwner(card.MentionOpenIds)
 	}
 	if strings.TrimSpace(card.OwnerOpenID) == "" {
@@ -999,7 +1002,7 @@ func buildFeishuAskCard(card HITLAskCard) ([]byte, error) {
 	if rec := strings.TrimSpace(card.Recommendation); rec != "" {
 		elements = append(elements, larkDiv("🔎 "+rec))
 	}
-	if len(options) > 0 {
+	if len(options) > 0 && card.Transport != "feishu-callback" {
 		elements = append(elements, larkDiv("**可选项**\n"+strings.Join(options, "\n")))
 	}
 	// Per-option consequences: pick this → that happens.
@@ -1011,11 +1014,41 @@ func buildFeishuAskCard(card HITLAskCard) ([]byte, error) {
 	if c := feishuConfidenceLabel(card.Confidence); c != "" {
 		noteParts = append(noteParts, c)
 	}
-	noteParts = append(noteParts, "loop "+seq, "请在来源系统回答；飞书回复不会被读取")
+	if card.Transport == "feishu-callback" {
+		noteParts = append(noteParts, "loop "+seq, "点选项或直接回文字")
+	} else {
+		noteParts = append(noteParts, "loop "+seq, "请在来源系统回答；飞书回复不会被读取")
+	}
 	elements = append(elements, map[string]any{"tag": "note", "elements": []any{map[string]any{"tag": "lark_md", "content": strings.Join(noteParts, " · ")}}})
 	elements = append(elements, feishuLooperOwnerNote(card.OwnerOpenID))
 	if answered := strings.TrimSpace(card.AnsweredWith); answered != "" {
 		elements = append(elements, larkDiv("✅ **已定夺:"+answered+"** · Looper 继续处理中 →"))
+	} else if card.Transport == "feishu-callback" {
+		// Existing daemon deployments answer through the verified callback;
+		// standalone collab uses the bridge's conversational thread renderer.
+		actions := make([]any, 0, len(card.Options))
+		for _, option := range card.Options {
+			option = strings.TrimSpace(option)
+			if option == "" {
+				continue
+			}
+			label, buttonType := option, "primary"
+			if recommended := strings.TrimSpace(card.RecommendedOption); recommended != "" {
+				if strings.EqualFold(option, recommended) {
+					label = "⭐ " + option + " · 推荐"
+				} else {
+					buttonType = "default"
+				}
+			}
+			actions = append(actions, map[string]any{
+				"tag": "button", "type": buttonType,
+				"text":  map[string]any{"tag": "plain_text", "content": label},
+				"value": map[string]any{"loopSeq": seq, "answer": option},
+			})
+		}
+		if len(actions) > 0 {
+			elements = append(elements, map[string]any{"tag": "action", "actions": actions})
+		}
 	} else {
 		elements = append(elements, map[string]any{"tag": "action", "actions": []any{map[string]any{
 			"tag":  "button",
@@ -2838,17 +2871,9 @@ func (g *Gateway) persistNotification(ctx context.Context, record storage.Notifi
 	})
 }
 
-func buildAppleScript(payload SystemNotificationPayload, cfg config.NotificationConfig, logFilePath string) string {
+func buildAppleScript(payload SystemNotificationPayload, cfg config.NotificationConfig) string {
 	body := escapeAppleScriptString(payload.Body)
 	title := escapeAppleScriptString(payload.Title)
-
-	if payload.Level == "failure" && strings.TrimSpace(logFilePath) != "" {
-		openLogPath := escapeAppleScriptString(logFilePath)
-		return fmt.Sprintf(`set dialogResult to display dialog %q with title %q buttons {"Open Log", "Dismiss"} default button "Dismiss" cancel button "Dismiss" giving up after 30
-if gave up of dialogResult is false and button returned of dialogResult is "Open Log" then
-  do shell script "open " & quoted form of %q
-end if`, body, title, openLogPath)
-	}
 
 	subtitle := ""
 	if payload.Subtitle != "" {

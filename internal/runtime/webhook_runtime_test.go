@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -609,7 +610,7 @@ func TestWebhookRuntimeReconcileUsesCapturedCatalogSnapshotWhenForgejoPublishes(
 	published.Projects = append(published.Projects, config.ProjectRefConfig{ID: "project_2", Provider: "forgejo-main", Repo: "acme/forgejo"})
 	rt.updateConfig(published)
 
-	if err := rt.reconcileSnapshot(repositories, captured); err != nil {
+	if err := rt.reconcileSnapshot(context.Background(), repositories, captured); err != nil {
 		t.Fatalf("reconcileSnapshot() error = %v", err)
 	}
 	status := rt.Status()
@@ -618,6 +619,8 @@ func TestWebhookRuntimeReconcileUsesCapturedCatalogSnapshotWhenForgejoPublishes(
 	}
 }
 
+// Contract: tunnel helpers must keep using the Reconcile-captured config while a
+// concurrent project publication rewrites w.cfg.Projects under updateConfig.
 func TestWebhookRuntimeTerminalForwarderExitLatchesWithoutRespawn(t *testing.T) {
 	testBin, err := os.Executable()
 	if err != nil {
@@ -697,7 +700,9 @@ func TestWebhookRuntimeBootstrapAdoptsMatchingForwarderRecord(t *testing.T) {
 		t.Fatalf("WebhookForwarders.Upsert() error = %v", err)
 	}
 
-	probe := &testProcessProbe{alive: true, start: 99, exe: ghPath, argv: []string{ghPath, "webhook", "forward", "--repo", "nexu-io/looper", "--events", events, "--url", endpoint}}
+	alive := &atomic.Bool{}
+	alive.Store(true)
+	probe := &testProcessProbe{aliveOverride: alive, start: 99, exe: ghPath, argv: []string{ghPath, "webhook", "forward", "--repo", "nexu-io/looper", "--events", events, "--url", endpoint}}
 	rt := &webhookRuntime{
 		cfg:             webhookRuntimeTestConfig("nexu-io/looper"),
 		ghPath:          ghPath,
@@ -707,7 +712,7 @@ func TestWebhookRuntimeBootstrapAdoptsMatchingForwarderRecord(t *testing.T) {
 		probe:           probe,
 		now:             time.Now,
 	}
-	t.Cleanup(func() { probe.alive = false; rt.Stop() })
+	t.Cleanup(func() { alive.Store(false); rt.Stop() })
 
 	rt.Start(repositories)
 	status := rt.Status()
@@ -756,7 +761,9 @@ func TestWebhookRuntimeBootstrapAdoptsDesiredForwarderWhenGHPathUnavailable(t *t
 	if err := repositories.WebhookForwarders.Upsert(context.Background(), record); err != nil {
 		t.Fatalf("WebhookForwarders.Upsert() error = %v", err)
 	}
-	probe := &testProcessProbe{alive: true, start: 99, exe: ghPath, argv: []string{ghPath, "webhook", "forward", "--repo", "nexu-io/looper", "--events", events, "--url", endpoint}}
+	alive := &atomic.Bool{}
+	alive.Store(true)
+	probe := &testProcessProbe{aliveOverride: alive, start: 99, exe: ghPath, argv: []string{ghPath, "webhook", "forward", "--repo", "nexu-io/looper", "--events", events, "--url", endpoint}}
 	rt := &webhookRuntime{
 		cfg:             webhookRuntimeTestConfig("nexu-io/looper"),
 		status:          WebhookStatus{Enabled: true, EndpointURL: endpoint, FallbackPollIntervalSeconds: 300},
@@ -765,7 +772,7 @@ func TestWebhookRuntimeBootstrapAdoptsDesiredForwarderWhenGHPathUnavailable(t *t
 		probe:           probe,
 		now:             time.Now,
 	}
-	t.Cleanup(func() { probe.alive = false; rt.Stop() })
+	t.Cleanup(func() { alive.Store(false); rt.Stop() })
 
 	rt.Bootstrap(context.Background(), repositories)
 	status := rt.Status()
@@ -957,8 +964,10 @@ func TestWebhookRuntimeBootstrapRetryDoesNotDuplicateAdoptedForwarders(t *testin
 		t.Fatalf("WebhookForwarders.Upsert(record2) error = %v", err)
 	}
 
+	alive := &atomic.Bool{}
+	alive.Store(true)
 	probe := &multiProcessProbe{probes: map[int]testProcessProbe{
-		4242: {alive: true, start: 99, exe: ghPath, argv: []string{ghPath, "webhook", "forward", "--repo", "nexu-io/looper", "--events", events1, "--url", endpoint}},
+		4242: {aliveOverride: alive, start: 99, exe: ghPath, argv: []string{ghPath, "webhook", "forward", "--repo", "nexu-io/looper", "--events", events1, "--url", endpoint}},
 		4343: {alive: true, startErr: errors.New("probe failed")},
 	}}
 	rt := &webhookRuntime{
@@ -970,7 +979,7 @@ func TestWebhookRuntimeBootstrapRetryDoesNotDuplicateAdoptedForwarders(t *testin
 		probe:           probe,
 		now:             time.Now,
 	}
-	t.Cleanup(func() { probe.probes[4242] = testProcessProbe{}; rt.Stop() })
+	t.Cleanup(func() { alive.Store(false); rt.Stop() })
 
 	rt.Bootstrap(context.Background(), repositories)
 	rt.Bootstrap(context.Background(), repositories)
@@ -1135,14 +1144,15 @@ func webhookRuntimeTestConfig(repos ...string) config.Config {
 }
 
 type testProcessProbe struct {
-	alive    bool
-	aliveErr error
-	start    int64
-	startErr error
-	exe      string
-	exeErr   error
-	argv     []string
-	argvErr  error
+	aliveOverride *atomic.Bool
+	alive         bool
+	aliveErr      error
+	start         int64
+	startErr      error
+	exe           string
+	exeErr        error
+	argv          []string
+	argvErr       error
 }
 
 type multiProcessProbe struct {
@@ -1151,7 +1161,7 @@ type multiProcessProbe struct {
 
 func (p *multiProcessProbe) IsAlive(pid int) (bool, error) {
 	probe := p.probes[pid]
-	return probe.alive, probe.aliveErr
+	return probe.IsAlive(pid)
 }
 func (p *multiProcessProbe) StartTime(pid int) (int64, error) {
 	probe := p.probes[pid]
@@ -1166,7 +1176,12 @@ func (p *multiProcessProbe) Argv(pid int) ([]string, error) {
 	return append([]string{}, probe.argv...), probe.argvErr
 }
 
-func (p *testProcessProbe) IsAlive(pid int) (bool, error)    { return p.alive, p.aliveErr }
+func (p *testProcessProbe) IsAlive(pid int) (bool, error) {
+	if p.aliveOverride != nil {
+		return p.aliveOverride.Load(), p.aliveErr
+	}
+	return p.alive, p.aliveErr
+}
 func (p *testProcessProbe) StartTime(pid int) (int64, error) { return p.start, p.startErr }
 func (p *testProcessProbe) Argv(pid int) ([]string, error) {
 	return append([]string{}, p.argv...), p.argvErr

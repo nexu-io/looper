@@ -14,6 +14,7 @@ import (
 
 	"github.com/nexu-io/looper/internal/infra/shell"
 	"github.com/nexu-io/looper/internal/storage"
+	"github.com/nexu-io/looper/internal/worktreesafety"
 )
 
 func TestGatewayRejectsRepoPathAsMutationWorktree(t *testing.T) {
@@ -847,9 +848,18 @@ func TestGatewayPrepareWorktreeSupportsExplicitRef(t *testing.T) {
 		t.Fatalf("CreateWorktree() error = %v", err)
 	}
 
-	prepared, err := gateway.PrepareWorktree(ctx, PrepareWorktreeInput{WorktreePath: worktree.WorktreePath, Branch: "reviewer/pr-42", Ref: "refs/heads/feature/fixer"})
+	// The base exists only remotely and is not an ancestor of the feature head.
+	fixture.createUnfetchedRemoteBranch(t, "advanced-base")
+	baseSHA := stringsTrimSpace(runGit(t, fixture.remotePath, "rev-parse", "refs/heads/advanced-base"))
+	prepared, err := gateway.PrepareWorktree(ctx, PrepareWorktreeInput{WorktreePath: worktree.WorktreePath, Branch: "reviewer/pr-42", Ref: "refs/heads/feature/fixer", BaseSHA: baseSHA})
 	if err != nil {
 		t.Fatalf("PrepareWorktree() error = %v", err)
+	}
+	if got := stringsTrimSpace(runGit(t, worktree.WorktreePath, "rev-parse", baseSHA+"^{commit}")); got != baseSHA {
+		t.Fatalf("local base = %s, want %s", got, baseSHA)
+	}
+	if got := stringsTrimSpace(runGit(t, worktree.WorktreePath, "rev-parse", "FETCH_HEAD")); got != prepared.HeadSHA {
+		t.Fatalf("base fetch displaced PR head: %s != %s", got, prepared.HeadSHA)
 	}
 	if !prepared.Clean {
 		t.Fatal("PrepareWorktree().Clean = false, want true")
@@ -1231,7 +1241,7 @@ func TestGatewayDiscardWorktreeChangesRejectsUnsafePaths(t *testing.T) {
 	}
 }
 
-func TestGatewayRestoreWorktreePropagatesHealthCheckFailureForStoredWorktree(t *testing.T) {
+func TestGatewayRestoreWorktreeRecreatesHollowStoredWorktree(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
@@ -1239,6 +1249,8 @@ func TestGatewayRestoreWorktreePropagatesHealthCheckFailureForStoredWorktree(t *
 	fixture.createMainOnlyRepo(t)
 	gateway := fixture.gateway()
 
+	// Empty hollow directory with an active DB row — the production failure mode
+	// that previously infinite-retried as retryable_transient.
 	brokenWorktreePath := filepath.Join(fixture.worktreeRoot, "broken-worktree")
 	mustMkdirAll(t, brokenWorktreePath)
 	metadata := `{"recovered":false}`
@@ -1247,16 +1259,111 @@ func TestGatewayRestoreWorktreePropagatesHealthCheckFailureForStoredWorktree(t *
 		t.Fatalf("Worktrees.Upsert() error = %v", err)
 	}
 
-	_, err := gateway.RestoreWorktree(ctx, RestoreWorktreeInput{ProjectID: fixture.projectID, RepoPath: fixture.repoPath, Branch: "feature/fixer", WorktreeRoot: fixture.worktreeRoot})
+	// Restore should clear the hollow path and fall through (nil, nil) so Create can rebuild.
+	restored, err := gateway.RestoreWorktree(ctx, RestoreWorktreeInput{ProjectID: fixture.projectID, RepoPath: fixture.repoPath, Branch: "feature/fixer", WorktreeRoot: fixture.worktreeRoot})
+	if err != nil {
+		t.Fatalf("RestoreWorktree() error = %v, want nil after clearing hollow path", err)
+	}
+	if restored != nil {
+		t.Fatalf("RestoreWorktree() restored = %+v, want nil so CreateWorktree can rebuild", restored)
+	}
+	if _, err := os.Stat(brokenWorktreePath); !os.IsNotExist(err) {
+		t.Fatalf("hollow path still exists after RestoreWorktree, err=%v", err)
+	}
+
+	created, err := gateway.CreateWorktree(ctx, CreateWorktreeInput{
+		ProjectID:    fixture.projectID,
+		RepoPath:     fixture.repoPath,
+		WorktreeRoot: fixture.worktreeRoot,
+		Branch:       "feature/fixer",
+		BaseBranch:   "main",
+	})
+	if err != nil {
+		t.Fatalf("CreateWorktree() error = %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(created.WorktreePath, ".git")); err != nil {
+		t.Fatalf("created worktree missing .git: %v", err)
+	}
+}
+
+func TestGatewayRestoreWorktreePreservesPopulatedUnusablePath(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	fixture := newFixture(t)
+	fixture.createMainOnlyRepo(t)
+	gateway := fixture.gateway()
+
+	brokenWorktreePath := filepath.Join(fixture.worktreeRoot, "populated-hollow")
+	mustMkdirAll(t, brokenWorktreePath)
+	if err := os.WriteFile(filepath.Join(brokenWorktreePath, "agent-output.txt"), []byte("keep\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	metadata := `{"recovered":false}`
+	baseBranch := "main"
+	if err := fixture.repos.Worktrees.Upsert(ctx, storage.WorktreeRecord{ID: "populated-record", ProjectID: fixture.projectID, RepoPath: fixture.repoPath, WorktreePath: brokenWorktreePath, Branch: "feature/populated", BaseBranch: &baseBranch, Status: "active", MetadataJSON: &metadata, CreatedAt: fixture.now().UTC().Format(javaScriptISOStringLayout), UpdatedAt: fixture.now().UTC().Format(javaScriptISOStringLayout)}); err != nil {
+		t.Fatalf("Worktrees.Upsert() error = %v", err)
+	}
+
+	_, err := gateway.RestoreWorktree(ctx, RestoreWorktreeInput{ProjectID: fixture.projectID, RepoPath: fixture.repoPath, Branch: "feature/populated", WorktreeRoot: fixture.worktreeRoot})
 	if err == nil {
-		t.Fatal("RestoreWorktree() error = nil, want health check failure")
+		t.Fatal("RestoreWorktree() error = nil, want preserved populated path error")
 	}
-	var commandErr *shell.CommandExecutionError
-	if !errors.As(err, &commandErr) {
-		t.Fatalf("RestoreWorktree() error = %T, want *shell.CommandExecutionError", err)
+	if !errors.Is(err, worktreesafety.ErrUnusableWorktreePreserved) {
+		t.Fatalf("RestoreWorktree() error = %v, want ErrUnusableWorktreePreserved", err)
 	}
-	if commandErr.Result.ExitCode == 1 {
-		t.Fatalf("RestoreWorktree() exit code = %d, want non-1 health check failure", commandErr.Result.ExitCode)
+	if _, err := os.Stat(filepath.Join(brokenWorktreePath, "agent-output.txt")); err != nil {
+		t.Fatalf("populated content missing: %v", err)
+	}
+}
+
+func TestGatewayIsHealthyWorktreePropagatesStatusFailureWhenLocalMetadataUsable(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	fixture := newFixture(t)
+	fixture.createMainOnlyRepo(t)
+	gateway := fixture.gateway()
+
+	created, err := gateway.CreateWorktree(ctx, CreateWorktreeInput{
+		ProjectID:    fixture.projectID,
+		RepoPath:     fixture.repoPath,
+		WorktreeRoot: fixture.worktreeRoot,
+		Branch:       "feature/status-fail",
+		BaseBranch:   "main",
+	})
+	if err != nil {
+		t.Fatalf("CreateWorktree() error = %v", err)
+	}
+	// Make the worktree path unreadable to git status while leaving local
+	// metadata layout intact. chmod 000 on the worktree directory causes
+	// `git -C path status` to fail without removing HEAD/objects/refs.
+	// Restore perms in cleanup so TempDir removal succeeds.
+	if err := os.Chmod(created.WorktreePath, 0o000); err != nil {
+		t.Fatalf("Chmod worktree: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(created.WorktreePath, 0o755) })
+
+	// LocalCheckoutUsable may still see metadata depending on OS permission
+	// checks; if the probe itself cannot read .git, the path is treated as
+	// local-unusable (false, nil) which is also correct. Prefer the stronger
+	// assertion when metadata remains readable.
+	if worktreesafety.LocalCheckoutUsable(created.WorktreePath) {
+		healthy, healthErr := gateway.isHealthyWorktree(ctx, created.WorktreePath)
+		if healthErr == nil {
+			t.Fatal("isHealthyWorktree() error = nil, want status failure propagated when metadata usable")
+		}
+		if healthy {
+			t.Fatal("isHealthyWorktree() = true, want false")
+		}
+		return
+	}
+	healthy, healthErr := gateway.isHealthyWorktree(ctx, created.WorktreePath)
+	if healthErr != nil {
+		t.Fatalf("isHealthyWorktree() error = %v, want nil for confirmed local-unusable", healthErr)
+	}
+	if healthy {
+		t.Fatal("isHealthyWorktree() = true, want false")
 	}
 }
 

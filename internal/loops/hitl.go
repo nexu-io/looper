@@ -14,6 +14,7 @@ const hitlMetadataKey = "hitl"
 // the answer is filled in by /respond or the configured answer transport. On resume the runner
 // reads Answer + SessionID to continue the same agent session.
 type HITLAsk struct {
+	Kind           string   `json:"kind,omitempty"`
 	MentionOpenIDs []string `json:"mentionOpenIds,omitempty"`
 	Question       string   `json:"question,omitempty"`
 	Options        []string `json:"options,omitempty"`

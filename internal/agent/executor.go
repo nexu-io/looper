@@ -114,10 +114,17 @@ type ExecutorConfig struct {
 }
 
 type ExecutorOptions struct {
+	// Nono is set only for Reviewer executors by the runtime.
+	Nono   *config.ReviewerNonoConfig
 	Config ExecutorConfig
 	Repos  *storage.Repositories
 	LogDir string
 	Now    func() time.Time
+	// HostingConfig is the captured daemon config used only when the run
+	// context binds a bot identity. Agent children never receive this snapshot.
+	HostingConfig     *config.Config
+	TrustedLooperPath string
+	HostingTracker    processcontainment.LiveTracker
 	// ParamsOwnerVendor marks Config.Params as global agent.params owned by that
 	// vendor (typically agent.vendor). effectiveConfig always filters command/args
 	// via ParamsForRoleVendor against the effective identity (role or sticky
@@ -167,7 +174,12 @@ type RunInput struct {
 	Metadata           map[string]any
 	IdempotencyKey     string
 	Env                map[string]string
+	TrustedReview      *forge.TrustedReviewAuthority
 	NativeSessionID    string
+	// DisableNativeResume skips LoopID auto-attach so a sibling start cannot
+	// consume a pending native session. Explicit NativeSessionID still wins.
+	DisableNativeResume bool
+
 	// UseSnapshot, when true with a non-empty SnapshotVendor, overrides the
 	// executor's configured vendor/model for this start only (spawn, native
 	// resume vendor checks, and persisted execution vendor). Env and
@@ -236,6 +248,7 @@ type Execution interface {
 }
 
 type ConfiguredExecutor struct {
+	nono                 *config.ReviewerNonoConfig
 	config               ExecutorConfig
 	paramsOwner          *config.AgentVendor
 	repos                *storage.Repositories
@@ -244,6 +257,9 @@ type ConfiguredExecutor struct {
 	owner                SpawnOwner
 	onHardPersistFailure func(error)
 	onProgress           func(context.Context, ProgressUpdate)
+	hostingConfig        *config.Config
+	trustedLooperPath    string
+	hostingTracker       processcontainment.LiveTracker
 }
 
 func New(options ExecutorOptions) *ConfiguredExecutor {
@@ -252,6 +268,7 @@ func New(options ExecutorOptions) *ConfiguredExecutor {
 		now = time.Now
 	}
 	return &ConfiguredExecutor{
+		nono:                 options.Nono,
 		config:               options.Config,
 		paramsOwner:          options.ParamsOwnerVendor,
 		repos:                options.Repos,
@@ -260,6 +277,9 @@ func New(options ExecutorOptions) *ConfiguredExecutor {
 		owner:                options.Owner,
 		onHardPersistFailure: options.OnHardPersistFailure,
 		onProgress:           options.OnProgress,
+		hostingConfig:        options.HostingConfig,
+		trustedLooperPath:    options.TrustedLooperPath,
+		hostingTracker:       options.HostingTracker,
 	}
 }
 
@@ -418,10 +438,13 @@ func (e *ConfiguredExecutor) resolveNativeResume(ctx context.Context, input RunI
 		}
 		return nativeResumeInfo{Mode: "checkpoint_restart", Status: "unsupported"}, nil
 	}
+	if input.DisableNativeResume {
+		return nativeResumeInfo{Mode: "checkpoint_restart", Status: "unavailable"}, nil
+	}
 	if e.repos == nil || e.repos.AgentExecutions == nil || strings.TrimSpace(input.LoopID) == "" {
 		return nativeResumeInfo{Mode: "checkpoint_restart", Status: "unavailable"}, nil
 	}
-	latest, err := e.repos.AgentExecutions.GetLatestByLoopID(ctx, input.LoopID)
+	latest, err := e.repos.AgentExecutions.GetLatestByLoopIDExcludingPhase(ctx, input.LoopID, "review-group")
 	if err != nil {
 		return nativeResumeInfo{}, fmt.Errorf("load latest agent execution for native resume: %w", err)
 	}
@@ -518,16 +541,30 @@ func (e *ConfiguredExecutor) Start(ctx context.Context, input RunInput) (Executi
 		}
 	}()
 
+	hosting, err := e.prepareHosting(ctx, input)
+	if err != nil {
+		return nil, err
+	}
+	hostingTransferred := false
+	var hostingProcess *execution
+	defer func() {
+		if !hostingTransferred {
+			retain := hostingProcess != nil && hostingProcess.handle != nil && !hostingProcess.handle.ConfirmedDead()
+			hosting.close(retain)
+		}
+	}()
+
 	spawnPrompt := input.Prompt
 	if resume.Enabled && strings.TrimSpace(input.NativeResumePrompt) != "" {
 		spawnPrompt = input.NativeResumePrompt
 	}
 	command, args := ResolveSpawnWithNativeResume(cfg, input.WorkingDirectory, spawnPrompt, resume.SessionID, resume.Enabled)
 
-	cmd := exec.Command(command, args...)
-	cmd.Dir = input.WorkingDirectory
-	processcontainment.Configure(cmd)
-	cmd.Env = buildCommandEnv(input.WorkingDirectory, spawnPrompt, cfg.Env, input.Env)
+	cmd, err := e.agentCommand(command, args, input, spawnPrompt, cfg, hosting)
+	if err != nil {
+		return nil, err
+	}
+	command, args = cmd.Args[0], cmd.Args[1:]
 
 	maxOutputBytes := input.MaxOutputBytes
 	if maxOutputBytes <= 0 {
@@ -560,7 +597,9 @@ func (e *ConfiguredExecutor) Start(ctx context.Context, input RunInput) (Executi
 		killCh:             make(chan string, 1),
 		doneCh:             make(chan execOutcome, 1),
 		lease:              lease,
+		hosting:            hosting,
 	}
+	hostingProcess = x
 	x.stdoutLogPath, x.stderrLogPath = e.executionLogPaths(input, executionID)
 	x.initializePersistedLogs()
 	cmd.Stdout = &streamCapture{onChunk: func(chunk []byte) { x.onOutput("stdout", chunk) }}
@@ -584,10 +623,12 @@ func (e *ConfiguredExecutor) Start(ctx context.Context, input RunInput) (Executi
 				// best-effort marker only; command fallback is the important recovery behavior
 			}
 			command, args = ResolveSpawn(cfg, input.WorkingDirectory, input.Prompt)
-			cmd = exec.Command(command, args...)
-			cmd.Dir = input.WorkingDirectory
-			processcontainment.Configure(cmd)
-			cmd.Env = buildCommandEnv(input.WorkingDirectory, input.Prompt, cfg.Env, input.Env)
+			var commandErr error
+			cmd, commandErr = e.agentCommand(command, args, input, input.Prompt, cfg, hosting)
+			if commandErr != nil {
+				return nil, commandErr
+			}
+			command, args = cmd.Args[0], cmd.Args[1:]
 			cmd.Stdout = &streamCapture{onChunk: func(chunk []byte) { x.onOutput("stdout", chunk) }}
 			cmd.Stderr = &streamCapture{onChunk: func(chunk []byte) { x.onOutput("stderr", chunk) }}
 			x.mu.Lock()
@@ -643,6 +684,7 @@ func (e *ConfiguredExecutor) Start(ctx context.Context, input RunInput) (Executi
 
 	// Transfer lease ownership to execution; defer must not Release on success.
 	lease = nil
+	hostingTransferred = true
 
 	resumeSessionID, resumeMode, resumeStatus, _ := x.nativeResumeSnapshot()
 	e.appendLifecycleEvent("agent.invoked", input, executionID, map[string]any{"command": command, "args": args, "cwd": input.WorkingDirectory, "nativeResumeMode": resumeMode, "nativeResumeStatus": resumeStatus, "nativeSessionId": resumeSessionID}, startedAtISO)
@@ -680,6 +722,7 @@ type execution struct {
 	process            *exec.Cmd
 	handle             *processcontainment.Handle
 	lease              SpawnLease
+	hosting            *hostingExecution
 	timeout            time.Duration
 	heartbeatTimeout   time.Duration
 	gracefulShutdown   time.Duration
@@ -719,12 +762,16 @@ func (x *execution) Wait(ctx context.Context) (Result, error) {
 	case <-ctx.Done():
 		return Result{}, ctx.Err()
 	case out := <-x.doneCh:
+		x.closeHosting()
 		x.doneCh <- out
 		return out.result, out.err
 	}
 }
 
 func (x *execution) Kill(reason string) error {
+	if x.hosting != nil {
+		x.hosting.cancel()
+	}
 	select {
 	case x.killCh <- reason:
 	default:
@@ -801,6 +848,7 @@ func (x *execution) waitLeader() error {
 
 func (x *execution) run(ctx context.Context) {
 	defer x.releaseLease()
+	defer x.closeHosting()
 
 	waitCh := make(chan error, 1)
 	go func() { waitCh <- x.waitLeader() }()
@@ -1179,10 +1227,11 @@ func (x *execution) runCheckpointFallback(ctx context.Context, nativeError strin
 
 	cfg := x.executor.effectiveConfig(x.input)
 	command, args := ResolveSpawn(cfg, x.input.WorkingDirectory, x.input.Prompt)
-	cmd := exec.Command(command, args...)
-	cmd.Dir = x.input.WorkingDirectory
-	processcontainment.Configure(cmd)
-	cmd.Env = buildCommandEnv(x.input.WorkingDirectory, x.input.Prompt, cfg.Env, x.input.Env)
+	cmd, err := x.executor.agentCommand(command, args, x.input, x.input.Prompt, cfg, x.hosting)
+	if err != nil {
+		return Result{}, "", false, err
+	}
+	command, args = cmd.Args[0], cmd.Args[1:]
 	cmd.Stdout = &streamCapture{onChunk: func(chunk []byte) { x.onOutput("stdout", chunk) }}
 	cmd.Stderr = &streamCapture{onChunk: func(chunk []byte) { x.onOutput("stderr", chunk) }}
 
@@ -2106,6 +2155,15 @@ func shellSingleQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
+// ResolveCommand returns the agent binary used for spawn for vendor + params.
+// When params["command"] is a non-empty string it wins; otherwise vendor defaults
+// apply (claude, codex, opencode, agent for cursor-cli, grok for grok-build,
+// pi for pi, omp for omp).
+// Same resolution as process spawn — callers may LookPath for an absolute path.
+func ResolveCommand(vendor config.AgentVendor, params map[string]any) string {
+	return resolveCommand(ExecutorConfig{Vendor: vendor, Params: params})
+}
+
 func resolveCommand(cfg ExecutorConfig) string {
 	if override, ok := cfg.Params["command"].(string); ok && strings.TrimSpace(override) != "" {
 		return override
@@ -2118,6 +2176,7 @@ func resolveCommand(cfg ExecutorConfig) string {
 	case config.AgentVendorGrokBuild:
 		return "grok"
 	default:
+		// pi, omp, codex, opencode, and any future vendor whose id matches the binary.
 		return string(cfg.Vendor)
 	}
 }

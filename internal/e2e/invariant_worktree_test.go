@@ -284,7 +284,7 @@ func TestInvariantWorkerCommitStaysOffUserBranch(t *testing.T) {
 	proc.Stop(context.Background())
 }
 
-func TestInvariantWorkerRecreatesUnsafeCheckpointOutsideUserRepo(t *testing.T) {
+func TestInvariantWorkerRejectsCompletedCheckpointAtUserRepo(t *testing.T) {
 	bins := harness.MustBinaries(t)
 	home := harness.NewTempHome(t)
 	repo := harness.CreateSeededRepo(t, "git")
@@ -367,19 +367,10 @@ func TestInvariantWorkerRecreatesUnsafeCheckpointOutsideUserRepo(t *testing.T) {
 	}
 	client.post(t, "/api/v1/loops/"+created.ID+"/start", nil, &started)
 	run := waitForNewTerminalRun(t, client, created.ID, map[string]struct{}{"run_failed_bad_checkpoint": {}}, 30*time.Second)
-	if run.Status != "success" {
-		t.Fatalf("run status = %s, want successful safe recreation (error=%q checkpoint=%s)", run.Status, stringValue(run.ErrorMessage), stringValue(run.CheckpointJSON))
-	}
-	var checkpoint struct {
-		Worktree struct {
-			Path string `json:"path"`
-		} `json:"worktree"`
-	}
-	if run.CheckpointJSON == nil || json.Unmarshal([]byte(*run.CheckpointJSON), &checkpoint) != nil {
-		t.Fatalf("checkpoint = %s, want valid recreated worktree checkpoint", stringValue(run.CheckpointJSON))
-	}
-	if checkpoint.Worktree.Path == repo.Path || !strings.HasPrefix(checkpoint.Worktree.Path, home.WorktreeRoot+string(os.PathSeparator)) {
-		t.Fatalf("recreated worktree path = %q, want isolated under %q", checkpoint.Worktree.Path, home.WorktreeRoot)
+	// A completed-execution claim at the user's repo cannot be validated by
+	// inventing a clean checkout. Preserve the repo and report the corrupt checkpoint.
+	if run.Status != "failed" || !strings.Contains(stringValue(run.ErrorMessage), "must not equal project repo path") {
+		t.Fatalf("run = %s, error=%q; want unsafe checkpoint rejection", run.Status, stringValue(run.ErrorMessage))
 	}
 	if _, err := os.Stat(fakeAgent.EvidencePath()); !os.IsNotExist(err) {
 		t.Fatalf("fake agent evidence = %v, want no agent execution", err)
@@ -397,8 +388,8 @@ func TestInvariantWorkerResumeAdoptsExistingPRAndEntersShepherding(t *testing.T)
 	fakeAgent := harness.NewFakeAgent(t, bins)
 	fakeGH := harness.NewFakeGH(t, bins, harness.GHSchema{JSONFieldAllowlist: map[string][]string{}})
 	branch := "looper/a4-existing-pr"
-	fakeGH.WriteState(t, harness.GHState{Routes: map[string]any{
-		"repos/acme/looper/pulls": json.RawMessage(`[{"number":201,"title":"Existing PR","html_url":"https://example.test/acme/looper/pull/201","state":"open","head":{"ref":"looper/a4-existing-pr"},"base":{"ref":"main"}}]`),
+	fakeGH.WriteState(t, harness.GHState{Commands: map[string]any{
+		"pr list": map[string]any{"stdout": json.RawMessage(`[{"number":201,"title":"Existing PR","url":"https://example.test/acme/looper/pull/201","state":"OPEN","headRefName":"looper/a4-existing-pr","baseRefName":"main"}]`)},
 	}})
 	cfg := configWithFakeTools(t, bins, home, repo, fakeGH, fakeAgent, port)
 	cfg.Defaults.OpenPRStrategy = "all_done"
@@ -474,7 +465,7 @@ func TestInvariantWorkerResumeAdoptsExistingPRAndEntersShepherding(t *testing.T)
 		t.Fatalf("fake agent evidence = %v, want no agent execution during PR adoption", err)
 	}
 	invocations := readInvocationLog(t, fakeGH.InvocationLog)
-	assertInvocationContainsOrdered(t, invocations, []string{"api", "--method", "GET", "repos/acme/looper/pulls"})
+	assertInvocationContainsOrdered(t, invocations, []string{"pr", "list"})
 	assertNoInvocationStartsWith(t, invocations, []string{"pr", "create"})
 	proc.Stop(context.Background())
 }
@@ -526,6 +517,10 @@ func TestInvariantReusedActiveWorkerUsesIsolatedWorktreeAndAvoidsDuplicateLoop(t
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
 	client := newAPIClient(proc.BaseURL())
+	// This invariant exercises real daemon/Git processes under the full suite;
+	// request latency is not its contract. Allow scheduling contention without
+	// weakening the worktree isolation or duplicate-loop assertions below.
+	client.client.Timeout = 10 * time.Second
 	var created struct {
 		ID     string `json:"id"`
 		Status string `json:"status"`

@@ -21,6 +21,8 @@ import (
 	"github.com/nexu-io/looper/internal/disclosure"
 	"github.com/nexu-io/looper/internal/domain"
 	"github.com/nexu-io/looper/internal/eventlog"
+	"github.com/nexu-io/looper/internal/forge"
+	"github.com/nexu-io/looper/internal/hostingidentity"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/infra/planedoc"
 	"github.com/nexu-io/looper/internal/infra/specpr"
@@ -138,12 +140,13 @@ type ListOpenPullRequestsInput struct {
 }
 
 type ListOpenIssuesInput struct {
-	Repo     string
-	CWD      string
-	Limit    int
-	Assignee string
-	Label    string
-	Labels   []string
+	IssueNumber int64
+	Repo        string
+	CWD         string
+	Limit       int
+	Assignee    string
+	Label       string
+	Labels      []string
 }
 
 type ViewIssueInput struct {
@@ -480,10 +483,12 @@ type Runner struct {
 }
 
 type DiscoveryInput struct {
-	ProjectID string
-	Repo      string
-	Limit     int
-	Snapshot  *githubinfra.DiscoverySnapshot
+	// IssueNumber targets a webhook issue without the polling list limit.
+	IssueNumber int64
+	ProjectID   string
+	Repo        string
+	Limit       int
+	Snapshot    *githubinfra.DiscoverySnapshot
 }
 
 type DiscoveryResult struct {
@@ -700,6 +705,11 @@ func New(options Options) *Runner {
 }
 
 func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (DiscoveryResult, error) {
+	bound, bindErr := hostingidentity.Bind(ctx, r.customInstructions, input.ProjectID, "planner")
+	if bindErr != nil {
+		return DiscoveryResult{}, bindErr
+	}
+	ctx = bound
 	ctx = githubinfra.ContextWithDiscoverySnapshot(ctx, input.Snapshot)
 	if r.repos == nil || r.repos.Projects == nil || r.repos.Loops == nil || r.repos.Queue == nil || r.repos.Runs == nil {
 		return DiscoveryResult{}, fmt.Errorf("planner repositories are not configured")
@@ -734,7 +744,7 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 	if policy.RequireAssigneeCurrentUser {
 		assigneeFilter = login
 	}
-	issues, err := r.listOpenIssuesForDiscovery(ctx, ListOpenIssuesInput{Repo: input.Repo, CWD: project.RepoPath, Limit: input.Limit, Assignee: assigneeFilter}, policy)
+	issues, err := r.listOpenIssuesForDiscovery(ctx, ListOpenIssuesInput{Repo: input.Repo, CWD: project.RepoPath, Limit: input.Limit, Assignee: assigneeFilter, IssueNumber: input.IssueNumber}, policy)
 	if err != nil {
 		return DiscoveryResult{}, err
 	}
@@ -799,6 +809,11 @@ func (r *Runner) ProcessNext(ctx context.Context, claimedBy string) (*ProcessRes
 }
 
 func (r *Runner) ProcessClaimedQueueItem(ctx context.Context, queueItem storage.QueueItemRecord) (*ProcessResult, error) {
+	bound, bindErr := r.bindClaimedHostingIdentity(ctx, queueItem)
+	if bindErr != nil {
+		return nil, bindErr
+	}
+	ctx = bound
 	result, err := r.ProcessClaimedItem(ctx, queueItem)
 	if err != nil {
 		return r.recoverClaimedItem(ctx, queueItem, err)
@@ -872,6 +887,11 @@ func (r *Runner) reconcileRecoveredLoop(ctx context.Context, queueItem storage.Q
 }
 
 func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.QueueItemRecord) (ProcessResult, error) {
+	bound, bindErr := r.bindClaimedHostingIdentity(ctx, queueItem)
+	if bindErr != nil {
+		return ProcessResult{}, bindErr
+	}
+	ctx = bound
 	if queueItem.Type != "planner" {
 		return ProcessResult{}, fmt.Errorf("unsupported queue item type: %s", queueItem.Type)
 	}
@@ -1223,7 +1243,8 @@ func (r *Runner) runDiscoverIssueStep(ctx context.Context, input stepInput) (pla
 		releaseOnError = false
 		return checkpoint, nil
 	}
-	if manual && currentLogin != "" && !includesLogin(detail.Assignees, currentLogin) {
+	skipGitHubAppSelfAssign := providerKindForProject(r.customInstructions, input.Project.ID) == config.ProviderKindGitHub && hostingKindForContext(ctx) == config.HostingIdentityGitHubApp
+	if manual && currentLogin != "" && !includesLogin(detail.Assignees, currentLogin) && !skipGitHubAppSelfAssign && !strings.HasSuffix(currentLogin, "[bot]") {
 		if err := r.github.AddIssueAssignees(ctx, IssueAssigneesInput{Repo: repo, IssueNumber: issueNumber, Assignees: []string{currentLogin}, CWD: input.Project.RepoPath}); err != nil {
 			return input.Checkpoint, &loopError{message: fmt.Sprintf("Unable to assign issue %s#%d to %s: %v", repo, issueNumber, currentLogin, err), kind: FailureRetryableAfterResume}
 		}
@@ -1628,7 +1649,7 @@ func (r *Runner) runWriteSpecStep(ctx context.Context, input stepInput) (planner
 		if err != nil {
 			return checkpoint, fmt.Errorf("resolve run agent identity: %w", err)
 		}
-		prompt, instructionBlock := buildPlannerPrompt(input.Project, r.customInstructions, issue, worktree, r.allowAutoPush, r.disclosure, agentVendor, derefString(agentModel))
+		prompt, instructionBlock := buildPlannerPrompt(input.Project, r.customInstructions, issue, worktree, r.allowAutoPush, r.disclosure, agentVendor, derefString(agentModel), hostingKindForContext(ctx))
 		if r.isPlaneProject(input.Project.ID) {
 			// On a Plane project the spec lives on a Plane page, never a PR. Some agents
 			// still reflexively run `gh pr create`; forbid it explicitly (looper closes a
@@ -3145,6 +3166,12 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 	if err != nil {
 		return resumedRunContext{}, err
 	}
+	if latestRun != nil && latestRun.Status == "running" {
+		return resumedRunContext{}, &loopError{
+			message: fmt.Sprintf("loop %s already has a running planner run %s", loop.ID, latestRun.ID),
+			kind:    FailureRetryableTransient,
+		}
+	}
 	check := parseCheckpoint(nil)
 	lastCompleted := PlannerStep("")
 	if latestRun != nil {
@@ -3232,6 +3259,18 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 	encoded := mustMarshalJSON(initialCheckpoint)
 	run.CheckpointJSON = &encoded
 	if err := r.repos.Runs.Upsert(ctx, run); err != nil {
+		if hasRunning, checkErr := r.repos.Runs.HasRunningByLoopID(ctx, loop.ID); checkErr == nil && hasRunning {
+			return resumedRunContext{}, &loopError{
+				message: fmt.Sprintf("loop %s already has a running planner run", loop.ID),
+				kind:    FailureRetryableTransient,
+			}
+		}
+		if failureclass.IsOneRunningRunPerLoopViolation(err) {
+			return resumedRunContext{}, &loopError{
+				message: fmt.Sprintf("loop %s already has a running planner run", loop.ID),
+				kind:    FailureRetryableTransient,
+			}
+		}
 		return resumedRunContext{}, err
 	}
 	return resumedRunContext{Run: run, StartStep: startStep, Checkpoint: initialCheckpoint, Resumed: resumed}, nil
@@ -3705,7 +3744,11 @@ func (c *plannerCheckpoint) ensureLifecycle(runner, branch, baseBranch string, e
 	}
 }
 
-func buildPlannerPrompt(project storage.ProjectRecord, instructionConfig config.Config, issue *checkpointIssue, worktree *checkpointWorktree, allowAutoPush bool, disclosureCfg config.DisclosureConfig, agentRuntime string, agentModel string) (string, config.CustomInstructionBlock) {
+func buildPlannerPrompt(project storage.ProjectRecord, instructionConfig config.Config, issue *checkpointIssue, worktree *checkpointWorktree, allowAutoPush bool, disclosureCfg config.DisclosureConfig, agentRuntime string, agentModel string, hostingKinds ...config.HostingIdentityKind) (string, config.CustomInstructionBlock) {
+	hostingKind := config.HostingIdentityKind("")
+	if len(hostingKinds) > 0 {
+		hostingKind = hostingKinds[0]
+	}
 	providerLabel := providerIssueSystemLabel(providerKindForProject(instructionConfig, project.ID))
 	parts := []string{
 		fmt.Sprintf("Write a planning spec for %s issue %s#%d.", providerLabel, issue.Repo, issue.IssueNumber),
@@ -3743,13 +3786,15 @@ func buildPlannerPrompt(project storage.ProjectRecord, instructionConfig config.
 		"- Do not replace an explicit product decision with your own recommendation or invent pricing, packaging, or prioritization questions that the product spec does not mark unresolved",
 		"- Keep the implementation scope aligned to the product spec",
 	}
-	if allowAutoPush {
+	if allowAutoPush || hostingKind != "" {
 		requirements = append(requirements, "- Commit the spec changes on the current branch so the PR can be opened")
 	} else {
 		requirements = append(requirements, "- Do not push the branch or open/update pull requests; leave repository publishing for Looper/manual follow-up")
 	}
 	parts = append(parts, strings.Join(requirements, "\n"))
-	if allowAutoPush {
+	if hostingKind != "" {
+		parts = append(parts, forge.HostingAgentContext(hostingKind, "planner", issue.Repo, issue.IssueNumber), botPublicationPrompt())
+	} else if allowAutoPush {
 		parts = append(parts, lifecycle.PromptInstruction("planner", worktree.Branch, worktree.BaseBranch, true, true, disclosureCfg, agentRuntime, agentModel))
 	} else {
 		parts = append(parts, noRemoteLifecyclePromptInstruction("planner", worktree.Branch, worktree.BaseBranch, disclosureCfg, agentRuntime, agentModel))

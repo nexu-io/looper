@@ -16,7 +16,7 @@ import (
 )
 
 func PrivateFeishuClient(cfg *config.Config) *feishucli.Client {
-	if cfg == nil || !cfg.HITL.Enabled || !strings.EqualFold(cfg.HITL.AnswerTransport, "feishu") || cfg.HITL.Feishu == nil {
+	if cfg == nil || !cfg.HITL.Enabled || !strings.EqualFold(cfg.HITL.AnswerTransport, "feishu") || cfg.HITL.Feishu == nil || strings.TrimSpace(cfg.HITL.Feishu.Inbound) != "" {
 		return nil
 	}
 	return &feishucli.Client{Config: *cfg.HITL.Feishu}

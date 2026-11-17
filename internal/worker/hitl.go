@@ -186,6 +186,30 @@ func (r *Runner) latestNativeSessionID(ctx context.Context, loopID, agentVendor 
 	return strings.TrimSpace(*execution.NativeSessionID)
 }
 
+// clearHumanInbox drops the loop's drained human messages after a successful turn
+// so they are not re-injected on a later run. No-op when the inbox is empty.
+func (r *Runner) clearHumanInbox(ctx context.Context, loop *storage.LoopRecord) {
+	if r.repos == nil || r.repos.Loops == nil {
+		return
+	}
+	fresh, err := r.repos.Loops.GetByID(ctx, loop.ID)
+	if err != nil || fresh == nil {
+		return
+	}
+	if len(loops.ReadHumanInbox(fresh.MetadataJSON)) == 0 {
+		return
+	}
+	meta, werr := loops.ClearHumanInbox(fresh.MetadataJSON)
+	if werr != nil {
+		return
+	}
+	fresh.MetadataJSON = &meta
+	fresh.UpdatedAt = r.nowISO()
+	if err := r.repos.Loops.Upsert(ctx, *fresh); err == nil {
+		loop.MetadataJSON = &meta
+	}
+}
+
 // markTakeoverResumeConsumed clears the takeover-resume marker after a successful
 // resumed turn so it is not re-applied on later runs. No-op when absent.
 func (r *Runner) markTakeoverResumeConsumed(ctx context.Context, loop *storage.LoopRecord) {
@@ -370,6 +394,9 @@ func (r *Runner) suspendForHuman(ctx context.Context, input stepInput, run stora
 		if meta, werr := loops.WriteHITLAsk(updated.MetadataJSON, ask); werr == nil {
 			updated.MetadataJSON = &meta
 		}
+		if meta, werr := loops.ClearHumanInbox(updated.MetadataJSON); werr == nil {
+			updated.MetadataJSON = &meta
+		}
 		if meta, werr := loopcondition.Set(updated.MetadataJSON, loopcondition.Record{Kind: loopcondition.HumanAnswered, Since: nowISO}); werr == nil {
 			updated.MetadataJSON = &meta
 		}
@@ -420,12 +447,27 @@ func (r *Runner) suspendForHuman(ctx context.Context, input stepInput, run stora
 			notif.SourceType = "GitHub decision comment"
 			notif.SourceRef = "PR #" + strconv.FormatInt(ask.PRNumber, 10)
 		}
-		if err := r.hitlNotify(ctx, notif); err != nil && r.logger != nil {
-			// The loop is already parked in awaiting_human; if the human is never
-			// notified they must find it via the dashboard / API. Surface loudly so an
-			// unconfigured or failing notifier can't silently strand a run.
-			r.logger.Warn("worker HITL ask notification failed; loop parked awaiting human with no notification sent", map[string]any{
-				"loopId": input.Loop.ID, "loopSeq": input.Loop.Seq, "runId": run.ID, "error": err.Error(),
+		if err := r.hitlNotify(ctx, notif); err != nil {
+			if r.logger != nil {
+				// The loop is already parked in awaiting_human; if the human is never
+				// notified they must find it via the dashboard / API. Surface loudly so an
+				// unconfigured or failing notifier can't silently strand a run.
+				r.logger.Warn("worker HITL ask notification failed; loop parked awaiting human with no notification sent", map[string]any{
+					"loopId": input.Loop.ID, "loopSeq": input.Loop.Seq, "runId": run.ID, "error": err.Error(),
+				})
+			}
+		} else if r.hitlTransportFeishu() {
+			// Durable delivery evidence for human-attention LocalOnly: suppress
+			// remote HA alerts only when a Feishu ask card was actually sent.
+			_, _ = r.updateLoop(ctx, input.Loop, func(updated *storage.LoopRecord) {
+				ask, ok := loops.ReadHITLAsk(updated.MetadataJSON)
+				if !ok {
+					return
+				}
+				ask.Transport = "feishu"
+				if meta, werr := loops.WriteHITLAsk(updated.MetadataJSON, ask); werr == nil {
+					updated.MetadataJSON = &meta
+				}
 			})
 		}
 	}
@@ -437,6 +479,11 @@ func (r *Runner) suspendForHuman(ctx context.Context, input stepInput, run stora
 func (r *Runner) hitlTransportGitHub() bool {
 	t := strings.TrimSpace(strings.ToLower(r.hitlAnswerTransport))
 	return t == "" || t == "github"
+}
+
+// hitlTransportFeishu reports whether the Feishu app-bot ask transport is active.
+func (r *Runner) hitlTransportFeishu() bool {
+	return strings.EqualFold(strings.TrimSpace(r.hitlAnswerTransport), "feishu")
 }
 
 func (r *Runner) hitlAwaitingLabel() string {

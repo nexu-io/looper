@@ -184,6 +184,12 @@ func TestWebhookForwarderEventsIncludePushAndCheckRun(t *testing.T) {
 	if !slices.Contains(webhookForwarderEvents, "check_run") {
 		t.Fatalf("webhookForwarderEvents = %v, want check_run subscription", webhookForwarderEvents)
 	}
+	if !slices.Contains(webhookForwarderEvents, "pull_request_review_thread") {
+		t.Fatalf("webhookForwarderEvents = %v, want pull_request_review_thread subscription", webhookForwarderEvents)
+	}
+	if !sameWebhookEvents(webhookForwarderEvents, webhookForwardEvents) {
+		t.Fatalf("webhookForwarderEvents = %v, webhookForwardEvents = %v, want identical event sets", webhookForwarderEvents, webhookForwardEvents)
+	}
 }
 
 func TestClassifyForwarderExitTerminalPatterns(t *testing.T) {

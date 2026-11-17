@@ -1,0 +1,5 @@
+Available models
+auto - Auto
+sonnet-4 - Sonnet 4
+gpt-5	GPT-5
+composer-1

@@ -152,6 +152,83 @@ func TestGatewayWebhookChannel(t *testing.T) {
 	})
 }
 
+func TestGatewayHumanAttentionWebhookByReason(t *testing.T) {
+	// awaiting_human without a Feishu ask must reach remote channels.
+	// awaiting_human with a delivered Feishu ask stays local-only.
+	// manual_intervention must reach an enabled generic webhook.
+	t.Setenv("LOOPER_TEST_WEBHOOK_URL", "https://example.test/human-attention")
+
+	ctx := context.Background()
+	webhookCfg := config.WebhookNotificationConfig{
+		Enabled:               true,
+		URLEnv:                "LOOPER_TEST_WEBHOOK_URL",
+		Format:                "feishu",
+		ThrottleWindowSeconds: 60,
+	}
+
+	t.Run("awaiting_human without feishu ask posts webhook", func(t *testing.T) {
+		var posts []capturedWebhookPost
+		gateway := newWebhookGateway(t, webhookCfg, &posts)
+		gateway.config.InApp = true
+
+		records := gateway.NotifyHumanAttention(ctx, HumanAttentionInput{
+			LoopSeq:  1,
+			Reason:   HumanAttentionAwaitingHuman,
+			EntryKey: "run:await_webhook_remote",
+		})
+		if len(posts) != 1 {
+			t.Fatalf("awaiting_human without Feishu ask webhook posts = %d, want 1; records=%#v", len(posts), records)
+		}
+		if got := notificationStatus(records, "webhook"); got != "success" {
+			t.Fatalf("awaiting_human without Feishu ask webhook status = %q, want success", got)
+		}
+	})
+
+	t.Run("awaiting_human with feishu ask skips webhook", func(t *testing.T) {
+		var posts []capturedWebhookPost
+		gateway := newWebhookGateway(t, webhookCfg, &posts)
+		gateway.config.InApp = true
+		// Simulate a live Feishu ask card for this loop (SendHITLAsk state).
+		gateway.state.askCards = map[string]askCardState{
+			"loop_feishu_ask": {msgID: "om_ask_1", card: HITLAskCard{LoopID: "loop_feishu_ask"}},
+		}
+
+		records := gateway.NotifyHumanAttention(ctx, HumanAttentionInput{
+			LoopID:   "loop_feishu_ask",
+			LoopSeq:  1,
+			Reason:   HumanAttentionAwaitingHuman,
+			EntryKey: "run:await_webhook_skip",
+		})
+		if len(posts) != 0 {
+			t.Fatalf("awaiting_human with Feishu ask webhook posts = %d, want 0", len(posts))
+		}
+		if got := notificationStatus(records, "webhook"); got != "" {
+			t.Fatalf("awaiting_human with Feishu ask webhook status = %q, want absent (LocalOnly)", got)
+		}
+	})
+
+	t.Run("manual_intervention posts webhook", func(t *testing.T) {
+		var posts []capturedWebhookPost
+		gateway := newWebhookGateway(t, webhookCfg, &posts)
+		gateway.config.InApp = true
+
+		records := gateway.NotifyHumanAttention(ctx, HumanAttentionInput{
+			LoopSeq:  2,
+			Reason:   HumanAttentionManualIntervention,
+			EntryKey: "queue:q_mi:t1",
+		})
+		if len(posts) != 1 {
+			t.Fatalf("manual_intervention webhook posts = %d, want 1; records=%#v", len(posts), records)
+		}
+		if got := notificationStatus(records, "webhook"); got != "success" {
+			t.Fatalf("manual_intervention webhook status = %q, want success", got)
+		}
+		body := string(posts[0].body)
+		assertContains(t, body, "Looper Needs Attention")
+		assertContains(t, body, "manual intervention")
+	})
+}
+
 func notificationError(records []storage.NotificationRecord, channel string) string {
 	for _, record := range records {
 		if record.Channel == channel {

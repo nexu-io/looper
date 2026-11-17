@@ -412,6 +412,28 @@ func (r *NotificationsRepository) GetLatestByDedupe(ctx context.Context, channel
 	return &record, nil
 }
 
+// InsertIfAbsent inserts a notification only when its primary key is free.
+// Returns true when this call created the row (atomic claim), false when the
+// id already existed. Used for permanent human-attention entry reservation so
+// concurrent recovery + post-claim observers cannot both emit.
+func (r *NotificationsRepository) InsertIfAbsent(ctx context.Context, record NotificationRecord) (bool, error) {
+	result, err := r.q.ExecContext(ctx, `
+		INSERT OR IGNORE INTO notifications (
+			id, project_id, loop_id, run_id, entity_type, entity_id, channel, level,
+			title, subtitle, body, status, dedupe_key, error_message, payload_json,
+			sent_at, created_at, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, record.ID, record.ProjectID, record.LoopID, record.RunID, record.EntityType, record.EntityID, record.Channel, record.Level, record.Title, record.Subtitle, record.Body, record.Status, record.DedupeKey, record.ErrorMessage, record.PayloadJSON, record.SentAt, record.CreatedAt, record.UpdatedAt)
+	if err != nil {
+		return false, fmt.Errorf("insert notification if absent: %w", err)
+	}
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("insert notification if absent rows affected: %w", err)
+	}
+	return rowsAffected > 0, nil
+}
+
 // FeishuThreadsRepository maps a Feishu message thread root to the loop whose
 // notifications thread under it, in both directions.
 type FeishuThreadsRepository struct{ q sqliteQuerier }
@@ -744,6 +766,61 @@ func (r *LoopsRepository) GetByID(ctx context.Context, id string) (*LoopRecord, 
 	return &record, nil
 }
 
+// UpdateMetadataIfMatch writes metadata_json and updated_at only when the
+// current row's metadata_json still matches expectedMetadataJSON. applied is
+// false on a CAS miss or when id is empty.
+func (r *LoopsRepository) UpdateMetadataIfMatch(ctx context.Context, id string, metadataJSON *string, newUpdatedAt string, expectedMetadataJSON *string) (applied bool, err error) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return false, nil
+	}
+	result, err := r.q.ExecContext(ctx, `UPDATE loops SET metadata_json = ?, updated_at = ? WHERE id = ? AND ((? IS NULL AND metadata_json IS NULL) OR metadata_json = ?)`, metadataJSON, newUpdatedAt, id, expectedMetadataJSON, expectedMetadataJSON)
+	if err != nil {
+		return false, fmt.Errorf("update loop metadata if match: %w", err)
+	}
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("update loop metadata if match rows affected: %w", err)
+	}
+	return rowsAffected > 0, nil
+}
+
+// UpdateIfMatch writes the full loop row only when the live status and
+// metadata_json still match the expected snapshot. applied is false on a CAS
+// miss or when id is empty. Does not insert.
+func (r *LoopsRepository) UpdateIfMatch(ctx context.Context, record LoopRecord, expectedStatus string, expectedMetadataJSON *string) (applied bool, err error) {
+	id := strings.TrimSpace(record.ID)
+	if id == "" {
+		return false, nil
+	}
+	result, err := r.q.ExecContext(ctx, `
+		UPDATE loops SET
+			seq = ?,
+			project_id = ?,
+			type = ?,
+			target_type = ?,
+			target_id = ?,
+			repo = ?,
+			pr_number = ?,
+			status = ?,
+			config_json = ?,
+			metadata_json = ?,
+			last_run_at = ?,
+			next_run_at = ?,
+			created_at = ?,
+			updated_at = ?
+		WHERE id = ? AND status = ? AND ((? IS NULL AND metadata_json IS NULL) OR metadata_json = ?)
+	`, record.Seq, record.ProjectID, record.Type, record.TargetType, record.TargetID, record.Repo, record.PRNumber, record.Status, record.ConfigJSON, record.MetadataJSON, record.LastRunAt, record.NextRunAt, record.CreatedAt, record.UpdatedAt, id, expectedStatus, expectedMetadataJSON, expectedMetadataJSON)
+	if err != nil {
+		return false, fmt.Errorf("update loop if match: %w", err)
+	}
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("update loop if match rows affected: %w", err)
+	}
+	return rowsAffected > 0, nil
+}
+
 func (r *LoopsRepository) GetBySeq(ctx context.Context, seq int64) (*LoopRecord, error) {
 	row := r.q.QueryRowContext(ctx, `SELECT * FROM loops WHERE seq = ?`, seq)
 	record, err := scanLoop(row)
@@ -803,11 +880,14 @@ func (r *LoopsRepository) AllocateSeq(ctx context.Context) (int64, error) {
 // ListLoopsOptions filters and paginates loop listings.
 // Empty Status/ProjectID match all. Limit 0 means no limit (full list).
 // Offset is always applied when > 0, including when Limit == 0 (SQLite LIMIT -1 OFFSET n).
+// Default order is newest-first (updated_at DESC, seq DESC). OrderByStatusTier is for
+// dashboard list UX only; generic List() and first-match scans must stay newest-first.
 type ListLoopsOptions struct {
-	Status    string
-	ProjectID string
-	Limit     int64
-	Offset    int64
+	Status            string
+	ProjectID         string
+	Limit             int64
+	Offset            int64
+	OrderByStatusTier bool
 }
 
 func (r *LoopsRepository) List(ctx context.Context) ([]LoopRecord, error) {
@@ -851,7 +931,28 @@ func buildLoopsListQuery(base string, opts ListLoopsOptions, withOrderAndLimit b
 		query += " WHERE " + strings.Join(clauses, " AND ")
 	}
 	if withOrderAndLimit {
-		query += " ORDER BY updated_at DESC, seq DESC"
+		if opts.OrderByStatusTier {
+			// Dashboard list only: active / attention-needed statuses first so
+			// recently completed loops (which bump updated_at) do not dominate.
+			// Generic List() stays newest-first for first-match mutation scans.
+			query += ` ORDER BY CASE status
+			WHEN 'running' THEN 0
+			WHEN 'awaiting_human' THEN 0
+			WHEN 'human_takeover' THEN 0
+			WHEN 'queued' THEN 1
+			WHEN 'paused' THEN 2
+			WHEN 'waiting' THEN 2
+			WHEN 'idle' THEN 2
+			WHEN 'failed' THEN 3
+			WHEN 'interrupted' THEN 3
+			WHEN 'stopped' THEN 4
+			WHEN 'completed' THEN 4
+			WHEN 'terminated' THEN 4
+			ELSE 5
+		END ASC, updated_at DESC, seq DESC`
+		} else {
+			query += " ORDER BY updated_at DESC, seq DESC"
+		}
 		if opts.Limit > 0 {
 			query += " LIMIT ?"
 			args = append(args, opts.Limit)
@@ -1322,7 +1423,19 @@ func (r *AgentExecutionsRepository) GetLatestActiveByRunID(ctx context.Context, 
 }
 
 func (r *AgentExecutionsRepository) GetLatestByLoopID(ctx context.Context, loopID string) (*AgentExecutionRecord, error) {
-	row := r.q.QueryRowContext(ctx, `SELECT `+agentExecutionColumns+` FROM agent_executions WHERE loop_id = ? ORDER BY started_at DESC, id DESC LIMIT 1`, loopID)
+	return r.GetLatestByLoopIDExcludingPhase(ctx, loopID, "")
+}
+
+// GetLatestByLoopIDExcludingPhase ignores auxiliary executions without skipping
+// newer non-resumable main executions in favor of older pending sessions.
+func (r *AgentExecutionsRepository) GetLatestByLoopIDExcludingPhase(ctx context.Context, loopID, phase string) (*AgentExecutionRecord, error) {
+	where := "loop_id = ?"
+	args := []any{loopID}
+	if phase != "" {
+		where += ` AND COALESCE(CASE WHEN json_valid(metadata_json) THEN json_extract(metadata_json, '$.metadata.phase') END, '') != ?`
+		args = append(args, phase)
+	}
+	row := r.q.QueryRowContext(ctx, `SELECT `+agentExecutionColumns+` FROM agent_executions WHERE `+where+` ORDER BY started_at DESC, id DESC LIMIT 1`, args...)
 	record, err := scanAgentExecution(row)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -2818,7 +2931,7 @@ const scheduledQueueBaseQuery = `
 	WHERE qi.status = 'queued'
 		AND qi.available_at <= ?
 		AND (qi.project_id IS NULL OR p.archived = 0)
-		AND COALESCE(l.status, 'queued') NOT IN ('paused', 'completed', 'failed', 'interrupted', 'terminated', 'stopped')
+		AND COALESCE(l.status, 'queued') NOT IN ('paused', 'completed', 'failed', 'interrupted', 'terminated', 'stopped', 'awaiting_human')
 		AND (
 			qi.lock_key IS NULL
 			OR NOT EXISTS (
@@ -3417,4 +3530,16 @@ func scanWorktree(row interface{ Scan(...any) error }) (WorktreeRecord, error) {
 	record.CleanedAt = nullableString(cleanedAt)
 
 	return record, nil
+}
+
+func (r *FeishuThreadsRepository) LoopByRoot(ctx context.Context, rootMessageID string) (string, error) {
+	var loopID string
+	err := r.q.QueryRowContext(ctx, `SELECT loop_id FROM feishu_threads WHERE root_message_id = ?`, rootMessageID).Scan(&loopID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", nil
+		}
+		return "", fmt.Errorf("feishu thread loop by root: %w", err)
+	}
+	return loopID, nil
 }

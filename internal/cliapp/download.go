@@ -11,11 +11,16 @@ import (
 	"io"
 	"path"
 	"strings"
+	"time"
 )
 
 // archiveAssetSuffix is appended to the per-target binary name to form the
 // archived release artifact name, e.g. looper-darwin-arm64.tar.gz.
 const archiveAssetSuffix = ".tar.gz"
+
+// A candidate gets one budget for its binary and checksum. A stalled download
+// must leave the caller's context usable for the next release source.
+const releaseDownloadTimeout = 2 * time.Minute
 
 // maxArchiveBinaryBytes caps the size of any binary extracted from a release
 // archive. The current looper/looperd binaries weigh well below 100 MiB; the
@@ -107,6 +112,9 @@ func findReleaseAssetSet(release githubReleasePayload, binaryName string) (downl
 // checksum, and (for archives) extracts the named binary. The returned bytes
 // are the final binary ready to be written to disk.
 func (r *commandRuntime) fetchAndExtractBinary(ctx context.Context, asset downloadAsset, progress io.Writer) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(ctx, releaseDownloadTimeout)
+	defer cancel()
+
 	payload, err := r.downloadBinary(ctx, asset.PreferredURL, asset.PreferredName, progress)
 	if err != nil {
 		return nil, err

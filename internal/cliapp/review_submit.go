@@ -17,10 +17,13 @@ import (
 	"github.com/nexu-io/looper/internal/disclosure"
 	"github.com/nexu-io/looper/internal/domain"
 	"github.com/nexu-io/looper/internal/forge"
+	"github.com/nexu-io/looper/internal/hostingidentity"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/infra/shell"
+	"github.com/nexu-io/looper/internal/loops"
 	"github.com/nexu-io/looper/internal/outboundguard"
 	"github.com/nexu-io/looper/internal/projects"
+	"github.com/nexu-io/looper/internal/reviewengagement"
 	"github.com/nexu-io/looper/internal/storage"
 	"github.com/spf13/cobra"
 )
@@ -46,7 +49,25 @@ type reviewSubmitComment struct {
 	Side      string `json:"side"`
 	StartLine int64  `json:"start_line"`
 	StartSide string `json:"start_side"`
+	// Looper-only finding contract fields. Validated on actionable comments and
+	// stripped before provider SubmitReview (GitHub/Forgejo receive body/path/line/side only).
+	Disposition   string `json:"disposition,omitempty"`
+	Severity      string `json:"severity,omitempty"`
+	ScopeBasis    string `json:"scopeBasis,omitempty"`
+	ScopeEvidence string `json:"scopeEvidence,omitempty"`
 }
+
+const (
+	reviewFindingDispositionMustFix    = "must_fix"
+	reviewFindingDispositionFollowUp   = "follow_up"
+	reviewFindingDispositionNeedsHuman = "needs_human"
+
+	reviewFindingScopeStatedIntent           = "stated_intent"
+	reviewFindingScopeIntroducedRegression   = "introduced_regression"
+	reviewFindingScopeRequiredInvariant      = "required_invariant"
+	reviewFindingScopeIndependentImprovement = "independent_improvement"
+	reviewFindingScopeAmbiguousIntent        = "ambiguous_intent"
+)
 
 type reviewSubmitDiagnosticFields struct {
 	Repo        string
@@ -66,12 +87,13 @@ type reviewSubmitPullRequestViewer interface {
 type reviewSubmitGateway interface {
 	reviewSubmitPullRequestViewer
 	GetCurrentUserLogin(context.Context, string) (string, error)
-	GetPullRequestDiff(context.Context, githubinfra.GetPullRequestDiffInput) (string, error)
+	BuildReviewAnchorIndex(context.Context, githubinfra.BuildReviewAnchorIndexInput) (*diffanchor.Index, string, error)
 	SubmitReview(context.Context, githubinfra.SubmitReviewInput) error
 }
 
 type forgejoReviewSubmitGateway struct {
 	client               *forge.ForgejoClient
+	localGit             *githubinfra.Gateway
 	stamper              disclosure.Stamper
 	requireReviewRequest bool
 	labels               []string
@@ -135,18 +157,8 @@ func (gateway forgejoReviewSubmitGateway) GetCurrentUserLogin(ctx context.Contex
 	return identity.Login, err
 }
 
-func (gateway forgejoReviewSubmitGateway) GetPullRequestDiff(ctx context.Context, input githubinfra.GetPullRequestDiffInput) (string, error) {
-	diff, err := gateway.client.PullRequestDiff(ctx, input.PRNumber)
-	if err != nil {
-		// Forgejo client caps response bodies at 1 MiB with a generic
-		// "response exceeds" error. Map that to ErrDiffTooLarge so top-level
-		// reviews without inline comments can use the existing no-anchor path.
-		if strings.Contains(err.Error(), "response exceeds") {
-			return "", githubinfra.ErrDiffTooLarge
-		}
-		return "", err
-	}
-	return diff, nil
+func (gateway forgejoReviewSubmitGateway) BuildReviewAnchorIndex(ctx context.Context, input githubinfra.BuildReviewAnchorIndexInput) (*diffanchor.Index, string, error) {
+	return gateway.localGit.BuildReviewAnchorIndex(ctx, input)
 }
 
 func (gateway forgejoReviewSubmitGateway) SubmitReview(ctx context.Context, input githubinfra.SubmitReviewInput) error {
@@ -209,6 +221,14 @@ func forgeReviewSubmitLabelNames(labels []forge.Label) []string {
 }
 
 func reviewSubmitGatewayForConfig(cfg config.Config, repo, cwd string, diagnostic func(string, map[string]any)) (reviewSubmitGateway, error) {
+	return reviewSubmitGatewayForContext(context.Background(), cfg, repo, cwd, diagnostic)
+}
+
+func reviewSubmitGatewayForContext(ctx context.Context, cfg config.Config, repo, cwd string, diagnostic func(string, map[string]any)) (reviewSubmitGateway, error) {
+	gitPath := "git"
+	if cfg.Tools.GitPath != nil && strings.TrimSpace(*cfg.Tools.GitPath) != "" {
+		gitPath = strings.TrimSpace(*cfg.Tools.GitPath)
+	}
 	matched, err := reviewSubmitProjectForRepo(cfg, repo, cwd)
 	if err != nil {
 		return nil, err
@@ -224,7 +244,7 @@ func reviewSubmitGatewayForConfig(cfg config.Config, repo, cwd string, diagnosti
 		if provider == nil {
 			return nil, fmt.Errorf("forgejo provider %q is not configured", matched.Provider)
 		}
-		client, err := forge.NewForgejoClientFromConfig(*provider, matched.Repo)
+		client, err := forge.NewForgejoClientForContext(ctx, *provider, matched.Repo)
 		if err != nil {
 			return nil, err
 		}
@@ -232,14 +252,10 @@ func reviewSubmitGatewayForConfig(cfg config.Config, repo, cwd string, diagnosti
 		// project-specific roles instead of falling back to global defaults.
 		roleCfg := reviewSubmitConfigWithMatchedProject(cfg, matched)
 		roles := config.ProjectRoleConfigs(roleCfg, matched.ID)
-		return forgejoReviewSubmitGateway{client: client, stamper: disclosure.FromConfig(cfg), requireReviewRequest: roles.Reviewer.Discovery.Triggers.RequireReviewRequest, labels: append([]string(nil), roles.Reviewer.Discovery.Triggers.Labels...), labelMode: roles.Reviewer.Discovery.Triggers.LabelMode}, nil
+		return forgejoReviewSubmitGateway{client: client, localGit: githubinfra.New(githubinfra.Options{GitPath: gitPath, CWD: cwd}), stamper: disclosure.FromConfig(cfg), requireReviewRequest: roles.Reviewer.Discovery.Triggers.RequireReviewRequest, labels: append([]string(nil), roles.Reviewer.Discovery.Triggers.Labels...), labelMode: roles.Reviewer.Discovery.Triggers.LabelMode}, nil
 	}
 	if cfg.Tools.GHPath == nil || strings.TrimSpace(*cfg.Tools.GHPath) == "" {
 		return nil, fmt.Errorf("GitHub CLI (gh) not found; install gh or set --gh-path <path>")
-	}
-	gitPath := "git"
-	if cfg.Tools.GitPath != nil && strings.TrimSpace(*cfg.Tools.GitPath) != "" {
-		gitPath = strings.TrimSpace(*cfg.Tools.GitPath)
 	}
 	return githubinfra.New(githubinfra.Options{
 		GHPath:                 *cfg.Tools.GHPath,
@@ -388,16 +404,19 @@ func (r *commandRuntime) reviewSubmit(cmd *cobra.Command, args []string) error {
 	// of any agent-visible wrapper path. The proxy child clears the socket env
 	// and re-enters this command with tokens injected.
 	if forge.TrustedReviewSockConfigured() {
-		raw, err := io.ReadAll(cmd.InOrStdin())
+		raw, err := io.ReadAll(io.LimitReader(cmd.InOrStdin(), (1<<20)+1))
 		if err != nil {
 			return fmt.Errorf("read review payload from stdin: %w", err)
+		}
+		if len(raw) > 1<<20 {
+			return fmt.Errorf("review payload exceeds size limit")
 		}
 		cwd, err := r.getwd()
 		if err != nil {
 			return fmt.Errorf("determine current working directory: %w", err)
 		}
 		argv := reviewSubmitProxyArgv(os.Args)
-		return forge.ProxyReviewSubmit(argv, raw, cwd)
+		return forge.ProxyReviewSubmitContext(cmd.Context(), argv, raw, cwd)
 	}
 
 	repo, prNumber, err := parsePullRequestRef(args[0])
@@ -422,9 +441,28 @@ func (r *commandRuntime) reviewSubmit(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("parse review payload JSON from stdin: %w", err)
 	}
 
-	loaded, err := r.loadConfig()
-	if err != nil {
-		return err
+	var loaded config.LoadedFileConfig
+	if forge.TrustedReviewProxyChildConfigured() {
+		var resolved *config.ResolvedHostingIdentity
+		loaded, resolved, _, err = forge.LoadTrustedHostingSnapshot()
+		if err != nil {
+			return err
+		}
+		if resolved != nil {
+			if resolved.Role != "reviewer" || !strings.EqualFold(resolved.Target.Repo, repo) {
+				return errors.New("trusted review identity does not match the reviewer repository")
+			}
+			bound, err := hostingidentity.BindResolved(cmd.Context(), *resolved)
+			if err != nil {
+				return err
+			}
+			cmd.SetContext(bound)
+		}
+	} else {
+		loaded, err = r.loadConfig()
+		if err != nil {
+			return err
+		}
 	}
 	policy, err := effectiveReviewSubmitPolicy(
 		loaded.Config.Roles.Reviewer.Behavior.ReviewEvents,
@@ -441,11 +479,24 @@ func (r *commandRuntime) reviewSubmit(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("determine current working directory: %w", err)
 	}
+	if _, selected := hostingidentity.FromContext(cmd.Context()); !selected {
+		matched, err := reviewSubmitProjectForRepo(loaded.Config, repo, cwd)
+		if err != nil {
+			return err
+		}
+		if matched != nil {
+			bound, err := hostingidentity.Bind(cmd.Context(), reviewSubmitConfigWithMatchedProject(loaded.Config, matched), matched.ID, "reviewer")
+			if err != nil {
+				return err
+			}
+			cmd.SetContext(bound)
+		}
+	}
 
 	diagnosticWriter := func(event string, fields map[string]any) {
 		writeReviewSubmitDiagnosticEntry(cmd.ErrOrStderr(), event, fields)
 	}
-	gateway, err := reviewSubmitGatewayForConfig(loaded.Config, repo, cwd, diagnosticWriter)
+	gateway, err := reviewSubmitGatewayForContext(cmd.Context(), loaded.Config, repo, cwd, diagnosticWriter)
 	if err != nil {
 		return err
 	}
@@ -475,6 +526,12 @@ func (r *commandRuntime) reviewSubmit(cmd *cobra.Command, args []string) error {
 		})
 		return err
 	}
+	if err := validateReviewSubmitCommentDispositions(payload.Comments); err != nil {
+		writeReviewSubmitDiagnostic(cmd.ErrOrStderr(), "github_review_submit_validation_failed", reviewSubmitDiagnosticFields{
+			Repo: repo, PRNumber: prNumber, Event: event, CommitID: commitID, Payload: payload, Error: err.Error(), RedactPaths: true,
+		})
+		return err
+	}
 	submissionEvent, err := r.effectiveReviewSubmitEvent(cmd, gateway, repo, prNumber, event, detail.Author, cwd)
 	if err != nil {
 		return err
@@ -485,18 +542,6 @@ func (r *commandRuntime) reviewSubmit(cmd *cobra.Command, args []string) error {
 	// prefix of `gh pr diff` and not the agent-provided line alone.
 	anchors, err := resolveReviewSubmitAnchors(cmd.Context(), gateway, repo, prNumber, cwd, detail, payload.Comments)
 	if err != nil {
-		if canSubmitWithoutAnchorValidation(err, payload.Comments) {
-			// Body-only oversized/truncated fallback still must fail closed on base/head
-			// drift: hold-only refresh is not enough when commit_id was captured earlier.
-			freshLabels, err := r.validateLatestReviewerReviewSubmitPublication(cmd, gateway, loaded.Config, repo, prNumber, commitID, detail.BaseSHA, getBoolFlag(cmd, "reviewer-manual"), getStringFlag(cmd, "reviewer-run-id"), cwd)
-			if err != nil {
-				return err
-			}
-			if err := validateForgejoReviewSubmitRequest(cmd.Context(), gateway, prNumber, freshLabels, requestBypass); err != nil {
-				return err
-			}
-			return submitReviewWithoutAnchorValidation(cmd, gateway, repo, prNumber, submissionEvent, payload, commitID, cwd, loaded.Config.Disclosure)
-		}
 		// Never reach SubmitReview's content guard on this path: redact paths and
 		// never return path-bearing git/remote errors (path may be secret-shaped).
 		writeReviewSubmitDiagnostic(cmd.ErrOrStderr(), "github_review_submit_validation_failed", reviewSubmitDiagnosticFields{
@@ -508,10 +553,6 @@ func (r *commandRuntime) reviewSubmit(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("resolve PR diff anchor authority for review submit: %w", githubinfra.ErrAnchorValidationUnavailable)
 	}
 
-	comments := make([]githubinfra.ReviewComment, 0, len(payload.Comments))
-	for _, comment := range payload.Comments {
-		comments = append(comments, githubinfra.ReviewComment{Body: comment.Body, Path: comment.Path, Line: comment.Line, Side: comment.Side, StartLine: comment.StartLine, StartSide: comment.StartSide})
-	}
 	// Fail closed on base/head drift between anchor resolution and mutation.
 	freshLabels, err := r.validateLatestReviewerReviewSubmitPublication(cmd, gateway, loaded.Config, repo, prNumber, commitID, detail.BaseSHA, getBoolFlag(cmd, "reviewer-manual"), getStringFlag(cmd, "reviewer-run-id"), cwd)
 	if err != nil {
@@ -520,10 +561,7 @@ func (r *commandRuntime) reviewSubmit(cmd *cobra.Command, args []string) error {
 	if err := validateForgejoReviewSubmitRequest(cmd.Context(), gateway, prNumber, freshLabels, requestBypass); err != nil {
 		return err
 	}
-	if err := gateway.SubmitReview(cmd.Context(), githubinfra.SubmitReviewInput{Repo: repo, PRNumber: prNumber, Event: submissionEvent, Body: payload.Body, CommitID: commitID, Comments: comments, Anchors: anchors, Disclosure: loaded.Config.Disclosure, CWD: cwd}); err != nil {
-		return wrapReviewSubmitError(cmd, repo, prNumber, submissionEvent, commitID, payload, "submit validated PR review", err)
-	}
-	return writeJSON(cmd.OutOrStdout(), map[string]any{"submitted": true})
+	return submitReviewWithAnchors(cmd, r, loaded.Config, gateway, repo, prNumber, submissionEvent, payload, commitID, cwd, loaded.Config.Disclosure, anchors)
 }
 
 func validateForgejoReviewSubmitRequest(ctx context.Context, gateway reviewSubmitGateway, prNumber int64, labels []string, bypass bool) error {
@@ -544,9 +582,9 @@ func validateForgejoReviewSubmitRequest(ctx context.Context, gateway reviewSubmi
 //   - the current trusted run is a manual reviewer loop (--reviewer-run-id), or
 //   - the current trusted reviewer loop is an enabled follow-up reviewing a head
 //     that differs from lastPublishedHeadSha (matching requireReviewRequestForLoop
-//     / reviewerFollowUpHasNewHead in the reviewer runner). Automatic follow-up
-//     runs do not pass --reviewer-run-id, so that path resolves the current
-//     running reviewer loop for the PR when the flag is absent.
+//     / reviewerFollowUpHasNewHead in the reviewer runner). Automatic prompts now
+//     pass --reviewer-run-id; the no-flag path still resolves the current running
+//     reviewer loop for the PR when the flag is absent.
 func (r *commandRuntime) trustedReviewRequestSubmitBypass(cmd *cobra.Command, cfg config.Config, repo string, prNumber int64, headSHA string) (bool, error) {
 	dbPath := strings.TrimSpace(cfg.Storage.DBPath)
 	if dbPath == "" {
@@ -569,6 +607,20 @@ func (r *commandRuntime) trustedReviewRequestSubmitBypass(cmd *cobra.Command, cf
 	}
 	defer func() { _ = db.Close() }()
 	repos := storage.NewRepositories(db)
+	resolve := func(loop storage.LoopRecord) (bool, error) {
+		previous, err := reviewengagement.Resolve(loop.MetadataJSON, headSHA, func() (string, error) {
+			cwd, err := r.getwd()
+			if err != nil {
+				return "", err
+			}
+			gateway, err := reviewSubmitGatewayForConfig(cfg, repo, cwd, nil)
+			if err != nil {
+				return "", err
+			}
+			return recoverReviewSubmitEngagement(cmd.Context(), gateway, cfg, loop, repo, prNumber, headSHA, cwd)
+		})
+		return previous != "" && previous != strings.TrimSpace(headSHA), err
+	}
 	runID := strings.TrimSpace(getStringFlag(cmd, "reviewer-run-id"))
 	if runID != "" {
 		manual, err := trustedManualReviewerRun(cmd.Context(), repos, repo, prNumber, runID)
@@ -578,55 +630,23 @@ func (r *commandRuntime) trustedReviewRequestSubmitBypass(cmd *cobra.Command, cf
 		if manual {
 			return true, nil
 		}
-		return trustedFollowUpNewHeadReviewerRun(cmd.Context(), repos, repo, prNumber, runID, headSHA)
+		return trustedFollowUpNewHeadReviewerRun(cmd.Context(), repos, repo, prNumber, runID, resolve)
 	}
-	return trustedCurrentFollowUpNewHeadReviewerBypass(cmd.Context(), repos, repo, prNumber, headSHA)
+	return trustedCurrentFollowUpNewHeadReviewerBypass(cmd.Context(), repos, repo, prNumber, resolve)
 }
 
-// resolveReviewSubmitAnchors establishes complete base/head anchor authority.
-// For actionable inline comments it prefers path-targeted local diffs (GitHub
-// gateway) and never treats a truncated remote capture as authoritative.
-// Body-only reviews may still proceed when only GitHub oversized / local
-// capture limits block a full remote diff. Forgejo uses the remote PR diff as
-// complete authority.
+// Body-only reviews need no diff. Both providers use the same local Git index
+// for inline comments at the refreshed PR base/head SHAs.
 func resolveReviewSubmitAnchors(ctx context.Context, gateway reviewSubmitGateway, repo string, prNumber int64, cwd string, detail githubinfra.PullRequestDetail, comments []reviewSubmitComment) (*diffanchor.Index, error) {
 	if len(comments) == 0 {
-		diff, err := gateway.GetPullRequestDiff(ctx, githubinfra.GetPullRequestDiffInput{Repo: repo, PRNumber: prNumber, CWD: cwd})
-		if err != nil {
-			return nil, err
-		}
-		parsed := diffanchor.Parse(diff)
-		return &parsed, nil
+		return nil, nil
 	}
-
-	// Prefer complete local base/head authority when the gateway supports it.
-	if gh, ok := gateway.(*githubinfra.Gateway); ok {
-		paths := make([]string, 0, len(comments))
-		for _, comment := range comments {
-			paths = append(paths, comment.Path)
-		}
-		anchors, _, err := gh.BuildReviewAnchorIndex(ctx, githubinfra.BuildReviewAnchorIndexInput{
-			CWD:     cwd,
-			BaseSHA: detail.BaseSHA,
-			HeadSHA: detail.HeadSHA,
-			Paths:   paths,
-			RemoteDiff: func(ctx context.Context) (string, error) {
-				return gh.GetPullRequestDiff(ctx, githubinfra.GetPullRequestDiffInput{Repo: repo, PRNumber: prNumber, CWD: cwd})
-			},
-		})
-		if err != nil {
-			return nil, err
-		}
-		return anchors, nil
+	paths := make([]string, 0, len(comments))
+	for _, comment := range comments {
+		paths = append(paths, comment.Path)
 	}
-
-	// Forgejo and other gateways: remote PR diff is the complete authority.
-	diff, err := gateway.GetPullRequestDiff(ctx, githubinfra.GetPullRequestDiffInput{Repo: repo, PRNumber: prNumber, CWD: cwd})
-	if err != nil {
-		return nil, err
-	}
-	parsed := diffanchor.Parse(diff)
-	return &parsed, nil
+	anchors, _, err := gateway.BuildReviewAnchorIndex(ctx, githubinfra.BuildReviewAnchorIndexInput{CWD: cwd, BaseSHA: detail.BaseSHA, HeadSHA: detail.HeadSHA, Paths: paths})
+	return anchors, err
 }
 
 // wrapReviewSubmitError keeps content-safety rejections actionable for agents
@@ -642,18 +662,31 @@ func wrapReviewSubmitError(cmd *cobra.Command, repo string, prNumber int64, even
 	return fmt.Errorf("%s: %w", prefix, err)
 }
 
-func (r *commandRuntime) effectiveReviewSubmitEvent(cmd *cobra.Command, gh reviewSubmitGateway, repo string, prNumber int64, event string, authorLogin string, cwd string) (string, error) {
-	if !strings.EqualFold(strings.TrimSpace(event), "APPROVE") || strings.TrimSpace(authorLogin) == "" {
+func (r *commandRuntime) effectiveReviewSubmitEvent(cmd *cobra.Command, gateway reviewSubmitGateway, repo string, prNumber int64, event string, authorLogin string, cwd string) (string, error) {
+	_, isForgejo := gateway.(forgejoReviewSubmitGateway)
+	isApproval := strings.EqualFold(strings.TrimSpace(event), "APPROVE")
+	isForgejoChangeRequest := isForgejo && strings.EqualFold(strings.TrimSpace(event), "REQUEST_CHANGES")
+	if (!isApproval && !isForgejoChangeRequest) || strings.TrimSpace(authorLogin) == "" {
 		return event, nil
 	}
-	currentLogin, err := gh.GetCurrentUserLogin(cmd.Context(), cwd)
+	providerName := "GitHub"
+	if isForgejo {
+		providerName = "Forgejo"
+	}
+	currentLogin, err := gateway.GetCurrentUserLogin(cmd.Context(), cwd)
 	if err != nil {
-		return "", fmt.Errorf("determine authenticated GitHub user for self-approval check: %w", err)
+		return "", fmt.Errorf("determine authenticated %s user for self-review check: %w", providerName, err)
 	}
 	if !sameGitHubLogin(currentLogin, authorLogin) {
 		return event, nil
 	}
-	_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "looper: downgrading APPROVE review to COMMENT for %s#%d because authenticated GitHub user %q authored the pull request and GitHub does not allow self-approval\n", repo, prNumber, strings.TrimSpace(currentLogin))
+	restriction := providerName + " does not allow self-approval"
+	if isForgejoChangeRequest {
+		restriction = "Forgejo does not allow authors to request changes on their own pull requests"
+	}
+	// This only adapts native transport. The validated outcome marker and inline
+	// findings remain unchanged, including a blocking outcome on a COMMENT review.
+	_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "looper: downgrading %s review to COMMENT for %s#%d because authenticated %s user %q authored the pull request and %s\n", event, repo, prNumber, providerName, strings.TrimSpace(currentLogin), restriction)
 	return "COMMENT", nil
 }
 
@@ -718,6 +751,7 @@ func validateReviewSubmitEventAllowed(event string, policy config.ReviewerReview
 var reviewSubmitMarkerRE = regexp.MustCompile(`<!--\s*looper:review\s+([^>]*)-->`)
 var markdownHTMLCommentRE = regexp.MustCompile(`(?s)<!--.*?-->`)
 var markdownReferenceDefinitionRE = regexp.MustCompile(`(?m)^\s{0,3}\[[^\]\n]+\]:[^\n]*(?:\n[ \t]+[^\n]*)*`)
+var reviewSubmitSuppressedFindingRE = regexp.MustCompile(`(?i)\b(?:follow_up|needs_human)\b`)
 
 func validateReviewSubmitBody(body string, comments []reviewSubmitComment, commitID string, event string, policy config.ReviewerReviewEventsConfig, authorLogin string) error {
 	matches := reviewSubmitMarkerRE.FindAllStringSubmatch(body, -1)
@@ -747,12 +781,71 @@ func validateReviewSubmitBody(body string, comments []reviewSubmitComment, commi
 		if outcome != "blocking" {
 			return fmt.Errorf("review marker outcome=%s does not match REQUEST_CHANGES event", outcome)
 		}
+		// Body-only must not be the sole carrier of a blocking finding.
+		if len(comments) == 0 {
+			return fmt.Errorf("REQUEST_CHANGES requires at least one inline comment; body-only reviews may only be clean COMMENT/APPROVE")
+		}
 	case "COMMENT":
 		if outcome == "clean" && policy.Clean == config.ReviewerReviewEventApprove {
 			return fmt.Errorf("review marker outcome=clean requires APPROVE under effective policy")
 		}
 		if outcome == "blocking" && policy.Blocking == config.ReviewerReviewEventRequestChanges {
 			return fmt.Errorf("review marker outcome=blocking requires REQUEST_CHANGES under effective policy")
+		}
+		// Clean COMMENT is body-only (same as APPROVE); inline comments imply must_fix.
+		if outcome == "clean" && len(comments) > 0 {
+			return fmt.Errorf("COMMENT reviews require clean outcome without inline comments")
+		}
+		// Actionable/blocking COMMENT with zero comments smuggles findings in body only.
+		if outcome != "clean" && len(comments) == 0 {
+			return fmt.Errorf("actionable COMMENT reviews require at least one inline comment; body-only reviews may only be clean COMMENT/APPROVE")
+		}
+	}
+	return validateReviewSubmitBodyHasNoSuppressedFindings(body)
+}
+
+// validateReviewSubmitBodyHasNoSuppressedFindings fail-closes when visible
+// review prose smuggles follow_up/needs_human findings. Spec 7.3 allows a
+// must_fix summary in the body; it does not allow suppressed dispositions.
+func validateReviewSubmitBodyHasNoSuppressedFindings(body string) error {
+	if reviewSubmitSuppressedFindingRE.FindString(cleanReviewHumanBody(body)) == "" {
+		return nil
+	}
+	return fmt.Errorf("review body must not include follow_up or needs_human findings; only must_fix may be published remotely")
+}
+
+// validateReviewSubmitCommentDispositions enforces the trusted finding contract on
+// actionable inline comments. Clean body-only APPROVE/COMMENT needs no dispositions.
+//
+// Authority for publishing a finding as remote review feedback is repository
+// instructions, PR intent, and spec 7.3 — not this gate. The gate fail-closes on
+// the agent's own structured disposition/scope fields so a prompt-only subset
+// cannot publish follow_up/needs_human or omit the declaration; it does not infer
+// disposition from GitHub or other infra state.
+func validateReviewSubmitCommentDispositions(comments []reviewSubmitComment) error {
+	if len(comments) == 0 {
+		return nil
+	}
+	for i, comment := range comments {
+		disposition := strings.TrimSpace(comment.Disposition)
+		scopeBasis := strings.TrimSpace(comment.ScopeBasis)
+		scopeEvidence := strings.TrimSpace(comment.ScopeEvidence)
+		if disposition == "" || scopeBasis == "" || scopeEvidence == "" {
+			return fmt.Errorf("actionable review comment %d requires disposition=must_fix, non-empty scopeBasis, and non-empty scopeEvidence", i)
+		}
+		switch disposition {
+		case reviewFindingDispositionMustFix:
+			// ok
+		case reviewFindingDispositionFollowUp, reviewFindingDispositionNeedsHuman:
+			return fmt.Errorf("actionable review comment %d rejects disposition=%s; only must_fix may be submitted as remote feedback", i, disposition)
+		default:
+			return fmt.Errorf("actionable review comment %d has invalid disposition %q (want must_fix)", i, disposition)
+		}
+		switch scopeBasis {
+		case reviewFindingScopeStatedIntent, reviewFindingScopeIntroducedRegression, reviewFindingScopeRequiredInvariant, reviewFindingScopeIndependentImprovement, reviewFindingScopeAmbiguousIntent:
+			// ok
+		default:
+			return fmt.Errorf("actionable review comment %d has invalid scopeBasis %q", i, scopeBasis)
 		}
 	}
 	return nil
@@ -908,7 +1001,7 @@ func trustedManualReviewerRun(ctx context.Context, repos *storage.Repositories, 
 // trustedFollowUpNewHeadReviewerRun reports whether --reviewer-run-id is the
 // current running reviewer run for an enabled follow-up loop whose last
 // published head differs from the head being submitted.
-func trustedFollowUpNewHeadReviewerRun(ctx context.Context, repos *storage.Repositories, repo string, prNumber int64, runID string, headSHA string) (bool, error) {
+func trustedFollowUpNewHeadReviewerRun(ctx context.Context, repos *storage.Repositories, repo string, prNumber int64, runID string, resolve func(storage.LoopRecord) (bool, error)) (bool, error) {
 	loop, err := trustedCurrentReviewerLoopForRun(ctx, repos, repo, prNumber, runID)
 	if err != nil {
 		return false, err
@@ -916,14 +1009,13 @@ func trustedFollowUpNewHeadReviewerRun(ctx context.Context, repos *storage.Repos
 	if loop == nil {
 		return false, nil
 	}
-	return reviewSubmitFollowUpHasNewHead(loop.MetadataJSON, headSHA), nil
+	return resolve(*loop)
 }
 
 // trustedCurrentFollowUpNewHeadReviewerBypass honors the runner's
 // follow_up_new_head requireReviewRequest bypass when agents submit without
-// --reviewer-run-id (automatic reviewer prompts only pass that flag for manual
-// runs). Authority is the current running reviewer loop for the PR.
-func trustedCurrentFollowUpNewHeadReviewerBypass(ctx context.Context, repos *storage.Repositories, repo string, prNumber int64, headSHA string) (bool, error) {
+// --reviewer-run-id. Authority is the current running reviewer loop for the PR.
+func trustedCurrentFollowUpNewHeadReviewerBypass(ctx context.Context, repos *storage.Repositories, repo string, prNumber int64, resolve func(storage.LoopRecord) (bool, error)) (bool, error) {
 	if repos == nil || repos.Runs == nil || repos.Loops == nil {
 		return false, fmt.Errorf("validate follow-up review request bypass: storage is not configured")
 	}
@@ -948,7 +1040,7 @@ func trustedCurrentFollowUpNewHeadReviewerBypass(ctx context.Context, repos *sto
 	if !strings.EqualFold(strings.TrimSpace(loopRepo), strings.TrimSpace(repo)) || loop.PRNumber == nil || *loop.PRNumber != prNumber {
 		return false, nil
 	}
-	return reviewSubmitFollowUpHasNewHead(loop.MetadataJSON, headSHA), nil
+	return resolve(*loop)
 }
 
 // trustedCurrentReviewerLoopForRun returns the loop for runID only when that
@@ -995,26 +1087,48 @@ func trustedCurrentReviewerLoopForRun(ctx context.Context, repos *storage.Reposi
 	return loop, nil
 }
 
-// reviewSubmitFollowUpHasNewHead mirrors reviewer.reviewerFollowUpHasNewHead:
-// enabled follow-up loops may publish without a fresh review request when the
-// head being submitted differs from the last published review head.
 func reviewSubmitFollowUpHasNewHead(metadataJSON *string, headSHA string) bool {
-	headSHA = strings.TrimSpace(headSHA)
-	if headSHA == "" {
-		return false
+	return reviewengagement.HasNewHead(metadataJSON, headSHA)
+}
+
+// Recovery never trusts submitted argv or payload markers. The caller has
+// already bound this lookup to the current running reviewer loop in storage.
+func recoverReviewSubmitEngagement(ctx context.Context, gateway reviewSubmitGateway, cfg config.Config, loop storage.LoopRecord, repo string, prNumber int64, headSHA, cwd string) (string, error) {
+	login, err := gateway.GetCurrentUserLogin(ctx, cwd)
+	if err != nil {
+		return "", err
 	}
-	meta := parseReviewSubmitJSONObject(metadataJSON)
-	if enabled, ok := meta["followUpdates"].(bool); !ok || !enabled {
-		return false
-	}
-	if loopMeta, ok := meta["loop"].(map[string]any); ok {
-		if enabled, ok := loopMeta["enabled"].(bool); ok && !enabled {
-			return false
+	var detail githubinfra.PullRequestDetail
+	switch gh := gateway.(type) {
+	case *githubinfra.Gateway:
+		detail, err = gh.ViewPullRequestForReviewer(ctx, githubinfra.ViewPullRequestInput{Repo: repo, PRNumber: prNumber, CWD: cwd})
+	case forgejoReviewSubmitGateway:
+		detail, err = gh.ViewPullRequest(ctx, githubinfra.ViewPullRequestInput{Repo: repo, PRNumber: prNumber, CWD: cwd})
+		if err == nil {
+			var reviews []forge.PullRequestReview
+			reviews, err = gh.client.ListPullRequestReviews(ctx, prNumber)
+			for _, review := range reviews {
+				detail.Reviews = append(detail.Reviews, map[string]any{"user": map[string]any{"login": review.User.Login}, "state": review.State, "body": review.Body, "commit_id": review.CommitID})
+			}
 		}
+	default:
+		return "", fmt.Errorf("review engagement recovery requires a provider review loader")
 	}
-	lastPublished, _ := meta["lastPublishedHeadSha"].(string)
-	lastPublished = strings.TrimSpace(lastPublished)
-	return lastPublished != "" && lastPublished != headSHA
+	if err != nil {
+		return "", err
+	}
+	if err := validateExpectedHeadCommit(headSHA, detail.HeadSHA); err != nil {
+		return "", err
+	}
+	matched, err := reviewSubmitProjectForRepo(cfg, repo, cwd)
+	if err != nil {
+		return "", err
+	}
+	policyCfg := reviewSubmitConfigWithMatchedProject(cfg, matched)
+	policy := reviewengagement.Policy(loop.MetadataJSON, config.ProjectRoleConfigs(policyCfg, loop.ProjectID).Reviewer.Behavior.ReviewEvents)
+	selfAuthored := sameGitHubLogin(login, detail.Author)
+	_, isForgejo := gateway.(forgejoReviewSubmitGateway)
+	return githubinfra.ReviewEngagementHead(detail.Reviews, loop.ID, headSHA, login, reviewengagement.AllowedEvents(policy), selfAuthored, selfAuthored && isForgejo), nil
 }
 
 func currentRunningReviewerRun(ctx context.Context, repos *storage.Repositories, repo string, prNumber int64) (*storage.RunRecord, error) {
@@ -1073,20 +1187,191 @@ func parseReviewSubmitJSONObject(value *string) map[string]any {
 	return parsed
 }
 
-func canSubmitWithoutAnchorValidation(err error, comments []reviewSubmitComment) bool {
-	if len(comments) != 0 {
-		// Actionable inline comments must not silently become body-only when
-		// anchor authority is unavailable; fail closed for retry instead.
-		return false
+func submitReviewWithAnchors(cmd *cobra.Command, r *commandRuntime, cfg config.Config, gh reviewSubmitGateway, repo string, prNumber int64, event string, payload reviewSubmitPayload, commitID string, cwd string, disclosureCfg config.DisclosureConfig, anchors *diffanchor.Index) error {
+	comments := make([]githubinfra.ReviewComment, 0, len(payload.Comments))
+	for _, comment := range payload.Comments {
+		// Strip Looper-only disposition/scope fields before the provider Adapter.
+		comments = append(comments, githubinfra.ReviewComment{Body: comment.Body, Path: comment.Path, Line: comment.Line, Side: comment.Side, StartLine: comment.StartLine, StartSide: comment.StartSide})
 	}
-	return errors.Is(err, githubinfra.ErrDiffTooLarge) || errors.Is(err, githubinfra.ErrLocalCaptureTruncated)
-}
-
-func submitReviewWithoutAnchorValidation(cmd *cobra.Command, gh reviewSubmitGateway, repo string, prNumber int64, event string, payload reviewSubmitPayload, commitID string, cwd string, disclosureCfg config.DisclosureConfig) error {
-	if err := gh.SubmitReview(cmd.Context(), githubinfra.SubmitReviewInput{Repo: repo, PRNumber: prNumber, Event: event, Body: payload.Body, CommitID: commitID, Disclosure: disclosureCfg, CWD: cwd}); err != nil {
-		return wrapReviewSubmitError(cmd, repo, prNumber, event, commitID, payload, "submit PR review without anchor validation", err)
+	if err := r.refuseReviewSubmitIfBudgetExhausted(cmd, cfg, repo, prNumber); err != nil {
+		return err
+	}
+	if err := gh.SubmitReview(cmd.Context(), githubinfra.SubmitReviewInput{Repo: repo, PRNumber: prNumber, Event: event, Body: payload.Body, CommitID: commitID, Comments: comments, Anchors: anchors, Disclosure: disclosureCfg, CWD: cwd}); err != nil {
+		return wrapReviewSubmitError(cmd, repo, prNumber, event, commitID, payload, "submit validated PR review", err)
 	}
 	return writeJSON(cmd.OutOrStdout(), map[string]any{"submitted": true})
+}
+
+// refuseReviewSubmitIfBudgetExhausted refuses agent-native review publish when the
+// authoritative submitting reviewer loop is already at/over the live
+// maxPublishesPerPR cap or is on a review-fix budget hold. One-shot manual is
+// exempt via ParticipatesInReviewFixBudget. Does not park — daemon owns park.
+//
+// Authority is the submitting loop only (--reviewer-run-id / active submit
+// run, including a budget-paused loop whose run is still running). Other lanes
+// and terminal/historical loops are ignored. When no submitting loop can be
+// resolved, skip (same optional-authority posture as a missing DB).
+//
+// Storage probe matches trustedReviewRequestSubmitBypass: only open an already-
+// materialized DB; if DB is absent, skip (optional authority lookup).
+func (r *commandRuntime) refuseReviewSubmitIfBudgetExhausted(cmd *cobra.Command, cfg config.Config, repo string, prNumber int64) error {
+	dbPath := strings.TrimSpace(cfg.Storage.DBPath)
+	if dbPath == "" {
+		return nil
+	}
+	if _, err := os.Stat(dbPath); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("check review-fix publish budget: %w", err)
+	}
+	db, err := storage.OpenSQLiteDB(cmd.Context(), dbPath)
+	if err != nil {
+		return fmt.Errorf("check review-fix publish budget: %w", err)
+	}
+	defer func() { _ = db.Close() }()
+	runID := strings.TrimSpace(getStringFlag(cmd, "reviewer-run-id"))
+	return refuseReviewSubmitBudgetAgainstRepos(cmd.Context(), storage.NewRepositories(db), cfg, repo, prNumber, runID)
+}
+
+// refuseReviewSubmitBudgetAgainstRepos is the DB-present budget gate used by
+// refuseReviewSubmitIfBudgetExhausted and unit tests. runID is the optional
+// --reviewer-run-id binding for the submitting loop.
+func refuseReviewSubmitBudgetAgainstRepos(ctx context.Context, repos *storage.Repositories, cfg config.Config, repo string, prNumber int64, runID string) error {
+	if repos == nil || repos.Loops == nil {
+		return nil
+	}
+	loop, err := submittingReviewerLoopForBudgetGate(ctx, repos, repo, prNumber, runID)
+	if err != nil {
+		return err
+	}
+	if loop == nil {
+		// No authoritative submitting loop — optional authority, same as missing DB.
+		return nil
+	}
+	if !loops.ParticipatesInReviewFixBudget(*loop) {
+		// One-shot manual (and any non-participating lane) is exempt.
+		return nil
+	}
+	if loops.IsReviewFixPairHold(*loop) {
+		if loops.IsReviewScopeHumanHold(*loop) && !loops.IsReviewFixBudgetHold(*loop) {
+			return fmt.Errorf("review submit refused: review scope requires human judgment for %s#%d; unpause or stop the loop before publishing", repo, prNumber)
+		}
+		return fmt.Errorf("review submit refused: review-fix budget is held for %s#%d; unpause or stop the loop before publishing", repo, prNumber)
+	}
+	cap := config.ProjectRoleConfigs(cfg, loop.ProjectID).Reviewer.Behavior.Loop.MaxPublishesPerPR
+	count := loops.ReviewerPublishCount(loop.MetadataJSON)
+	if loops.BudgetExhausted(count, cap) {
+		return fmt.Errorf("review submit refused: review-fix publish budget exhausted for %s#%d (%d/%d); unpause or stop the loop before publishing", repo, prNumber, count, cap)
+	}
+	return nil
+}
+
+// submittingReviewerLoopForBudgetGate resolves only the submitting reviewer loop.
+// Prefer --reviewer-run-id via the active run even when sibling parking has
+// paused the loop; otherwise the single running reviewer run for the PR,
+// including budget-paused and awaiting-human loops. Multiple running reviewer
+// runs without a run ID are fail-closed so a held lane cannot be masked.
+func submittingReviewerLoopForBudgetGate(ctx context.Context, repos *storage.Repositories, repo string, prNumber int64, runID string) (*storage.LoopRecord, error) {
+	runID = strings.TrimSpace(runID)
+	if runID != "" {
+		loop, err := reviewerLoopForActiveSubmitRun(ctx, repos, repo, prNumber, runID)
+		if err != nil {
+			return nil, fmt.Errorf("check review-fix publish budget: %w", err)
+		}
+		return loop, nil
+	}
+	if repos.Runs == nil {
+		return nil, nil
+	}
+	currentRun, err := currentSubmittingReviewerRunForBudgetGate(ctx, repos, repo, prNumber)
+	if err != nil {
+		return nil, fmt.Errorf("check review-fix publish budget: %w", err)
+	}
+	if currentRun == nil {
+		return nil, nil
+	}
+	return reviewerLoopForBudgetGate(ctx, repos, currentRun.LoopID, repo, prNumber)
+}
+
+// reviewerLoopForActiveSubmitRun returns the reviewer loop for a still-running
+// submit run even when budget parking has paused the loop. Unlike
+// trustedCurrentReviewerLoopForRun, it does not require loop status running.
+func reviewerLoopForActiveSubmitRun(ctx context.Context, repos *storage.Repositories, repo string, prNumber int64, runID string) (*storage.LoopRecord, error) {
+	if repos == nil || repos.Runs == nil || repos.Loops == nil {
+		return nil, fmt.Errorf("storage is not configured")
+	}
+	run, err := repos.Runs.GetByID(ctx, runID)
+	if err != nil {
+		return nil, err
+	}
+	if run == nil || run.Status != string(domain.RunStatusRunning) {
+		return nil, nil
+	}
+	return reviewerLoopForBudgetGate(ctx, repos, run.LoopID, repo, prNumber)
+}
+
+// currentSubmittingReviewerRunForBudgetGate finds the single running reviewer
+// run for the PR even when sibling parking has moved the loop off running.
+// Two independently budgeted lanes can both have running runs; recency is not
+// authority, so more than one candidate is an error.
+func currentSubmittingReviewerRunForBudgetGate(ctx context.Context, repos *storage.Repositories, repo string, prNumber int64) (*storage.RunRecord, error) {
+	loops, err := repos.Loops.ListByStatuses(ctx, []string{
+		string(domain.LoopStatusRunning),
+		string(domain.LoopStatusPaused),
+		string(domain.LoopStatusAwaitingHuman),
+	})
+	if err != nil {
+		return nil, err
+	}
+	loopIDs := make([]string, 0, len(loops))
+	for _, loop := range loops {
+		if !reviewerLoopMatchesPR(loop, repo, prNumber) {
+			continue
+		}
+		loopIDs = append(loopIDs, loop.ID)
+	}
+	if len(loopIDs) == 0 {
+		return nil, nil
+	}
+	runs, err := repos.Runs.ListLatestByLoopIDs(ctx, loopIDs)
+	if err != nil {
+		return nil, err
+	}
+	var current *storage.RunRecord
+	for i := range runs {
+		if runs[i].Status != string(domain.RunStatusRunning) {
+			continue
+		}
+		if current != nil {
+			return nil, fmt.Errorf("multiple running reviewer runs for %s#%d; pass --reviewer-run-id", repo, prNumber)
+		}
+		run := runs[i]
+		current = &run
+	}
+	return current, nil
+}
+
+func reviewerLoopForBudgetGate(ctx context.Context, repos *storage.Repositories, loopID, repo string, prNumber int64) (*storage.LoopRecord, error) {
+	loop, err := repos.Loops.GetByID(ctx, loopID)
+	if err != nil {
+		return nil, err
+	}
+	if loop == nil || !reviewerLoopMatchesPR(*loop, repo, prNumber) {
+		return nil, nil
+	}
+	return loop, nil
+}
+
+func reviewerLoopMatchesPR(loop storage.LoopRecord, repo string, prNumber int64) bool {
+	if loop.Type != string(domain.LoopTypeReviewer) {
+		return false
+	}
+	loopRepo := ""
+	if loop.Repo != nil {
+		loopRepo = *loop.Repo
+	}
+	return strings.EqualFold(strings.TrimSpace(loopRepo), strings.TrimSpace(repo)) && loop.PRNumber != nil && *loop.PRNumber == prNumber
 }
 
 func writeReviewSubmitDiagnostic(w io.Writer, event string, fields reviewSubmitDiagnosticFields) {

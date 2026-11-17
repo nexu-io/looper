@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -14,15 +15,19 @@ import (
 	"time"
 
 	"github.com/nexu-io/looper/internal/config"
+	"github.com/nexu-io/looper/internal/hostingidentity"
 	"github.com/nexu-io/looper/internal/outboundguard"
 )
 
 const defaultForgejoTimeout = 30 * time.Second
+
+// maxForgejoResponseBodyBytes bounds health probes and login discovery only.
 const maxForgejoResponseBodyBytes = 1 << 20
 
 type ForgejoClient struct {
 	baseURL         *url.URL
 	token           string
+	session         *hostingidentity.Session
 	httpClient      *http.Client
 	repo            RepositoryRef
 	capabilityMu    sync.Mutex
@@ -75,7 +80,39 @@ func WithLookPath(lookPath func(string) (string, error)) ForgejoOption {
 	}
 }
 
+func readBoundedResponse(r io.Reader, limit int) ([]byte, error) {
+	if limit <= 0 {
+		return io.ReadAll(r)
+	}
+	return io.ReadAll(io.LimitReader(r, int64(limit)+1))
+}
+
+func responseExceedsLimit(n, limit int) bool {
+	return limit > 0 && n > limit
+}
+
 func NewForgejoClient(ref RepositoryRef, token string, options ...ForgejoOption) (*ForgejoClient, error) {
+	return newForgejoClient(ref, token, nil, options...)
+}
+
+// NewForgejoClientForContext bypasses legacy token/tea lookup for an explicit
+// run binding. Its credential is refreshed before each request.
+func NewForgejoClientForContext(ctx context.Context, provider config.ProviderConfig, repo string, options ...ForgejoOption) (*ForgejoClient, error) {
+	session, selected := hostingidentity.FromContext(ctx)
+	if !selected {
+		return NewForgejoClientFromConfig(provider, repo, options...)
+	}
+	target := session.Target()
+	if session.Kind() != config.HostingIdentityForgejoToken || provider.Kind != config.ProviderKindForgejo || strings.TrimRight(provider.BaseURL, "/") != target.BaseURL {
+		return nil, fmt.Errorf("hosting identity %q: Forgejo provider differs from the bound target", session.Name())
+	}
+	if err := session.CheckRepository(repo); err != nil {
+		return nil, err
+	}
+	return newForgejoClient(RepositoryRef{ProviderID: target.ProviderID, Kind: ProviderKindForgejo, BaseURL: target.BaseURL, Repo: target.Repo}, "", session, options...)
+}
+
+func newForgejoClient(ref RepositoryRef, token string, session *hostingidentity.Session, options ...ForgejoOption) (*ForgejoClient, error) {
 	baseURL, err := parseForgejoBaseURL(ref.BaseURL)
 	if err != nil {
 		return nil, err
@@ -86,13 +123,20 @@ func NewForgejoClient(ref RepositoryRef, token string, options ...ForgejoOption)
 	if strings.TrimSpace(ref.Repo) == "" {
 		return nil, fmt.Errorf("forgejo client: repo is required")
 	}
-	if strings.TrimSpace(token) == "" {
+	if strings.TrimSpace(token) == "" && session == nil {
 		return nil, fmt.Errorf("forgejo client: token is required")
+	}
+	httpClient := &http.Client{Timeout: defaultForgejoTimeout}
+	if session != nil {
+		if identityClient := session.HTTPClient(); identityClient != nil {
+			httpClient = identityClient
+		}
 	}
 	client := &ForgejoClient{
 		baseURL:    baseURL,
 		token:      token,
-		httpClient: &http.Client{Timeout: defaultForgejoTimeout},
+		session:    session,
+		httpClient: httpClient,
 		repo: RepositoryRef{
 			ProviderID: strings.TrimSpace(ref.ProviderID),
 			Kind:       ProviderKindForgejo,
@@ -110,6 +154,12 @@ func NewForgejoClient(ref RepositoryRef, token string, options ...ForgejoOption)
 	}
 	if client.httpClient.Timeout == 0 {
 		client.httpClient.Timeout = defaultForgejoTimeout
+	}
+	if session != nil {
+		copy := *client.httpClient
+		copy.Jar = nil
+		copy.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+		client.httpClient = &copy
 	}
 	return client, nil
 }
@@ -176,9 +226,6 @@ func newForgejoClientFromTea(provider config.ProviderConfig, repo string, option
 		}
 	}
 	runner := client.teaRunner
-	if runner == nil {
-		runner = defaultTeaRunner{}
-	}
 	ctx, cancel := context.WithTimeout(context.Background(), teaLoginsListTimeout)
 	defer cancel()
 	teaPath, login, err := ValidateTeaLoginForProvider(ctx, provider, runner, client.lookPath)
@@ -189,7 +236,7 @@ func newForgejoClientFromTea(provider config.ProviderConfig, repo string, option
 	if client.httpClient != nil && client.httpClient.Timeout > 0 {
 		timeout = client.httpClient.Timeout
 	}
-	client.tea = newTeaTransport(teaPath, login.Name, baseURL, timeout, runner)
+	client.tea = newTeaTransport(teaPath, login.Name, baseURL, timeout, runner, 0)
 	return client, nil
 }
 
@@ -203,6 +250,10 @@ func (forgejo *ForgejoClient) Capabilities() Capabilities {
 }
 
 func (forgejo *ForgejoClient) CurrentUser(ctx context.Context) (Identity, error) {
+	if forgejo.session != nil {
+		credential, err := forgejo.session.Credentials(ctx)
+		return Identity{Login: credential.Login, ID: credential.NumericID}, err
+	}
 	var user forgejoUser
 	if err := forgejo.do(ctx, http.MethodGet, "user", nil, nil, &user); err != nil {
 		return Identity{}, err
@@ -295,6 +346,7 @@ type UpdateCommentInput struct {
 
 type Issue struct {
 	Number           int64
+	IsPullRequest    bool
 	Title            string
 	Body             string
 	State            string
@@ -320,6 +372,9 @@ type PullRequest struct {
 	Labels    []Label
 	Assignees []Identity
 	Reviewers []Identity
+	// Mergeable is not a conflict verdict: Forgejo also returns false while
+	// checking mergeability, for server errors, and for work-in-progress PRs.
+	Mergeable *bool
 }
 
 type BranchRef struct {
@@ -354,16 +409,22 @@ type PullRequestReviewComment struct {
 	DiffHunk            string
 	PullRequestReviewID int64
 	Resolver            ForgejoReviewCommentResolverField
+	ReviewBody          string
+	ReviewState         string
+	ReviewCommitID      string
+	ReviewAuthor        string
 }
 
 type PullRequestReview struct {
-	ID       int64
-	State    string
-	Body     string
-	CommitID string
-	HTMLURL  string
-	User     Identity
-	Comments []PullRequestReviewComment
+	ID        int64
+	State     string
+	Body      string
+	CommitID  string
+	HTMLURL   string
+	User      Identity
+	Comments  []PullRequestReviewComment
+	Dismissed bool
+	Stale     bool
 }
 
 type UnsupportedCapabilityError struct {
@@ -385,6 +446,7 @@ type ForgejoHTTPError struct {
 	Path       string
 	StatusCode int
 	Message    string
+	body       string
 }
 
 func (err *ForgejoHTTPError) Error() string {
@@ -597,6 +659,79 @@ func (forgejo *ForgejoClient) RemoveIssueAssignees(ctx context.Context, issueNum
 	return forgejo.do(ctx, http.MethodDelete, forgejo.repoPath("issues", strconv.FormatInt(issueNumber, 10), "assignees"), nil, map[string][]string{"assignees": assignees}, nil)
 }
 
+func (forgejo *ForgejoClient) AddIssueReaction(ctx context.Context, issueNumber int64, content string) error {
+	content = strings.TrimSpace(content)
+	if content == "" {
+		return nil
+	}
+	path := forgejo.repoPath("issues", strconv.FormatInt(issueNumber, 10), "reactions")
+	err := forgejo.do(ctx, http.MethodPost, path, nil, map[string]string{"content": content}, nil)
+	if forgejoReactionAlreadyPresent(err) {
+		return nil
+	}
+	var httpErr *ForgejoHTTPError
+	if !errors.As(err, &httpErr) || httpErr.StatusCode < 500 || httpErr.StatusCode >= 600 {
+		return err
+	}
+	// Some Forgejo servers return 500 for duplicate reactions. Reconcile the
+	// desired state without hiding failures when this account's reaction is absent.
+	user, userErr := forgejo.CurrentUser(ctx)
+	if userErr != nil || user.ID <= 0 {
+		return err
+	}
+	var reactions []struct {
+		Content string      `json:"content"`
+		User    forgejoUser `json:"user"`
+	}
+	if listErr := forgejo.getPaged(ctx, path, nil, 0, &reactions); listErr != nil {
+		return err
+	}
+	for _, reaction := range reactions {
+		if reaction.User.ID == user.ID && reaction.Content == content {
+			return nil
+		}
+	}
+	return err
+}
+
+func (forgejo *ForgejoClient) RemoveIssueReaction(ctx context.Context, issueNumber int64, content string) error {
+	content = strings.TrimSpace(content)
+	if content == "" {
+		return nil
+	}
+	err := forgejo.do(ctx, http.MethodDelete, forgejo.repoPath("issues", strconv.FormatInt(issueNumber, 10), "reactions"), nil, map[string]string{"content": content}, nil)
+	if forgejoReactionMissing(err) {
+		return nil
+	}
+	return err
+}
+
+func forgejoReactionAlreadyPresent(err error) bool {
+	var httpErr *ForgejoHTTPError
+	if !errors.As(err, &httpErr) {
+		return false
+	}
+	if httpErr.StatusCode == http.StatusConflict {
+		return true
+	}
+	return httpErr.StatusCode == http.StatusForbidden && strings.Contains(strings.ToLower(httpErr.responseBody()), "already")
+}
+
+func (err *ForgejoHTTPError) responseBody() string {
+	if err == nil {
+		return ""
+	}
+	if strings.TrimSpace(err.body) != "" {
+		return err.body
+	}
+	return err.Message
+}
+
+func forgejoReactionMissing(err error) bool {
+	var httpErr *ForgejoHTTPError
+	return errors.As(err, &httpErr) && httpErr.StatusCode == http.StatusNotFound
+}
+
 func (forgejo *ForgejoClient) CreateIssueComment(ctx context.Context, input CreateCommentInput) (Comment, error) {
 	if err := outboundguard.Validate(outboundguard.Field{Name: "issue comment body", Text: input.Body}); err != nil {
 		return Comment{}, err
@@ -632,21 +767,24 @@ func (forgejo *ForgejoClient) UpdateIssueComment(ctx context.Context, input Upda
 }
 
 func (forgejo *ForgejoClient) ListPullRequestReviewComments(ctx context.Context, number int64) ([]PullRequestReviewComment, error) {
-	var reviews []forgejoPullRequestReview
-	if err := forgejo.getPaged(ctx, forgejo.repoPath("pulls", strconv.FormatInt(number, 10), "reviews"), nil, 0, &reviews); err != nil {
+	reviews, err := forgejo.listPullRequestReviews(ctx, number, true)
+	if err != nil {
 		return nil, err
 	}
 	comments := make([]PullRequestReviewComment, 0)
 	for _, review := range reviews {
-		var output []forgejoPullRequestReviewComment
-		if err := forgejo.getPaged(ctx, forgejo.repoPath("pulls", strconv.FormatInt(number, 10), "reviews", strconv.FormatInt(review.ID, 10), "comments"), nil, 0, &output); err != nil {
-			return nil, err
-		}
-		for _, comment := range output {
-			comments = append(comments, convertPullRequestReviewComment(comment))
-		}
+		comments = append(comments, review.Comments...)
 	}
 	return comments, nil
+}
+
+// ListPullRequestReviewSummaries avoids fetching every inline comment when a
+// caller only needs reviewer identities or the latest review decisions.
+func (forgejo *ForgejoClient) ListPullRequestReviewSummaries(ctx context.Context, number int64) ([]PullRequestReview, error) {
+	if err := forgejo.requireCapability(ctx, "nativeReviews", http.MethodGet, "/repos/{owner}/{repo}/pulls/{index}/reviews"); err != nil {
+		return nil, err
+	}
+	return forgejo.listPullRequestReviews(ctx, number, false)
 }
 
 func (forgejo *ForgejoClient) ListPullRequestReviews(ctx context.Context, number int64) ([]PullRequestReview, error) {
@@ -659,6 +797,10 @@ func (forgejo *ForgejoClient) ListPullRequestReviews(ctx context.Context, number
 	if err := forgejo.requireCapability(ctx, "nativeReviews", http.MethodGet, "/repos/{owner}/{repo}/pulls/{index}/reviews/{id}/comments"); err != nil {
 		return nil, err
 	}
+	return forgejo.listPullRequestReviews(ctx, number, true)
+}
+
+func (forgejo *ForgejoClient) listPullRequestReviews(ctx context.Context, number int64, includeComments bool) ([]PullRequestReview, error) {
 	var output []forgejoPullRequestReview
 	if err := forgejo.getPaged(ctx, forgejo.repoPath("pulls", strconv.FormatInt(number, 10), "reviews"), nil, 0, &output); err != nil {
 		return nil, err
@@ -666,7 +808,7 @@ func (forgejo *ForgejoClient) ListPullRequestReviews(ctx context.Context, number
 	reviews := make([]PullRequestReview, 0, len(output))
 	for _, review := range output {
 		converted := convertPullRequestReview(review)
-		if len(converted.Comments) == 0 {
+		if includeComments && len(converted.Comments) == 0 && (review.CommentsCount == nil || *review.CommentsCount > 0) {
 			var comments []forgejoPullRequestReviewComment
 			if err := forgejo.getPaged(ctx, forgejo.repoPath("pulls", strconv.FormatInt(number, 10), "reviews", strconv.FormatInt(review.ID, 10), "comments"), nil, 0, &comments); err != nil {
 				return nil, err
@@ -675,9 +817,24 @@ func (forgejo *ForgejoClient) ListPullRequestReviews(ctx context.Context, number
 				converted.Comments = append(converted.Comments, convertPullRequestReviewComment(comment))
 			}
 		}
+		for index := range converted.Comments {
+			comment := &converted.Comments[index]
+			comment.PullRequestReviewID = converted.ID
+			comment.ReviewBody = converted.Body
+			comment.ReviewState = converted.State
+			comment.ReviewCommitID = converted.CommitID
+			comment.ReviewAuthor = converted.User.Login
+		}
 		reviews = append(reviews, converted)
 	}
 	return reviews, nil
+}
+
+func (forgejo *ForgejoClient) DismissPullRequestReview(ctx context.Context, number, reviewID int64, message string) error {
+	if err := outboundguard.Validate(outboundguard.Field{Name: "review dismissal message", Text: message}); err != nil {
+		return err
+	}
+	return forgejo.do(ctx, http.MethodPost, forgejo.repoPath("pulls", strconv.FormatInt(number, 10), "reviews", strconv.FormatInt(reviewID, 10), "dismissals"), nil, map[string]any{"message": message, "priors": false}, nil)
 }
 
 func (forgejo *ForgejoClient) CreatePullRequestReview(ctx context.Context, input CreatePullRequestReviewInput) (PullRequestReview, error) {
@@ -746,10 +903,24 @@ func (forgejo *ForgejoClient) requireCapability(ctx context.Context, name, metho
 			statusCode = httpErr.StatusCode
 		}
 	} else {
-		response, probeErr := forgejoProbeGET(ctx, forgejo.httpClient, forgejoProbeURL(forgejo.baseURL, "swagger.v1.json"), forgejo.token, maxForgejoOpenAPIBytes)
+		token := forgejo.token
+		if forgejo.session != nil {
+			credential, credentialErr := forgejo.session.Credentials(ctx)
+			if credentialErr != nil {
+				return credentialErr
+			}
+			token = credential.Token
+		}
+		response, probeErr := forgejoProbeGET(ctx, forgejo.httpClient, forgejoProbeURL(forgejo.baseURL, "swagger.v1.json"), token, maxForgejoOpenAPIBytes)
 		err = probeErr
 		body = response.body
 		statusCode = response.statusCode
+		if forgejo.session != nil && err != nil && statusCode != http.StatusNotFound && statusCode != http.StatusMethodNotAllowed {
+			if statusCode == http.StatusUnauthorized || statusCode == http.StatusForbidden {
+				forgejo.session.Invalidate(token)
+			}
+			return &hostingidentity.Error{Identity: forgejo.session.Name(), Operation: "probe Forgejo capability", StatusCode: statusCode, Reason: "hosting server capability request failed"}
+		}
 	}
 	if err != nil {
 		state := ProbeStateUnknown
@@ -856,6 +1027,9 @@ func (forgejo *ForgejoClient) do(ctx context.Context, method string, path string
 		return nil
 	}
 	if err := json.Unmarshal(response.body, out); err != nil {
+		if forgejo.session != nil {
+			return fmt.Errorf("hosting identity %q: Forgejo API returned invalid JSON", forgejo.session.Name())
+		}
 		return fmt.Errorf("forgejo API decode %s %s: %w", method, path, err)
 	}
 	return nil
@@ -870,6 +1044,17 @@ func (forgejo *ForgejoClient) doRaw(ctx context.Context, method string, path str
 		return rawResponse{}, err
 	}
 	apiURL.RawQuery = query.Encode()
+	token := forgejo.token
+	if forgejo.session != nil {
+		if err := forgejo.session.CheckAPIURL(apiURL.String()); err != nil {
+			return rawResponse{}, err
+		}
+		credential, err := forgejo.session.Credentials(ctx)
+		if err != nil {
+			return rawResponse{}, err
+		}
+		token = credential.Token
+	}
 	var body io.Reader
 	if payload != nil {
 		encoded, err := json.Marshal(payload)
@@ -883,24 +1068,41 @@ func (forgejo *ForgejoClient) doRaw(ctx context.Context, method string, path str
 		return rawResponse{}, fmt.Errorf("forgejo API build request %s %s: %w", method, path, err)
 	}
 	request.Header.Set("Accept", "application/json")
-	request.Header.Set("Authorization", "token "+forgejo.token)
+	request.Header.Set("Authorization", "token "+token)
 	if payload != nil {
 		request.Header.Set("Content-Type", "application/json")
 	}
 	response, err := forgejo.httpClient.Do(request)
 	if err != nil {
+		if forgejo.session != nil {
+			if ctx.Err() != nil {
+				return rawResponse{}, fmt.Errorf("hosting identity %q: Forgejo request: %w", forgejo.session.Name(), ctx.Err())
+			}
+			return rawResponse{}, fmt.Errorf("hosting identity %q: Forgejo hosting server request failed", forgejo.session.Name())
+		}
 		return rawResponse{}, fmt.Errorf("forgejo API %s %s failed: %w", method, path, err)
 	}
 	defer response.Body.Close()
-	responseBody, err := io.ReadAll(io.LimitReader(response.Body, maxForgejoResponseBodyBytes+1))
+	responseBody, err := io.ReadAll(response.Body)
 	if err != nil {
+		if forgejo.session != nil {
+			return rawResponse{}, &hostingidentity.Error{Identity: forgejo.session.Name(), Operation: "read Forgejo response", Reason: "cannot read hosting server response"}
+		}
 		return rawResponse{}, fmt.Errorf("forgejo API read response %s %s: %w", method, path, err)
 	}
-	if len(responseBody) > maxForgejoResponseBodyBytes {
-		return rawResponse{}, fmt.Errorf("forgejo API %s %s response exceeds %d bytes", method, path, maxForgejoResponseBodyBytes)
-	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return rawResponse{}, &ForgejoHTTPError{Method: method, Path: path, StatusCode: response.StatusCode, Message: sanitizeForgejoErrorBody(responseBody, forgejo.token)}
+		sanitized := sanitizeForgejoErrorBody(responseBody, token)
+		httpErr := &ForgejoHTTPError{Method: method, Path: path, StatusCode: response.StatusCode, Message: sanitized, body: sanitized}
+		if forgejo.session != nil {
+			if response.StatusCode == http.StatusUnauthorized || (response.StatusCode == http.StatusForbidden && !forgejoReactionAlreadyPresent(httpErr)) {
+				forgejo.session.Invalidate(token)
+			}
+			httpErr.Message = fmt.Sprintf("hosting identity %q: hosting server rejected the request", forgejo.session.Name())
+		}
+		return rawResponse{}, httpErr
+	}
+	if forgejo.session != nil {
+		responseBody = []byte(forgejo.session.Redact(string(responseBody)))
 	}
 	return rawResponse{body: responseBody, header: response.Header.Clone()}, nil
 }
@@ -955,15 +1157,16 @@ type forgejoLabel struct {
 }
 
 type forgejoIssue struct {
-	Number    int64          `json:"number"`
-	Title     string         `json:"title"`
-	Body      string         `json:"body"`
-	State     string         `json:"state"`
-	HTMLURL   string         `json:"html_url"`
-	UpdatedAt string         `json:"updated_at"`
-	User      forgejoUser    `json:"user"`
-	Labels    []forgejoLabel `json:"labels"`
-	Assignees []forgejoUser  `json:"assignees"`
+	Number      int64          `json:"number"`
+	PullRequest *struct{}      `json:"pull_request"`
+	Title       string         `json:"title"`
+	Body        string         `json:"body"`
+	State       string         `json:"state"`
+	HTMLURL     string         `json:"html_url"`
+	UpdatedAt   string         `json:"updated_at"`
+	User        forgejoUser    `json:"user"`
+	Labels      []forgejoLabel `json:"labels"`
+	Assignees   []forgejoUser  `json:"assignees"`
 }
 
 type forgejoPullRequest struct {
@@ -980,6 +1183,7 @@ type forgejoPullRequest struct {
 	Labels    []forgejoLabel `json:"labels"`
 	Assignees []forgejoUser  `json:"assignees"`
 	Reviewers []forgejoUser  `json:"requested_reviewers"`
+	Mergeable *bool          `json:"mergeable"`
 }
 
 type forgejoBranch struct {
@@ -1039,21 +1243,24 @@ type forgejoPullRequestReviewComment struct {
 }
 
 type forgejoPullRequestReview struct {
-	ID       int64                             `json:"id"`
-	State    string                            `json:"state"`
-	Body     string                            `json:"body"`
-	CommitID string                            `json:"commit_id"`
-	HTMLURL  string                            `json:"html_url"`
-	User     forgejoUser                       `json:"user"`
-	Comments []forgejoPullRequestReviewComment `json:"comments"`
+	ID            int64                             `json:"id"`
+	State         string                            `json:"state"`
+	Body          string                            `json:"body"`
+	CommitID      string                            `json:"commit_id"`
+	HTMLURL       string                            `json:"html_url"`
+	User          forgejoUser                       `json:"user"`
+	Comments      []forgejoPullRequestReviewComment `json:"comments"`
+	CommentsCount *int                              `json:"comments_count"`
+	Dismissed     bool                              `json:"dismissed"`
+	Stale         bool                              `json:"stale"`
 }
 
 func convertIssue(input forgejoIssue) Issue {
-	return Issue{Number: input.Number, Title: input.Title, Body: input.Body, State: input.State, HTMLURL: input.HTMLURL, UpdatedAt: input.UpdatedAt, User: convertUser(input.User), Labels: convertLabels(input.Labels), Assignees: convertUsers(input.Assignees)}
+	return Issue{Number: input.Number, IsPullRequest: input.PullRequest != nil, Title: input.Title, Body: input.Body, State: input.State, HTMLURL: input.HTMLURL, UpdatedAt: input.UpdatedAt, User: convertUser(input.User), Labels: convertLabels(input.Labels), Assignees: convertUsers(input.Assignees)}
 }
 
 func convertPullRequest(input forgejoPullRequest) PullRequest {
-	return PullRequest{Number: input.Number, Title: input.Title, Body: input.Body, State: input.State, IsDraft: input.Draft, HTMLURL: input.HTMLURL, UpdatedAt: input.UpdatedAt, User: convertUser(input.User), Head: convertBranch(input.Head), Base: convertBranch(input.Base), Labels: convertLabels(input.Labels), Assignees: convertUsers(input.Assignees), Reviewers: convertUsers(input.Reviewers)}
+	return PullRequest{Number: input.Number, Title: input.Title, Body: input.Body, State: input.State, IsDraft: input.Draft, HTMLURL: input.HTMLURL, UpdatedAt: input.UpdatedAt, User: convertUser(input.User), Head: convertBranch(input.Head), Base: convertBranch(input.Base), Labels: convertLabels(input.Labels), Assignees: convertUsers(input.Assignees), Reviewers: convertUsers(input.Reviewers), Mergeable: input.Mergeable}
 }
 
 func convertPullRequestReview(input forgejoPullRequestReview) PullRequestReview {
@@ -1061,7 +1268,11 @@ func convertPullRequestReview(input forgejoPullRequestReview) PullRequestReview 
 	for _, comment := range input.Comments {
 		comments = append(comments, convertPullRequestReviewComment(comment))
 	}
-	return PullRequestReview{ID: input.ID, State: normalizeForgejoReviewState(input.State), Body: input.Body, CommitID: input.CommitID, HTMLURL: input.HTMLURL, User: convertUser(input.User), Comments: comments}
+	state := normalizeForgejoReviewState(input.State)
+	if input.Dismissed {
+		state = "DISMISSED"
+	}
+	return PullRequestReview{ID: input.ID, State: state, Body: input.Body, CommitID: input.CommitID, HTMLURL: input.HTMLURL, User: convertUser(input.User), Comments: comments, Dismissed: input.Dismissed, Stale: input.Stale}
 }
 
 func normalizeForgejoReviewEvent(event string) string {

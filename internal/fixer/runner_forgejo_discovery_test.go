@@ -2,7 +2,7 @@ package fixer
 
 import (
 	"context"
-	"errors"
+	"net/http"
 	"strings"
 	"testing"
 
@@ -11,7 +11,7 @@ import (
 	"github.com/nexu-io/looper/internal/storage"
 )
 
-func TestForgejoAutoDiscoveryUsesReviewerSummaryWithoutReadingNativeComments(t *testing.T) {
+func TestForgejoAutoDiscoveryUsesReviewerSummaryAndNativeComments(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
 	detail := forgejoDiscoveryDetail(t, "head-1", 1)
@@ -19,8 +19,7 @@ func TestForgejoAutoDiscoveryUsesReviewerSummaryWithoutReadingNativeComments(t *
 		currentUser:    "looper",
 		listOpen:       []PullRequestSummary{{Number: 42, State: "OPEN", HeadSHA: "head-1", Author: "looper"}},
 		viewResponses:  []PullRequestDetail{detail},
-		nativeComments: []NativeReviewComment{{ProviderCommentID: 101, Body: "Rename this helper", Author: "alice", ObservedFingerprint: NativeReviewCommentFingerprint(101, "u1"), ResolverPresent: true}},
-		listNativeErr:  errors.New("native API must not be called during automatic discovery"),
+		nativeComments: []NativeReviewComment{{ProviderCommentID: 101, Body: "Rename this helper", Author: "alice", ObservedFingerprint: NativeReviewCommentFingerprint(101, "Rename this helper"), ResolverPresent: true}},
 	}
 	cfg := forgejoFixerDiscoveryConfig(t, fixture)
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, CustomInstructions: cfg})
@@ -92,7 +91,7 @@ func TestForgejoAutoDiscoverySuppressesConsumedReviewerRoundUntilHeadChanges(t *
 	}
 }
 
-func TestForgejoAutoDiscoveryIgnoresNativeCommentsRegardlessOfResolverField(t *testing.T) {
+func TestForgejoAutoDiscoveryAcceptsOpenNativeCommentsRegardlessOfResolverField(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {
 		name            string
@@ -110,8 +109,7 @@ func TestForgejoAutoDiscoveryIgnoresNativeCommentsRegardlessOfResolverField(t *t
 				currentUser:    "looper",
 				listOpen:       []PullRequestSummary{{Number: 42, State: "OPEN", HeadSHA: "head-1", Author: "looper"}},
 				viewResponses:  []PullRequestDetail{detail},
-				nativeComments: []NativeReviewComment{{ProviderCommentID: 101, Body: "Fix this", Author: "alice", ObservedFingerprint: NativeReviewCommentFingerprint(101, "u1"), ResolverPresent: tc.resolverPresent, IsResolved: tc.resolved}},
-				listNativeErr:  errors.New("resolver response fields are not API capability authority"),
+				nativeComments: []NativeReviewComment{{ProviderCommentID: 101, Body: "Fix this", Author: "alice", ObservedFingerprint: NativeReviewCommentFingerprint(101, "Fix this"), ResolverPresent: tc.resolverPresent, IsResolved: tc.resolved}},
 			}
 			cfg := forgejoFixerDiscoveryConfig(t, fixture)
 			runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, CustomInstructions: cfg})
@@ -120,14 +118,18 @@ func TestForgejoAutoDiscoveryIgnoresNativeCommentsRegardlessOfResolverField(t *t
 			if err != nil {
 				t.Fatalf("DiscoverPullRequests() error = %v", err)
 			}
-			if len(result.QueueItems) != 0 {
-				t.Fatalf("QueueItems = %#v, native comments must not authorize automatic Forgejo fixer work", result.QueueItems)
+			want := 1
+			if tc.resolved {
+				want = 0
+			}
+			if len(result.QueueItems) != want {
+				t.Fatalf("QueueItems = %#v, want %d for open native feedback", result.QueueItems, want)
 			}
 		})
 	}
 }
 
-func TestForgejoAutomaticCollectDoesNotAttachNativeComments(t *testing.T) {
+func TestForgejoAutomaticCollectAttachesNativeComments(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
 	cfg := forgejoFixerDiscoveryConfig(t, fixture)
@@ -137,9 +139,9 @@ func TestForgejoAutomaticCollectDoesNotAttachNativeComments(t *testing.T) {
 	untrusted["author"] = map[string]any{"login": "mallory"}
 	detail.IssueComments = append(detail.IssueComments, untrusted)
 	github := &fakeGitHubGateway{currentUser: "looper", nativeComments: []NativeReviewComment{
-		{ProviderCommentID: 101, Body: "Fix this", Author: "alice", ObservedFingerprint: NativeReviewCommentFingerprint(101, "u1"), ResolverPresent: true},
-		{ProviderCommentID: 102, Body: "Unsupported", Author: "bob", ObservedFingerprint: NativeReviewCommentFingerprint(102, "u2"), ResolverPresent: false},
-	}, listNativeErr: errors.New("automatic collect must not read native comments")}
+		{ProviderCommentID: 101, Body: "Fix this", Author: "alice", ObservedFingerprint: NativeReviewCommentFingerprint(101, "Fix this"), ResolverPresent: true},
+		{ProviderCommentID: 102, Body: "Unsupported", Author: "bob", ObservedFingerprint: NativeReviewCommentFingerprint(102, "Unsupported"), ResolverPresent: false},
+	}}
 	runner := New(Options{GitHub: github, CustomInstructions: cfg})
 	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
 	if err != nil || project == nil {
@@ -149,8 +151,8 @@ func TestForgejoAutomaticCollectDoesNotAttachNativeComments(t *testing.T) {
 	if err != nil {
 		t.Fatalf("runCollectFixesStep() error = %v", err)
 	}
-	if len(checkpoint.FixItems) != 1 || checkpoint.FixItems[0].ID != "R-001" {
-		t.Fatalf("FixItems = %#v, want only the trusted reviewer summary item", checkpoint.FixItems)
+	if len(checkpoint.FixItems) != 3 {
+		t.Fatalf("FixItems = %#v, want two native items and the trusted summary item", checkpoint.FixItems)
 	}
 }
 
@@ -237,6 +239,80 @@ func TestForgejoAutoDiscoveryIgnoresUntrustedSummaryMarker(t *testing.T) {
 	}
 	if len(result.QueueItems) != 0 {
 		t.Fatalf("QueueItems = %#v, label and untrusted summary must not invent repair authority", result.QueueItems)
+	}
+}
+
+func TestForgejoSummaryCommentDiscoveryIgnoresUnsupportedNativeReviews(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	detail := forgejoDiscoveryDetail(t, "head-1", 1)
+	github := &fakeGitHubGateway{
+		currentUser:   "looper",
+		listOpen:      []PullRequestSummary{{Number: 42, State: "OPEN", HeadSHA: "head-1", Author: "looper"}},
+		viewResponses: []PullRequestDetail{detail},
+		listNativeErr: &forge.ForgejoHTTPError{StatusCode: http.StatusNotFound, Method: "GET", Path: "/pulls/42/reviews", Message: "missing endpoint"},
+	}
+	cfg := forgejoFixerDiscoveryConfig(t, fixture)
+	cfg.Roles.Reviewer.Behavior.PublishMode = config.ReviewerPublishModeSummaryComment
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, CustomInstructions: cfg})
+
+	result, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
+	if err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	if len(result.QueueItems) != 1 || len(result.CreatedLoopIDs) != 1 {
+		t.Fatalf("result = %#v, want summary_comment fixer loop from Reviewer Summary", result)
+	}
+	if github.listNativeCalls != 0 {
+		t.Fatalf("listNativeCalls = %d, summary_comment discovery must not require native review APIs", github.listNativeCalls)
+	}
+}
+
+func TestForgejoNativeDiscoveryRequiresNativeReviewAPI(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	detail := forgejoDiscoveryDetail(t, "head-1", 1)
+	github := &fakeGitHubGateway{
+		currentUser:   "looper",
+		listOpen:      []PullRequestSummary{{Number: 42, State: "OPEN", HeadSHA: "head-1", Author: "looper"}},
+		viewResponses: []PullRequestDetail{detail},
+		listNativeErr: &forge.ForgejoHTTPError{StatusCode: http.StatusNotFound, Method: "GET", Path: "/pulls/42/reviews", Message: "missing endpoint"},
+	}
+	cfg := forgejoFixerDiscoveryConfig(t, fixture)
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, CustomInstructions: cfg})
+
+	_, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
+	if err == nil || !strings.Contains(err.Error(), "discovery is unsupported") {
+		t.Fatalf("DiscoverPullRequests() error = %v, want native discovery manual intervention", err)
+	}
+}
+
+func TestRunCollectFixesStepSummaryCommentSkipsUnsupportedNativeDiscovery(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	detail := forgejoDiscoveryDetail(t, "head-1", 1)
+	github := &fakeGitHubGateway{
+		currentUser:   "looper",
+		listNativeErr: &forge.ForgejoHTTPError{StatusCode: http.StatusNotFound, Method: "GET", Path: "/pulls/42/reviews", Message: "missing endpoint"},
+	}
+	cfg := forgejoFixerDiscoveryConfig(t, fixture)
+	cfg.Roles.Reviewer.Behavior.PublishMode = config.ReviewerPublishModeSummaryComment
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, CustomInstructions: cfg})
+
+	checkpoint, err := runner.runCollectFixesStep(context.Background(), stepInput{
+		Project:    storage.ProjectRecord{ID: "project_1", RepoPath: fixtureProjectPath(t, fixture)},
+		Repo:       "acme/looper",
+		PRNumber:   42,
+		Checkpoint: fixerCheckpoint{Detail: pullRequestCheckpointDetail(detail)},
+	})
+	if err != nil {
+		t.Fatalf("runCollectFixesStep() error = %v", err)
+	}
+	if github.listNativeCalls != 0 {
+		t.Fatalf("listNativeCalls = %d, summary_comment collect-fixes must not require native review APIs", github.listNativeCalls)
+	}
+	if len(checkpoint.FixItems) == 0 {
+		t.Fatalf("FixItems = %#v, want Reviewer Summary items", checkpoint.FixItems)
 	}
 }
 

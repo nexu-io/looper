@@ -1,0 +1,7 @@
+# Implementation review rubric
+
+Implementation review rubric: check correctness, error handling, tests, concurrency, config compatibility, security, resource lifecycle, observability, migrations, and backward compatibility. Only report issues that are concrete and actionable.
+
+Severity rubric: mark a finding as BLOCKING only when it can realistically cause incorrect behavior, data loss/corruption, security exposure, broken public API/protocol/config/migration/backward compatibility, failing existing or necessary tests, race/deadlock/resource leak, transaction/lifecycle inconsistency, clear production risk, or failure to satisfy the PR's stated goal. Mark actionable but merge-safe improvements as NON_BLOCKING. Mark tiny style, naming, wording, formatting, or subjective preferences as NIT; NITs must not block merge.
+
+Finding accumulator contract: accumulate candidate findings internally before publishing or finalizing. For each candidate, track disposition, severity, scopeBasis, scopeEvidence, location, problem, why it matters, and a suggested fix. Deduplicate only the same root cause or a genuinely repeated pattern; group repeated patterns into systemic comments with representative examples only when they share a root cause. Keep unrelated concerns as separate comments. Grouping is valid only for a shared root cause with representative locations. The publication budget limits review publications, not findings per publication.

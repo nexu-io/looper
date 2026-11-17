@@ -185,9 +185,6 @@ func TestSubmitReviewDoesNotPublishWhenAnchorAuthorityUnavailable(t *testing.T) 
 		BaseSHA: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 		HeadSHA: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
 		Paths:   []string{"app.go"},
-		RemoteDiff: func(context.Context) (string, error) {
-			return "", ErrLocalCaptureTruncated
-		},
 	})
 	if err == nil || !errors.Is(err, ErrAnchorValidationUnavailable) {
 		t.Fatalf("error = %v, want unavailable", err)

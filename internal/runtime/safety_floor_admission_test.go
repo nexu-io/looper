@@ -81,7 +81,6 @@ func TestSafetyFloorMutationsAndClaimsGatedUntilReady(t *testing.T) {
 	if claimCalls.Load() <= beforeReadyClaims {
 		t.Fatalf("claim pump calls after ready = %d, want > %d", claimCalls.Load(), beforeReadyClaims)
 	}
-	claimsWhenReady := claimCalls.Load()
 
 	// Dual-flag invariant: forcing ownershipAcquired alone must not admit work
 	// when admission is degraded.
@@ -95,9 +94,12 @@ func TestSafetyFloorMutationsAndClaimsGatedUntilReady(t *testing.T) {
 	if err := rt.AllowClaim(); !errors.Is(err, ErrAdmissionDegraded) {
 		t.Fatalf("AllowClaim() while degraded with ownershipAcquired = %v, want degraded", err)
 	}
+	// Snapshot after degrade so a background claim-pump tick that raced while
+	// still ready cannot fail the assertion.
+	claimsAtDegrade := claimCalls.Load()
 	rt.executeSchedulerClaimPass(context.Background())
-	if claimCalls.Load() != claimsWhenReady {
-		t.Fatalf("claim pump advanced while degraded, calls=%d want %d", claimCalls.Load(), claimsWhenReady)
+	if claimCalls.Load() != claimsAtDegrade {
+		t.Fatalf("claim pump advanced while degraded, calls=%d want %d", claimCalls.Load(), claimsAtDegrade)
 	}
 }
 

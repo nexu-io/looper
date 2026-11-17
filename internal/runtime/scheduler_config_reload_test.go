@@ -12,6 +12,7 @@ import (
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/infra/shell"
 	"github.com/nexu-io/looper/internal/projects"
+	"github.com/nexu-io/looper/internal/reviewer"
 	"github.com/nexu-io/looper/internal/storage"
 )
 
@@ -114,6 +115,7 @@ func TestCatalogSchedulerStartsUsingVendorPublishedAfterDaemonStartup(t *testing
 		nil,
 		nil,
 		nil,
+		nil,
 	)
 	if handlers.webhook != nil {
 		t.Cleanup(handlers.webhook.Close)
@@ -207,6 +209,7 @@ func TestBuildDefaultSchedulerHandlers_PerRoleAgentVendors(t *testing.T) {
 		nil,
 		newSchedulerNotificationGatewayFactory(),
 		coordinatorrole.NewRuntimeState(),
+		reviewer.NewFollowUpSweepState(),
 	)
 	if handlers.input == nil {
 		t.Fatal("handlers.input = nil")
@@ -297,6 +300,7 @@ func TestCatalogSchedulerPreservesCoordinatorThrottleAcrossConfigSnapshots(t *te
 		nil,
 		nil,
 		func() time.Time { return now },
+		nil,
 		nil,
 		nil,
 		nil,

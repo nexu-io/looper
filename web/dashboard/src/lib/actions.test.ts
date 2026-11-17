@@ -12,7 +12,7 @@ const ALL: LoopAction[] = [
 
 function enabledOf(
   status: string,
-  opts?: { hasActiveRun?: boolean },
+  opts?: { hasActiveRun?: boolean; displayStatus?: string | null },
 ): LoopAction[] {
   const m = actionsForLoopStatus(status, opts);
   return ALL.filter((a) => m[a]);
@@ -36,6 +36,28 @@ describe("actionsForLoopStatus", () => {
     expect(actionsForLoopStatus("paused").unpause).toBe(true);
     expect(actionsForLoopStatus("running").unpause).toBe(false);
     expect(actionsForLoopStatus("stopped").unpause).toBe(false);
+  });
+
+  it("unpause: disabled under displayStatus=manual_intervention", () => {
+    // Generic /start requeues without /worktree preflight; recovery owns restart.
+    expect(
+      actionsForLoopStatus("paused", {
+        displayStatus: "manual_intervention",
+      }).unpause,
+    ).toBe(false);
+    expect(
+      actionsForLoopStatus("paused", {
+        displayStatus: "manual_intervention",
+      }).retry,
+    ).toBe(true);
+    expect(
+      actionsForLoopStatus("paused", { displayStatus: "paused" }).unpause,
+    ).toBe(true);
+    expect(
+      actionsForLoopStatus("paused", {
+        displayStatus: " Manual_Intervention ",
+      }).unpause,
+    ).toBe(false);
   });
 
   it("retry: failed, paused, interrupted — not running or stopped", () => {
@@ -95,5 +117,11 @@ describe("actionsForLoopStatus", () => {
 
   it("paused enables unpause and retry", () => {
     expect(enabledOf("paused").sort()).toEqual(["retry", "unpause"].sort());
+  });
+
+  it("paused + manual_intervention enables retry only (not unpause)", () => {
+    expect(
+      enabledOf("paused", { displayStatus: "manual_intervention" }).sort(),
+    ).toEqual(["retry"]);
   });
 });

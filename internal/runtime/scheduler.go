@@ -2,11 +2,13 @@ package runtime
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"github.com/nexu-io/looper/internal/executionhost"
 	"github.com/nexu-io/looper/internal/workerhost"
+	"io"
 	"math"
 	"net/http"
 	"net/url"
@@ -25,13 +27,17 @@ import (
 	"github.com/nexu-io/looper/internal/disclosure"
 	"github.com/nexu-io/looper/internal/fixer"
 	"github.com/nexu-io/looper/internal/forge"
+	"github.com/nexu-io/looper/internal/hostingidentity"
 	"github.com/nexu-io/looper/internal/infra/disk"
 	gitinfra "github.com/nexu-io/looper/internal/infra/git"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/infra/notify"
 	"github.com/nexu-io/looper/internal/infra/planedoc"
+	"github.com/nexu-io/looper/internal/infra/shell"
+	"github.com/nexu-io/looper/internal/loops"
 	loopcondition "github.com/nexu-io/looper/internal/loops/condition"
 	loopengine "github.com/nexu-io/looper/internal/loops/engine"
+	"github.com/nexu-io/looper/internal/loops/failureclass"
 	networkclient "github.com/nexu-io/looper/internal/network/client"
 	"github.com/nexu-io/looper/internal/network/protocol"
 	"github.com/nexu-io/looper/internal/networkpolicy"
@@ -90,7 +96,7 @@ type schedulerAsyncRunner interface {
 
 type defaultSchedulerTickInput struct {
 	Repos             *storage.Repositories
-	ActiveExecutions  *ActiveExecutionRegistry
+	DB                *sql.DB
 	GitHubGateway     *githubinfra.Gateway
 	Logger            bootstrap.Logger
 	Now               func() time.Time
@@ -132,6 +138,16 @@ type defaultSchedulerTickInput struct {
 	// OnHITLAnswerDelivered, when set, is called after a Feishu HITL answer is
 	// delivered to a loop, so the transport can mark the ask card resolved.
 	OnHITLAnswerDelivered func(context.Context, string, string)
+	// NotifyHumanAttention, when set, observes durable loop/queue state after a
+	// claim finishes and emits a best-effort action_required notification when
+	// the loop newly entered awaiting_human or manual_intervention.
+	NotifyHumanAttention func(context.Context, string)
+	// DrainHITLPair stops live pair agents before a scope Stop answer is
+	// applied by GitHub/Feishu poll. Optional; tests may inject a recorder.
+	DrainHITLPair func(context.Context, storage.LoopRecord) error
+	// ActiveExecutions reopens sticky pair spawn gates when a scope Stop drain
+	// loses to a concurrent Continue.
+	ActiveExecutions *ActiveExecutionRegistry
 }
 
 type defaultSchedulerHandlers struct {
@@ -352,9 +368,396 @@ func mintTrustedReviewProxyForPR(realLooper string, trustedEnv map[string]string
 	return forge.StartTrustedReviewProxy(resolvedLooper, trustedEnv, allowedPRRef, allowedCwd, configSnapshot, policy, tracker)
 }
 
-func forgeReviewContext(ctx context.Context, client *forge.ForgejoClient, pr forge.PullRequest, compatibilityFallback bool) ([]string, []networkpolicy.GitHubUser, []map[string]any, string, error) {
+// forgejoClientForContext uses the captured target before any legacy provider
+// lookup, including credential-less bot-only providers and same-slug repos.
+func forgejoClientForContext(ctx context.Context, cfg *config.Config, repo string, cwd ...string) (*forge.ForgejoClient, bool, error) {
+	if session, selected := hostingidentity.FromContext(ctx); selected {
+		if session.Kind() != config.HostingIdentityForgejoToken {
+			return nil, false, nil
+		}
+		target := session.Target()
+		if strings.TrimSpace(repo) == "" {
+			repo = target.Repo
+		}
+		provider := config.ProviderConfig{ID: target.ProviderID, Kind: config.ProviderKindForgejo, BaseURL: target.BaseURL}
+		client, err := forge.NewForgejoClientForContext(ctx, provider, strings.TrimSpace(repo))
+		return client, true, err
+	}
+	return forgeClientForLocation(cfg, repo, cwd, forgejoClientForCWD, forgejoClientForRepo)
+}
+
+func forgejoClientForIssueContext(ctx context.Context, cfg *config.Config, repo, cwd string) (*forge.ForgejoClient, bool, error) {
+	if _, selected := hostingidentity.FromContext(ctx); selected {
+		return forgejoClientForContext(ctx, cfg, repo, cwd)
+	}
+	return forgejoClientForIssueLookup(cfg, repo, cwd)
+}
+
+func forgejoClientForRepo(cfg *config.Config, repo string) (*forge.ForgejoClient, bool, error) {
+	provider, ok, err := forgejoProviderForRepo(cfg, repo)
+	if !ok || err != nil {
+		return nil, ok, err
+	}
+	client, err := forge.NewForgejoClientFromConfig(provider, strings.TrimSpace(repo))
+	if err != nil {
+		return nil, true, err
+	}
+	return client, true, nil
+}
+
+// forgejoReviewerDiscoveryLabelsForRepo returns configured reviewer trigger
+// labels for a Forgejo project. Used as a discovery fallback when native
+// requested_reviewers alone is insufficient (label-triggered discovery or
+// instances without requested_reviewers support).
+func forgejoReviewerDiscoveryLabelsForRepo(cfg *config.Config, repo, cwd string) []string {
+	if cfg == nil {
+		return nil
+	}
+	repo = strings.TrimSpace(repo)
+	if strings.TrimSpace(cwd) != "" {
+		for _, project := range cfg.Projects {
+			if cwdBelongsToProject(project, cwd) {
+				return forgejoReviewerDiscoveryLabelsForProject(*cfg, project)
+			}
+		}
+	}
+	var matched *config.ProjectRefConfig
+	for _, project := range cfg.Projects {
+		if !strings.EqualFold(strings.TrimSpace(project.Repo), repo) {
+			continue
+		}
+		if matched != nil {
+			return nil
+		}
+		projectCopy := project
+		matched = &projectCopy
+	}
+	if matched != nil {
+		return forgejoReviewerDiscoveryLabelsForProject(*cfg, *matched)
+	}
+	return nil
+}
+
+func forgejoReviewerDiscoveryLabelsForProject(cfg config.Config, project config.ProjectRefConfig) []string {
+	if config.ResolvedProjectProviderKind(cfg, project) != config.ProviderKindForgejo {
+		return nil
+	}
+	labels := config.ProjectRoleConfigs(cfg, project.ID).Reviewer.Discovery.Triggers.Labels
+	result := make([]string, 0, len(labels))
+	for _, label := range labels {
+		label = strings.TrimSpace(label)
+		if label != "" {
+			result = append(result, label)
+		}
+	}
+	return result
+}
+
+// addForgejoPullRequestReviewers requests native reviewers and, when the project
+// is label-triggered, also applies discovery trigger labels so reviewer
+// auto-discovery still matches. If native request fails but labels are
+// configured, labels alone keep compatibility instances working.
+// When native request succeeds on a native-request-triggered project
+// (requireReviewRequest=true), label application is best-effort because
+// requested_reviewers already makes the PR discoverable. Label failure remains
+// fatal for label-triggered projects (requireReviewRequest=false with trigger
+// labels): discovery still filters by labels, so a missing label would leave
+// the handoff permanently undiscoverable if publish marked it done.
+func addForgejoPullRequestReviewers(ctx context.Context, client *forge.ForgejoClient, cfg *config.Config, repo string, prNumber int64, reviewers []string, cwd string) error {
+	labels := forgejoReviewerDiscoveryLabelsForRepo(cfg, repo, cwd)
+	nativeErr := client.AddPullRequestReviewers(ctx, prNumber, reviewers)
+	if nativeErr != nil && len(labels) == 0 {
+		return nativeErr
+	}
+	if len(labels) > 0 {
+		if _, err := client.AddIssueLabels(ctx, prNumber, labels); err != nil {
+			if nativeErr != nil {
+				return fmt.Errorf("forgejo native review request failed (%v); label fallback also failed: %w", nativeErr, err)
+			}
+			// Native request already succeeded. Only native-request-triggered
+			// discovery can treat labels as best-effort; label-triggered
+			// projects must keep the handoff retryable until labels land.
+			if forgejoReviewerRequireReviewRequestForRepo(cfg, repo, cwd) {
+				return nil
+			}
+			return err
+		}
+	}
+	return nil
+}
+
+// forgejoReviewerRequireReviewRequestForRepo reports whether reviewer discovery
+// for the matched Forgejo project requires a native review request. Defaults to
+// true when no unique project match exists (labels are also empty in that case).
+func forgejoReviewerRequireReviewRequestForRepo(cfg *config.Config, repo, cwd string) bool {
+	if cfg == nil {
+		return true
+	}
+	repo = strings.TrimSpace(repo)
+	if strings.TrimSpace(cwd) != "" {
+		for _, project := range cfg.Projects {
+			if cwdBelongsToProject(project, cwd) {
+				return forgejoReviewerRequireReviewRequestForProject(*cfg, project)
+			}
+		}
+	}
+	var matched *config.ProjectRefConfig
+	for _, project := range cfg.Projects {
+		if !strings.EqualFold(strings.TrimSpace(project.Repo), repo) {
+			continue
+		}
+		if matched != nil {
+			return true
+		}
+		projectCopy := project
+		matched = &projectCopy
+	}
+	if matched != nil {
+		return forgejoReviewerRequireReviewRequestForProject(*cfg, *matched)
+	}
+	return true
+}
+
+func forgejoReviewerRequireReviewRequestForProject(cfg config.Config, project config.ProjectRefConfig) bool {
+	if config.ResolvedProjectProviderKind(cfg, project) != config.ProviderKindForgejo {
+		return true
+	}
+	return config.ProjectRoleConfigs(cfg, project.ID).Reviewer.Discovery.Triggers.RequireReviewRequest
+}
+
+func forgejoClientForCWD(cfg *config.Config, cwd string) (*forge.ForgejoClient, bool, error) {
+	project, provider, ok, err := forgejoProjectProviderForCWD(cfg, cwd)
+	if !ok || err != nil {
+		return nil, ok, err
+	}
+	client, err := forge.NewForgejoClientFromConfig(provider, strings.TrimSpace(project.Repo))
+	if err != nil {
+		return nil, true, err
+	}
+	return client, true, nil
+}
+
+func forgejoProviderForRepo(cfg *config.Config, repo string) (config.ProviderConfig, bool, error) {
+	if cfg == nil {
+		return config.ProviderConfig{}, false, nil
+	}
+	repo = strings.TrimSpace(repo)
+	var matched *config.ProjectRefConfig
+	for _, project := range cfg.Projects {
+		if !strings.EqualFold(strings.TrimSpace(project.Repo), repo) {
+			continue
+		}
+		if matched != nil {
+			return config.ProviderConfig{}, false, fmt.Errorf("repository %s is bound to multiple projects; project path or id is required", repo)
+		}
+		projectCopy := project
+		matched = &projectCopy
+	}
+	if matched != nil {
+		if config.ResolvedProjectProviderKind(*cfg, *matched) != config.ProviderKindForgejo {
+			return config.ProviderConfig{}, false, nil
+		}
+		provider, ok := forgejoProviderByID(*cfg, matched.Provider)
+		if !ok {
+			return config.ProviderConfig{}, false, fmt.Errorf("forgejo provider %q not configured for repo %s", matched.Provider, repo)
+		}
+		return provider, true, nil
+	}
+	return config.ProviderConfig{}, false, nil
+}
+
+func forgejoProjectProviderForCWD(cfg *config.Config, cwd string) (config.ProjectRefConfig, config.ProviderConfig, bool, error) {
+	if cfg == nil {
+		return config.ProjectRefConfig{}, config.ProviderConfig{}, false, nil
+	}
+	project, matched, err := projectForCWD(*cfg, cwd)
+	if err != nil || !matched {
+		return config.ProjectRefConfig{}, config.ProviderConfig{}, false, err
+	}
+	if config.ResolvedProjectProviderKind(*cfg, project) != config.ProviderKindForgejo {
+		return config.ProjectRefConfig{}, config.ProviderConfig{}, false, nil
+	}
+	provider, ok := forgejoProviderByID(*cfg, project.Provider)
+	if !ok {
+		return config.ProjectRefConfig{}, config.ProviderConfig{}, false, fmt.Errorf("forgejo provider %q not configured for project %s", project.Provider, project.ID)
+	}
+	if strings.TrimSpace(project.Repo) == "" {
+		return config.ProjectRefConfig{}, config.ProviderConfig{}, false, fmt.Errorf("forgejo project %s is missing repo", project.ID)
+	}
+	return project, provider, true, nil
+}
+
+func projectForCWD(cfg config.Config, cwd string) (config.ProjectRefConfig, bool, error) {
+	matches := make([]config.ProjectRefConfig, 0, 1)
+	for _, project := range cfg.Projects {
+		if cwdBelongsToProject(project, cwd) {
+			matches = append(matches, project)
+		}
+	}
+	if len(matches) == 0 {
+		return config.ProjectRefConfig{}, false, nil
+	}
+	if len(matches) > 1 {
+		ids := make([]string, 0, len(matches))
+		for _, project := range matches {
+			ids = append(ids, project.ID)
+		}
+		return config.ProjectRefConfig{}, false, fmt.Errorf("working directory %s matches multiple projects: %s", strings.TrimSpace(cwd), strings.Join(ids, ", "))
+	}
+	return matches[0], true, nil
+}
+
+func cwdBelongsToProject(project config.ProjectRefConfig, cwd string) bool {
+	cwd = filepath.Clean(strings.TrimSpace(cwd))
+	if cwd == "." || cwd == "" {
+		return false
+	}
+	repoPath := filepath.Clean(strings.TrimSpace(project.RepoPath))
+	if repoPath != "." && cwd == repoPath {
+		return true
+	}
+	worktreeRoot := ""
+	if project.WorktreeRoot != nil {
+		worktreeRoot = strings.TrimSpace(*project.WorktreeRoot)
+	}
+	if worktreeRoot == "" {
+		resolved, err := config.DefaultProjectWorktreeRoot(project.ID, project.RepoPath)
+		if err != nil {
+			return false
+		}
+		worktreeRoot = resolved
+	}
+	worktreeRoot = filepath.Clean(worktreeRoot)
+	relative, err := filepath.Rel(worktreeRoot, cwd)
+	return err == nil && relative != "." && relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator))
+}
+
+func forgejoProviderByID(cfg config.Config, providerID string) (config.ProviderConfig, bool) {
+	providerID = strings.TrimSpace(providerID)
+	if providerID == "" {
+		return config.ProviderConfig{}, false
+	}
+	for _, provider := range cfg.Providers {
+		if provider.ID == providerID {
+			return provider, true
+		}
+	}
+	return config.ProviderConfig{}, false
+}
+
+// planeClientForRepo returns a Plane task-source client for a project whose
+// provider kind is "plane" and whose code repo (project.Repo, a GitHub repo)
+// matches repo. The second return is false when repo is not a plane project, in
+// which case callers fall through to the GitHub/forgejo path.
+func planeClientForRepo(cfg *config.Config, repo string) (*forge.PlaneClient, bool, error) {
+	provider, codeRepo, ok, err := planeProviderForRepo(cfg, repo)
+	if !ok || err != nil {
+		return nil, ok, err
+	}
+	client, err := forge.NewPlaneClientFromConfig(provider, codeRepo)
+	if err != nil {
+		return nil, true, err
+	}
+	return client, true, nil
+}
+
+func planeClientForCWD(cfg *config.Config, cwd string) (*forge.PlaneClient, bool, error) {
+	project, provider, ok, err := planeProjectProviderForCWD(cfg, cwd)
+	if !ok || err != nil {
+		return nil, ok, err
+	}
+	client, err := forge.NewPlaneClientFromConfig(provider, strings.TrimSpace(project.Repo))
+	if err != nil {
+		return nil, true, err
+	}
+	return client, true, nil
+}
+
+func planeProviderForRepo(cfg *config.Config, repo string) (config.ProviderConfig, string, bool, error) {
+	if cfg == nil {
+		return config.ProviderConfig{}, "", false, nil
+	}
+	repo = strings.TrimSpace(repo)
+	var matched *config.ProjectRefConfig
+	for _, project := range cfg.Projects {
+		if !strings.EqualFold(strings.TrimSpace(project.Repo), repo) {
+			continue
+		}
+		if matched != nil {
+			return config.ProviderConfig{}, "", false, fmt.Errorf("repository %s is bound to multiple projects; project path or id is required", repo)
+		}
+		projectCopy := project
+		matched = &projectCopy
+	}
+	if matched != nil {
+		if config.ResolvedProjectProviderKind(*cfg, *matched) != config.ProviderKindPlane {
+			return config.ProviderConfig{}, "", false, nil
+		}
+		provider, ok := forgejoProviderByID(*cfg, matched.Provider)
+		if !ok {
+			return config.ProviderConfig{}, "", false, fmt.Errorf("plane provider %q not configured for repo %s", matched.Provider, repo)
+		}
+		return provider, strings.TrimSpace(matched.Repo), true, nil
+	}
+	return config.ProviderConfig{}, "", false, nil
+}
+
+func planeProjectProviderForCWD(cfg *config.Config, cwd string) (config.ProjectRefConfig, config.ProviderConfig, bool, error) {
+	if cfg == nil {
+		return config.ProjectRefConfig{}, config.ProviderConfig{}, false, nil
+	}
+	project, matched, err := projectForCWD(*cfg, cwd)
+	if err != nil || !matched {
+		return config.ProjectRefConfig{}, config.ProviderConfig{}, false, err
+	}
+	if config.ResolvedProjectProviderKind(*cfg, project) != config.ProviderKindPlane {
+		return config.ProjectRefConfig{}, config.ProviderConfig{}, false, nil
+	}
+	provider, ok := forgejoProviderByID(*cfg, project.Provider)
+	if !ok {
+		return config.ProjectRefConfig{}, config.ProviderConfig{}, false, fmt.Errorf("plane provider %q not configured for project %s", project.Provider, project.ID)
+	}
+	if strings.TrimSpace(project.Repo) == "" {
+		return config.ProjectRefConfig{}, config.ProviderConfig{}, false, fmt.Errorf("plane project %s is missing repo", project.ID)
+	}
+	return project, provider, true, nil
+}
+
+func forgeIdentityLogins(identities []forge.Identity) []string {
+	if identities == nil {
+		return nil
+	}
+	logins := make([]string, 0, len(identities))
+	for _, identity := range identities {
+		if login := strings.TrimSpace(identity.Login); login != "" {
+			logins = append(logins, login)
+		}
+	}
+	return logins
+}
+
+func forgeLabelNames(labels []forge.Label) []string {
+	if labels == nil {
+		return nil
+	}
+	names := make([]string, 0, len(labels))
+	for _, label := range labels {
+		if name := strings.TrimSpace(label.Name); name != "" {
+			names = append(names, name)
+		}
+	}
+	return names
+}
+
+func forgeReviewContext(ctx context.Context, client *forge.ForgejoClient, pr forge.PullRequest, compatibilityFallback bool, includeComments bool) ([]string, []networkpolicy.GitHubUser, []map[string]any, string, error) {
 	requested := pr.Reviewers
-	reviews, err := client.ListPullRequestReviews(ctx, pr.Number)
+	var reviews []forge.PullRequestReview
+	var err error
+	if includeComments {
+		reviews, err = client.ListPullRequestReviews(ctx, pr.Number)
+	} else {
+		reviews, err = client.ListPullRequestReviewSummaries(ctx, pr.Number)
+	}
 	if err != nil {
 		var capabilityErr *forge.UnsupportedCapabilityError
 		if !compatibilityFallback || !errors.As(err, &capabilityErr) {
@@ -362,31 +765,73 @@ func forgeReviewContext(ctx context.Context, client *forge.ForgejoClient, pr for
 		}
 	}
 	objects := make([]map[string]any, 0, len(reviews))
-	latestStates := map[string]string{}
+	latestVotes := map[string]forge.PullRequestReview{}
 	for _, review := range reviews {
 		objects = append(objects, map[string]any{
-			"id":     review.ID,
-			"author": map[string]any{"login": review.User.Login},
-			"body":   review.Body,
-			"state":  review.State,
-			"commit": map[string]any{"oid": review.CommitID},
-			"url":    review.HTMLURL,
+			"id":        review.ID,
+			"author":    map[string]any{"login": review.User.Login},
+			"body":      review.Body,
+			"state":     review.State,
+			"commit":    map[string]any{"oid": review.CommitID},
+			"url":       review.HTMLURL,
+			"comments":  forgeReviewCommentsToObjects(review.Comments),
+			"dismissed": review.Dismissed,
+			"stale":     review.Stale,
 		})
-		if login := strings.ToLower(strings.TrimSpace(review.User.Login)); login != "" {
-			latestStates[login] = review.State
+		if login := strings.ToLower(strings.TrimSpace(review.User.Login)); login != "" && (review.State == "CHANGES_REQUESTED" || review.State == "APPROVED") && !review.Dismissed {
+			if prior, found := latestVotes[login]; !found || review.ID > prior.ID {
+				latestVotes[login] = review
+			}
 		}
 	}
 	decision := ""
-	for _, state := range latestStates {
-		if state == "CHANGES_REQUESTED" {
+	for _, review := range latestVotes {
+		if review.State == "CHANGES_REQUESTED" {
 			decision = "CHANGES_REQUESTED"
 			break
 		}
-		if state == "APPROVED" {
+		if review.State == "APPROVED" {
 			decision = "APPROVED"
 		}
 	}
 	return workerhost.ForgeIdentityLogins(requested), workerhost.ForgeNetworkPolicyUsers(requested), objects, decision, nil
+}
+
+func forgeReviewCommentsToObjects(comments []forge.PullRequestReviewComment) []map[string]any {
+	objects := make([]map[string]any, 0, len(comments))
+	for _, comment := range comments {
+		objects = append(objects, map[string]any{
+			"id": comment.ID, "body": comment.Body, "author": map[string]any{"login": comment.User.Login},
+			"url": comment.HTMLURL, "path": comment.Path, "diffHunk": comment.DiffHunk,
+			"isResolved": comment.Resolver.Value != nil, "updatedAt": comment.UpdatedAt,
+		})
+	}
+	return objects
+}
+
+func forgeReviewContextComments(reviews []map[string]any) []map[string]any {
+	var comments []map[string]any
+	for _, review := range reviews {
+		state, _ := review["state"].(string)
+		if state == "PENDING" || state == "DISMISSED" {
+			continue
+		}
+		inline, _ := review["comments"].([]map[string]any)
+		comments = append(comments, inline...)
+	}
+	return comments
+}
+
+func forgeChecksToObjects(checks []forge.CommitCheck) []map[string]any {
+	objects := make([]map[string]any, 0, len(checks))
+	for _, check := range checks {
+		objects = append(objects, map[string]any{
+			"id": check.ID, "name": check.Name, "state": check.State,
+			"description": check.Description, "url": check.URL, "detailsUrl": check.URL,
+			"actionRunId": check.ActionRunID,
+		})
+	}
+	return objects
 }
 
 func forgejoSummaryCommentMode(cfg *config.Config, repo, cwd string) bool {
@@ -423,7 +868,7 @@ func appendLabels(label string, labels []string) []string {
 }
 
 func (a plannerGitHubAdapter) forgejo(ctx context.Context, repo string, cwd ...string) (*forge.ForgejoClient, bool, error) {
-	client, ok, err := workerhost.ForgeClientForLocation(a.config, repo, cwd, workerhost.ForgejoClientForCWD, workerhost.ForgejoClientForRepo)
+	client, ok, err := forgejoClientForContext(ctx, a.config, repo, cwd...)
 	return client, ok, err
 }
 
@@ -433,6 +878,60 @@ func (a plannerGitHubAdapter) forgejo(ctx context.Context, repo string, cwd ...s
 func (a plannerGitHubAdapter) plane(ctx context.Context, repo string, cwd ...string) (*forge.PlaneClient, bool, error) {
 	client, ok, err := workerhost.ForgeClientForLocation(a.config, repo, cwd, workerhost.PlaneClientForCWD, workerhost.PlaneClientForRepo)
 	return client, ok, err
+}
+
+func forgeClientForLocation[T any](cfg *config.Config, repo string, cwd []string, byCWD func(*config.Config, string) (*T, bool, error), byRepo func(*config.Config, string) (*T, bool, error)) (*T, bool, error) {
+	if len(cwd) > 0 && strings.TrimSpace(cwd[0]) != "" {
+		client, ok, err := byCWD(cfg, cwd[0])
+		if ok || err != nil {
+			return client, ok, err
+		}
+		// A configured project path is authoritative even when it belongs to
+		// GitHub; do not fall through and select a same-slug Forgejo project.
+		if cfg != nil {
+			for _, project := range cfg.Projects {
+				if cwdBelongsToProject(project, cwd[0]) {
+					return nil, false, nil
+				}
+			}
+		}
+	}
+	return byRepo(cfg, repo)
+}
+
+// forgejoClientForIssueLookup binds ViewIssue to the referenced repository.
+// CWD still disambiguates same-slug projects, but a closing reference such as
+// Fixes other/repo#123 must not reuse the PR project's client.
+func forgejoClientForIssueLookup(cfg *config.Config, repo, cwd string) (*forge.ForgejoClient, bool, error) {
+	repo = strings.TrimSpace(repo)
+	cwd = strings.TrimSpace(cwd)
+	if cwd != "" {
+		project, provider, ok, err := forgejoProjectProviderForCWD(cfg, cwd)
+		if err != nil {
+			return nil, false, err
+		}
+		if ok {
+			projectRepo := strings.TrimSpace(project.Repo)
+			if repo == "" || strings.EqualFold(projectRepo, repo) {
+				client, err := forge.NewForgejoClientFromConfig(provider, projectRepo)
+				if err != nil {
+					return nil, true, err
+				}
+				return client, true, nil
+			}
+			client, ok, err := forgejoClientForRepo(cfg, repo)
+			if ok || err != nil {
+				return client, ok, err
+			}
+			return nil, true, &forge.ForgejoHTTPError{
+				Method:     http.MethodGet,
+				Path:       "issues",
+				StatusCode: http.StatusNotFound,
+				Message:    fmt.Sprintf("cross-repository issue %s is not bound to a configured Forgejo project", repo),
+			}
+		}
+	}
+	return forgeClientForLocation(cfg, repo, []string{cwd}, forgejoClientForCWD, forgejoClientForRepo)
 }
 
 func (a plannerGitHubAdapter) ListOpenIssues(ctx context.Context, input planner.ListOpenIssuesInput) ([]planner.IssueSummary, error) {
@@ -454,7 +953,7 @@ func (a plannerGitHubAdapter) ListOpenIssues(ctx context.Context, input planner.
 		if err != nil {
 			return nil, err
 		}
-		issues, err := client.ListOpenIssues(ctx, forge.ListIssuesInput{Labels: input.Labels, Assignee: input.Assignee, Limit: input.Limit})
+		issues, err := forgejoDiscoveryIssues(ctx, client, forge.ListIssuesInput{Labels: input.Labels, Assignee: input.Assignee, Limit: input.Limit}, input.IssueNumber)
 		if err != nil {
 			return nil, err
 		}
@@ -563,7 +1062,7 @@ func (a plannerGitHubAdapter) GetCurrentUserLogin(ctx context.Context, cwd strin
 		identity, err := client.CurrentUser(ctx)
 		return identity.Login, err
 	}
-	if client, ok, err := workerhost.ForgejoClientForCWD(a.config, cwd); ok || err != nil {
+	if client, ok, err := forgejoClientForContext(ctx, a.config, "", cwd); ok || err != nil {
 		if err != nil {
 			return "", err
 		}
@@ -796,7 +1295,7 @@ type reviewerGitHubAdapter struct {
 }
 
 func (a reviewerGitHubAdapter) forgejo(ctx context.Context, repo string, cwd ...string) (*forge.ForgejoClient, bool, error) {
-	client, ok, err := workerhost.ForgeClientForLocation(a.config, repo, cwd, workerhost.ForgejoClientForCWD, workerhost.ForgejoClientForRepo)
+	client, ok, err := forgejoClientForContext(ctx, a.config, repo, cwd...)
 	return client, ok, err
 }
 
@@ -815,11 +1314,14 @@ func (a reviewerGitHubAdapter) ListOpenPullRequests(ctx context.Context, input r
 		}
 		result := make([]reviewer.PullRequestSummary, 0, len(pullRequests))
 		for _, pr := range pullRequests {
-			requests, requestUsers, reviews, decision, err := forgeReviewContext(ctx, client, pr, forgejoSummaryCommentMode(a.config, input.Repo, input.CWD))
+			requests, requestUsers, reviews, decision, err := forgeReviewContext(ctx, client, pr, forgejoSummaryCommentMode(a.config, input.Repo, input.CWD), false)
 			if err != nil {
 				return nil, err
 			}
-			result = append(result, reviewer.PullRequestSummary{Number: pr.Number, Title: pr.Title, State: pr.State, IsDraft: pr.IsDraft, ReviewDecision: decision, Labels: workerhost.ForgeLabelNames(pr.Labels), HeadSHA: pr.Head.SHA, BaseSHA: pr.Base.SHA, Author: pr.User.Login, ReviewRequests: requests, ReviewRequestUsers: requestUsers, Reviews: reviews})
+			// Exact merge-tree checks stay on ViewPullRequest. List runs before
+			// eligibility filtering, and one mergeable=false draft whose commits
+			// cannot be fetched or merge-tree'd must not abort the whole list.
+			result = append(result, reviewer.PullRequestSummary{Number: pr.Number, Title: pr.Title, State: pr.State, IsDraft: pr.IsDraft, ReviewDecision: decision, Labels: forgeLabelNames(pr.Labels), HeadSHA: pr.Head.SHA, BaseSHA: pr.Base.SHA, Author: pr.User.Login, ReviewRequests: requests, ReviewRequestUsers: requestUsers, Reviews: reviews})
 		}
 		return result, nil
 	}
@@ -848,11 +1350,14 @@ func (a reviewerGitHubAdapter) ListReviewRequestedPullRequests(ctx context.Conte
 		}
 		result := make([]reviewer.PullRequestSummary, 0, len(pullRequests))
 		for _, pr := range pullRequests {
-			requests, requestUsers, reviews, decision, err := forgeReviewContext(ctx, client, pr, forgejoSummaryCommentMode(a.config, input.Repo, input.CWD))
+			requests, requestUsers, reviews, decision, err := forgeReviewContext(ctx, client, pr, forgejoSummaryCommentMode(a.config, input.Repo, input.CWD), false)
 			if err != nil {
 				return nil, err
 			}
-			result = append(result, reviewer.PullRequestSummary{Number: pr.Number, Title: pr.Title, State: pr.State, IsDraft: pr.IsDraft, ReviewDecision: decision, Labels: workerhost.ForgeLabelNames(pr.Labels), HeadSHA: pr.Head.SHA, BaseSHA: pr.Base.SHA, Author: pr.User.Login, ReviewRequests: requests, ReviewRequestUsers: requestUsers, Reviews: reviews})
+			// Exact merge-tree checks stay on ViewPullRequest. List runs before
+			// eligibility filtering, and one mergeable=false draft whose commits
+			// cannot be fetched or merge-tree'd must not abort the whole list.
+			result = append(result, reviewer.PullRequestSummary{Number: pr.Number, Title: pr.Title, State: pr.State, IsDraft: pr.IsDraft, ReviewDecision: decision, Labels: forgeLabelNames(pr.Labels), HeadSHA: pr.Head.SHA, BaseSHA: pr.Base.SHA, Author: pr.User.Login, ReviewRequests: requests, ReviewRequestUsers: requestUsers, Reviews: reviews})
 		}
 		return result, nil
 	}
@@ -871,7 +1376,7 @@ func (a reviewerGitHubAdapter) ListReviewRequestedPullRequests(ctx context.Conte
 }
 
 func (a reviewerGitHubAdapter) GetCurrentUserLogin(ctx context.Context, cwd string) (string, error) {
-	if client, ok, err := workerhost.ForgejoClientForCWD(a.config, cwd); ok || err != nil {
+	if client, ok, err := forgejoClientForContext(ctx, a.config, "", cwd); ok || err != nil {
 		if err != nil {
 			return "", err
 		}
@@ -881,7 +1386,19 @@ func (a reviewerGitHubAdapter) GetCurrentUserLogin(ctx context.Context, cwd stri
 	if a.gateway == nil {
 		return "", fmt.Errorf("github gateway is not configured")
 	}
-	return a.gateway.GetCurrentUserLogin(ctx, cwd)
+	login, err := a.gateway.GetCurrentUserLogin(ctx, cwd)
+	if err != nil {
+		return "", err
+	}
+	login = strings.TrimSpace(login)
+	if login != "" {
+		return login, nil
+	}
+	ident, identErr := a.gateway.GetCurrentUserIdentity(ctx, cwd)
+	if identErr != nil {
+		return "", identErr
+	}
+	return strings.TrimSpace(ident.Login), nil
 }
 
 func (a reviewerGitHubAdapter) ViewPullRequest(ctx context.Context, input reviewer.ViewPullRequestInput) (reviewer.PullRequestDetail, error) {
@@ -893,23 +1410,30 @@ func (a reviewerGitHubAdapter) ViewPullRequest(ctx context.Context, input review
 		if err != nil {
 			return reviewer.PullRequestDetail{}, err
 		}
-		diff, err := client.PullRequestDiff(ctx, input.PRNumber)
-		if err != nil {
-			return reviewer.PullRequestDetail{}, err
-		}
 		comments, err := client.ListIssueComments(ctx, input.PRNumber)
 		if err != nil {
 			return reviewer.PullRequestDetail{}, err
 		}
-		requests, requestUsers, reviews, decision, err := forgeReviewContext(ctx, client, pr, forgejoSummaryCommentMode(a.config, input.Repo, input.CWD))
+		requests, requestUsers, reviews, decision, err := forgeReviewContext(ctx, client, pr, forgejoSummaryCommentMode(a.config, input.Repo, input.CWD), true)
 		if err != nil {
 			return reviewer.PullRequestDetail{}, err
 		}
-		return reviewer.PullRequestDetail{Number: pr.Number, Title: pr.Title, Body: pr.Body, State: pr.State, IsDraft: pr.IsDraft, ReviewDecision: decision, Labels: workerhost.ForgeLabelNames(pr.Labels), HeadSHA: pr.Head.SHA, BaseSHA: pr.Base.SHA, HeadRefName: pr.Head.Name, BaseRefName: pr.Base.Name, Author: pr.User.Login, ReviewRequests: requests, ReviewRequestUsers: requestUsers, Diff: diff, IssueComments: forgeCommentsToObjects(comments), Reviews: reviews}, nil
+		checks, err := client.ListCommitChecks(ctx, pr.Head.SHA)
+		if err != nil {
+			return reviewer.PullRequestDetail{}, err
+		}
+		conflicted, err := forgejoPullRequestHasConflicts(ctx, a.config, input.Repo, input.CWD, pr)
+		if err != nil {
+			return reviewer.PullRequestDetail{}, err
+		}
+		return reviewer.PullRequestDetail{Number: pr.Number, URL: pr.HTMLURL, Title: pr.Title, Body: pr.Body, State: pr.State, IsDraft: pr.IsDraft, ReviewDecision: decision, Labels: forgeLabelNames(pr.Labels), HeadSHA: pr.Head.SHA, BaseSHA: pr.Base.SHA, HeadRefName: pr.Head.Name, BaseRefName: pr.Base.Name, Author: pr.User.Login, ReviewRequests: requests, ReviewRequestUsers: requestUsers, HasConflicts: conflicted, ChecksSummary: summarizeCheckStates(forgeChecksToObjects(checks)), Comments: forgeReviewContextComments(reviews), IssueComments: forgeCommentsToObjects(comments), Reviews: reviews}, nil
 	}
 	if a.gateway == nil {
 		return reviewer.PullRequestDetail{}, fmt.Errorf("github gateway is not configured")
 	}
+	// Always use the reviewer profile (includes reviews). Do not route through
+	// DiscoverySnapshot/ViewPullRequest, which intentionally uses the fixer
+	// profile and omits reviews for shared discovery caching.
 	detail, err := a.gateway.ViewPullRequestForReviewer(ctx, githubinfra.ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD})
 	if err != nil {
 		return reviewer.PullRequestDetail{}, err
@@ -917,8 +1441,19 @@ func (a reviewerGitHubAdapter) ViewPullRequest(ctx context.Context, input review
 	return reviewer.PullRequestDetail{Number: detail.Number, Title: detail.Title, Body: detail.Body, State: detail.State, IsDraft: detail.IsDraft, ReviewDecision: detail.ReviewDecision, Labels: detail.Labels, HeadSHA: detail.HeadSHA, BaseSHA: detail.BaseSHA, HeadRefName: detail.HeadRefName, BaseRefName: detail.BaseRefName, Author: detail.Author, ReviewRequests: detail.ReviewRequests, ReviewRequestUsers: workerhost.NetworkPolicyUsers(detail.ReviewRequestUsers), HasConflicts: detail.HasConflicts, ChecksSummary: summarizeCheckStates(detail.Checks), Comments: detail.Comments, IssueComments: commentInfosToObjects(detail.IssueComments), Reviews: detail.Reviews}, nil
 }
 
+// LoadPullRequestReviews implements reviewer engagement recovery. It always uses
+// the reviewer profile so DiscoverySnapshot's fixer-profile cache cannot strip
+// the submitted reviews needed to restore lastPublishedHeadSha.
+func (a reviewerGitHubAdapter) LoadPullRequestReviews(ctx context.Context, input reviewer.ViewPullRequestInput) ([]map[string]any, error) {
+	detail, err := a.ViewPullRequest(ctx, input)
+	if err != nil {
+		return nil, err
+	}
+	return detail.Reviews, nil
+}
+
 func (a reviewerGitHubAdapter) ViewIssue(ctx context.Context, input githubinfra.ViewIssueInput) (githubinfra.IssueDetail, error) {
-	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
+	if client, ok, err := forgejoClientForIssueContext(ctx, a.config, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return githubinfra.IssueDetail{}, err
 		}
@@ -926,7 +1461,7 @@ func (a reviewerGitHubAdapter) ViewIssue(ctx context.Context, input githubinfra.
 		if err != nil {
 			return githubinfra.IssueDetail{}, err
 		}
-		return githubinfra.IssueDetail{Number: issue.Number, Title: issue.Title, Body: issue.Body, URL: issue.HTMLURL, State: issue.State, Labels: workerhost.ForgeLabelNames(issue.Labels), Assignees: workerhost.ForgeIdentityLogins(issue.Assignees), Author: issue.User.Login}, nil
+		return githubinfra.IssueDetail{IsPullRequest: issue.IsPullRequest, Number: issue.Number, Title: issue.Title, Body: issue.Body, URL: issue.HTMLURL, State: issue.State, Labels: forgeLabelNames(issue.Labels), Assignees: forgeIdentityLogins(issue.Assignees), Author: issue.User.Login}, nil
 	}
 	if a.gateway == nil {
 		return githubinfra.IssueDetail{}, fmt.Errorf("github gateway is not configured")
@@ -935,10 +1470,24 @@ func (a reviewerGitHubAdapter) ViewIssue(ctx context.Context, input githubinfra.
 }
 
 func (a reviewerGitHubAdapter) GetRepositorySettings(ctx context.Context, input githubinfra.RepositorySettingsInput) (githubinfra.RepositorySettings, error) {
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
+		if err != nil {
+			return githubinfra.RepositorySettings{}, err
+		}
+		settings, err := client.GetRepositoryMergeSettings(ctx)
+		return githubinfra.RepositorySettings{AllowSquashMerge: settings.AllowSquashMerge, AllowMergeCommit: settings.AllowMergeCommit, AllowRebaseMerge: settings.AllowRebaseMerge, AllowAutoMerge: true}, err
+	}
 	return a.gateway.GetRepositorySettings(ctx, input)
 }
 
 func (a reviewerGitHubAdapter) GetBranchProtection(ctx context.Context, input githubinfra.BranchProtectionInput) (githubinfra.BranchProtection, error) {
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
+		if err != nil {
+			return githubinfra.BranchProtection{}, err
+		}
+		branch, err := client.GetBranchProtection(ctx, input.Branch)
+		return githubinfra.BranchProtection{Enabled: branch.Protected, HasRequiredChecks: branch.Protected && branch.EnableStatusCheck && len(branch.StatusCheckContexts) > 0, RequiredChecks: branch.StatusCheckContexts}, err
+	}
 	return a.gateway.GetBranchProtection(ctx, input)
 }
 
@@ -965,11 +1514,7 @@ func (a reviewerGitHubAdapter) CapturePullRequestSnapshot(ctx context.Context, i
 		if err != nil {
 			return storage.PullRequestSnapshotRecord{}, err
 		}
-		diff, err := client.PullRequestDiff(ctx, input.PRNumber)
-		if err != nil {
-			return storage.PullRequestSnapshotRecord{}, err
-		}
-		payloadJSON, err := json.Marshal(map[string]any{"diff": diff})
+		payload, err := json.Marshal(map[string]any{"detail": map[string]any{"state": pr.State, "isDraft": pr.IsDraft}})
 		if err != nil {
 			return storage.PullRequestSnapshotRecord{}, err
 		}
@@ -979,12 +1524,12 @@ func (a reviewerGitHubAdapter) CapturePullRequestSnapshot(ctx context.Context, i
 			ProjectID:   input.ProjectID,
 			Repo:        input.Repo,
 			PRNumber:    input.PRNumber,
+			PayloadJSON: stringPtr(string(payload)),
 			HeadSHA:     pr.Head.SHA,
 			BaseSHA:     stringPtr(baseSHA),
 			Title:       stringPtr(pr.Title),
 			Body:        stringPtr(pr.Body),
 			Author:      stringPtr(pr.User.Login),
-			PayloadJSON: stringPtr(string(payloadJSON)),
 			CapturedAt:  input.CapturedAt,
 			CreatedAt:   input.CapturedAt,
 		}, nil
@@ -1061,12 +1606,15 @@ func findForgejoNativeReviewMarker(reviews []forge.PullRequestReview, input revi
 		if !ok {
 			continue
 		}
+		if review.CommitID != "" && !strings.EqualFold(strings.TrimSpace(review.CommitID), marker.Head) {
+			continue
+		}
 		author := strings.TrimSpace(review.User.Login)
 		if expectedAuthor != "" && strings.ToLower(author) != expectedAuthor {
 			continue
 		}
 		event := forgejoReviewEventFromState(review.State)
-		if !forgejoNativeReviewMarkerEventAllowed(marker.Outcome, event, input.AllowedReviewEvents, input.AllowCleanComment) {
+		if !forgejoNativeReviewMarkerEventAllowed(marker.Outcome, event, input.AllowedReviewEvents, input.AllowCleanComment, input.AllowBlockingComment) {
 			continue
 		}
 		inlineBodies := make([]string, 0, len(review.Comments))
@@ -1096,8 +1644,8 @@ func forgejoReviewEventFromState(state string) reviewer.ReviewEvent {
 // forgejoNativeReviewMarkerEventAllowed mirrors github.reviewMarkerEventAllowedForOutcome so
 // outcome=clean requires APPROVE when that event is allowed, outcome=blocking requires
 // REQUEST_CHANGES when allowed, and COMMENT only matches non-blocking/actionable (or the
-// explicit clean-comment self-approval fallback).
-func forgejoNativeReviewMarkerEventAllowed(outcome string, event reviewer.ReviewEvent, allowed []reviewer.ReviewEvent, allowCleanComment bool) bool {
+// explicit self-authored COMMENT transport fallbacks).
+func forgejoNativeReviewMarkerEventAllowed(outcome string, event reviewer.ReviewEvent, allowed []reviewer.ReviewEvent, allowCleanComment, allowBlockingComment bool) bool {
 	if event == "" {
 		return false
 	}
@@ -1117,6 +1665,9 @@ func forgejoNativeReviewMarkerEventAllowed(outcome string, event reviewer.Review
 		}
 		return event == reviewer.ReviewEventComment
 	case "blocking":
+		if allowBlockingComment && event == reviewer.ReviewEventComment {
+			return true
+		}
 		if forgejoReviewEventAllowed(reviewer.ReviewEventRequestChanges, allowed) {
 			return event == reviewer.ReviewEventRequestChanges
 		}
@@ -1327,25 +1878,31 @@ func (a reviewerGitHubAdapter) SubmitReview(ctx context.Context, input githubinf
 }
 
 func (a reviewerGitHubAdapter) EnableAutoMerge(ctx context.Context, input githubinfra.EnableAutoMergeInput) error {
-	if _, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return err
 		}
-		return fmt.Errorf("forgejo provider capability autoMerge is unsupported")
+		return client.EnableAutoMerge(ctx, input.PRNumber, string(input.Strategy), input.HeadSHA)
 	}
 	return a.gateway.EnableAutoMerge(ctx, input)
 }
 
 func (a reviewerGitHubAdapter) AddPullRequestReaction(ctx context.Context, input reviewer.PullRequestReactionInput) error {
-	if _, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
-		return err
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
+		if err != nil {
+			return err
+		}
+		return client.AddIssueReaction(ctx, input.PRNumber, input.Content)
 	}
 	return a.gateway.AddPullRequestReaction(ctx, githubinfra.PullRequestReactionInput{Repo: input.Repo, PRNumber: input.PRNumber, Content: input.Content, CWD: input.CWD})
 }
 
 func (a reviewerGitHubAdapter) RemovePullRequestReaction(ctx context.Context, input reviewer.PullRequestReactionInput) error {
-	if _, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
-		return err
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
+		if err != nil {
+			return err
+		}
+		return client.RemoveIssueReaction(ctx, input.PRNumber, input.Content)
 	}
 	return a.gateway.RemovePullRequestReaction(ctx, githubinfra.PullRequestReactionInput{Repo: input.Repo, PRNumber: input.PRNumber, Content: input.Content, CWD: input.CWD})
 }
@@ -1404,7 +1961,7 @@ func (a reviewerGitHubAdapter) ListReviewThreads(ctx context.Context, input revi
 	if a.gateway == nil {
 		return nil, fmt.Errorf("github gateway is not configured")
 	}
-	threads, err := a.gateway.ListReviewThreads(ctx, githubinfra.ListReviewThreadsInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD, Limit: input.Limit})
+	threads, err := a.gateway.ListReviewThreads(ctx, githubinfra.ListReviewThreadsInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD, Limit: input.Limit, AllPages: input.AllPages})
 	if err != nil {
 		return nil, err
 	}
@@ -1412,7 +1969,7 @@ func (a reviewerGitHubAdapter) ListReviewThreads(ctx context.Context, input revi
 	for _, thread := range threads {
 		converted := reviewer.ReviewThread{ID: thread.ID, IsResolved: thread.IsResolved, Path: thread.Path, Line: thread.Line, URL: thread.URL}
 		for _, comment := range thread.Comments {
-			converted.Comments = append(converted.Comments, reviewer.ReviewThreadComment{ID: comment.ID, Body: comment.Body, Author: comment.Author, CreatedAt: comment.CreatedAt, UpdatedAt: comment.UpdatedAt, Path: comment.Path, Line: comment.Line, OriginalCommitOID: comment.OriginalCommitOID, CommitOID: comment.CommitOID, URL: comment.URL})
+			converted.Comments = append(converted.Comments, reviewer.ReviewThreadComment{ID: comment.ID, Body: comment.Body, Author: comment.Author, AuthorAssociation: comment.AuthorAssociation, CreatedAt: comment.CreatedAt, UpdatedAt: comment.UpdatedAt, Path: comment.Path, Line: comment.Line, OriginalCommitOID: comment.OriginalCommitOID, CommitOID: comment.CommitOID, URL: comment.URL})
 		}
 		out = append(out, converted)
 	}
@@ -1475,7 +2032,20 @@ func (a *reviewerAgentExecutionAdapter) closeProxy() {
 	})
 }
 
-type reviewerGitAdapter struct{ gateway *gitinfra.Gateway }
+type reviewerGitAdapter struct {
+	gateway   *gitinfra.Gateway
+	localDiff *githubinfra.Gateway
+}
+
+func (a reviewerGitAdapter) ReadPullRequestDiff(ctx context.Context, cwd, baseSHA, headSHA string) (string, error) {
+	var diff string
+	err := a.localDiff.ReadLocalPullRequestDiff(ctx, cwd, baseSHA, headSHA, nil, func(reader io.Reader) error {
+		data, err := io.ReadAll(reader)
+		diff = string(data)
+		return err
+	})
+	return diff, err
+}
 
 func (a reviewerGitAdapter) CreateWorktree(ctx context.Context, input reviewer.CreateWorktreeInput) (reviewer.CreateWorktreeResult, error) {
 	worktree, err := a.gateway.CreateWorktree(ctx, gitinfra.CreateWorktreeInput{ProjectID: input.ProjectID, RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot, Branch: input.Branch, BaseBranch: input.BaseBranch, PRNumber: input.PRNumber, ProtectedBranches: input.ProtectedBranches, CheckoutMode: gitinfra.CheckoutMode(input.CheckoutMode)})
@@ -1486,7 +2056,7 @@ func (a reviewerGitAdapter) CreateWorktree(ctx context.Context, input reviewer.C
 }
 
 func (a reviewerGitAdapter) PrepareWorktree(ctx context.Context, input reviewer.PrepareWorktreeInput) (reviewer.PrepareWorktreeResult, error) {
-	result, err := a.gateway.PrepareWorktree(ctx, gitinfra.PrepareWorktreeInput{RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot, WorktreePath: input.WorktreePath, Branch: input.Branch, Ref: input.Ref, ExpectedHeadSHA: input.ExpectedHeadSHA, Remote: input.Remote})
+	result, err := a.gateway.PrepareWorktree(ctx, gitinfra.PrepareWorktreeInput{RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot, WorktreePath: input.WorktreePath, Branch: input.Branch, Ref: input.Ref, ExpectedHeadSHA: input.ExpectedHeadSHA, BaseSHA: input.BaseSHA, Remote: input.Remote})
 	if err != nil {
 		return reviewer.PrepareWorktreeResult{}, err
 	}
@@ -1495,6 +2065,10 @@ func (a reviewerGitAdapter) PrepareWorktree(ctx context.Context, input reviewer.
 
 func (a reviewerGitAdapter) CleanupWorktree(ctx context.Context, input reviewer.CleanupWorktreeInput) error {
 	return a.gateway.CleanupWorktree(ctx, gitinfra.CleanupWorktreeInput{ProjectID: input.ProjectID, RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot, WorktreePath: input.WorktreePath, Branch: input.Branch, ProtectedBranches: input.ProtectedBranches})
+}
+
+func (a reviewerGitAdapter) ScrubReservedReviewerScratch(ctx context.Context, worktreePath string) error {
+	return a.gateway.ScrubReservedReviewerScratch(ctx, worktreePath)
 }
 
 // reviewerTrustedReviewEnv injects the trusted review-submit socket only for
@@ -1655,38 +2229,46 @@ func (a reviewerAgentExecutorAdapter) Start(ctx context.Context, input reviewer.
 	// (comment-only) runs reuse this adapter but must not receive review-publish
 	// capability via LOOPER_TRUSTED_REVIEW_SOCK.
 	sock := ""
+	var trustedReview *forge.TrustedReviewAuthority
+	_, hostingSelected := hostingidentity.FromContext(ctx)
 	proxyCleanup := func() {}
 	if reviewerAllowsTrustedReviewProxy(a.config, input.ProjectID, input.Metadata) {
 		allowedPR := reviewerAllowedPRRef(input.Metadata)
 		allowedCwd := strings.TrimSpace(input.WorkingDirectory)
 		policy := reviewerAllowedReviewPolicy(input.Metadata)
-		if policy.ReviewerManual && policy.ReviewerRunID != strings.TrimSpace(input.RunID) {
+		if policy.ReviewerRunID != "" && policy.ReviewerRunID != strings.TrimSpace(input.RunID) {
 			return nil, fmt.Errorf("install run-bound trusted review proxy: reviewer run id does not match agent run")
 		}
-		vendor, model := reviewerTrustedReviewAgentIdentity(input, a.agentVendor, a.agentModel)
-		configSnapshot := materializeTrustedReviewAgentIdentity(*a.config, vendor, model)
-		var err error
-		sock, proxyCleanup, err = mintTrustedReviewProxyForPR(a.realLooper, a.trustedEnv, allowedPR, allowedCwd, configSnapshot, policy, a.tracker)
-		if err != nil {
-			return nil, fmt.Errorf("install run-bound trusted review proxy: %w", err)
+		if hostingSelected {
+			trustedReview = &forge.TrustedReviewAuthority{PRRef: allowedPR, Policy: policy}
+		} else {
+			vendor, model := reviewerTrustedReviewAgentIdentity(input, a.agentVendor, a.agentModel)
+			configSnapshot := materializeTrustedReviewAgentIdentity(*a.config, vendor, model)
+			var err error
+			sock, proxyCleanup, err = mintTrustedReviewProxyForPR(a.realLooper, a.trustedEnv, allowedPR, allowedCwd, configSnapshot, policy, a.tracker)
+			if err != nil {
+				return nil, fmt.Errorf("install run-bound trusted review proxy: %w", err)
+			}
 		}
 	}
 	execution, err := a.executor.Start(ctx, agent.RunInput{
-		ExecutionID:        input.ExecutionID,
-		ProjectID:          input.ProjectID,
-		LoopID:             input.LoopID,
-		RunID:              input.RunID,
-		Prompt:             input.Prompt,
-		NativeResumePrompt: input.NativeResumePrompt,
-		WorkingDirectory:   input.WorkingDirectory,
-		Timeout:            input.Timeout,
-		HeartbeatTimeout:   input.HeartbeatTimeout,
-		Metadata:           input.Metadata,
-		IdempotencyKey:     input.IdempotencyKey,
-		Env:                reviewerTrustedReviewEnv(sock),
-		UseSnapshot:        input.UseSnapshot,
-		SnapshotVendor:     input.SnapshotVendor,
-		SnapshotModel:      input.SnapshotModel,
+		ExecutionID:         input.ExecutionID,
+		ProjectID:           input.ProjectID,
+		LoopID:              input.LoopID,
+		RunID:               input.RunID,
+		Prompt:              input.Prompt,
+		NativeResumePrompt:  input.NativeResumePrompt,
+		DisableNativeResume: input.DisableNativeResume,
+		WorkingDirectory:    input.WorkingDirectory,
+		Timeout:             input.Timeout,
+		HeartbeatTimeout:    input.HeartbeatTimeout,
+		Metadata:            input.Metadata,
+		IdempotencyKey:      input.IdempotencyKey,
+		Env:                 reviewerTrustedReviewEnv(sock),
+		TrustedReview:       trustedReview,
+		UseSnapshot:         input.UseSnapshot,
+		SnapshotVendor:      input.SnapshotVendor,
+		SnapshotModel:       input.SnapshotModel,
 	})
 	if err != nil {
 		proxyCleanup()
@@ -1716,12 +2298,12 @@ type fixerGitHubAdapter struct {
 }
 
 func (a fixerGitHubAdapter) forgejo(ctx context.Context, repo string, cwd ...string) (*forge.ForgejoClient, bool, error) {
-	client, ok, err := workerhost.ForgeClientForLocation(a.config, repo, cwd, workerhost.ForgejoClientForCWD, workerhost.ForgejoClientForRepo)
+	client, ok, err := forgejoClientForContext(ctx, a.config, repo, cwd...)
 	return client, ok, err
 }
 
 func (a fixerGitHubAdapter) forgejoForCWD(ctx context.Context, cwd string) (*forge.ForgejoClient, bool, error) {
-	client, ok, err := workerhost.ForgejoClientForCWD(a.config, cwd)
+	client, ok, err := forgejoClientForContext(ctx, a.config, "", cwd)
 	return client, ok, err
 }
 
@@ -1774,48 +2356,157 @@ func (a fixerGitHubAdapter) ListOpenPullRequests(ctx context.Context, input fixe
 func (a fixerGitHubAdapter) GetCurrentUserLogin(ctx context.Context, cwd string) (string, error) {
 	if client, ok, err := a.forgejoForCWD(ctx, cwd); ok || err != nil {
 		if err != nil {
-			return "", err
+			// Client construction / project resolution failures are local and
+			// deterministic; do not tag them as hosting-API transport errors.
+			return "", failureclass.WithBoundary(err, failureclass.BoundaryConfig)
 		}
 		identity, err := client.CurrentUser(ctx)
-		return identity.Login, err
+		if err != nil {
+			return "", failureclass.WithBoundary(err, failureclass.BoundaryGitHubAPI)
+		}
+		return identity.Login, nil
 	}
-	return a.gateway.GetCurrentUserLogin(ctx, cwd)
+	login, err := a.gateway.GetCurrentUserLogin(ctx, cwd)
+	if err != nil {
+		return "", withHostingAPIBoundary(err)
+	}
+	login = strings.TrimSpace(login)
+	if login != "" {
+		return login, nil
+	}
+	ident, identErr := a.gateway.GetCurrentUserIdentity(ctx, cwd)
+	if identErr != nil {
+		return "", withHostingAPIBoundary(identErr)
+	}
+	return strings.TrimSpace(ident.Login), nil
 }
 
 func (a fixerGitHubAdapter) GetPullRequestAuthor(ctx context.Context, input fixer.ViewPullRequestInput) (string, error) {
 	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
-			return "", err
+			return "", failureclass.WithBoundary(err, failureclass.BoundaryConfig)
 		}
 		pr, err := client.ViewPullRequest(ctx, input.PRNumber)
 		if err != nil {
-			return "", err
+			return "", failureclass.WithBoundary(err, failureclass.BoundaryGitHubAPI)
 		}
 		return pr.User.Login, nil
 	}
-	return a.gateway.GetPullRequestAuthor(ctx, githubinfra.ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD})
+	author, err := a.gateway.GetPullRequestAuthor(ctx, githubinfra.ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD})
+	if err != nil {
+		return "", withHostingAPIBoundary(err)
+	}
+	return author, nil
 }
 
 func (a fixerGitHubAdapter) ViewPullRequest(ctx context.Context, input fixer.ViewPullRequestInput) (fixer.PullRequestDetail, error) {
 	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
-			return fixer.PullRequestDetail{}, err
+			return fixer.PullRequestDetail{}, failureclass.WithBoundary(err, failureclass.BoundaryConfig)
 		}
 		pr, err := client.ViewPullRequest(ctx, input.PRNumber)
 		if err != nil {
-			return fixer.PullRequestDetail{}, err
+			return fixer.PullRequestDetail{}, failureclass.WithBoundary(err, failureclass.BoundaryGitHubAPI)
 		}
 		comments, err := client.ListIssueComments(ctx, input.PRNumber)
 		if err != nil {
+			return fixer.PullRequestDetail{}, failureclass.WithBoundary(err, failureclass.BoundaryGitHubAPI)
+		}
+		checks, err := client.ListCommitChecks(ctx, pr.Head.SHA)
+		if err != nil {
+			return fixer.PullRequestDetail{}, failureclass.WithBoundary(err, failureclass.BoundaryGitHubAPI)
+		}
+		conflicted, err := forgejoPullRequestHasConflicts(ctx, a.config, input.Repo, input.CWD, pr)
+		if err != nil {
 			return fixer.PullRequestDetail{}, err
 		}
-		return fixer.PullRequestDetail{Number: pr.Number, State: pr.State, IsDraft: pr.IsDraft, Labels: workerhost.ForgeLabelNames(pr.Labels), HeadSHA: pr.Head.SHA, HeadRefName: pr.Head.Name, BaseRefName: pr.Base.Name, BaseSHA: pr.Base.SHA, IssueComments: forgeCommentsToObjects(comments), Author: pr.User.Login}, nil
+		return fixer.PullRequestDetail{Number: pr.Number, URL: pr.HTMLURL, State: pr.State, IsDraft: pr.IsDraft, Labels: forgeLabelNames(pr.Labels), HeadSHA: pr.Head.SHA, HeadRefName: pr.Head.Name, BaseRefName: pr.Base.Name, BaseSHA: pr.Base.SHA, IssueComments: forgeCommentsToObjects(comments), Checks: forgeChecksToObjects(checks), HasConflicts: conflicted, Author: pr.User.Login}, nil
 	}
 	detail, err := a.gateway.ViewPullRequestForFixer(ctx, githubinfra.ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD})
 	if err != nil {
-		return fixer.PullRequestDetail{}, err
+		return fixer.PullRequestDetail{}, withHostingAPIBoundary(err)
 	}
 	return fixer.PullRequestDetail{Number: detail.Number, State: detail.State, IsDraft: detail.IsDraft, Labels: detail.Labels, HeadSHA: detail.HeadSHA, HeadRefName: detail.HeadRefName, BaseRefName: detail.BaseRefName, BaseSHA: detail.BaseSHA, ReviewDecision: detail.ReviewDecision, Comments: detail.Comments, IssueComments: commentInfosToObjects(detail.IssueComments), Checks: detail.Checks, HasConflicts: detail.HasConflicts, Author: detail.Author}, nil
+}
+
+// withHostingAPIBoundary tags remote GitHub/hosting transport failures as
+// BoundaryGitHubAPI. Deterministic local CLI failures keep BoundaryConfig so
+// unlimited fixer queues request intervention instead of retrying forever:
+//   - launch failures: missing/moved gh, inaccessible CWD, bad permissions
+//   - completed CLI contract failures: incompatible gh schema/invocation
+//     (e.g. unknown --json field), zero-exit invalidJSONError payloads
+//     ("Invalid gh JSON payload"), and local shell capture truncation
+//     ("GitHub command output truncated" / Result truncation flags)
+//
+// Transient host-pressure launch failures (EAGAIN, ENOMEM, ETXTBSY, EMFILE,
+// ENFILE after the short shell retry) stay BoundaryGitHubAPI so Classify
+// leaves them retryable.
+func withHostingAPIBoundary(err error) error {
+	if err == nil {
+		return nil
+	}
+	if shell.IsStartFailure(err) && !shell.IsTransientStartFailure(err) {
+		return failureclass.WithBoundary(err, failureclass.BoundaryConfig)
+	}
+	if isLocalCLIContractFailure(err) {
+		return failureclass.WithBoundary(err, failureclass.BoundaryConfig)
+	}
+	return failureclass.WithBoundary(err, failureclass.BoundaryGitHubAPI)
+}
+
+// isLocalCLIContractFailure reports whether err is a successfully-launched
+// CLI failure from local invocation/schema/output-contract incompatibility
+// rather than a remote hosting API response. Examples:
+//   - gh pr view --json rejects a field (`unknown JSON field: "..."`) and
+//     exits nonzero — not IsStartFailure, but deterministic local mismatch
+//   - gh exits 0 with malformed/empty JSON and gateway emits
+//     `Invalid gh JSON payload` via invalidJSONError — still local decode
+//     contract, not a remote transport outage
+//   - shell capture exceeds the 256 KiB bound: runGhWithTimeout returns
+//     CommandExecutionError with StdoutTruncated/StderrTruncated and message
+//     "GitHub command output truncated" — local buffer limit, not API outage
+//
+// Retrying forever under BoundaryGitHubAPI cannot fix these deterministic
+// CLI-output contract failures.
+func isLocalCLIContractFailure(err error) bool {
+	if err == nil || shell.IsStartFailure(err) {
+		return false
+	}
+	var commandErr *shell.CommandExecutionError
+	if !errors.As(err, &commandErr) {
+		return false
+	}
+	// Prefer structural truncation flags from the shell Result; gateway
+	// runGhWithTimeout sets these when the local capture limit is hit.
+	if commandErr.Result.StdoutTruncated || commandErr.Result.StderrTruncated {
+		return true
+	}
+	message := strings.ToLower(strings.Join([]string{
+		commandErr.Message,
+		commandErr.Result.Stdout,
+		commandErr.Result.Stderr,
+	}, "\n"))
+	return isLocalCLIContractMessage(message)
+}
+
+func isLocalCLIContractMessage(message string) bool {
+	for _, fragment := range []string{
+		"unknown json field",
+		"invalid gh json payload",         // zero-exit decode/shape failures from invalidJSONError
+		"github command output truncated", // local shell capture limit (flags may be lost after wrap)
+		"unknown flag",
+		"flag provided but not defined",
+		"unknown command",
+		"accepts at most",
+		"accepts between",
+		"requires at least",
+		"required flag",
+	} {
+		if strings.Contains(message, fragment) {
+			return true
+		}
+	}
+	return false
 }
 
 func forgeCommentsToObjects(items []forge.Comment) []map[string]any {
@@ -1855,7 +2546,7 @@ func (a fixerGitHubAdapter) ListReviewThreads(ctx context.Context, input fixer.L
 		}
 		return nil, fmt.Errorf("forgejo fixer does not support native review threads")
 	}
-	threads, err := a.gateway.ListReviewThreads(ctx, githubinfra.ListReviewThreadsInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD, Limit: input.Limit})
+	threads, err := a.gateway.ListReviewThreads(ctx, githubinfra.ListReviewThreadsInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD, Limit: input.Limit, AllPages: input.AllPages})
 	if err != nil {
 		return nil, err
 	}
@@ -1863,7 +2554,7 @@ func (a fixerGitHubAdapter) ListReviewThreads(ctx context.Context, input fixer.L
 	for _, thread := range threads {
 		comments := make([]fixer.ReviewThreadComment, 0, len(thread.Comments))
 		for _, comment := range thread.Comments {
-			comments = append(comments, fixer.ReviewThreadComment{ID: comment.ID, Body: comment.Body, Author: comment.Author, CreatedAt: comment.CreatedAt, UpdatedAt: comment.UpdatedAt})
+			comments = append(comments, fixer.ReviewThreadComment{ID: comment.ID, Body: comment.Body, Author: comment.Author, AuthorAssociation: comment.AuthorAssociation, CreatedAt: comment.CreatedAt, UpdatedAt: comment.UpdatedAt})
 		}
 		out = append(out, fixer.ReviewThread{ID: thread.ID, IsResolved: thread.IsResolved, Comments: comments})
 	}
@@ -1883,7 +2574,7 @@ func (a fixerGitHubAdapter) ViewReviewThread(ctx context.Context, input fixer.Vi
 	}
 	comments := make([]fixer.ReviewThreadComment, 0, len(thread.Comments))
 	for _, comment := range thread.Comments {
-		comments = append(comments, fixer.ReviewThreadComment{ID: comment.ID, Body: comment.Body, Author: comment.Author, CreatedAt: comment.CreatedAt, UpdatedAt: comment.UpdatedAt})
+		comments = append(comments, fixer.ReviewThreadComment{ID: comment.ID, Body: comment.Body, Author: comment.Author, AuthorAssociation: comment.AuthorAssociation, CreatedAt: comment.CreatedAt, UpdatedAt: comment.UpdatedAt})
 	}
 	return fixer.ReviewThread{ID: thread.ID, IsResolved: thread.IsResolved, Comments: comments}, nil
 }
@@ -1915,11 +2606,15 @@ func (a fixerGitHubAdapter) ListNativeReviewComments(ctx context.Context, input 
 				URL:                 comment.HTMLURL,
 				Path:                comment.Path,
 				DiffHunk:            comment.DiffHunk,
-				ObservedFingerprint: fixer.NativeReviewCommentFingerprint(comment.ID, comment.UpdatedAt),
+				ObservedFingerprint: fixer.NativeReviewCommentFingerprint(comment.ID, comment.Body),
 				ResolverPresent:     comment.Resolver.Present,
 				IsResolved:          comment.Resolver.Value != nil,
 				Author:              comment.User.Login,
 				UpdatedAt:           comment.UpdatedAt,
+				ReviewBody:          comment.ReviewBody,
+				ReviewState:         comment.ReviewState,
+				ReviewCommitID:      comment.ReviewCommitID,
+				ReviewAuthor:        comment.ReviewAuthor,
 			})
 		}
 		return out, nil
@@ -1960,15 +2655,12 @@ func (a fixerGitHubAdapter) AddReviewThreadReply(ctx context.Context, input fixe
 }
 
 func (a fixerGitHubAdapter) CompareCommits(ctx context.Context, input fixer.CompareCommitsInput) (fixer.CompareCommitsResult, error) {
-	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
+	if _, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return fixer.CompareCommitsResult{}, err
 		}
-		out, err := client.CompareBranches(ctx, forge.CompareBranchesInput{Base: input.Base, Head: input.Head})
-		if err != nil {
-			return fixer.CompareCommitsResult{}, err
-		}
-		return fixer.CompareCommitsResult{Status: out.Status}, nil
+		status, err := forgejoCompareCommits(ctx, a.config, input.Repo, input.CWD, input.Base, input.Head)
+		return fixer.CompareCommitsResult{Status: status}, err
 	}
 	out, err := a.gateway.CompareCommits(ctx, githubinfra.CompareCommitsInput{Repo: input.Repo, Base: input.Base, Head: input.Head, CWD: input.CWD})
 	if err != nil {
@@ -2035,10 +2727,30 @@ func (a fixerGitHubAdapter) RemovePullRequestLabels(ctx context.Context, input f
 }
 
 func (a fixerGitHubAdapter) AddPullRequestReviewers(ctx context.Context, input fixer.PullRequestReviewersInput) error {
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
+		if err != nil {
+			return err
+		}
+		return addForgejoPullRequestReviewers(ctx, client, a.config, input.Repo, input.PRNumber, input.Reviewers, input.CWD)
+	}
 	return a.gateway.AddPullRequestReviewers(ctx, githubinfra.PullRequestReviewersInput{Repo: input.Repo, PRNumber: input.PRNumber, Reviewers: input.Reviewers, CWD: input.CWD})
 }
 
 func (a fixerGitHubAdapter) ListPullRequestReviews(ctx context.Context, input fixer.ViewPullRequestInput) ([]fixer.ReviewSummary, error) {
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
+		if err != nil {
+			return nil, err
+		}
+		reviews, err := client.ListPullRequestReviewSummaries(ctx, input.PRNumber)
+		if err != nil {
+			return nil, err
+		}
+		out := make([]fixer.ReviewSummary, 0, len(reviews))
+		for _, review := range reviews {
+			out = append(out, fixer.ReviewSummary{ID: review.ID, State: review.State, Author: review.User.Login, Body: review.Body})
+		}
+		return out, nil
+	}
 	reviews, err := a.gateway.ListPullRequestReviews(ctx, githubinfra.ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD})
 	if err != nil {
 		return nil, err
@@ -2051,6 +2763,12 @@ func (a fixerGitHubAdapter) ListPullRequestReviews(ctx context.Context, input fi
 }
 
 func (a fixerGitHubAdapter) DismissReview(ctx context.Context, input fixer.DismissReviewInput) error {
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
+		if err != nil {
+			return err
+		}
+		return client.DismissPullRequestReview(ctx, input.PRNumber, input.ReviewID, input.Message)
+	}
 	return a.gateway.DismissReview(ctx, githubinfra.DismissReviewInput{Repo: input.Repo, PRNumber: input.PRNumber, ReviewID: input.ReviewID, Message: input.Message, CWD: input.CWD})
 }
 
@@ -2116,21 +2834,311 @@ func (a fixerGitAdapter) CleanupWorktree(ctx context.Context, input fixer.Cleanu
 	return a.gateway.CleanupWorktree(ctx, gitinfra.CleanupWorktreeInput{ProjectID: input.ProjectID, RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot, WorktreePath: input.WorktreePath, Branch: input.Branch, ProtectedBranches: input.ProtectedBranches})
 }
 
+type fixerAgentExecutionAdapter struct{ execution agent.Execution }
+
+func (a fixerAgentExecutionAdapter) Kill(reason string) error { return a.execution.Kill(reason) }
+
 type fixerAgentExecutorAdapter struct{ executor *agent.ConfiguredExecutor }
 
 func (a fixerAgentExecutorAdapter) Start(ctx context.Context, input fixer.AgentRunInput) (fixer.AgentExecution, error) {
 	execution, err := a.executor.Start(ctx, agent.RunInput{
 		ExecutionID: input.ExecutionID, ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID,
-		Prompt: input.Prompt, WorkingDirectory: input.WorkingDirectory, Timeout: input.Timeout, HeartbeatTimeout: input.HeartbeatTimeout,
+		Prompt: input.Prompt, NativeResumePrompt: input.NativeResumePrompt, NativeSessionID: input.NativeSessionID,
+		WorkingDirectory: input.WorkingDirectory, Timeout: input.Timeout, HeartbeatTimeout: input.HeartbeatTimeout,
 		Metadata: input.Metadata, IdempotencyKey: input.IdempotencyKey,
 		UseSnapshot: input.UseSnapshot, SnapshotVendor: input.SnapshotVendor, SnapshotModel: input.SnapshotModel,
 	})
 	if err != nil {
 		return nil, err
 	}
-	return convertedAgentExecution[fixer.AgentResult]{execution: execution, convert: func(result agent.Result) fixer.AgentResult {
-		return fixer.AgentResult{Status: result.Status, Summary: result.Summary, Stdout: result.Stdout, Stderr: result.Stderr, ParseStatus: result.ParseStatus, Lifecycle: result.Lifecycle, TimeoutType: result.TimeoutType, ConfiguredIdleTimeoutSeconds: result.ConfiguredIdleTimeoutSeconds, ConfiguredMaxRuntimeSeconds: result.ConfiguredMaxRuntimeSeconds, ElapsedRuntimeSeconds: result.ElapsedRuntimeSeconds, LastProgressAt: result.LastProgressAt}
-	}}, nil
+	return fixerAgentExecutionAdapter{execution: execution}, nil
+}
+
+func (a fixerAgentExecutionAdapter) Wait(ctx context.Context) (fixer.AgentResult, error) {
+	result, err := a.execution.Wait(ctx)
+	if err != nil {
+		return fixer.AgentResult{}, err
+	}
+	return fixer.AgentResult{Status: result.Status, Summary: result.Summary, Stdout: result.Stdout, Stderr: result.Stderr, ParseStatus: result.ParseStatus, Lifecycle: result.Lifecycle, TimeoutType: result.TimeoutType, ConfiguredIdleTimeoutSeconds: result.ConfiguredIdleTimeoutSeconds, ConfiguredMaxRuntimeSeconds: result.ConfiguredMaxRuntimeSeconds, ElapsedRuntimeSeconds: result.ElapsedRuntimeSeconds, LastProgressAt: result.LastProgressAt}, nil
+}
+
+type workerGitHubAdapter struct {
+	gateway *githubinfra.Gateway
+	stamper disclosure.Stamper
+	config  *config.Config
+}
+
+func (a workerGitHubAdapter) forgejo(ctx context.Context, repo string, cwd ...string) (*forge.ForgejoClient, bool, error) {
+	client, ok, err := forgejoClientForContext(ctx, a.config, repo, cwd...)
+	return client, ok, err
+}
+
+// plane returns a Plane task-source client when repo belongs to a plane-kind
+// project. The worker reads issues and posts issue-side comments/labels through
+// Plane; pull-request creation stays on the GitHub code repo.
+func (a workerGitHubAdapter) plane(ctx context.Context, repo string, cwd ...string) (*forge.PlaneClient, bool, error) {
+	client, ok, err := forgeClientForLocation(a.config, repo, cwd, planeClientForCWD, planeClientForRepo)
+	return client, ok, err
+}
+
+func (a workerGitHubAdapter) ListOpenPullRequests(ctx context.Context, input worker.ListOpenPullRequestsInput) ([]worker.PullRequestSummary, error) {
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
+		if err != nil {
+			return nil, err
+		}
+		pullRequests, err := client.ListOpenPullRequests(ctx, forge.ListPullRequestsInput{Limit: input.Limit})
+		if err != nil {
+			return nil, err
+		}
+		result := make([]worker.PullRequestSummary, 0, len(pullRequests))
+		for _, pr := range pullRequests {
+			result = append(result, worker.PullRequestSummary{Number: pr.Number, URL: pr.HTMLURL, State: pr.State, HeadRefName: pr.Head.Name, BaseRefName: pr.Base.Name})
+		}
+		return result, nil
+	}
+	if a.gateway == nil {
+		return nil, fmt.Errorf("github gateway is not configured")
+	}
+	pullRequests, err := a.gateway.ListOpenPullRequests(ctx, githubinfra.ListOpenPullRequestsInput{Repo: input.Repo, CWD: input.CWD, Limit: input.Limit, Label: input.Label})
+	if err != nil {
+		return nil, err
+	}
+	result := make([]worker.PullRequestSummary, 0, len(pullRequests))
+	for _, pr := range pullRequests {
+		result = append(result, worker.PullRequestSummary{Number: pr.Number, URL: pr.URL, State: pr.State, HeadRefName: pr.HeadRefName, BaseRefName: pr.BaseRefName})
+	}
+	return result, nil
+}
+
+func (a workerGitHubAdapter) ListOpenIssues(ctx context.Context, input worker.ListOpenIssuesInput) ([]worker.IssueSummary, error) {
+	if client, ok, err := a.plane(ctx, input.Repo, input.CWD); ok || err != nil {
+		if err != nil {
+			return nil, err
+		}
+		issues, err := client.ListOpenIssues(ctx, forge.ListIssuesInput{Labels: input.Labels, Assignee: input.Assignee, Limit: input.Limit})
+		if err != nil {
+			return nil, err
+		}
+		result := make([]worker.IssueSummary, 0, len(issues))
+		for _, issue := range issues {
+			result = append(result, worker.IssueSummary{Number: issue.Number, Title: issue.Title, Body: issue.Body, URL: issue.HTMLURL, Assignees: forgeIdentityLogins(issue.Assignees), AssigneeUsers: workerhost.ForgeNetworkPolicyUsers(issue.Assignees), Labels: forgeLabelNames(issue.Labels)})
+		}
+		return result, nil
+	}
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
+		if err != nil {
+			return nil, err
+		}
+		issues, err := forgejoDiscoveryIssues(ctx, client, forge.ListIssuesInput{Labels: input.Labels, Assignee: input.Assignee, Limit: input.Limit}, input.IssueNumber)
+		if err != nil {
+			return nil, err
+		}
+		result := make([]worker.IssueSummary, 0, len(issues))
+		for _, issue := range issues {
+			result = append(result, worker.IssueSummary{Number: issue.Number, Title: issue.Title, Body: issue.Body, URL: issue.HTMLURL, Assignees: forgeIdentityLogins(issue.Assignees), AssigneeUsers: workerhost.ForgeNetworkPolicyUsers(issue.Assignees), Labels: forgeLabelNames(issue.Labels)})
+		}
+		return result, nil
+	}
+	if a.gateway == nil {
+		return nil, fmt.Errorf("github gateway is not configured")
+	}
+	issues, err := a.gateway.ListOpenIssues(ctx, githubinfra.ListOpenIssuesInput{Repo: input.Repo, CWD: input.CWD, Limit: input.Limit, Assignee: input.Assignee, Label: input.Label, Labels: input.Labels})
+	if err != nil {
+		return nil, err
+	}
+	result := make([]worker.IssueSummary, 0, len(issues))
+	for _, issue := range issues {
+		result = append(result, worker.IssueSummary{Number: issue.Number, Title: issue.Title, Body: issue.Body, URL: issue.URL, Author: issue.Author, Assignees: issue.Assignees, AssigneeUsers: workerhost.NetworkPolicyUsers(issue.AssigneeUsers), Labels: issue.Labels})
+	}
+	return result, nil
+}
+
+func (a workerGitHubAdapter) GetCurrentUserLogin(ctx context.Context, cwd string) (string, error) {
+	if client, ok, err := planeClientForCWD(a.config, cwd); ok || err != nil {
+		if err != nil {
+			return "", err
+		}
+		identity, err := client.CurrentUser(ctx)
+		return identity.Login, err
+	}
+	if client, ok, err := forgejoClientForContext(ctx, a.config, "", cwd); ok || err != nil {
+		if err != nil {
+			return "", err
+		}
+		identity, err := client.CurrentUser(ctx)
+		return identity.Login, err
+	}
+	if a.gateway == nil {
+		return "", fmt.Errorf("github gateway is not configured")
+	}
+	return a.gateway.GetCurrentUserLogin(ctx, cwd)
+}
+
+func (a workerGitHubAdapter) AddIssueAssignees(ctx context.Context, input worker.IssueAssigneesInput) error {
+	if client, ok, err := a.plane(ctx, input.Repo, input.CWD); ok || err != nil {
+		if err != nil {
+			return err
+		}
+		return client.AddIssueAssignees(ctx, input.IssueNumber, input.Assignees)
+	}
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
+		if err != nil {
+			return err
+		}
+		return client.AddIssueAssignees(ctx, input.IssueNumber, input.Assignees)
+	}
+	if a.gateway == nil {
+		return fmt.Errorf("github gateway is not configured")
+	}
+	return a.gateway.AddIssueAssignees(ctx, githubinfra.IssueAssigneesInput{Repo: input.Repo, IssueNumber: input.IssueNumber, Assignees: input.Assignees, CWD: input.CWD})
+}
+
+func (a workerGitHubAdapter) ViewPullRequest(ctx context.Context, input worker.ViewPullRequestInput) (worker.PullRequestDetail, error) {
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
+		if err != nil {
+			return worker.PullRequestDetail{}, err
+		}
+		pr, err := client.ViewPullRequest(ctx, input.PRNumber)
+		if err != nil {
+			return worker.PullRequestDetail{}, err
+		}
+		return worker.PullRequestDetail{Number: pr.Number, Title: pr.Title, Body: pr.Body, URL: pr.HTMLURL, State: pr.State, HeadRefName: pr.Head.Name, BaseRefName: pr.Base.Name, HeadSHA: pr.Head.SHA, Labels: forgeLabelNames(pr.Labels)}, nil
+	}
+	if a.gateway == nil {
+		return worker.PullRequestDetail{}, fmt.Errorf("github gateway is not configured")
+	}
+	detail, err := a.gateway.ViewPullRequest(ctx, githubinfra.ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD})
+	if err != nil {
+		return worker.PullRequestDetail{}, err
+	}
+	return worker.PullRequestDetail{Number: detail.Number, Title: detail.Title, Body: detail.Body, URL: detail.URL, State: detail.State, HeadRefName: detail.HeadRefName, BaseRefName: detail.BaseRefName, HeadSHA: detail.HeadSHA, Labels: append([]string(nil), detail.Labels...), ReviewRequests: detail.ReviewRequests, ReviewRequestUsers: workerhost.NetworkPolicyUsers(detail.ReviewRequestUsers)}, nil
+}
+
+func (a workerGitHubAdapter) ViewIssue(ctx context.Context, input worker.ViewIssueInput) (worker.IssueDetail, error) {
+	if client, ok, err := a.plane(ctx, input.Repo, input.CWD); ok || err != nil {
+		if err != nil {
+			return worker.IssueDetail{}, err
+		}
+		issue, err := client.ViewIssue(ctx, input.IssueNumber)
+		if err != nil {
+			return worker.IssueDetail{}, err
+		}
+		return worker.IssueDetail{Number: issue.Number, Title: issue.Title, Body: issue.Body, URL: issue.HTMLURL, State: issue.State, AssigneeUsers: workerhost.ForgeNetworkPolicyUsers(issue.Assignees), Labels: forgeLabelNames(issue.Labels)}, nil
+	}
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
+		if err != nil {
+			return worker.IssueDetail{}, err
+		}
+		issue, err := client.ViewIssue(ctx, input.IssueNumber)
+		if err != nil {
+			return worker.IssueDetail{}, err
+		}
+		return worker.IssueDetail{Number: issue.Number, Title: issue.Title, Body: issue.Body, URL: issue.HTMLURL, State: issue.State, AssigneeUsers: workerhost.ForgeNetworkPolicyUsers(issue.Assignees), Labels: forgeLabelNames(issue.Labels)}, nil
+	}
+	if a.gateway == nil {
+		return worker.IssueDetail{}, fmt.Errorf("github gateway is not configured")
+	}
+	issue, err := a.gateway.ViewIssue(ctx, githubinfra.ViewIssueInput{Repo: input.Repo, IssueNumber: input.IssueNumber, CWD: input.CWD})
+	if err != nil {
+		return worker.IssueDetail{}, err
+	}
+	return worker.IssueDetail{Number: issue.Number, Title: issue.Title, Body: issue.Body, URL: issue.URL, State: issue.State, IsPullRequest: issue.IsPullRequest, AssigneeUsers: workerhost.NetworkPolicyUsers(issue.AssigneeUsers), Labels: issue.Labels}, nil
+}
+
+func (a workerGitHubAdapter) CreateIssueComment(ctx context.Context, input worker.IssueCommentInput) (worker.IssueCommentResult, error) {
+	body := a.stamper.WithIdentity(input.DisclosureAgent, input.DisclosureModel).Markdown(input.Body, "worker", disclosure.ChannelIssueComment)
+	if client, ok, err := a.plane(ctx, input.Repo, input.CWD); ok || err != nil {
+		if err != nil {
+			return worker.IssueCommentResult{}, err
+		}
+		comment, err := client.CreateIssueComment(ctx, forge.CreateCommentInput{IssueNumber: input.IssueNumber, Body: body})
+		if err != nil {
+			return worker.IssueCommentResult{}, err
+		}
+		// Plane comment ids are UUIDs and do not fit looper's int64 comment id, so
+		// ID stays 0; the URL points at the work-item web page.
+		return worker.IssueCommentResult{ID: comment.ID, URL: comment.HTMLURL}, nil
+	}
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
+		if err != nil {
+			return worker.IssueCommentResult{}, err
+		}
+		comment, err := client.CreateIssueComment(ctx, forge.CreateCommentInput{IssueNumber: input.IssueNumber, Body: body})
+		if err != nil {
+			return worker.IssueCommentResult{}, err
+		}
+		return worker.IssueCommentResult{ID: comment.ID, URL: comment.HTMLURL}, nil
+	}
+	if a.gateway == nil {
+		return worker.IssueCommentResult{}, fmt.Errorf("github gateway is not configured")
+	}
+	comment, err := a.gateway.CreateIssueComment(ctx, githubinfra.IssueCommentInput{Repo: input.Repo, IssueNumber: input.IssueNumber, Body: body, CWD: input.CWD})
+	if err != nil {
+		return worker.IssueCommentResult{}, err
+	}
+	return worker.IssueCommentResult{ID: comment.ID, URL: comment.URL}, nil
+}
+
+func (a workerGitHubAdapter) UpdateIssueComment(ctx context.Context, input worker.UpdateIssueCommentInput) error {
+	body := a.stamper.WithIdentity(input.DisclosureAgent, input.DisclosureModel).Markdown(input.Body, "worker", disclosure.ChannelIssueComment)
+	if _, ok, err := a.plane(ctx, input.Repo, input.CWD); ok || err != nil {
+		if err != nil {
+			return err
+		}
+		// Plane comment ids are UUIDs, which do not round-trip through looper's
+		// int64 comment id, so in-place updates are not supported. This is a
+		// no-op: the worker's CreateIssueComment path (which returns id 0) posts a
+		// fresh progress comment on each status transition instead.
+		// TODO(plane): track the Plane comment UUID to enable true updates.
+		return nil
+	}
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
+		if err != nil {
+			return err
+		}
+		_, err = client.UpdateIssueComment(ctx, forge.UpdateCommentInput{CommentID: input.CommentID, Body: body})
+		return err
+	}
+	if a.gateway == nil {
+		return fmt.Errorf("github gateway is not configured")
+	}
+	return a.gateway.UpdateIssueComment(ctx, githubinfra.UpdateIssueCommentInput{Repo: input.Repo, CommentID: input.CommentID, Body: body, CWD: input.CWD})
+}
+
+func (a workerGitHubAdapter) CreatePullRequest(ctx context.Context, input worker.CreatePullRequestInput) (worker.CreatePullRequestResult, error) {
+	body := a.stamper.WithIdentity(input.DisclosureAgent, input.DisclosureModel).Markdown(input.Body, "worker", disclosure.ChannelPullRequest)
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
+		if err != nil {
+			return worker.CreatePullRequestResult{}, err
+		}
+		pr, err := client.CreatePullRequest(ctx, forge.CreatePullRequestInput{Title: input.Title, Body: body, Head: input.HeadBranch, Base: input.BaseBranch})
+		if err != nil {
+			return worker.CreatePullRequestResult{}, err
+		}
+		return worker.CreatePullRequestResult{Number: pr.Number, URL: pr.HTMLURL}, nil
+	}
+	if a.gateway == nil {
+		return worker.CreatePullRequestResult{}, fmt.Errorf("github gateway is not configured")
+	}
+	pr, err := a.gateway.CreatePullRequest(ctx, githubinfra.CreatePullRequestInput{Repo: input.Repo, HeadBranch: input.HeadBranch, BaseBranch: input.BaseBranch, Title: input.Title, Body: body, Draft: input.Draft, CWD: input.CWD})
+	if err != nil {
+		return worker.CreatePullRequestResult{}, err
+	}
+	return worker.CreatePullRequestResult{Number: pr.Number, URL: pr.URL}, nil
+}
+
+func (a workerGitHubAdapter) AddPullRequestLabels(ctx context.Context, input worker.PullRequestLabelsInput) error {
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
+		if err != nil {
+			return err
+		}
+		_, err := client.AddIssueLabels(ctx, input.PRNumber, input.Labels)
+		return err
+	}
+	if a.gateway == nil {
+		return fmt.Errorf("github gateway is not configured")
+	}
+	return a.gateway.AddPullRequestLabels(ctx, githubinfra.PullRequestLabelsInput{Repo: input.Repo, PRNumber: input.PRNumber, Labels: input.Labels, CWD: input.CWD})
 }
 
 // providerHasGitHubPullRequests reports whether a project of this provider kind
@@ -2173,7 +3181,7 @@ func (f *schedulerNotificationGatewayFactory) New(options notify.Options) *notif
 	return notify.NewGateway(options)
 }
 
-func buildCatalogSchedulerHandlers(source projects.ConfigSource, claimBoundary *sync.RWMutex, configPath string, logger bootstrap.Logger, coordinator *storage.SQLiteCoordinator, repos *storage.Repositories, gitGateway *gitinfra.Gateway, githubGateway *githubinfra.Gateway, activeExecutions *ActiveExecutionRegistry, asyncRunner func() schedulerAsyncRunner, requestWake func(), now func() time.Time, reconcileStaleRuns func(context.Context) (StaleRunReconcileSummary, error), allowClaim func() error, withAllowClaim func(fn func()) error, shepherds ...webhookforward.TargetedShepherd) defaultSchedulerHandlers {
+func buildCatalogSchedulerHandlers(source projects.ConfigSource, claimBoundary *sync.RWMutex, configPath string, logger bootstrap.Logger, coordinator *storage.SQLiteCoordinator, repos *storage.Repositories, gitGateway *gitinfra.Gateway, githubGateway *githubinfra.Gateway, activeExecutions *ActiveExecutionRegistry, asyncRunner func() schedulerAsyncRunner, requestWake func(), now func() time.Time, reconcileStaleRuns func(context.Context) (StaleRunReconcileSummary, error), allowClaim func() error, withAllowClaim func(fn func()) error, notifyHumanAttention func(context.Context, string), shepherds ...webhookforward.TargetedShepherd) defaultSchedulerHandlers {
 	if source == nil {
 		fail := func(context.Context, Services) error { return fmt.Errorf("project catalog is not configured") }
 		return defaultSchedulerHandlers{tick: fail, claim: fail}
@@ -2185,12 +3193,13 @@ func buildCatalogSchedulerHandlers(source projects.ConfigSource, claimBoundary *
 	}
 	notificationGateways := newSchedulerNotificationGatewayFactory()
 	coordinatorState := coordinatorrole.NewRuntimeState()
+	followUpSweeps := reviewer.NewFollowUpSweepState()
 	// Trusted review proxies are minted per reviewer agent run (bound to that
 	// run's PR). Catalog snapshots reuse claim serialization and notification
 	// transport continuity while retaining config-specific policy.
 	buildSnapshot := func() defaultSchedulerHandlers {
 		cfg := source.Snapshot()
-		return buildDefaultSchedulerHandlersWithOptions(cfg, configPath, logger, coordinator, repos, gitGateway, githubGateway, activeExecutions, asyncRunner, requestWake, now, reconcileStaleRuns, false, claimMu, nil, notificationGateways, coordinatorState, shepherd)
+		return buildDefaultSchedulerHandlersWithOptions(cfg, configPath, logger, coordinator, repos, gitGateway, githubGateway, activeExecutions, asyncRunner, requestWake, now, reconcileStaleRuns, false, claimMu, nil, notificationGateways, coordinatorState, followUpSweeps, shepherd)
 	}
 	handlers := defaultSchedulerHandlers{
 		snapshot:             buildSnapshot,
@@ -2208,8 +3217,12 @@ func buildCatalogSchedulerHandlers(source projects.ConfigSource, claimBoundary *
 				return handlers.snapshot().fixer
 			}},
 			Shepherd: shepherd,
-			Logger:   logger,
-			Now:      now,
+			DiscoverProject: func(ctx context.Context, request webhookforward.ProjectDiscovery) error {
+				input := handlers.snapshot().input(Services{Repositories: repos, Coordinator: coordinator})
+				return discoverWebhookProject(ctx, input, request)
+			},
+			Logger: logger,
+			Now:    now,
 			// Accept-time gate only: once Forward returns accepted/202 the
 			// delivery is committed and workers complete discovery even if
 			// admission later degrades. BeginShutdown/Stop aborts via CancelExecute.
@@ -2222,6 +3235,12 @@ func buildCatalogSchedulerHandlers(source projects.ConfigSource, claimBoundary *
 	attachClaimGate := func(input defaultSchedulerTickInput, services Services) defaultSchedulerTickInput {
 		input.ClaimBoundary = claimBoundary
 		input.AllowClaim = allowClaim
+		// Runtime-owned cancelable lifecycle for post-claim human-attention
+		// delivery (BeginShutdown cancel + Stop drain). Overrides the snapshot
+		// default which would run under the detached WithoutCancel dispatch ctx.
+		if notifyHumanAttention != nil {
+			input.NotifyHumanAttention = notifyHumanAttention
+		}
 		// Wire Supervisor operation leases for claim ownership span (#579).
 		// Prefer the live registry from Services when present (daemon path).
 		if services.ActiveExecutions != nil {
@@ -2236,6 +3255,9 @@ func buildCatalogSchedulerHandlers(source projects.ConfigSource, claimBoundary *
 				stopped.MaxConcurrentRuns = 0
 				stopped.RefreshForClaim = nil
 				stopped.AllowClaim = allowClaim
+				if notifyHumanAttention != nil {
+					stopped.NotifyHumanAttention = notifyHumanAttention
+				}
 				if services.ActiveExecutions != nil {
 					stopped.OperationOwner = services.ActiveExecutions
 				} else if activeExecutions != nil {
@@ -2246,6 +3268,9 @@ func buildCatalogSchedulerHandlers(source projects.ConfigSource, claimBoundary *
 			latest := latestSnapshot.input(services)
 			latest.ClaimBoundary = claimBoundary
 			latest.AllowClaim = allowClaim
+			if notifyHumanAttention != nil {
+				latest.NotifyHumanAttention = notifyHumanAttention
+			}
 			if services.ActiveExecutions != nil {
 				latest.OperationOwner = services.ActiveExecutions
 			} else if activeExecutions != nil {
@@ -2273,10 +3298,10 @@ func buildCatalogSchedulerHandlers(source projects.ConfigSource, claimBoundary *
 }
 
 func buildDefaultSchedulerHandlers(cfg config.Config, logger bootstrap.Logger, coordinator *storage.SQLiteCoordinator, repos *storage.Repositories, gitGateway *gitinfra.Gateway, githubGateway *githubinfra.Gateway, activeExecutions *ActiveExecutionRegistry, asyncRunner func() schedulerAsyncRunner, requestWake func(), now func() time.Time, reconcileStaleRuns func(context.Context) (StaleRunReconcileSummary, error)) defaultSchedulerHandlers {
-	return buildDefaultSchedulerHandlersWithOptions(cfg, "", logger, coordinator, repos, gitGateway, githubGateway, activeExecutions, asyncRunner, requestWake, now, reconcileStaleRuns, true, nil, nil, newSchedulerNotificationGatewayFactory(), coordinatorrole.NewRuntimeState())
+	return buildDefaultSchedulerHandlersWithOptions(cfg, "", logger, coordinator, repos, gitGateway, githubGateway, activeExecutions, asyncRunner, requestWake, now, reconcileStaleRuns, true, nil, nil, newSchedulerNotificationGatewayFactory(), coordinatorrole.NewRuntimeState(), reviewer.NewFollowUpSweepState())
 }
 
-func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath string, logger bootstrap.Logger, coordinator *storage.SQLiteCoordinator, repos *storage.Repositories, gitGateway *gitinfra.Gateway, githubGateway *githubinfra.Gateway, activeExecutions *ActiveExecutionRegistry, asyncRunner func() schedulerAsyncRunner, requestWake func(), now func() time.Time, reconcileStaleRuns func(context.Context) (StaleRunReconcileSummary, error), includeWebhook bool, claimMu *sync.Mutex, configSource projects.ConfigSource, notificationGateways *schedulerNotificationGatewayFactory, coordinatorState *coordinatorrole.RuntimeState, shepherds ...webhookforward.TargetedShepherd) defaultSchedulerHandlers {
+func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath string, logger bootstrap.Logger, coordinator *storage.SQLiteCoordinator, repos *storage.Repositories, gitGateway *gitinfra.Gateway, githubGateway *githubinfra.Gateway, activeExecutions *ActiveExecutionRegistry, asyncRunner func() schedulerAsyncRunner, requestWake func(), now func() time.Time, reconcileStaleRuns func(context.Context) (StaleRunReconcileSummary, error), includeWebhook bool, claimMu *sync.Mutex, configSource projects.ConfigSource, notificationGateways *schedulerNotificationGatewayFactory, coordinatorState *coordinatorrole.RuntimeState, followUpSweeps *reviewer.FollowUpSweepState, shepherds ...webhookforward.TargetedShepherd) defaultSchedulerHandlers {
 	var shepherd webhookforward.TargetedShepherd
 	if len(shepherds) > 0 {
 		shepherd = shepherds[0]
@@ -2310,7 +3335,6 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 		Config:        cfg.Notifications,
 		FeishuCLI:     privateClient,
 		OsascriptPath: derefString(cfg.Tools.OsascriptPath),
-		LogFilePath:   filepath.Join(cfg.Daemon.LogDir, "looperd.log"),
 		Repositories:  repos,
 		Now:           now,
 		ResolveOwnerOpenID: func(projectID string) string {
@@ -2320,6 +3344,9 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			return config.ProjectOwner(cfg, projectID)
 		},
 	})
+	notifyHumanAttention := func(ctx context.Context, loopID string) {
+		notifyDurableHumanAttention(ctx, notificationGateway, repos, loopID)
+	}
 	// refreshFeishuAnchor re-renders a loop's thread-anchor card to reflect its
 	// CURRENT status (colour + label), without disturbing the retained live tail.
 	// The anchor is otherwise only patched opportunistically by the progress ticker
@@ -2368,7 +3395,71 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 		return nil
 	}
 	notifyWorkerRunCompleted := func(ctx context.Context, input workerRunCompletedNotificationInput) error {
-		return workerhost.NotifyWorkerCompleted(ctx, cfg, repos, notificationGateway, logger, worker.RunCompletedInput(input))
+		workerNotificationKeyID := runtimeFirstNonEmpty(input.RunID, input.LoopID)
+		// Hard holds are owned by the central human-attention path after claim
+		// finalization and lease release (runOwnedQueueClaims post-observer).
+		// Do not notify here: OnRunCompleted still holds the operation lease and
+		// the loop is still running, so a slow local or remote notifier would
+		// hold a concurrency slot before the durable pause.
+		// Still record the Feishu milestone / refresh below.
+		if input.Status == "failed" && input.FailureKind == worker.FailureManualIntervention {
+			if strings.TrimSpace(input.LoopID) != "" && strings.EqualFold(strings.TrimSpace(cfg.Notifications.Webhook.Mode), "app") {
+				notificationGateway.RecordMilestone(ctx, input.LoopID, "⏸ 需要人处理")
+			} else {
+				refreshFeishuAnchor(ctx, input.LoopID)
+			}
+			return nil
+		}
+		payload := notify.SystemNotificationPayload{
+			ProjectID:  input.ProjectID,
+			LoopID:     input.LoopID,
+			RunID:      input.RunID,
+			Subtitle:   input.Subtitle,
+			EntityType: "run",
+			EntityID:   input.RunID,
+		}
+		switch {
+		case input.Status == "failed":
+			payload.Level = "failure"
+			payload.Title = "Looper Worker Failed"
+			payload.Body = input.Summary
+			payload.DedupeKey = fmt.Sprintf("runtime.worker.failed:%s", workerNotificationKeyID)
+		case input.Status == "skipped":
+			payload.Level = "action_required"
+			payload.Title = "Looper Worker Needs Attention"
+			payload.Body = input.Summary
+			payload.DedupeKey = fmt.Sprintf("runtime.worker.action_required:%s", workerNotificationKeyID)
+		case input.PullRequestNumber > 0:
+			payload.Level = "action_required"
+			payload.Title = "Looper Worker Opened a PR"
+			payload.Body = fmt.Sprintf("PR #%d is ready: %s", input.PullRequestNumber, runtimeFirstNonEmpty(input.PullRequestURL, input.Summary))
+			payload.DedupeKey = fmt.Sprintf("runtime.worker.pr_ready:%s", input.RunID)
+		default:
+			payload.Level = "success"
+			payload.Title = "Looper Worker Completed"
+			payload.Body = runtimeFirstNonEmpty(input.Summary, "Worker completed successfully")
+			payload.DedupeKey = fmt.Sprintf("runtime.worker.completed:%s", input.RunID)
+		}
+		notificationGateway.Notify(ctx, payload)
+		// Log the outcome to the loop's story so the anchor reads as a narrative.
+		if strings.TrimSpace(input.LoopID) != "" && strings.EqualFold(strings.TrimSpace(cfg.Notifications.Webhook.Mode), "app") {
+			switch {
+			case input.PullRequestNumber > 0:
+				link := runtimeFirstNonEmpty(input.PullRequestURL, "")
+				if link != "" {
+					notificationGateway.RecordMilestone(ctx, input.LoopID, fmt.Sprintf("🔀 已开 [PR #%d](%s)", input.PullRequestNumber, link))
+				} else {
+					notificationGateway.RecordMilestone(ctx, input.LoopID, fmt.Sprintf("🔀 已开 PR #%d", input.PullRequestNumber))
+				}
+			case input.Status == "failed":
+				notificationGateway.RecordMilestone(ctx, input.LoopID, "⚠️ 本轮失败,重试中")
+			case input.Status != "skipped":
+				notificationGateway.RecordMilestone(ctx, input.LoopID, "✅ 完成")
+			}
+		} else {
+			refreshFeishuAnchor(ctx, input.LoopID)
+		}
+		return nil
 	}
 
 	var plannerRunner plannerScheduler
@@ -2401,7 +3492,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			activeExecutions.ReportHardPersistFailure(err)
 		}
 	}
-	newRoleAgentExecutor := func(resolved config.ResolvedAgent) *agent.ConfiguredExecutor {
+	newRoleAgentExecutor := func(resolved config.ResolvedAgent, nono *config.ReviewerNonoConfig) *agent.ConfiguredExecutor {
 		// agent.params (especially command/args) belong to the global agent
 		// vendor. Keep the unstripped map and the owner vendor on the executor
 		// so effectiveConfig can filter against the effective identity: live
@@ -2409,6 +3500,8 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 		// retries that restore the owner vendor keep command/args (resolveCommand
 		// prefers params.command over vendor defaults).
 		return agent.New(agent.ExecutorOptions{
+			HostingConfig: &cfg, TrustedLooperPath: looperCLIPath, HostingTracker: activeExecutions,
+			Nono: nono,
 			Config: agent.ExecutorConfig{
 				Vendor:              resolved.Vendor,
 				Model:               resolved.Model,
@@ -2446,7 +3539,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 	resolvedPlanner, plannerConfigured := config.ResolveAgent(cfg, "", config.CodingRolePlanner)
 	{
 		resolved := resolvedPlanner
-		plannerExecutor := newRoleAgentExecutor(resolved)
+		plannerExecutor := newRoleAgentExecutor(resolved, nil)
 		var agentModel *string
 		if resolved.Model != nil {
 			model := *resolved.Model
@@ -2516,6 +3609,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 		// ParamsForRoleVendor nil-owner path strips wrappers and coordinator
 		// triage launches bare vendor defaults while role executors keep them.
 		globalExecutor := agent.New(agent.ExecutorOptions{
+			HostingConfig: &cfg, TrustedLooperPath: looperCLIPath, HostingTracker: activeExecutions,
 			Config: agent.ExecutorConfig{
 				Vendor:              *cfg.Agent.Vendor,
 				Model:               cfg.Agent.Model,
@@ -2544,7 +3638,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 	resolvedReviewer, reviewerConfigured := config.ResolveAgent(cfg, "", config.CodingRoleReviewer)
 	{
 		resolved := resolvedReviewer
-		reviewerExecutor := newRoleAgentExecutor(resolved)
+		reviewerExecutor := newRoleAgentExecutor(resolved, cfg.Roles.Reviewer.Nono)
 		var agentModel *string
 		if resolved.Model != nil {
 			model := *resolved.Model
@@ -2559,7 +3653,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			DB:     coordinator.DB(),
 			Repos:  repos,
 			GitHub: reviewerGitHubAdapter{gateway: githubGateway, stamper: reviewerStamper, config: &cfg},
-			Git:    reviewerGitAdapter{gateway: gitGateway},
+			Git:    reviewerGitAdapter{gateway: gitGateway, localDiff: githubinfra.New(githubinfra.Options{GitPath: derefString(cfg.Tools.GitPath)})},
 			AgentExecutor: reviewerAgentExecutorAdapter{
 				executor:    reviewerExecutor,
 				realLooper:  looperCLIPath,
@@ -2601,6 +3695,8 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			RetryMaxAttempts:        int64(cfg.Scheduler.RetryMaxAttempts),
 			RetryPolicy:             cfg.Roles.Reviewer.Behavior.Retry,
 			OnQueueItemEnqueued:     requestWake,
+			NotifyHumanAttention:    notifyHumanAttention,
+			FollowUpSweeps:          followUpSweeps,
 			OnAgentExecutionStarted: func(ctx context.Context, input reviewer.AgentExecutionStartedInput) error {
 				return notifyAgentExecutionStarted(ctx, agentExecutionNotificationInput{ExecutionID: input.ExecutionID, ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID, Title: "Looper Reviewer", Subtitle: input.Subtitle, Body: input.Body, DedupeKey: input.DedupeKey})
 			},
@@ -2609,7 +3705,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 	resolvedFixer, fixerConfigured := config.ResolveAgent(cfg, "", config.CodingRoleFixer)
 	{
 		resolved := resolvedFixer
-		fixerExecutor := newRoleAgentExecutor(resolved)
+		fixerExecutor := newRoleAgentExecutor(resolved, nil)
 		var agentModel *string
 		if resolved.Model != nil {
 			model := *resolved.Model
@@ -2631,6 +3727,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			AllowAutoCommit:    cfg.Defaults.AllowAutoCommit,
 			AllowAutoPush:      cfg.Defaults.AllowAutoPush,
 			AllowRiskyFixes:    cfg.Defaults.AllowRiskyFixes,
+			HITLEnabled:        cfg.HITL.Enabled,
 			FixAllPullRequests: cfg.Defaults.FixAllPullRequests,
 			// Validation shell is Supervisor-owned (#577): track handles for retain-storage.
 			ContainmentTracker: activeExecutions,
@@ -2641,16 +3738,17 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 				Labels:        append([]string(nil), cfg.Roles.Fixer.Triggers.Labels...),
 				LabelMode:     cfg.Roles.Fixer.Triggers.LabelMode,
 			},
-			Disclosure:          &cfg.Disclosure,
-			AgentRuntime:        string(resolved.Vendor),
-			AgentProfileID:      resolved.ProfileID,
-			CustomInstructions:  &cfg,
-			AgentModel:          agentModel,
-			AgentTimeout:        time.Duration(cfg.Agent.Timeouts.FixerMaxRuntimeSeconds) * time.Second,
-			AgentIdleTimeout:    time.Duration(cfg.Agent.Timeouts.FixerIdleTimeoutSeconds) * time.Second,
-			RetryBaseDelay:      retryBaseDelay,
-			RetryMaxAttempts:    int64(cfg.Scheduler.RetryMaxAttempts),
-			OnQueueItemEnqueued: requestWake,
+			Disclosure:           &cfg.Disclosure,
+			AgentRuntime:         string(resolved.Vendor),
+			AgentProfileID:       resolved.ProfileID,
+			CustomInstructions:   &cfg,
+			AgentModel:           agentModel,
+			AgentTimeout:         time.Duration(cfg.Agent.Timeouts.FixerMaxRuntimeSeconds) * time.Second,
+			AgentIdleTimeout:     time.Duration(cfg.Agent.Timeouts.FixerIdleTimeoutSeconds) * time.Second,
+			RetryBaseDelay:       retryBaseDelay,
+			RetryMaxAttempts:     int64(cfg.Scheduler.RetryMaxAttempts),
+			OnQueueItemEnqueued:  requestWake,
+			NotifyHumanAttention: notifyHumanAttention,
 			OnAgentExecutionStarted: func(ctx context.Context, input fixer.AgentExecutionStartedInput) error {
 				return notifyAgentExecutionStarted(ctx, agentExecutionNotificationInput{ExecutionID: input.ExecutionID, ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID, Title: "Looper Fixer", Subtitle: input.Subtitle, Body: input.Body, DedupeKey: input.DedupeKey})
 			},
@@ -2660,8 +3758,14 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 		if privateFeishuClient(&cfg) != nil {
 			return postPrivateFeishuQuestion(ctx, &cfg, repos, notificationGateway, ask.LoopID)
 		}
+		transport := ""
+		if strings.EqualFold(strings.TrimSpace(cfg.HITL.AnswerTransport), "feishu") {
+			// Existing daemon deployments answer through the verified callback
+			// or CF inbox. The standalone collab service uses its own bridge.
+			transport = "feishu-callback"
+		}
 		return notificationGateway.SendHITLAsk(ctx, notify.HITLAskCard{
-			ProjectID: ask.ProjectID, LoopID: ask.LoopID, LoopSeq: ask.LoopSeq,
+			Transport: transport, ProjectID: ask.ProjectID, LoopID: ask.LoopID, LoopSeq: ask.LoopSeq,
 			Repo: ask.Repo, Title: ask.Title, Question: ask.Question, Options: ask.Options,
 			SourceType: ask.SourceType, SourceRef: ask.SourceRef, SourceURL: ask.SourceURL,
 			TriggerLogin:      ask.TriggerLogin,
@@ -2674,7 +3778,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 	resolvedWorker, workerConfigured := config.ResolveAgent(cfg, "", config.CodingRoleWorker)
 	{
 		resolved := resolvedWorker
-		workerExecutor := newRoleAgentExecutor(resolved)
+		workerExecutor := newRoleAgentExecutor(resolved, nil)
 		var agentModel *string
 		if resolved.Model != nil {
 			model := *resolved.Model
@@ -2691,7 +3795,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			PlaneDoc: func(projectID string) (*planedoc.Gateway, string, bool) {
 				return workerhost.PlaneDocForProject(&cfg, projectID)
 			},
-			GitHub: workerhost.GitHub{Gateway: githubGateway, Stamper: workerStamper, Config: &cfg},
+			GitHub: workerGitHubAdapter{gateway: githubGateway, stamper: workerStamper, config: &cfg},
 			GitHubCLIAutoPROpeningAvailable: func(ctx context.Context, repo, cwd string) bool {
 				return githubCLIAutoPROpeningAvailable(ctx, cfg, githubGateway, logger, repo, cwd)
 			},
@@ -2746,9 +3850,13 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 		if githubGateway != nil {
 			snapshotter = githubGateway
 		}
+		var tickDB *sql.DB
+		if services.Coordinator != nil {
+			tickDB = services.Coordinator.DB()
+		}
 		return defaultSchedulerTickInput{
 			Repos:                services.Repositories,
-			ActiveExecutions:     activeExecutions,
+			DB:                   tickDB,
 			GitHubGateway:        githubGateway,
 			Logger:               logger,
 			Now:                  now,
@@ -2776,6 +3884,11 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			OnPullRequestSnapshot:    refreshTaskCardForPR,
 			OnHITLAsk:                notifyHITLAsk,
 			OnHITLAnswerDelivered:    notificationGateway.MarkAskAnswered,
+			NotifyHumanAttention:     notifyHumanAttention,
+			DrainHITLPair: func(ctx context.Context, loop storage.LoopRecord) error {
+				return drainReviewFixPairExecutions(ctx, services.Repositories, loop, services.ActiveExecutions)
+			},
+			ActiveExecutions: services.ActiveExecutions,
 		}
 	}
 
@@ -2816,8 +3929,11 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			Reviewer:     webhookReviewer,
 			Fixer:        webhookFixer,
 			Shepherd:     shepherd,
-			Logger:       logger,
-			Now:          now,
+			DiscoverProject: func(ctx context.Context, request webhookforward.ProjectDiscovery) error {
+				return discoverWebhookProject(ctx, inputForServices(Services{Repositories: repos, Coordinator: coordinator}), request)
+			},
+			Logger: logger,
+			Now:    now,
 		})
 	}
 	return handlers
@@ -3068,6 +4184,10 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 			break
 		}
 		runGitHubHITLPoll(ctx, input, project)
+	}
+
+	if err := admissionRefuseWork(input); err == nil {
+		runFeishuHITLPoll(ctx, input)
 	}
 
 	claimedCount, availableSlots, err = executeClaimPhase(ctx, "post_discovery", input, discoveredRunnableIDs, true)
@@ -3753,6 +4873,10 @@ func dispatchClaimedQueueItems(ctx context.Context, queueItems []storage.QueueIt
 // schedulerLoopParked reports whether a claimed queue item's loop was parked
 // (human takeover / paused) — a state the scheduler may observe AFTER the claim
 // due to a race, and must then decline to run.
+//
+// Exception: a reviewer disposition-only item on a budget-held loop must still
+// run so same-head wontfix adjudication can refresh the handoff without a
+// Continue. Scope holds / human_takeover / non-budget awaiting_human stay parked.
 func schedulerLoopParked(ctx context.Context, item storage.QueueItemRecord, input defaultSchedulerTickInput) bool {
 	if item.LoopID == nil || input.Repos == nil || input.Repos.Loops == nil {
 		return false
@@ -3765,11 +4889,26 @@ func schedulerLoopParked(ctx context.Context, item storage.QueueItemRecord, inpu
 		return true
 	}
 	switch loop.Status {
-	case "human_takeover", "paused":
+	case "human_takeover", "paused", "awaiting_human":
+		if item.Type == "reviewer" && payloadDispositionOnly(item.PayloadJSON) && loops.IsReviewFixBudgetHold(*loop) {
+			return false
+		}
 		return true
 	default:
 		return false
 	}
+}
+
+func payloadDispositionOnly(payloadJSON *string) bool {
+	if payloadJSON == nil || strings.TrimSpace(*payloadJSON) == "" {
+		return false
+	}
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(*payloadJSON), &payload); err != nil {
+		return false
+	}
+	v, ok := payload["dispositionOnly"].(bool)
+	return ok && v
 }
 
 func runScheduledQueueItems(ctx context.Context, queueItems []storage.QueueItemRecord, input defaultSchedulerTickInput) error {
@@ -3942,6 +5081,18 @@ func runOwnedQueueClaims(ctx context.Context, owned []ownedQueueClaim, input def
 					return
 				}
 				lease.Release()
+			}
+			// Best-effort operator notify for durable human-attention parks.
+			// Never affects claim finalization or recovery.
+			//
+			// The dispatch ctx is WithoutCancel so finalize survives shutdown;
+			// do not keep notification transports on that detached lifetime.
+			// Daemon wiring (notifyHumanAttentionPostClaim) ignores this ctx and
+			// uses a runtime-owned cancelable parent that BeginShutdown cancels
+			// and Stop drains before SQLite close. Tests may pass a direct
+			// callback that uses the provided ctx.
+			if input.NotifyHumanAttention != nil && item.LoopID != nil {
+				input.NotifyHumanAttention(ctx, *item.LoopID)
 			}
 			if runErr != nil && input.Logger != nil {
 				input.Logger.Warn("scheduler queue item failed", map[string]any{"type": item.Type, "queueItemId": item.ID, "error": runErr.Error()})
@@ -4160,6 +5311,13 @@ func processSnapshotQueueItem(ctx context.Context, item storage.QueueItemRecord,
 	if now == nil {
 		now = time.Now
 	}
+	if input.Config != nil {
+		bound, bindErr := hostingidentity.Bind(ctx, *input.Config, project.ID, "reviewer")
+		if bindErr != nil {
+			return failSnapshotQueueItem(ctx, item, input, bindErr.Error(), "non_retryable")
+		}
+		ctx = bound
+	}
 	snapshot, err := input.Snapshotter.CapturePullRequestSnapshot(ctx, githubinfra.CapturePullRequestSnapshotInput{ProjectID: project.ID, Repo: *item.Repo, PRNumber: *item.PRNumber, CWD: cwd, CapturedAt: formatJavaScriptISOString(now().UTC())})
 	if err != nil {
 		return failSnapshotQueueItem(ctx, item, input, err.Error(), "retryable_transient")
@@ -4291,4 +5449,85 @@ func finalizeCancelledClaim(ctx context.Context, item storage.QueueItemRecord, i
 }
 func ensureClaimFinalized(ctx context.Context, item storage.QueueItemRecord, runErr error, input defaultSchedulerTickInput, now func() time.Time) error {
 	return executionhost.EnsureClaimFinalized(ctx, input.Repos, item, runErr, now)
+}
+
+func (a workerGitHubAdapter) CompareBranches(ctx context.Context, input worker.CompareBranchesInput) (worker.CompareBranchesResult, error) {
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
+		if err != nil {
+			return worker.CompareBranchesResult{}, err
+		}
+		comparison, err := client.CompareBranches(ctx, forge.CompareBranchesInput{Base: input.BaseBranch, Head: input.HeadBranch})
+		if err != nil {
+			return worker.CompareBranchesResult{}, err
+		}
+		return worker.CompareBranchesResult{AheadBy: comparison.AheadBy, BehindBy: comparison.BehindBy, Status: comparison.Status, TotalCommits: comparison.TotalCommits}, nil
+	}
+	if a.gateway == nil {
+		return worker.CompareBranchesResult{}, fmt.Errorf("github gateway is not configured")
+	}
+	comparison, err := a.gateway.CompareBranches(ctx, githubinfra.CompareBranchesInput{Repo: input.Repo, BaseBranch: input.BaseBranch, HeadBranch: input.HeadBranch, CWD: input.CWD})
+	if err != nil {
+		return worker.CompareBranchesResult{}, err
+	}
+	return worker.CompareBranchesResult{AheadBy: comparison.AheadBy, BehindBy: comparison.BehindBy, Status: comparison.Status, TotalCommits: comparison.TotalCommits}, nil
+}
+
+func (a workerGitHubAdapter) UpdatePullRequestBody(ctx context.Context, input worker.UpdatePullRequestBodyInput) error {
+	body := a.stamper.WithIdentity(input.DisclosureAgent, input.DisclosureModel).Markdown(input.Body, "worker", disclosure.ChannelPullRequest)
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
+		if err != nil {
+			return err
+		}
+		_, err = client.UpdatePullRequest(ctx, forge.UpdatePullRequestInput{Number: input.PRNumber, Body: &body})
+		return err
+	}
+	if a.gateway == nil {
+		return fmt.Errorf("github gateway is not configured")
+	}
+	return a.gateway.UpdatePullRequestBody(ctx, githubinfra.UpdatePullRequestBodyInput{Repo: input.Repo, PRNumber: input.PRNumber, Body: body, CWD: input.CWD})
+}
+
+func (a workerGitHubAdapter) UpdatePullRequestTitle(ctx context.Context, input worker.UpdatePullRequestTitleInput) error {
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
+		if err != nil {
+			return err
+		}
+		_, err = client.UpdatePullRequest(ctx, forge.UpdatePullRequestInput{Number: input.PRNumber, Title: &input.Title})
+		return err
+	}
+	if a.gateway == nil {
+		return fmt.Errorf("github gateway is not configured")
+	}
+	return a.gateway.UpdatePullRequestTitle(ctx, githubinfra.UpdatePullRequestTitleInput{Repo: input.Repo, PRNumber: input.PRNumber, Title: input.Title, CWD: input.CWD})
+}
+
+func (a workerGitHubAdapter) RemovePullRequestLabels(ctx context.Context, input worker.PullRequestLabelsInput) error {
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
+		if err != nil {
+			return err
+		}
+		for _, label := range input.Labels {
+			if err := client.RemoveIssueLabel(ctx, input.PRNumber, label); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if a.gateway == nil {
+		return fmt.Errorf("github gateway is not configured")
+	}
+	return a.gateway.RemovePullRequestLabels(ctx, githubinfra.PullRequestLabelsInput{Repo: input.Repo, PRNumber: input.PRNumber, Labels: input.Labels, CWD: input.CWD})
+}
+
+func (a workerGitHubAdapter) AddPullRequestReviewers(ctx context.Context, input worker.PullRequestReviewersInput) error {
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
+		if err != nil {
+			return err
+		}
+		return addForgejoPullRequestReviewers(ctx, client, a.config, input.Repo, input.PRNumber, input.Reviewers, input.CWD)
+	}
+	if a.gateway == nil {
+		return fmt.Errorf("github gateway is not configured")
+	}
+	return a.gateway.AddPullRequestReviewers(ctx, githubinfra.PullRequestReviewersInput{Repo: input.Repo, PRNumber: input.PRNumber, Reviewers: input.Reviewers, CWD: input.CWD})
 }

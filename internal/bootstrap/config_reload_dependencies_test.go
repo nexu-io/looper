@@ -131,3 +131,41 @@ func TestValidateConfiguredToolPathsRejectsMissingHotTool(t *testing.T) {
 		})
 	}
 }
+
+func TestBootstrapRejectsBotHostingCLIOnReload(t *testing.T) {
+	root := t.TempDir()
+	initial := config.LoadedFileConfig{Config: config.Config{
+		Storage: config.StorageConfig{DBPath: filepath.Join(root, "looper.sqlite")},
+		Daemon:  config.DaemonConfig{LogDir: filepath.Join(root, "logs"), WorkingDirectory: root},
+	}, Metadata: config.LoadFileMetadata{ConfigPath: filepath.Join(root, "config.json")}}
+	loads := 0
+	_, err := Bootstrap(context.Background(), Options{
+		LoadConfig: func(config.LoadFileOptions) (config.LoadedFileConfig, error) {
+			candidate := initial
+			loads++
+			if loads > 1 {
+				candidate.Config.Identities = map[string]config.HostingIdentityConfig{"bot": {Kind: config.HostingIdentityGitHubApp, AppID: 1, InstallationID: 2, PrivateKeyFile: filepath.Join(root, "app.pem")}}
+			}
+			return candidate, nil
+		},
+		CreateLogger: func(config.LoggingConfig, string, LoggerOptions) (Logger, error) { return &recordingLogger{}, nil },
+		StartRuntime: func(_ context.Context, deps RuntimeDependencies) (Runtime, error) {
+			for _, load := range []func() (config.LoadedFileConfig, error){deps.ReloadConfig, func() (config.LoadedFileConfig, error) {
+				return deps.LoadConfigAt(filepath.Join(root, "candidate.json"))
+			}} {
+				_, err := load()
+				var validation *config.ConfigValidationError
+				if !errors.As(err, &validation) || len(validation.Issues) != 1 || validation.Issues[0].Path != "tools.looperPath" {
+					t.Fatalf("bot config reload accepted missing CLI: %v", err)
+				}
+			}
+			return struct{}{}, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loads != 3 {
+		t.Fatalf("config loads = %d, want initial and both reload routes", loads)
+	}
+}

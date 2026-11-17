@@ -20,6 +20,336 @@ import (
 	"github.com/nexu-io/looper/internal/storage"
 )
 
+func TestHandlerLoopWorktreeStatusDirtyAndClean(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	h := NewHandler(Context{Config: cfg, Runtime: rt})
+	services := rt.Services()
+	nowISO := "2026-04-11T12:00:00.000Z"
+
+	dirty := seedManagedWorktreeFixture(t, services.Repositories, managedWorktreeSeed{
+		ProjectID: "project_wt_status_dirty",
+		LoopID:    "loop_wt_status_dirty",
+		LoopSeq:   3201,
+		LoopType:  "fixer",
+		Branch:    "feature/wt-status-dirty",
+		NowISO:    nowISO,
+		Dirty:     true,
+	})
+	clean := seedManagedWorktreeFixture(t, services.Repositories, managedWorktreeSeed{
+		ProjectID: "project_wt_status_clean",
+		LoopID:    "loop_wt_status_clean",
+		LoopSeq:   3202,
+		LoopType:  "fixer",
+		Branch:    "feature/wt-status-clean",
+		NowISO:    nowISO,
+		Dirty:     false,
+	})
+
+	reqDirty := httptest.NewRequest(http.MethodGet, "/api/v1/loops/3201/worktree", nil)
+	recDirty := httptest.NewRecorder()
+	h.ServeHTTP(recDirty, reqDirty)
+	if recDirty.Code != http.StatusOK {
+		t.Fatalf("dirty status = %d, want 200; body=%s", recDirty.Code, recDirty.Body.String())
+	}
+	dirtyData := parseJSONMap(t, recDirty.Body.Bytes())["data"].(map[string]any)
+	assertEqual(t, dirtyData["present"], true)
+	assertEqual(t, dirtyData["managed"], true)
+	assertEqual(t, dirtyData["dirty"], true)
+	assertEqual(t, dirtyData["clean"], false)
+	assertEqual(t, dirtyData["reason"], "dirty")
+	assertEqual(t, dirtyData["worktreePath"], dirty.WorktreePath)
+	assertEqual(t, dirtyData["branch"], "feature/wt-status-dirty")
+
+	reqClean := httptest.NewRequest(http.MethodGet, "/api/v1/loops/3202/worktree", nil)
+	recClean := httptest.NewRecorder()
+	h.ServeHTTP(recClean, reqClean)
+	if recClean.Code != http.StatusOK {
+		t.Fatalf("clean status = %d, want 200; body=%s", recClean.Code, recClean.Body.String())
+	}
+	cleanData := parseJSONMap(t, recClean.Body.Bytes())["data"].(map[string]any)
+	assertEqual(t, cleanData["present"], true)
+	assertEqual(t, cleanData["managed"], true)
+	assertEqual(t, cleanData["dirty"], false)
+	assertEqual(t, cleanData["clean"], true)
+	assertEqual(t, cleanData["reason"], "already_clean")
+	assertEqual(t, cleanData["worktreePath"], clean.WorktreePath)
+
+	// Missing path: present=false, path still returned for diagnostics.
+	if err := os.RemoveAll(dirty.WorktreePath); err != nil {
+		t.Fatalf("RemoveAll(dirty worktree) error = %v", err)
+	}
+	reqMissing := httptest.NewRequest(http.MethodGet, "/api/v1/loops/3201/worktree", nil)
+	recMissing := httptest.NewRecorder()
+	h.ServeHTTP(recMissing, reqMissing)
+	if recMissing.Code != http.StatusOK {
+		t.Fatalf("missing status = %d, want 200; body=%s", recMissing.Code, recMissing.Body.String())
+	}
+	missingData := parseJSONMap(t, recMissing.Body.Bytes())["data"].(map[string]any)
+	assertEqual(t, missingData["present"], false)
+	assertEqual(t, missingData["reason"], "worktree_missing")
+	assertEqual(t, missingData["worktreePath"], dirty.WorktreePath)
+	if _, ok := missingData["dirty"]; ok {
+		t.Fatalf("missing worktree should omit dirty, got %#v", missingData["dirty"])
+	}
+}
+
+func TestHandlerLoopWorktreeStatusUnusablePath(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	h := NewHandler(Context{Config: cfg, Runtime: rt})
+	services := rt.Services()
+	nowISO := "2026-04-11T12:00:00.000Z"
+
+	fixture := seedManagedWorktreeFixture(t, services.Repositories, managedWorktreeSeed{
+		ProjectID: "project_wt_status_unusable",
+		LoopID:    "loop_wt_status_unusable",
+		LoopSeq:   3203,
+		LoopType:  "fixer",
+		Branch:    "feature/wt-status-unusable",
+		NowISO:    nowISO,
+		Dirty:     false,
+	})
+
+	// Hollow leftover: remove git checkout, leave agent cache junk.
+	if err := os.RemoveAll(fixture.WorktreePath); err != nil {
+		t.Fatalf("RemoveAll(worktree) error = %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(fixture.WorktreePath, ".tmp", "e2e"), 0o755); err != nil {
+		t.Fatalf("MkdirAll hollow: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(fixture.WorktreePath, ".tmp", "e2e", "cache"), []byte("x\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile hollow: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/loops/3203/worktree", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	data := parseJSONMap(t, rec.Body.Bytes())["data"].(map[string]any)
+	assertEqual(t, data["present"], true)
+	assertEqual(t, data["managed"], true)
+	assertEqual(t, data["reason"], "unusable_path")
+	assertEqual(t, data["worktreePath"], fixture.WorktreePath)
+	assertEqual(t, data["supportsClearUnusablePath"], true)
+	if _, ok := data["dirty"]; ok {
+		t.Fatalf("unusable_path should omit dirty, got %#v", data["dirty"])
+	}
+	if _, ok := data["clean"]; ok {
+		t.Fatalf("unusable_path should omit clean, got %#v", data["clean"])
+	}
+}
+
+func TestHandlerLoopRetryClearUnusableWorktreePath(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	h := NewHandler(Context{Config: cfg, Runtime: rt})
+	services := rt.Services()
+	nowISO := "2026-04-11T12:00:00.000Z"
+
+	fixture := seedManagedWorktreeFixture(t, services.Repositories, managedWorktreeSeed{
+		ProjectID: "project_retry_clear_unusable",
+		LoopID:    "loop_retry_clear_unusable",
+		LoopSeq:   3140,
+		LoopType:  "fixer",
+		Branch:    "feature/clear-unusable",
+		NowISO:    nowISO,
+		Dirty:     false,
+	})
+
+	if err := os.RemoveAll(fixture.WorktreePath); err != nil {
+		t.Fatalf("RemoveAll(worktree) error = %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(fixture.WorktreePath, ".tmp", "e2e"), 0o755); err != nil {
+		t.Fatalf("MkdirAll hollow: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(fixture.WorktreePath, ".tmp", "e2e", "cache"), []byte("leftover\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile hollow: %v", err)
+	}
+
+	reqBody := fmt.Sprintf(
+		`{"mode":"auto","resetAttempts":true,"clearUnusableWorktreePath":true,"expectedWorktreePath":%q}`,
+		fixture.WorktreePath,
+	)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/loops/3140/retry", strings.NewReader(reqBody))
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+
+	body := parseJSONMap(t, recorder.Body.Bytes())
+	data := body["data"].(map[string]any)
+	assertEqual(t, data["clearUnusableWorktreePath"], true)
+	assertEqual(t, data["discardWorktreeChanges"], false)
+	clear := data["worktreeClearUnusable"].(map[string]any)
+	assertEqual(t, clear["cleared"], true)
+	assertEqual(t, clear["noOp"], false)
+	assertEqual(t, clear["reason"], "cleared")
+	assertEqual(t, clear["worktreePath"], fixture.WorktreePath)
+
+	if _, err := os.Stat(fixture.WorktreePath); !os.IsNotExist(err) {
+		t.Fatalf("hollow path still present after clear: %v", err)
+	}
+
+	loop, err := services.Repositories.Loops.GetByID(context.Background(), fixture.LoopID)
+	if err != nil || loop == nil || loop.Status != "queued" {
+		t.Fatalf("loop after retry = %#v, %v, want queued", loop, err)
+	}
+
+	events, err := services.Repositories.Events.List(context.Background(), 50)
+	if err != nil {
+		t.Fatalf("Events.List() error = %v", err)
+	}
+	found := false
+	for _, event := range events {
+		if event.EventType == "looper.worktree.unusable_path_cleared" {
+			found = true
+			if event.LoopID == nil || *event.LoopID != fixture.LoopID {
+				t.Fatalf("clear event loop id = %#v, want %s", event.LoopID, fixture.LoopID)
+			}
+			break
+		}
+	}
+	if !found {
+		t.Fatal("expected looper.worktree.unusable_path_cleared event")
+	}
+}
+
+func TestHandlerLoopRetryClearUnusableRejectsUsableCheckout(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	h := NewHandler(Context{Config: cfg, Runtime: rt})
+	services := rt.Services()
+	nowISO := "2026-04-11T12:00:00.000Z"
+
+	fixture := seedManagedWorktreeFixture(t, services.Repositories, managedWorktreeSeed{
+		ProjectID: "project_retry_clear_usable",
+		LoopID:    "loop_retry_clear_usable",
+		LoopSeq:   3141,
+		LoopType:  "fixer",
+		Branch:    "feature/clear-usable-refuse",
+		NowISO:    nowISO,
+		Dirty:     true,
+	})
+
+	reqBody := fmt.Sprintf(
+		`{"mode":"auto","clearUnusableWorktreePath":true,"expectedWorktreePath":%q}`,
+		fixture.WorktreePath,
+	)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/loops/3141/retry", strings.NewReader(reqBody))
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", recorder.Code, recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), "usable checkout") {
+		t.Fatalf("body = %s, want usable checkout refusal", recorder.Body.String())
+	}
+	// Dirty file must still exist — clear must not have run.
+	if _, err := os.Stat(filepath.Join(fixture.WorktreePath, "dirty.txt")); err != nil {
+		t.Fatalf("dirty.txt missing after refused clear: %v", err)
+	}
+}
+
+func TestHandlerLoopRetryClearUnusableRequiresExpectedPath(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	h := NewHandler(Context{Config: cfg, Runtime: rt})
+	services := rt.Services()
+	nowISO := "2026-04-11T12:00:00.000Z"
+
+	fixture := seedManagedWorktreeFixture(t, services.Repositories, managedWorktreeSeed{
+		ProjectID: "project_retry_clear_need_path",
+		LoopID:    "loop_retry_clear_need_path",
+		LoopSeq:   3148,
+		LoopType:  "fixer",
+		Branch:    "feature/clear-need-path",
+		NowISO:    nowISO,
+		Dirty:     false,
+	})
+	if err := os.RemoveAll(fixture.WorktreePath); err != nil {
+		t.Fatalf("RemoveAll(worktree) error = %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(fixture.WorktreePath, ".tmp"), 0o755); err != nil {
+		t.Fatalf("MkdirAll hollow: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/loops/3148/retry", strings.NewReader(`{"mode":"auto","clearUnusableWorktreePath":true}`))
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", recorder.Code, recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), "expectedWorktreePath is required") {
+		t.Fatalf("body = %s, want expectedWorktreePath required", recorder.Body.String())
+	}
+	if _, err := os.Stat(fixture.WorktreePath); err != nil {
+		t.Fatalf("hollow path removed without expected path bind: %v", err)
+	}
+}
+
+func TestHandlerLoopRetryClearUnusableRejectsPathDrift(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	h := NewHandler(Context{Config: cfg, Runtime: rt})
+	services := rt.Services()
+	nowISO := "2026-04-11T12:00:00.000Z"
+
+	fixture := seedManagedWorktreeFixture(t, services.Repositories, managedWorktreeSeed{
+		ProjectID: "project_retry_clear_path_drift",
+		LoopID:    "loop_retry_clear_path_drift",
+		LoopSeq:   3149,
+		LoopType:  "fixer",
+		Branch:    "feature/clear-path-drift",
+		NowISO:    nowISO,
+		Dirty:     false,
+	})
+	if err := os.RemoveAll(fixture.WorktreePath); err != nil {
+		t.Fatalf("RemoveAll(worktree) error = %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(fixture.WorktreePath, ".tmp"), 0o755); err != nil {
+		t.Fatalf("MkdirAll hollow: %v", err)
+	}
+
+	reqBody := `{"mode":"auto","clearUnusableWorktreePath":true,"expectedWorktreePath":"/tmp/stale-confirmed-path"}`
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/loops/3149/retry", strings.NewReader(reqBody))
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409; body=%s", recorder.Code, recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), "does not match confirmed path") {
+		t.Fatalf("body = %s, want path drift refusal", recorder.Body.String())
+	}
+	if _, err := os.Stat(fixture.WorktreePath); err != nil {
+		t.Fatalf("hollow path removed on path drift: %v", err)
+	}
+}
+
+func TestHandlerLoopRetryClearAndDiscardMutuallyExclusive(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	h := NewHandler(Context{Config: cfg, Runtime: rt})
+	services := rt.Services()
+	nowISO := "2026-04-11T12:00:00.000Z"
+
+	_ = seedManagedWorktreeFixture(t, services.Repositories, managedWorktreeSeed{
+		ProjectID: "project_retry_clear_xor_discard",
+		LoopID:    "loop_retry_clear_xor_discard",
+		LoopSeq:   3142,
+		LoopType:  "fixer",
+		Branch:    "feature/clear-xor-discard",
+		NowISO:    nowISO,
+		Dirty:     true,
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/loops/3142/retry", strings.NewReader(`{"mode":"auto","discardWorktreeChanges":true,"clearUnusableWorktreePath":true}`))
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", recorder.Code, recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), "mutually exclusive") {
+		t.Fatalf("body = %s, want mutually exclusive", recorder.Body.String())
+	}
+}
+
 func TestHandlerLoopRetryDiscardWorktreeChangesDirtyFixer(t *testing.T) {
 	rt, cfg := startTestRuntime(t)
 	h := NewHandler(Context{Config: cfg, Runtime: rt})

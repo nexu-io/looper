@@ -94,6 +94,54 @@ func TestTeaTransportHTTPStatusError(t *testing.T) {
 	}
 }
 
+func TestTeaAddIssueReactionDuplicate(t *testing.T) {
+	t.Parallel()
+
+	for _, test := range []struct {
+		name     string
+		stdout   string
+		exitCode int
+		wantErr  bool
+	}{
+		{name: "zero-exit already exists", stdout: `{"message":"reaction already exists"}`, exitCode: 0},
+		{name: "nonzero already exists", stdout: `{"message":"reaction already exists"}`, exitCode: 1},
+		{name: "nonzero permission denied", stdout: `{"message":"user should have write access"}`, exitCode: 1, wantErr: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			runner := &recordingTeaRunner{
+				loginsJSON: mustJSON(t, []TeaLogin{{Name: "selected-login", URL: "https://code.example.com"}}),
+				apiHandlers: map[string]teaAPIResponse{
+					"POST /repos/acme/looper/issues/54/reactions": {
+						Stdout:   test.stdout,
+						Stderr:   "HTTP/1.1 403 Forbidden\nContent-Type: application/json\n\n",
+						ExitCode: test.exitCode,
+					},
+				},
+			}
+			provider := config.ProviderConfig{
+				ID: "fj", Kind: config.ProviderKindForgejo, BaseURL: "https://code.example.com",
+				Auth: config.ProviderAuthTea, TeaLogin: stringPtr("selected-login"),
+			}
+			client, err := NewForgejoClientFromConfig(provider, "acme/looper", WithTeaRunner(runner), WithLookPath(fakeTeaLookPath))
+			if err != nil {
+				t.Fatalf("construct: %v", err)
+			}
+			err = client.AddIssueReaction(context.Background(), 54, "+1")
+			if test.wantErr {
+				var httpErr *ForgejoHTTPError
+				if !errors.As(err, &httpErr) || httpErr.StatusCode != http.StatusForbidden {
+					t.Fatalf("AddIssueReaction() error = %v, want HTTP 403", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("AddIssueReaction() error = %v, want duplicate treated as success", err)
+			}
+		})
+	}
+}
+
 func TestProbeForgejoProviderTeaStates(t *testing.T) {
 	runner := &recordingTeaRunner{
 		loginsJSON: mustJSON(t, []TeaLogin{{Name: "selected-login", URL: "https://code.example.com"}}),

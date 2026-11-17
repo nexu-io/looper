@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/nexu-io/looper/internal/hostingidentity"
 	"github.com/nexu-io/looper/internal/infra/shell"
 	"github.com/nexu-io/looper/internal/storage"
 	"github.com/nexu-io/looper/internal/worktreesafety"
@@ -73,6 +74,7 @@ type PrepareWorktreeInput struct {
 	Branch          string
 	Ref             string
 	ExpectedHeadSHA string
+	BaseSHA         string
 	Remote          string
 }
 
@@ -164,6 +166,7 @@ func (e *ProtectedBranchError) Error() string {
 type RemoteHeadChangedError struct {
 	Branch          string
 	ExpectedHeadSHA string
+	BaseSHA         string
 	ActualHeadSHA   string
 }
 
@@ -242,6 +245,17 @@ func (g *Gateway) CreateWorktree(ctx context.Context, input CreateWorktreeInput)
 		return *restored, nil
 	}
 
+	// Unregistered hollow leftovers block `git worktree add`. Clear only when
+	// local metadata proves the path is not a usable checkout; preserve any
+	// other content for manual intervention.
+	if err := worktreesafety.EnsureUnusableManagedPathCleared(worktreesafety.CheckInput{
+		WorktreePath: worktreePath,
+		RepoPath:     input.RepoPath,
+		WorktreeRoot: input.WorktreeRoot,
+	}, worktreePath); err != nil {
+		return storage.WorktreeRecord{}, err
+	}
+
 	if checkoutMode == CheckoutModeDetached {
 		startPoint, err := g.resolveDetachedStartPoint(ctx, input)
 		if err != nil {
@@ -273,6 +287,13 @@ func (g *Gateway) CreateWorktree(ctx context.Context, input CreateWorktreeInput)
 	// Keep common build artifacts (e.g. .pnpm-store/, node_modules/) out of every
 	// loop commit via the worktree-local git exclude file. Best-effort.
 	g.applyWorktreeArtifactExcludes(ctx, worktreePath)
+	// Any CreateWorktree claim invalidates prior fixer ownership so path equality
+	// alone cannot authorize dirty adopt after another runner used this directory.
+	// Fail the claim if the marker cannot be revoked — stale authority is worse
+	// than a retryable create error.
+	if err := worktreesafety.ClearFixerOwnerToken(worktreePath); err != nil {
+		return storage.WorktreeRecord{}, err
+	}
 
 	headSHA, err := g.getHeadSHA(ctx, worktreePath)
 	if err != nil {
@@ -367,6 +388,16 @@ func (g *Gateway) RestoreWorktree(ctx context.Context, input RestoreWorktreeInpu
 			}
 			if !storedHealthy {
 				g.tryRemoveWorktree(ctx, input.RepoPath, stored.WorktreePath)
+				// Hollow/unregistered leftovers survive `worktree remove`. Clear
+				// empty or metadata-only paths so Create can recreate; preserve
+				// populated unusable paths as MI instead of infinite retry.
+				if err := worktreesafety.EnsureUnusableManagedPathCleared(worktreesafety.CheckInput{
+					WorktreePath: stored.WorktreePath,
+					RepoPath:     input.RepoPath,
+					WorktreeRoot: input.WorktreeRoot,
+				}, stored.WorktreePath); err != nil {
+					return nil, err
+				}
 			} else {
 				storedCheckoutMatches, err := g.matchesRestoreCheckoutMode(ctx, stored.WorktreePath, checkoutMode, input.Branch)
 				if err != nil {
@@ -386,6 +417,10 @@ func (g *Gateway) RestoreWorktree(ctx context.Context, input RestoreWorktreeInpu
 						return nil, fmt.Errorf("upsert restored worktree record: %w", err)
 					}
 					g.applyWorktreeArtifactExcludes(ctx, restored.WorktreePath)
+					// Restoring for a new CreateWorktree claim drops prior fixer ownership.
+					if err := worktreesafety.ClearFixerOwnerToken(restored.WorktreePath); err != nil {
+						return nil, err
+					}
 					return &restored, nil
 				}
 				shouldReplace, err := g.shouldReplaceStoredWorktreeOnRestoreMismatch(ctx, stored.WorktreePath, checkoutMode, input.Branch, input.ExpectedWorktreePath)
@@ -435,6 +470,13 @@ func (g *Gateway) RestoreWorktree(ctx context.Context, input RestoreWorktreeInpu
 	}
 	if !healthy {
 		g.tryRemoveWorktree(ctx, input.RepoPath, match.Path)
+		if err := worktreesafety.EnsureUnusableManagedPathCleared(worktreesafety.CheckInput{
+			WorktreePath: match.Path,
+			RepoPath:     input.RepoPath,
+			WorktreeRoot: input.WorktreeRoot,
+		}, match.Path); err != nil {
+			return nil, err
+		}
 		return nil, nil
 	}
 
@@ -489,6 +531,9 @@ func (g *Gateway) RestoreWorktree(ctx context.Context, input RestoreWorktreeInpu
 	}
 
 	g.applyWorktreeArtifactExcludes(ctx, record.WorktreePath)
+	if err := worktreesafety.ClearFixerOwnerToken(record.WorktreePath); err != nil {
+		return nil, err
+	}
 	return &record, nil
 }
 
@@ -679,6 +724,12 @@ func (g *Gateway) PrepareWorktree(ctx context.Context, input PrepareWorktreeInpu
 	}
 	if targetSpec == "" {
 		return PrepareWorktreeResult{}, fmt.Errorf("branch or ref is required")
+	}
+	// Fetch the immutable base before the PR head: the head fetch owns FETCH_HEAD.
+	if input.BaseSHA != "" {
+		if err := g.runGit(ctx, input.WorktreePath, nil, "fetch", remote, input.BaseSHA); err != nil {
+			return PrepareWorktreeResult{}, err
+		}
 	}
 	if err := g.runGit(ctx, input.WorktreePath, nil, "fetch", remote, targetSpec); err != nil {
 		return PrepareWorktreeResult{}, err
@@ -1010,6 +1061,15 @@ func (g *Gateway) isHealthyWorktree(ctx context.Context, worktreePath string) (b
 		return false, err
 	}
 
+	// Confirmed local-unusable (hollow/corrupt metadata): treat as unhealthy
+	// without propagating git status. Restore can remove + clear + recreate
+	// instead of infinite retryable_transient storms.
+	// Usable local metadata with a failing `git status` still propagates —
+	// that may be locks, permissions, or other non-hollow failures.
+	if !worktreesafety.LocalCheckoutUsable(worktreePath) {
+		return false, nil
+	}
+
 	_, err := g.runGitResult(ctx, worktreePath, nil, "status", "--porcelain", "--untracked-files=all")
 	if err == nil {
 		return true, nil
@@ -1269,9 +1329,18 @@ func (g *Gateway) runGitResultOnce(ctx context.Context, cwd string, env map[stri
 }
 
 func (g *Gateway) runGitResultOnceWithStartGate(ctx context.Context, cwd string, env map[string]string, startGate func(start func() error) error, args ...string) (shell.Result, error) {
-	result, err := shell.Run(ctx, shell.Options{Command: g.gitPath, Args: args, CWD: cwd, Env: env, StartGate: startGate})
+	result, err := hostingidentity.RunGit(ctx, shell.Options{Command: g.gitPath, Args: args, CWD: cwd, Env: env, StartGate: startGate}, nil)
 	if err == nil {
 		return result, nil
+	}
+	commandLabel := strings.Join(args, " ")
+	if _, selected := hostingidentity.FromContext(ctx); selected {
+		// A rejected destination may itself contain credentials. Keep it out
+		// of the gateway's outer error as well as the transport's diagnostics.
+		commandLabel = "operation"
+		if len(args) > 0 {
+			commandLabel = args[0]
+		}
 	}
 
 	var commandErr *shell.CommandExecutionError
@@ -1285,10 +1354,10 @@ func (g *Gateway) runGitResultOnceWithStartGate(ctx context.Context, cwd string,
 		}
 		formatted := *commandErr
 		formatted.Message = message
-		return formatted.Result, fmt.Errorf("git %s: %w", strings.Join(args, " "), &formatted)
+		return formatted.Result, fmt.Errorf("git %s: %w", commandLabel, &formatted)
 	}
 
-	return result, fmt.Errorf("git %s: %w", strings.Join(args, " "), err)
+	return result, fmt.Errorf("git %s: %w", commandLabel, err)
 }
 
 func isRetryableFetchRefLockRace(args []string, err error) bool {
@@ -1308,6 +1377,23 @@ func buildWorktreeDirectoryName(input CreateWorktreeInput) string {
 	}
 
 	return sanitizeBranchName(input.Branch)
+}
+
+// DetachedPRWorktreePath returns the managed shared detached worktree path that
+// CreateWorktree claims for a PR (looper-fix-<project>-pr-<N>-detached).
+// Callers that must read ownership markers before CreateWorktree revokes them
+// should probe this candidate path even when no checkpoint worktree exists.
+func DetachedPRWorktreePath(worktreeRoot, projectID string, prNumber int64) string {
+	worktreeRoot = strings.TrimSpace(worktreeRoot)
+	projectID = strings.TrimSpace(projectID)
+	if worktreeRoot == "" || projectID == "" || prNumber == 0 {
+		return ""
+	}
+	return filepath.Join(worktreeRoot, buildWorktreeDirectoryName(CreateWorktreeInput{
+		ProjectID:    projectID,
+		PRNumber:     prNumber,
+		CheckoutMode: CheckoutModeDetached,
+	}))
 }
 
 func parseGitHubRepoFromRemoteURL(remoteURL string) string {

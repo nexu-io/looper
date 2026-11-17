@@ -23,7 +23,64 @@ func Normalize(cwd string, partials ...PartialConfig) (Config, error) {
 		return Config{}, err
 	}
 
+	applyQuietPeriodInheritance(&config, partials...)
+	if err := normalizeHostingIdentityPaths(&config, cwd); err != nil {
+		return Config{}, err
+	}
+
 	return config, nil
+}
+
+// applyQuietPeriodInheritance resolves role quiet-period values when the role
+// field is unset but defaults.loop.quietPeriodSeconds was set in a partial:
+//
+//	role override ?? defaults.loop ?? role-specific DefaultConfig value
+//
+// Reviewer keeps 60 and fixer keeps 0 when neither defaults.loop nor the role
+// field is present in any partial (DefaultConfig values).
+func applyQuietPeriodInheritance(cfg *Config, partials ...PartialConfig) {
+	defaultsExplicit := false
+	reviewerExplicit := false
+	fixerExplicit := false
+	for _, partial := range partials {
+		if partial.Defaults != nil && partial.Defaults.Loop != nil && partial.Defaults.Loop.QuietPeriodSeconds != nil {
+			defaultsExplicit = true
+		}
+		if quietPeriodExplicitInReviewerPartial(partial) {
+			reviewerExplicit = true
+		}
+		if quietPeriodExplicitInFixerPartial(partial) {
+			fixerExplicit = true
+		}
+	}
+	if !defaultsExplicit {
+		return
+	}
+	if !reviewerExplicit {
+		cfg.Roles.Reviewer.Behavior.Loop.QuietPeriodSeconds = cfg.Defaults.Loop.QuietPeriodSeconds
+	}
+	if !fixerExplicit {
+		cfg.Roles.Fixer.Behavior.Loop.QuietPeriodSeconds = cfg.Defaults.Loop.QuietPeriodSeconds
+	}
+}
+
+func quietPeriodExplicitInReviewerPartial(partial PartialConfig) bool {
+	if partial.LegacyReviewer != nil && partial.LegacyReviewer.Loop != nil && partial.LegacyReviewer.Loop.QuietPeriodSeconds != nil {
+		return true
+	}
+	if partial.Roles == nil || partial.Roles.Reviewer == nil || partial.Roles.Reviewer.Behavior == nil {
+		return false
+	}
+	loop := partial.Roles.Reviewer.Behavior.Loop
+	return loop != nil && loop.QuietPeriodSeconds != nil
+}
+
+func quietPeriodExplicitInFixerPartial(partial PartialConfig) bool {
+	if partial.Roles == nil || partial.Roles.Fixer == nil || partial.Roles.Fixer.Behavior == nil {
+		return false
+	}
+	loop := partial.Roles.Fixer.Behavior.Loop
+	return loop != nil && loop.QuietPeriodSeconds != nil
 }
 
 func CanonicalizePartialForMigration(partial PartialConfig) PartialConfig {
@@ -391,6 +448,14 @@ func mergeConfig(config *Config, partial PartialConfig) {
 
 	if partial.Providers != nil {
 		config.Providers = cloneProviderConfigs(*partial.Providers)
+	}
+	if partial.Identities != nil {
+		if config.Identities == nil {
+			config.Identities = make(map[string]HostingIdentityConfig, len(*partial.Identities))
+		}
+		for name, definition := range *partial.Identities {
+			config.Identities[name] = normalizeHostingIdentity(definition)
+		}
 	}
 }
 
@@ -1140,6 +1205,16 @@ func mergeDefaultsConfig(config *DefaultsConfig, partial PartialDefaultsConfig) 
 	if partial.AddSnapshotMode != nil {
 		config.AddSnapshotMode = *partial.AddSnapshotMode
 	}
+
+	if partial.Loop != nil {
+		mergeDefaultsLoopConfig(&config.Loop, *partial.Loop)
+	}
+}
+
+func mergeDefaultsLoopConfig(config *DefaultsLoopConfig, partial PartialDefaultsLoopConfig) {
+	if partial.QuietPeriodSeconds != nil {
+		config.QuietPeriodSeconds = *partial.QuietPeriodSeconds
+	}
 }
 
 func mergeReviewerConfig(config *ReviewerConfig, partial PartialReviewerConfig) {
@@ -1168,6 +1243,14 @@ func mergeReviewerConfig(config *ReviewerConfig, partial PartialReviewerConfig) 
 	}
 	if partial.ThreadResolution != nil {
 		mergeReviewerThreadResolutionConfig(&config.ThreadResolution, *partial.ThreadResolution)
+	}
+	if partial.RelatedFileGroups != nil {
+		if partial.RelatedFileGroups.Enabled != nil {
+			config.RelatedFileGroups.Enabled = *partial.RelatedFileGroups.Enabled
+		}
+		if partial.RelatedFileGroups.MinChangedFiles != nil {
+			config.RelatedFileGroups.MinChangedFiles = *partial.RelatedFileGroups.MinChangedFiles
+		}
 	}
 }
 
@@ -1269,6 +1352,9 @@ func mergeReviewerLoopConfig(config *ReviewerLoopConfig, partial PartialReviewer
 	if partial.StopOnIdenticalOutput != nil {
 		config.StopOnIdenticalOutput = *partial.StopOnIdenticalOutput
 	}
+	if partial.MaxPublishesPerPR != nil {
+		config.MaxPublishesPerPR = *partial.MaxPublishesPerPR
+	}
 }
 
 func mergeInstructionsConfig(config *InstructionsConfig, partial PartialInstructionsConfig) {
@@ -1299,6 +1385,9 @@ func mergeRoleConfigs(config *RoleConfigs, partial PartialRoleConfigs) {
 }
 
 func mergeCoordinatorRoleConfig(config *CoordinatorRoleConfig, partial PartialCoordinatorRoleConfig) {
+	if partial.Identity != nil {
+		config.Identity = strings.TrimSpace(*partial.Identity)
+	}
 	if partial.Enabled != nil {
 		config.Enabled = *partial.Enabled
 	}
@@ -1401,6 +1490,9 @@ func mergeCoordinatorMergeWatchConfig(config *CoordinatorMergeWatchConfig, parti
 }
 
 func mergePlannerRoleConfig(config *PlannerRoleConfig, partial PartialPlannerRoleConfig) {
+	if partial.Identity != nil {
+		config.Identity = strings.TrimSpace(*partial.Identity)
+	}
 	if partial.AutoDiscovery != nil {
 		config.AutoDiscovery = *partial.AutoDiscovery
 	}
@@ -1419,6 +1511,9 @@ func mergePlannerRoleConfig(config *PlannerRoleConfig, partial PartialPlannerRol
 }
 
 func mergeWorkerRoleConfig(config *WorkerRoleConfig, partial PartialWorkerRoleConfig) {
+	if partial.Identity != nil {
+		config.Identity = strings.TrimSpace(*partial.Identity)
+	}
 	if partial.AutoDiscovery != nil {
 		config.AutoDiscovery = *partial.AutoDiscovery
 	}
@@ -1434,6 +1529,13 @@ func mergeWorkerRoleConfig(config *WorkerRoleConfig, partial PartialWorkerRoleCo
 }
 
 func mergeReviewerRoleConfig(config *ReviewerRoleConfig, partial PartialReviewerRoleConfig) {
+	if partial.Nono != nil {
+		nono := *partial.Nono
+		config.Nono = &nono
+	}
+	if partial.Identity != nil {
+		config.Identity = strings.TrimSpace(*partial.Identity)
+	}
 	if partial.AutoDiscovery != nil || partial.Triggers != nil || partial.SpecReview != nil {
 		mergeReviewerRoleDiscoveryConfig(&config.Discovery, PartialReviewerRoleDiscoveryConfig{
 			AutoDiscovery: partial.AutoDiscovery,
@@ -1452,6 +1554,9 @@ func mergeReviewerRoleConfig(config *ReviewerRoleConfig, partial PartialReviewer
 	}
 	if partial.Instructions != nil {
 		config.Instructions = *partial.Instructions
+	}
+	if partial.Skills != nil {
+		mergeReviewerSkillsConfig(&config.Skills, *partial.Skills)
 	}
 	if partial.Agent != nil {
 		mergeRoleAgentConfig(&config.Agent, partial.Agent)
@@ -1476,6 +1581,18 @@ func mergeReviewerAutoMergeConfig(config *ReviewerAutoMergeConfig, partial Parti
 	}
 }
 
+func mergeReviewerSkillsConfig(config *ReviewerSkillsConfig, partial PartialReviewerSkillsConfig) {
+	if partial.Mode != nil {
+		config.Mode = *partial.Mode
+	}
+	if partial.Required != nil {
+		config.Required = cloneStrings(*partial.Required)
+	}
+	if partial.Optional != nil {
+		config.Optional = cloneStrings(*partial.Optional)
+	}
+}
+
 func mergeReviewerRoleDiscoveryConfig(config *ReviewerRoleDiscoveryConfig, partial PartialReviewerRoleDiscoveryConfig) {
 	if partial.AutoDiscovery != nil {
 		config.AutoDiscovery = *partial.AutoDiscovery
@@ -1486,20 +1603,44 @@ func mergeReviewerRoleDiscoveryConfig(config *ReviewerRoleDiscoveryConfig, parti
 	if partial.SpecReview != nil {
 		mergeReviewerSpecReviewConfig(&config.SpecReview, *partial.SpecReview)
 	}
+	if partial.FollowUpInterval != nil {
+		config.FollowUpInterval = strings.TrimSpace(*partial.FollowUpInterval)
+	}
 }
 
 func mergeFixerRoleConfig(config *FixerRoleConfig, partial PartialFixerRoleConfig) {
+	if partial.Identity != nil {
+		config.Identity = strings.TrimSpace(*partial.Identity)
+	}
 	if partial.AutoDiscovery != nil {
 		config.AutoDiscovery = *partial.AutoDiscovery
 	}
 	if partial.Triggers != nil {
 		mergeFixerRoleTriggersConfig(&config.Triggers, *partial.Triggers)
 	}
+	if partial.Behavior != nil {
+		mergeFixerBehaviorConfig(&config.Behavior, *partial.Behavior)
+	}
 	if partial.Instructions != nil {
 		config.Instructions = *partial.Instructions
 	}
 	if partial.Agent != nil {
 		mergeRoleAgentConfig(&config.Agent, partial.Agent)
+	}
+}
+
+func mergeFixerBehaviorConfig(config *FixerBehaviorConfig, partial PartialFixerBehaviorConfig) {
+	if partial.Loop != nil {
+		mergeFixerLoopConfig(&config.Loop, *partial.Loop)
+	}
+}
+
+func mergeFixerLoopConfig(config *FixerLoopConfig, partial PartialFixerLoopConfig) {
+	if partial.QuietPeriodSeconds != nil {
+		config.QuietPeriodSeconds = *partial.QuietPeriodSeconds
+	}
+	if partial.MaxPushesPerPR != nil {
+		config.MaxPushesPerPR = *partial.MaxPushesPerPR
 	}
 }
 
@@ -1650,6 +1791,13 @@ func cloneStrings(values []string) []string {
 
 func clonePartialConfig(partial PartialConfig) PartialConfig {
 	cloned := partial
+	if partial.Identities != nil {
+		identities := make(map[string]HostingIdentityConfig, len(*partial.Identities))
+		for name, definition := range *partial.Identities {
+			identities[name] = definition
+		}
+		cloned.Identities = &identities
+	}
 	if partial.Network != nil {
 		network := *partial.Network
 		cloned.Network = &network
@@ -1706,6 +1854,7 @@ func clonePartialProjects(projects []PartialProjectRefConfig) []PartialProjectRe
 	cloned := make([]PartialProjectRefConfig, len(projects))
 	for index, project := range projects {
 		cloned[index] = PartialProjectRefConfig{
+			Identity:     cloneStringPtr(project.Identity),
 			ID:           project.ID,
 			Name:         project.Name,
 			Provider:     cloneStringPtr(project.Provider),
@@ -1809,6 +1958,9 @@ func cloneProjects(projects []PartialProjectRefConfig) []ProjectRefConfig {
 			Path:     project.Path,
 			Network:  ProjectNetworkConfig{Mode: NetworkModeOff},
 			Roles:    roles,
+		}
+		if project.Identity != nil {
+			cloned[index].Identity = strings.TrimSpace(*project.Identity)
 		}
 		if project.Provider != nil {
 			cloned[index].Provider = strings.TrimSpace(*project.Provider)
@@ -1985,6 +2137,7 @@ func clonePartialRoleConfigs(configs *PartialRoleConfigs) *PartialRoleConfigs {
 	cloned := PartialRoleConfigs{}
 	if configs.Planner != nil {
 		planner := *configs.Planner
+		planner.Identity = cloneStringPtr(configs.Planner.Identity)
 		if configs.Planner.Triggers != nil {
 			triggers := *configs.Planner.Triggers
 			if triggers.Labels != nil {
@@ -1998,6 +2151,7 @@ func clonePartialRoleConfigs(configs *PartialRoleConfigs) *PartialRoleConfigs {
 	}
 	if configs.Worker != nil {
 		worker := *configs.Worker
+		worker.Identity = cloneStringPtr(configs.Worker.Identity)
 		if configs.Worker.Triggers != nil {
 			triggers := *configs.Worker.Triggers
 			if triggers.Labels != nil {
@@ -2011,6 +2165,7 @@ func clonePartialRoleConfigs(configs *PartialRoleConfigs) *PartialRoleConfigs {
 	}
 	if configs.Coordinator != nil {
 		coordinator := *configs.Coordinator
+		coordinator.Identity = cloneStringPtr(configs.Coordinator.Identity)
 		if configs.Coordinator.Triage != nil {
 			triage := *configs.Coordinator.Triage
 			if configs.Coordinator.Triage.Disposition != nil {
@@ -2043,6 +2198,7 @@ func clonePartialRoleConfigs(configs *PartialRoleConfigs) *PartialRoleConfigs {
 	}
 	if configs.Reviewer != nil {
 		reviewer := *configs.Reviewer
+		reviewer.Identity = cloneStringPtr(configs.Reviewer.Identity)
 		if configs.Reviewer.Discovery != nil {
 			discovery := *configs.Reviewer.Discovery
 			if configs.Reviewer.Discovery.Triggers != nil {
@@ -2099,11 +2255,28 @@ func clonePartialRoleConfigs(configs *PartialRoleConfigs) *PartialRoleConfigs {
 			}
 			reviewer.Behavior = &behavior
 		}
+		if configs.Reviewer.Skills != nil {
+			skills := *configs.Reviewer.Skills
+			if skills.Required != nil {
+				required := cloneStrings(*skills.Required)
+				skills.Required = &required
+			}
+			if skills.Optional != nil {
+				optional := cloneStrings(*skills.Optional)
+				skills.Optional = &optional
+			}
+			reviewer.Skills = &skills
+		}
 		reviewer.Agent = cloneRoleAgentConfig(configs.Reviewer.Agent)
+		if configs.Reviewer.Nono != nil {
+			nono := *configs.Reviewer.Nono
+			reviewer.Nono = &nono
+		}
 		cloned.Reviewer = &reviewer
 	}
 	if configs.Fixer != nil {
 		fixer := *configs.Fixer
+		fixer.Identity = cloneStringPtr(configs.Fixer.Identity)
 		if configs.Fixer.Triggers != nil {
 			triggers := *configs.Fixer.Triggers
 			if triggers.Labels != nil {

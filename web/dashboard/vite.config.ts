@@ -15,6 +15,7 @@ const PUBLIC_MIME: Record<string, string> = {
   ".svg": "image/svg+xml",
   ".webmanifest": "application/manifest+json",
   ".json": "application/json",
+  ".js": "text/javascript; charset=utf-8",
 };
 
 function servePublicUnderBase() {

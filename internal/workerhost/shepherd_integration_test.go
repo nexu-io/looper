@@ -41,6 +41,8 @@ func TestShepherdWakesChangedCIWithoutPassCapAndCompletesOnlyOnMerge(t *testing.
 	gh := githubinfra.New(githubinfra.Options{GHRun: func(_ context.Context, opts shell.Options) (shell.Result, error) {
 		args := strings.Join(opts.Args, " ")
 		switch {
+		case args == "api user --jq .login":
+			return shell.Result{Stdout: "reviewer"}, nil
 		case strings.HasPrefix(args, "pr view"):
 			data, _ := json.Marshal(map[string]any{"number": 7, "state": state, "headRefOid": "head", "baseRefOid": "base", "reviewDecision": "APPROVED", "reviews": []any{map[string]any{"state": "APPROVED", "commit": map[string]any{"oid": "head"}}}, "statusCheckRollup": []any{map[string]any{"status": "COMPLETED", "conclusion": check}}, "mergeStateStatus": "CLEAN"})
 			return shell.Result{Stdout: string(data)}, nil

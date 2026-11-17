@@ -11,6 +11,7 @@ const DefaultServerPort = 17310
 const (
 	DefaultReviewerAutoRecoveryMaxAttempts = 3
 	DefaultReviewerRetryMaxDelayMS         = 300000
+	DefaultReviewFixBudgetCap              = 3
 )
 
 func DefaultLooperHome() (string, error) {
@@ -184,6 +185,11 @@ func DefaultConfig(cwd string) (Config, error) {
 			FixAllPullRequests: false,
 			OpenPRStrategy:     OpenPRStrategyAllDone,
 			AddSnapshotMode:    AddSnapshotModeAsync,
+			Loop: DefaultsLoopConfig{
+				// Shared quiet-period default. Reviewer inherits when its role
+				// field is unset; fixer defaults to 0 at the role level (opt-in).
+				QuietPeriodSeconds: 60,
+			},
 		},
 		Instructions: InstructionsConfig{Enabled: true, MaxBytes: 8192},
 		Roles: RoleConfigs{
@@ -258,6 +264,8 @@ func DefaultConfig(cwd string) (Config, error) {
 						StopOnApproved:            false,
 						StopOnReadyLabel:          true,
 						StopOnIdenticalOutput:     true,
+						// Always enforced; HITL only selects ask vs no-ask hold presentation.
+						MaxPublishesPerPR: DefaultReviewFixBudgetCap,
 					},
 					Retry:                   DefaultReviewerRetryConfig(),
 					Scope:                   ReviewerScopeChangedRanges,
@@ -265,6 +273,7 @@ func DefaultConfig(cwd string) (Config, error) {
 					ReviewEvents:            ReviewerReviewEventsConfig{Clean: ReviewerReviewEventApprove, Blocking: ReviewerReviewEventRequestChanges},
 					DetectDuplicateFindings: true,
 					NativeResume:            ReviewerNativeResumeConfig{OnHeadChange: false, ReReviewPromptOnHeadChange: false},
+					RelatedFileGroups:       ReviewerRelatedFileGroupsConfig{Enabled: false, MinChangedFiles: 24},
 					ThreadResolution: ReviewerThreadResolutionConfig{
 						Enabled:                     false,
 						Mode:                        ReviewerThreadResolutionModeReportOnly,
@@ -283,6 +292,11 @@ func DefaultConfig(cwd string) (Config, error) {
 					TransientRetries:        3,
 					Scope:                   ReviewerAutoMergeScopeLooperOnly,
 				},
+				Skills: ReviewerSkillsConfig{
+					Mode:     ReviewerSkillsModeExtend,
+					Required: []string{},
+					Optional: []string{},
+				},
 			},
 			Fixer: FixerRoleConfig{
 				AutoDiscovery: true,
@@ -291,6 +305,14 @@ func DefaultConfig(cwd string) (Config, error) {
 					AuthorFilter:  FixerAuthorFilterCurrentUser,
 					Labels:        []string{},
 					LabelMode:     LabelModeAll,
+				},
+				Behavior: FixerBehaviorConfig{
+					Loop: FixerLoopConfig{
+						// Opt-in: keep historical immediate-start behavior until operators enable quiet period.
+						QuietPeriodSeconds: 0,
+						// Always enforced; HITL only selects ask vs no-ask hold presentation.
+						MaxPushesPerPR: DefaultReviewFixBudgetCap,
+					},
 				},
 			},
 			Worker: WorkerRoleConfig{

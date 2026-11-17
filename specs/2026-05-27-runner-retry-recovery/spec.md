@@ -53,10 +53,11 @@ The result is an unsatisfying split for every runner:
   is doing too much work, and each runner reinvents a slightly different
   fragment of it.
 
-`dirty worktree` is already treated as `manual_intervention` in
-`reviewer`, `worker`, and `fixer` (planner has no worktree). What is missing
-in all four is a first-class operator retry UX that makes the post-fix path
-obvious.
+`dirty worktree` is already treated as `manual_intervention` in `reviewer` and
+`worker` (planner has no worktree). Fixer keeps MI for cross-head / gated dirty
+cases, with a same-head adopt exception on daemon-owned managed worktrees
+(see §4). What is missing in all four is a first-class operator retry UX that
+makes the post-fix path obvious.
 
 ## Goals
 
@@ -75,8 +76,9 @@ obvious.
 - Make `manual_intervention` failures highly visible in operator tooling,
   especially `looper ps`, so they are not silently buried inside generic
   `paused` or `failed` output.
-- Keep `dirty worktree` conservative by default for reviewer/worker/fixer,
-  while still providing an explicit, convenient recovery path.
+- Keep `dirty worktree` conservative by default for reviewer/worker; fixer
+  same-head adopt on daemon-owned managed worktrees per §4, with an explicit
+  recovery path for remaining MI cases.
 - Preserve dedupe, active-run, queue, and scheduler invariants.
 - Fix the small fixer-specific gap where `context.Canceled` /
   `DeadlineExceeded` is not classified as transient.
@@ -236,7 +238,8 @@ and recovery path.
 
 The following remain explicit hard-stop classes for any runner:
 
-- dirty worktree (reviewer, worker, fixer)
+- dirty worktree (reviewer, worker; fixer cross-head / gated failures only —
+  same-head adopt is not hard-stop, see §4)
 - invalid checkpoint / missing invariant state that should never be absent in a
   healthy run
 - config validation failures
@@ -245,10 +248,10 @@ The following remain explicit hard-stop classes for any runner:
 - policy / permission denials
 - explicit manual-intervention cases already modeled in code
 
-### 4. Keep dirty worktree as `manual_intervention` by default (reviewer / worker / fixer)
+### 4. Keep dirty worktree as `manual_intervention` by default (reviewer / worker); fixer same-head adopt exception
 
-`dirty worktree` should remain `manual_intervention` by default in reviewer,
-worker, and fixer. Planner has no worktree and is unaffected.
+`dirty worktree` should remain `manual_intervention` by default in reviewer and
+worker. Planner has no worktree and is unaffected.
 
 Reason:
 
@@ -265,14 +268,64 @@ Current behavior in:
 
 - `reviewer.runPrepareWorktreeStep`
 - `worker` worktree prepare paths (dirty branch worktree → manual_intervention)
-- `fixer` worktree prepare and adopt paths (dirty worktree → manual_intervention)
 
 is correct and should be preserved.
+
+#### Fixer same-head dirty adopt (daemon-owned managed worktrees)
+
+Fixer `runPrepareWorktreeStep` has a narrow exception when prepare finds a dirty
+managed worktree but **local HEAD still matches the expected PR head** and the
+checkpoint already has **fixer-run-specific ownership** for that path:
+
+- Managed fixer worktrees are daemon-owned unless human takeover / HITL.
+- Dirt after an agent interrupt (HEAD unchanged) is treated as authorized partial
+  agent output: **default-adopt** and continue (no reset/clean, no discard).
+- Ownership is a **persisted dual-write** (not event-only):
+  - On successful prepare (and after dirty adopt), fixer writes
+    `checkpoint.Worktree.OwnerToken` and stamps the same value into the
+    worktree-private git dir (`looper-fixer-owner`).
+  - Dirty adopt requires path match **and** on-disk token == checkpoint token.
+  - **Invalidation surface:** Gateway `CreateWorktree` / `RestoreWorktree` clear
+    the on-disk stamp; reviewer/worker also clear when reusing a prepared
+    checkpoint without Create/Restore (early return or resume past worktree).
+    Clear failures **fail the claim** so a stale token cannot authorize
+    cross-runner dirt.
+  - Shared project/PR directory names alone do **not** authorize adopt.
+  - **Costs accepted:** keep checkpoint + disk copies synchronized; every
+    non-fixer claim path must clear and propagate clear errors; prepare-failure
+    rediscovery must carry Path+Branch+OwnerToken (PreparedAt empty) so the
+    next prepare can still same-head adopt after a transient probe failure.
+  - **Rejected simpler alternatives:** path equality alone (adopts reviewer
+    dirt); event `fixer.worktree.dirty_adopted` without a durable stamp (no
+    authority after crash/restart); silent clear failures (stale authority).
+- On prepare-retry rewind (`PreparedAt` cleared, path + `OwnerToken` kept),
+  same-head adopt (or clean re-stamp) runs **before** `CleanupWorktree` so
+  interrupt leftovers are not force-deleted. The same ownership slice is
+  preserved when prepare-worktree failure restarts from discover.
+- Gates (all required):
+  - fixer-run ownership for the path (token match above);
+  - loop status is **not** `human_takeover` or `awaiting_human`;
+  - loop metadata has **no** pending `takeoverResume`;
+  - expected PR head is known (`detail.HeadSHA` non-empty);
+  - remote head from prepare (when present) matches expected;
+  - local HEAD from `InspectHead` equals expected (same-head).
+- Cross-head dirty (local HEAD ≠ expected) stays `manual_intervention`.
+- Gateway `PrepareWorktree` still returns `Clean: false` when dirty; fixer must
+  inspect local HEAD separately (`prepared.HeadSHA` is remote when dirty).
+- After adopt, later `reconcileCommits` may auto-commit dirt when allowed.
+- Rejected dirty adopt (missing ownership, cleared token after other-runner
+  claim, human-control gates, empty expected head, remote/local HEAD mismatch)
+  preserves the worktree and returns `manual_intervention` — it does **not**
+  fall through to `CleanupWorktree` or recreate. Prepare-probe failures on the
+  rewind path (fetch/transport/remote head advanced before status is read)
+  likewise return the prepare error without cleanup so interrupted-repair dirt
+  is not destroyed.
 
 #### Optional narrow future automation
 
 This spec permits a future, strictly narrower optimization for disposable
-worktree cleanup, but **not** in the base path for this change.
+worktree cleanup (true discard cases), but **not** as a substitute for the
+same-head adopt path above.
 
 Any future auto-clean subset would need all of the following:
 

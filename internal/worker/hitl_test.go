@@ -208,6 +208,7 @@ func TestSuspendForHumanTransitionsAndNotifies(t *testing.T) {
 			}
 		})
 	}
+
 }
 
 func TestSuspendForHumanDeliversAskToGitHub(t *testing.T) {

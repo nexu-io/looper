@@ -19,6 +19,7 @@ import (
 	"github.com/nexu-io/looper/internal/coordinator/triage"
 	"github.com/nexu-io/looper/internal/disclosure"
 	"github.com/nexu-io/looper/internal/eventlog"
+	"github.com/nexu-io/looper/internal/hostingidentity"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/infra/specpr"
 	"github.com/nexu-io/looper/internal/network/protocol"
@@ -191,6 +192,13 @@ func New(options Options) *Runner {
 }
 
 func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (DiscoveryResult, error) {
+	if r.config != nil {
+		bound, err := hostingidentity.Bind(ctx, *r.config, input.ProjectID, "coordinator")
+		if err != nil {
+			return DiscoveryResult{}, err
+		}
+		ctx = bound
+	}
 	ctx = githubinfra.ContextWithDiscoverySnapshot(ctx, input.Snapshot)
 	if !r.shouldRunTick(input.ProjectID) {
 		return DiscoveryResult{Skipped: true}, nil
@@ -270,7 +278,7 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 		}
 		analysisStartedAt := r.now().UTC()
 		processed++
-		decision, err := r.decide(ctx, project.RepoPath, input.Repo, loadedIssue.issue, triageCfg)
+		decision, err := r.decide(ctx, input.ProjectID, project.RepoPath, input.Repo, loadedIssue.issue, triageCfg)
 		if err != nil {
 			return DiscoveryResult{}, err
 		}
@@ -431,7 +439,7 @@ func (r *Runner) hasDispatchWork(action dispatch.Action) bool {
 	return action.ReactionCommentID != 0 || len(action.TriggerLabels) != 0 || action.FailureCommentBody != ""
 }
 
-func (r *Runner) decide(ctx context.Context, repoPath string, repo string, issue triage.Issue, cfg triage.Config) (triage.Decision, error) {
+func (r *Runner) decide(ctx context.Context, projectID string, repoPath string, repo string, issue triage.Issue, cfg triage.Config) (triage.Decision, error) {
 	reTriage := triage.ShouldReTriage(issue, cfg, r.now().UTC())
 	if !reTriage && !triage.ShouldTriage(issue, cfg, r.now().UTC()) {
 		return triage.NoOpDecision(), nil
@@ -442,7 +450,7 @@ func (r *Runner) decide(ctx context.Context, repoPath string, repo string, issue
 	}
 	repoCtx.Repo = repo
 	repoCtx.WorkingDirectory = repoPath
-	return triage.Decide(ctx, r.triageLLM, triage.Input{Issue: issue, RepoContext: repoCtx, Config: cfg, Now: r.now().UTC()}), nil
+	return triage.Decide(ctx, r.triageLLM, triage.Input{ProjectID: projectID, Issue: issue, RepoContext: repoCtx, Config: cfg, Now: r.now().UTC()}), nil
 }
 
 func (r *Runner) applyDecision(ctx context.Context, repo string, cwd string, issue triage.Issue, cfg triage.Config, analysisStartedAt time.Time, decision triage.Decision) error {

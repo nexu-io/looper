@@ -1,6 +1,6 @@
 # Looper Quick User Guide
 
-This guide is for everyday users. It focuses on how `coordinator`, `planner`, `reviewer`, `fixer`, and `worker` interact with forge issues and PRs. GitHub is fully supported; Forgejo support includes planner, worker, native reviewer requests/reviews, summary-comment compatibility, and the manual/direct native-review-comment fixer path.
+This guide is for everyday users. It focuses on how `coordinator`, `planner`, `reviewer`, `fixer`, and `worker` interact with forge issues and PRs. GitHub is fully supported; Forgejo support includes planner, worker, native reviewer/fixer loops, summary-comment compatibility, and opt-in reviewer auto-merge.
 
 ## 1. Prerequisites
 
@@ -106,15 +106,17 @@ If no project matches the current directory, or multiple projects match, pass `-
 | `coordinator` | Proactively triages fresh issues and commits a Disposition with durable labels | runs automatically inside `looperd` |
 | `planner` | Generates a spec from an issue and opens a spec PR | `looper plan --project <id> --issue <num>` |
 | `reviewer` | Reviews a PR or spec PR and publishes GitHub reviews | `looper review <repo>#<pr> [--loop]` or `looper review <pr> [--loop]` from inside the repo |
-| `fixer` | Fixes PR issues based on review comments and tries to resolve threads | `looper fix <repo>#<pr>` |
+| `fixer` | Fixes PR issues based on review comments; declines leave threads open for Reviewer | `looper fix <repo>#<pr>` |
 | `worker` | Implements the actual work from a spec or issue, and can reuse an existing PR | `looper work --issue <num>` or `looper work --project <id> --issue <num>` |
 
-Forgejo MVP role support:
+Forgejo role support:
 
 - Planner and Worker are supported over the Forgejo REST API.
-- Reviewer supports native review requests and native `APPROVE`, `REQUEST_CHANGES`, and `COMMENT` reviews. A configured `summary_comment` publish mode retains the top-level Reviewer Summary compatibility protocol.
-- Fixer is supported through two Forgejo-specific paths: Reviewer Summary items still flow through the top-level Fixer Summary PR comment, and manual/direct `looper fix` runs also read unresolved native Forgejo PR review comments and can resolve those native comments after validation, push, and post-push verification.
-- Coordinator, auto-merge, routed network mode, and webhook modes remain unsupported for Forgejo.
+- Reviewer supports native review requests and native `APPROVE`, `REQUEST_CHANGES`, and `COMMENT` reviews. A configured `summary_comment` publish mode retains the top-level comment protocol. Both modes use the same visible templates and disclosure as GitHub.
+- Fixer automatically consumes native inline findings and legacy summary items, repairs the code, validates, and pushes. Without a remote resolve API, it reports the fix in a PR comment and leaves the native comment open. Local acknowledgements prevent unchanged findings from repeating after a restart.
+- Reviewer auto-merge is available when explicitly enabled, subject to the existing review, scope, and branch policies. It defaults to disabled.
+- Native tunnel webhooks trigger issue and PR discovery with polling fallback; see [Forgejo webhook setup](configuration.md#forgejo-webhook-setup).
+- Coordinator, native thread resolution, routed network mode, and `gh-forward` remain unsupported for Forgejo.
 - A Forgejo-only daemon can start without `gh`; mixed or GitHub projects still require `gh`.
 
 ## 4. Recommended flow
@@ -240,14 +242,14 @@ So the most common GitHub-side trigger is:
 
 Planner will:
 
-- add the current GitHub user as an issue assignee when the issue is claimed, preserving any existing assignees
+- add the current GitHub user as an issue assignee when the issue is claimed, preserving any existing assignees. GitHub App identities skip this step for GitHub issues: GitHub forbids App installations from assigning themselves
 - create a worktree
 - write the spec file
 - push a spec PR
 - add the `looper:spec-reviewing` label to that PR
 - request reviewers when appropriate
 
-If planner cannot assign the issue in GitHub, it reports a retryable failure rather than continuing with ambiguous ownership.
+If planner cannot assign the issue in GitHub, it reports a retryable failure rather than continuing with ambiguous ownership. That failure does not apply to GitHub App identities.
 
 ## 7. Reviewer: review a spec PR or a normal PR
 
@@ -271,6 +273,35 @@ looper review owner/repo#42 --loop
 
 Use this when new commits are expected to keep landing on the PR.
 
+### Same-head `wontfix` (GitHub, continuous Reviewer)
+
+A continuous GitHub Reviewer loop (`looper review … --loop` or auto-discovery) reacts to trusted dispositions on an unchanged PR head. Reply **in a Looper-authored review thread**:
+
+```text
+/looper wontfix <reason>
+```
+
+Compatibility aliases: a trusted comment whose entire non-quoted body is `wontfix`, `won't fix`, or `won’t fix` (Unicode apostrophe), optionally followed by `: <reason>`. Incidental prose that merely contains those words is not a command.
+
+`/looper reconsider <reason>` cancels the latest accepted disposition on an unresolved or reopened thread.
+
+Authority is the PR author or a GitHub identity whose association is `OWNER`, `MEMBER`, or `COLLABORATOR`. Arbitrary users and bots are not disposition authorities.
+
+Reviewer then:
+
+- **accepts** (`accept_wontfix`): replies with scope evidence and resolves the thread
+- **rejects** (`reject_wontfix`): replies with concrete authority and leaves the thread open for Fixer
+- **needs human**: holds the Reviewer/Fixer pair; no remote adjudication reply
+
+This path does **not** enable `roles.reviewer.behavior.threadResolution.enabled`. That setting still gates objective stale-thread reconciliation only and stays `false` by default. Forgejo is exempt from same-head disposition; Reviewer and Fixer budgets still apply there.
+
+When either role budget trips, or Reviewer returns `needs_human`:
+
+- HITL on: Continue/Stop ask on the pair
+- HITL off (default): paused with no ask. Resume with `looper unpause <seq>` (Continue: refill only exhausted meters) or `looper stop <seq>` (terminate both). Either seq in the held pair works.
+
+Budget exhaustion is not approval. It never publishes a clean review, resolves a blocker, or enables auto-merge. Inspect a hold with `looper describe <seq>`.
+
 ### Reviewer auto-discovery rules
 
 Reviewer mainly watches two kinds of PRs:
@@ -282,7 +313,7 @@ For the default review-requested path, Looper asks GitHub for PRs requested from
 
 For spec PRs, `looper:spec-reviewing` marks the review phase, but it does not by itself authorize other users' Looper instances to run. Request review from the intended GitHub user to trigger that user's automatic reviewer.
 
-For Forgejo projects, reviewer auto-discovery defaults to review requests. Configured labels can be used independently or combined with review requests; combined results are deduplicated deterministically. Reviewer publishes native `APPROVE`, `REQUEST_CHANGES`, or `COMMENT` reviews according to configuration and preserves Looper disclosure/idempotency markers. Self-authored PRs are skipped by default; when self-review is enabled, an attempted clean approval is explicitly downgraded to `COMMENT`. Set reviewer `publishMode` to `summary_comment` to keep the legacy Reviewer Summary/Fixer Summary workflow.
+For Forgejo projects, reviewer auto-discovery defaults to review requests. Configured labels can be used independently or combined with review requests; combined results are deduplicated deterministically. Reviewer publishes native `APPROVE`, `REQUEST_CHANGES`, or `COMMENT` reviews according to configuration and preserves Looper disclosure/idempotency markers. Self-authored PRs are skipped by default; an authorized self-review uses `COMMENT` for both clean and blocking outcomes when Forgejo rejects the configured event. A clean self-comment does not authorize auto-merge. Set reviewer `publishMode` to `summary_comment` to keep the legacy comment workflow with common message templates.
 
 ### What happens after reviewer finishes
 
@@ -340,17 +371,23 @@ Use this when you want to force a repair pass on demand before waiting for any a
 Fixer will:
 
 - read pending review comments and threads on the PR
-- create a worktree and apply fixes
+- create a worktree and apply each listed repair; when the link is clear, prefer a complete coherent fix of that root cause across the affected dependency chain (unrelated cleanup and speculative hardening stay out of scope)
 - run validation
 - push back to the same PR branch
 - after validation and push succeed, try to resolve only the review threads that were both verified by Looper and explicitly confirmed by the fixer agent
+- if a finding is out of documented PR scope, reply with a structured decline and **leave the thread unresolved** so Reviewer can accept, reject, or escalate (`needs_human`)
 
-For Forgejo projects, automatic Fixer runs are summary-only because Forgejo's public REST API does not currently expose a native review-comment resolve mutation:
+Third-party review comments (a human or Codex, not Looper) stay Fixer-eligible. If Fixer declines one of those, it still replies with evidence and leaves the thread open; Reviewer adjudicates the decline. Trusted `/looper` directives apply only on Looper-authored threads.
 
-- reviewer-summary items still come from the top-level Reviewer Summary comment
-- native Forgejo PR review comments do not trigger automatic Fixer runs, even when their response includes a `resolver` field
-- the `resolver` response field describes state; it is not treated as proof that a resolve mutation exists
-- explicit manual Fixer runs may inspect native comments, but stop with a manual-intervention error when the provider cannot resolve them
+For Forgejo projects, automatic and manual Fixer runs consume native findings without requiring a review-comment resolve mutation:
+
+- native findings from other reviewers and the current account's Looper Reviewer can trigger repairs; ordinary self-comments and Fixer chatter are ignored
+- a matching structured `fixed` decision, successful validation, and current input/head checks acknowledge the code repair; the remote comment stays open and the PR receives a common Fixer message
+- unchanged acknowledged findings are suppressed across polling and restarts while the current head contains the repair; edited comments, new findings, and removal of the repair commit re-arm them
+- deferred and declined findings remain open; existing manual holds and role budgets apply, and explicit `needs_human` results suspend for intervention
+- legacy reviewer-summary items remain supported, with protocol metadata hidden from the visible message
+
+After a repair changes the head, Reviewer can review the new code. GitHub's same-head decline adjudication is not available on Forgejo. See [Forgejo configuration](configuration.md#provider-support) for opt-in auto-merge and the remaining provider limits.
 
 If the PR is still in the spec review phase and the review becomes clean, fixer can also move the labels from:
 
@@ -381,7 +418,7 @@ If that issue already has a related planner loop, worker will try to reuse plann
 
 That means issue → planner → worker can flow through without manually copying the spec path.
 
-When worker claims an issue, it adds the current GitHub user as an assignee and preserves any existing assignees. If GitHub assignment fails, the claim reports a retryable failure instead of silently continuing with ambiguous ownership.
+When worker claims an issue, it adds the current GitHub user as an assignee and preserves any existing assignees. GitHub App identities skip this step for GitHub issues: GitHub forbids App installations from assigning themselves. If GitHub assignment fails, the claim reports a retryable failure instead of silently continuing with ambiguous ownership. That failure does not apply to GitHub App identities.
 
 For Forgejo projects, Worker does not claim issues by mutating assignees. The issue must already be assigned to the current Forgejo provider user, and Worker re-checks that assignment before side effects.
 
@@ -497,6 +534,7 @@ looper ps
 looper describe 12
 looper logs 12 --follow
 looper jump 12
+looper unpause 12
 looper stop 12
 looper run reconcile-stale
 ```
@@ -504,11 +542,12 @@ looper run reconcile-stale
 Typical usage:
 
 - `looper ps`: see which loops are currently running (includes a truncated failure reason when present)
-- `looper describe <id>`: show why a loop is blocked (manual intervention reason, diagnosis); same as `looper loop inspect`
+- `looper describe <id>`: show why a loop is blocked (manual intervention reason, diagnosis); same as `looper loop inspect`. For a review-fix budget or scope hold, also names the hold reason and the next command (`looper unpause <seq>` / `looper stop <seq>`).
 - `looper logs <id> --follow`: stream logs live
 - `looper jump <id>`: print the shell command for the loop's worktree; use `eval "$(looper jump 12)"` to actually change directories, or pass `--print-path` to print just the path
 - `looper worktree cleanup`: inspect Looper-managed worktree cleanup candidates without deleting anything; add `--confirm` for one immediate cleanup pass or `--json` for structured output
-- `looper stop <id>`: stop an active loop
+- `looper unpause <id>`: on a review-fix budget hold, Continue the pair (refill exhausted meters only); on a `needs_human` scope hold, release only the overlay and leave independent blockers; otherwise resume that one paused loop
+- `looper stop <id>`: stop an active loop, or terminate a budget/scope-held pair
 - `looper run reconcile-stale`: interrupt stale running runs, repair blocked queue state, and requeue eligible loops after sleep/wake or other local process loss; `looper daemon restart` is still a reasonable fallback if you want a full daemon restart
 
 ## 15. Minimal end-to-end example

@@ -311,6 +311,7 @@ type OsascriptNotificationConfig struct {
 }
 
 type WebhookNotificationConfig struct {
+	VerificationTokenEnv  string                   `json:"verificationTokenEnv,omitempty"`
 	Enabled               bool                     `json:"enabled"`
 	URLEnv                string                   `json:"urlEnv"`
 	Format                string                   `json:"format"`
@@ -430,20 +431,27 @@ type ProjectNetworkConfig struct {
 	Mode NetworkMode `json:"mode,omitempty"`
 }
 
+type DefaultsLoopConfig struct {
+	// QuietPeriodSeconds is the shared default settle window for role loops.
+	// 0 disables quiet-period debounce. Role overrides win when set.
+	// Must be >= 0 and fit in time.Duration when converted from seconds.
+	// Design trade-off (failure prevented, costs, alternatives): see
+	// docs/configuration.md § Quiet-period debounce → Concept trade-off.
+	QuietPeriodSeconds int `json:"quietPeriodSeconds"`
+}
+
 type DefaultsConfig struct {
-	BaseBranch         string          `json:"baseBranch"`
-	AllowAutoCommit    bool            `json:"allowAutoCommit"`
-	AllowAutoPush      bool            `json:"allowAutoPush"`
-	AllowAutoApprove   bool            `json:"allowAutoApprove"`
-	AllowAutoMerge     bool            `json:"allowAutoMerge"`
-	AllowRiskyFixes    bool            `json:"allowRiskyFixes"`
-	FixAllPullRequests bool            `json:"fixAllPullRequests"`
-	OpenPRStrategy     OpenPRStrategy  `json:"openPrStrategy"`
-	AddSnapshotMode    AddSnapshotMode `json:"addSnapshotMode"`
-	// WorkerShepherd opts workers into shepherding their own impl PR toward merge after
-	// open-pr (still gated per-issue by the looper:auto label). Off by default; also
-	// enabled by the LOOPER_WORKER_SHEPHERD=1 env override.
-	WorkerShepherd bool `json:"workerShepherd"`
+	BaseBranch         string             `json:"baseBranch"`
+	AllowAutoCommit    bool               `json:"allowAutoCommit"`
+	AllowAutoPush      bool               `json:"allowAutoPush"`
+	AllowAutoApprove   bool               `json:"allowAutoApprove"`
+	AllowAutoMerge     bool               `json:"allowAutoMerge"`
+	AllowRiskyFixes    bool               `json:"allowRiskyFixes"`
+	FixAllPullRequests bool               `json:"fixAllPullRequests"`
+	OpenPRStrategy     OpenPRStrategy     `json:"openPrStrategy"`
+	AddSnapshotMode    AddSnapshotMode    `json:"addSnapshotMode"`
+	Loop               DefaultsLoopConfig `json:"loop"`
+	WorkerShepherd     bool               `json:"workerShepherd"`
 }
 
 type ReviewerLoopConfig struct {
@@ -458,17 +466,25 @@ type ReviewerLoopConfig struct {
 	StopOnApproved            bool `json:"stopOnApproved"`
 	StopOnReadyLabel          bool `json:"stopOnReadyLabel"`
 	StopOnIdenticalOutput     bool `json:"stopOnIdenticalOutput"`
+	// MaxPublishesPerPR caps successful reviewer publishes on one PR. 0 disables.
+	MaxPublishesPerPR int `json:"maxPublishesPerPR"`
 }
 
 type ReviewerConfig struct {
-	Loop                    ReviewerLoopConfig             `json:"loop"`
-	Retry                   ReviewerRetryConfig            `json:"retry"`
-	Scope                   ReviewerScope                  `json:"scope"`
-	PublishMode             ReviewerPublishMode            `json:"publishMode"`
-	ReviewEvents            ReviewerReviewEventsConfig     `json:"reviewEvents"`
-	DetectDuplicateFindings bool                           `json:"detectDuplicateFindings"`
-	NativeResume            ReviewerNativeResumeConfig     `json:"nativeResume"`
-	ThreadResolution        ReviewerThreadResolutionConfig `json:"threadResolution"`
+	Loop                    ReviewerLoopConfig              `json:"loop"`
+	Retry                   ReviewerRetryConfig             `json:"retry"`
+	Scope                   ReviewerScope                   `json:"scope"`
+	PublishMode             ReviewerPublishMode             `json:"publishMode"`
+	ReviewEvents            ReviewerReviewEventsConfig      `json:"reviewEvents"`
+	DetectDuplicateFindings bool                            `json:"detectDuplicateFindings"`
+	NativeResume            ReviewerNativeResumeConfig      `json:"nativeResume"`
+	ThreadResolution        ReviewerThreadResolutionConfig  `json:"threadResolution"`
+	RelatedFileGroups       ReviewerRelatedFileGroupsConfig `json:"relatedFileGroups"`
+}
+
+type ReviewerRelatedFileGroupsConfig struct {
+	Enabled         bool `json:"enabled"`
+	MinChangedFiles int  `json:"minChangedFiles"`
 }
 
 type ReviewerRetryConfig struct {
@@ -506,6 +522,25 @@ type ReviewerAutoMergeConfig struct {
 	RequireBranchProtection bool                      `json:"requireBranchProtection"`
 	TransientRetries        int                       `json:"transientRetries"`
 	Scope                   ReviewerAutoMergeScope    `json:"scope"`
+}
+
+type ReviewerSkillsMode string
+
+const (
+	ReviewerSkillsModeExtend  ReviewerSkillsMode = "extend"
+	ReviewerSkillsModeReplace ReviewerSkillsMode = "replace"
+)
+
+type ReviewerSkillsConfig struct {
+	Mode     ReviewerSkillsMode `json:"mode"`
+	Required []string           `json:"required"`
+	Optional []string           `json:"optional"`
+}
+
+type PartialReviewerSkillsConfig struct {
+	Mode     *ReviewerSkillsMode `json:"mode,omitempty"`
+	Required *[]string           `json:"required,omitempty"`
+	Optional *[]string           `json:"optional,omitempty"`
 }
 
 type IssueRoleTriggersConfig struct {
@@ -548,6 +583,9 @@ type ReviewerRoleDiscoveryConfig struct {
 	AutoDiscovery bool                       `json:"autoDiscovery"`
 	Triggers      ReviewerRoleTriggersConfig `json:"triggers"`
 	SpecReview    ReviewerSpecReviewConfig   `json:"specReview"`
+	// FollowUpInterval is the minimum time between full follow-up sweeps for one
+	// project and repo, as a time.Duration string. Empty sweeps on every tick.
+	FollowUpInterval string `json:"followUpInterval,omitempty"`
 }
 
 type FixerRoleTriggersConfig struct {
@@ -558,31 +596,56 @@ type FixerRoleTriggersConfig struct {
 }
 
 type PlannerRoleConfig struct {
+	Identity             string                  `json:"identity,omitempty"`
 	AutoDiscovery        bool                    `json:"autoDiscovery"`
-	PreSpecDecisionGrill bool                    `json:"preSpecDecisionGrill,omitempty"`
 	Triggers             IssueRoleTriggersConfig `json:"triggers"`
 	Instructions         string                  `json:"instructions,omitempty"`
 	Agent                *RoleAgentConfig        `json:"agent,omitempty"`
+	PreSpecDecisionGrill bool                    `json:"preSpecDecisionGrill,omitempty"`
 }
 
 type WorkerRoleConfig struct {
+	Identity      string                  `json:"identity,omitempty"`
 	AutoDiscovery bool                    `json:"autoDiscovery"`
 	Triggers      IssueRoleTriggersConfig `json:"triggers"`
 	Instructions  string                  `json:"instructions,omitempty"`
 	Agent         *RoleAgentConfig        `json:"agent,omitempty"`
 }
 
+// ReviewerNonoConfig is global operator policy, never a project-level override.
+type ReviewerNonoConfig struct {
+	Profile string `json:"profile"`
+	Command string `json:"command,omitempty"`
+}
+
 type ReviewerRoleConfig struct {
+	Nono         *ReviewerNonoConfig         `json:"nono,omitempty"`
+	Identity     string                      `json:"identity,omitempty"`
 	Discovery    ReviewerRoleDiscoveryConfig `json:"discovery"`
 	Behavior     ReviewerConfig              `json:"behavior"`
 	AutoMerge    ReviewerAutoMergeConfig     `json:"autoMerge"`
 	Instructions string                      `json:"instructions,omitempty"`
+	Skills       ReviewerSkillsConfig        `json:"skills"`
 	Agent        *RoleAgentConfig            `json:"agent,omitempty"`
 }
 
+type FixerLoopConfig struct {
+	// QuietPeriodSeconds delays fixer work after a new/changed fixable set.
+	// 0 disables quiet-period debounce (immediate enqueue). Default is 0.
+	QuietPeriodSeconds int `json:"quietPeriodSeconds"`
+	// MaxPushesPerPR caps successful fixer pushes on one PR. 0 disables.
+	MaxPushesPerPR int `json:"maxPushesPerPR"`
+}
+
+type FixerBehaviorConfig struct {
+	Loop FixerLoopConfig `json:"loop"`
+}
+
 type FixerRoleConfig struct {
+	Identity      string                  `json:"identity,omitempty"`
 	AutoDiscovery bool                    `json:"autoDiscovery"`
 	Triggers      FixerRoleTriggersConfig `json:"triggers"`
+	Behavior      FixerBehaviorConfig     `json:"behavior"`
 	Instructions  string                  `json:"instructions,omitempty"`
 	Agent         *RoleAgentConfig        `json:"agent,omitempty"`
 }
@@ -629,6 +692,7 @@ type CoordinatorMergeWatchConfig struct {
 }
 
 type CoordinatorRoleConfig struct {
+	Identity     string                        `json:"identity,omitempty"`
 	Enabled      bool                          `json:"enabled"`
 	PollInterval string                        `json:"pollInterval"`
 	Triage       CoordinatorTriageConfig       `json:"triage"`
@@ -646,6 +710,7 @@ type RoleConfigs struct {
 }
 
 type ProjectRefConfig struct {
+	Identity     string               `json:"identity,omitempty"`
 	ID           string               `json:"id"`
 	Name         string               `json:"name"`
 	Provider     string               `json:"provider,omitempty"`
@@ -698,6 +763,7 @@ type ProjectWebhookConfig struct {
 }
 
 type PartialProjectRefConfig struct {
+	Identity     *string                      `json:"identity,omitempty"`
 	ID           string                       `json:"id"`
 	Name         string                       `json:"name"`
 	Provider     *string                      `json:"provider,omitempty"`
@@ -740,6 +806,8 @@ type PartialProviderConfig struct {
 }
 
 type Config struct {
+	Identities map[string]HostingIdentityConfig `json:"identities,omitempty"`
+
 	Server        ServerConfig       `json:"server"`
 	Storage       StorageConfig      `json:"storage"`
 	Scheduler     SchedulerConfig    `json:"scheduler"`
@@ -779,6 +847,9 @@ type HITLConfig struct {
 // open to the collaborators invited into the task group; ownerOpenId is only
 // attribution and the default reminder target.
 type HITLFeishuConfig struct {
+	// Inbound retains the legacy daemon cf-inbox transport. Empty selects the
+	// collab/private bridge configuration below.
+	Inbound string `json:"inbound,omitempty"`
 	// Optional shared-app event inbox. When configured, collab polls this URL
 	// instead of opening a competing Feishu WebSocket on every local instance.
 	EventInboxURLEnv   string `json:"eventInboxUrlEnv,omitempty"`
@@ -900,6 +971,7 @@ type PartialOsascriptNotificationConfig struct {
 }
 
 type PartialWebhookNotificationConfig struct {
+	VerificationTokenEnv  *string                   `json:"verificationTokenEnv,omitempty"`
 	Enabled               *bool                     `json:"enabled,omitempty"`
 	URLEnv                *string                   `json:"urlEnv,omitempty"`
 	Format                *string                   `json:"format,omitempty"`
@@ -971,17 +1043,22 @@ type PartialNetworkConfig struct {
 	GitHubUserID     *int64  `json:"githubUserId,omitempty"`
 }
 
+type PartialDefaultsLoopConfig struct {
+	QuietPeriodSeconds *int `json:"quietPeriodSeconds,omitempty"`
+}
+
 type PartialDefaultsConfig struct {
-	BaseBranch         *string          `json:"baseBranch,omitempty"`
-	AllowAutoCommit    *bool            `json:"allowAutoCommit,omitempty"`
-	AllowAutoPush      *bool            `json:"allowAutoPush,omitempty"`
-	AllowAutoApprove   *bool            `json:"allowAutoApprove,omitempty"`
-	AllowAutoMerge     *bool            `json:"allowAutoMerge,omitempty"`
-	AllowRiskyFixes    *bool            `json:"allowRiskyFixes,omitempty"`
-	FixAllPullRequests *bool            `json:"fixAllPullRequests,omitempty"`
-	OpenPRStrategy     *OpenPRStrategy  `json:"openPrStrategy,omitempty"`
-	AddSnapshotMode    *AddSnapshotMode `json:"addSnapshotMode,omitempty"`
-	WorkerShepherd     *bool            `json:"workerShepherd,omitempty"`
+	BaseBranch         *string                    `json:"baseBranch,omitempty"`
+	AllowAutoCommit    *bool                      `json:"allowAutoCommit,omitempty"`
+	AllowAutoPush      *bool                      `json:"allowAutoPush,omitempty"`
+	AllowAutoApprove   *bool                      `json:"allowAutoApprove,omitempty"`
+	AllowAutoMerge     *bool                      `json:"allowAutoMerge,omitempty"`
+	AllowRiskyFixes    *bool                      `json:"allowRiskyFixes,omitempty"`
+	FixAllPullRequests *bool                      `json:"fixAllPullRequests,omitempty"`
+	OpenPRStrategy     *OpenPRStrategy            `json:"openPrStrategy,omitempty"`
+	AddSnapshotMode    *AddSnapshotMode           `json:"addSnapshotMode,omitempty"`
+	Loop               *PartialDefaultsLoopConfig `json:"loop,omitempty"`
+	WorkerShepherd     *bool                      `json:"workerShepherd,omitempty"`
 }
 
 type PartialReviewerLoopConfig struct {
@@ -996,18 +1073,25 @@ type PartialReviewerLoopConfig struct {
 	StopOnApproved            *bool `json:"stopOnApproved,omitempty"`
 	StopOnReadyLabel          *bool `json:"stopOnReadyLabel,omitempty"`
 	StopOnIdenticalOutput     *bool `json:"stopOnIdenticalOutput,omitempty"`
+	MaxPublishesPerPR         *int  `json:"maxPublishesPerPR,omitempty"`
 }
 
 type PartialReviewerConfig struct {
-	Loop                    *PartialReviewerLoopConfig             `json:"loop,omitempty"`
-	Retry                   *PartialReviewerRetryConfig            `json:"retry,omitempty"`
-	Scope                   *ReviewerScope                         `json:"scope,omitempty"`
-	PublishMode             *ReviewerPublishMode                   `json:"publishMode,omitempty"`
-	ReviewEvents            *PartialReviewerReviewEventsConfig     `json:"reviewEvents,omitempty"`
-	DetectDuplicateFindings *bool                                  `json:"detectDuplicateFindings,omitempty"`
-	DedupeFindings          *bool                                  `json:"dedupeFindings,omitempty"`
-	NativeResume            *PartialReviewerNativeResumeConfig     `json:"nativeResume,omitempty"`
-	ThreadResolution        *PartialReviewerThreadResolutionConfig `json:"threadResolution,omitempty"`
+	Loop                    *PartialReviewerLoopConfig              `json:"loop,omitempty"`
+	Retry                   *PartialReviewerRetryConfig             `json:"retry,omitempty"`
+	Scope                   *ReviewerScope                          `json:"scope,omitempty"`
+	PublishMode             *ReviewerPublishMode                    `json:"publishMode,omitempty"`
+	ReviewEvents            *PartialReviewerReviewEventsConfig      `json:"reviewEvents,omitempty"`
+	DetectDuplicateFindings *bool                                   `json:"detectDuplicateFindings,omitempty"`
+	DedupeFindings          *bool                                   `json:"dedupeFindings,omitempty"`
+	NativeResume            *PartialReviewerNativeResumeConfig      `json:"nativeResume,omitempty"`
+	ThreadResolution        *PartialReviewerThreadResolutionConfig  `json:"threadResolution,omitempty"`
+	RelatedFileGroups       *PartialReviewerRelatedFileGroupsConfig `json:"relatedFileGroups,omitempty"`
+}
+
+type PartialReviewerRelatedFileGroupsConfig struct {
+	Enabled         *bool `json:"enabled,omitempty"`
+	MinChangedFiles *int  `json:"minChangedFiles,omitempty"`
 }
 
 type PartialReviewerRetryConfig struct {
@@ -1092,9 +1176,10 @@ type PartialReviewerSpecReviewConfig struct {
 }
 
 type PartialReviewerRoleDiscoveryConfig struct {
-	AutoDiscovery *bool                              `json:"autoDiscovery,omitempty"`
-	Triggers      *PartialReviewerRoleTriggersConfig `json:"triggers,omitempty"`
-	SpecReview    *PartialReviewerSpecReviewConfig   `json:"specReview,omitempty"`
+	AutoDiscovery    *bool                              `json:"autoDiscovery,omitempty"`
+	Triggers         *PartialReviewerRoleTriggersConfig `json:"triggers,omitempty"`
+	SpecReview       *PartialReviewerSpecReviewConfig   `json:"specReview,omitempty"`
+	FollowUpInterval *string                            `json:"followUpInterval,omitempty"`
 }
 
 type PartialFixerRoleTriggersConfig struct {
@@ -1105,14 +1190,16 @@ type PartialFixerRoleTriggersConfig struct {
 }
 
 type PartialPlannerRoleConfig struct {
+	Identity             *string                         `json:"identity,omitempty"`
 	AutoDiscovery        *bool                           `json:"autoDiscovery,omitempty"`
-	PreSpecDecisionGrill *bool                           `json:"preSpecDecisionGrill,omitempty"`
 	Triggers             *PartialIssueRoleTriggersConfig `json:"triggers,omitempty"`
 	Instructions         *string                         `json:"instructions,omitempty"`
 	Agent                *RoleAgentConfig                `json:"agent,omitempty"`
+	PreSpecDecisionGrill *bool                           `json:"preSpecDecisionGrill,omitempty"`
 }
 
 type PartialWorkerRoleConfig struct {
+	Identity      *string                         `json:"identity,omitempty"`
 	AutoDiscovery *bool                           `json:"autoDiscovery,omitempty"`
 	Triggers      *PartialIssueRoleTriggersConfig `json:"triggers,omitempty"`
 	Instructions  *string                         `json:"instructions,omitempty"`
@@ -1120,10 +1207,13 @@ type PartialWorkerRoleConfig struct {
 }
 
 type PartialReviewerRoleConfig struct {
+	Nono         *ReviewerNonoConfig                 `json:"nono,omitempty"`
+	Identity     *string                             `json:"identity,omitempty"`
 	Discovery    *PartialReviewerRoleDiscoveryConfig `json:"discovery,omitempty"`
 	Behavior     *PartialReviewerConfig              `json:"behavior,omitempty"`
 	AutoMerge    *PartialReviewerAutoMergeConfig     `json:"autoMerge,omitempty"`
 	Instructions *string                             `json:"instructions,omitempty"`
+	Skills       *PartialReviewerSkillsConfig        `json:"skills,omitempty"`
 	Agent        *RoleAgentConfig                    `json:"agent,omitempty"`
 
 	AutoDiscovery *bool                              `json:"autoDiscovery,omitempty"`
@@ -1131,9 +1221,20 @@ type PartialReviewerRoleConfig struct {
 	SpecReview    *PartialReviewerSpecReviewConfig   `json:"specReview,omitempty"`
 }
 
+type PartialFixerLoopConfig struct {
+	QuietPeriodSeconds *int `json:"quietPeriodSeconds,omitempty"`
+	MaxPushesPerPR     *int `json:"maxPushesPerPR,omitempty"`
+}
+
+type PartialFixerBehaviorConfig struct {
+	Loop *PartialFixerLoopConfig `json:"loop,omitempty"`
+}
+
 type PartialFixerRoleConfig struct {
+	Identity      *string                         `json:"identity,omitempty"`
 	AutoDiscovery *bool                           `json:"autoDiscovery,omitempty"`
 	Triggers      *PartialFixerRoleTriggersConfig `json:"triggers,omitempty"`
+	Behavior      *PartialFixerBehaviorConfig     `json:"behavior,omitempty"`
 	Instructions  *string                         `json:"instructions,omitempty"`
 	Agent         *RoleAgentConfig                `json:"agent,omitempty"`
 }
@@ -1180,6 +1281,7 @@ type PartialCoordinatorMergeWatchConfig struct {
 }
 
 type PartialCoordinatorRoleConfig struct {
+	Identity     *string                               `json:"identity,omitempty"`
 	Enabled      *bool                                 `json:"enabled,omitempty"`
 	PollInterval *string                               `json:"pollInterval,omitempty"`
 	Triage       *PartialCoordinatorTriageConfig       `json:"triage,omitempty"`
@@ -1199,6 +1301,8 @@ type PartialRoleConfigs struct {
 }
 
 type PartialConfig struct {
+	Identities *map[string]HostingIdentityConfig `json:"identities,omitempty"`
+
 	Server         *PartialServerConfig       `json:"server,omitempty"`
 	Storage        *PartialStorageConfig      `json:"storage,omitempty"`
 	Scheduler      *PartialSchedulerConfig    `json:"scheduler,omitempty"`

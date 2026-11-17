@@ -745,6 +745,9 @@ func splitLogLines(content string) []string {
 }
 
 func (r *commandRuntime) loadConfig() (config.LoadedFileConfig, error) {
+	// Trusted proxy children supply a one-shot snapshot FD. Auto-upgrade
+	// skips those children so review submit is the sole consumer; a second
+	// loadConfig fails loud (descriptor required / EBADF) rather than caching.
 	if loaded, configured, err := forge.LoadTrustedReviewConfigSnapshot(); configured {
 		if err != nil {
 			return config.LoadedFileConfig{}, err

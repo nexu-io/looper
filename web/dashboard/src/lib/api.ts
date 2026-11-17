@@ -225,6 +225,11 @@ export type Loop = {
   repo?: string | null;
   prNumber?: number | null;
   status: string;
+  /**
+   * Dashboard-facing projection of durable queue/checkpoint facts
+   * (e.g. manual_intervention). Not a true loop status authority.
+   */
+  displayStatus?: string | null;
   configJson?: string | null;
   metadataJson?: string | null;
   lastRunAt?: string | null;
@@ -237,6 +242,7 @@ export type Loop = {
   maxAttempts?: number | null;
   lastFailureKind?: string | null;
   lastFailureReason?: string | null;
+  resumePolicy?: string | null;
 };
 
 export type LoopsList = {
@@ -254,6 +260,8 @@ export type Project = {
   archived: boolean;
   provider: string;
   repo?: string | null;
+  /** Forge HTML URL for the repo (provider base + owner/name). */
+  repoUrl?: string | null;
   worktreeRoot?: string | null;
   createdAt: string;
   updatedAt: string;
@@ -453,6 +461,43 @@ export function fetchConfig(signal?: AbortSignal): Promise<ConfigData> {
   return apiFetch<ConfigData>("/api/v1/config", { signal });
 }
 
+export type AgentModelSource = "static" | "probe" | "merged";
+export type AgentModelProbeStatus = "ok" | "skipped" | "error" | "unsupported";
+
+export type AgentModelEntry = {
+  id: string;
+  label: string;
+  source: AgentModelSource;
+};
+
+export type AgentModelsData = {
+  vendor: string;
+  models: AgentModelEntry[];
+  sources: {
+    static: boolean;
+    probe: AgentModelProbeStatus;
+    probeError?: string;
+  };
+  probedAt?: string;
+};
+
+/**
+ * Read the agent model suggestion catalog for a vendor. Advisory — never blocks
+ * config save. Backend serves a merged static+probe list with a short cache;
+ * pass `refresh: true` to bypass it.
+ */
+export function fetchAgentModels(
+  vendor: string,
+  opts?: { refresh?: boolean; signal?: AbortSignal },
+): Promise<AgentModelsData> {
+  const params = new URLSearchParams({ vendor });
+  if (opts?.refresh) params.set("refresh", "1");
+  return apiFetch<AgentModelsData>(
+    `/api/v1/agent/models?${params.toString()}`,
+    { signal: opts?.signal },
+  );
+}
+
 export function patchConfig(
   body: PatchConfigBody,
   signal?: AbortSignal,
@@ -471,6 +516,13 @@ export type RetryLoopBody = {
   resetAttempts: true;
   /** Never set on handback; optional on retry only. */
   discardWorktreeChanges?: boolean;
+  /** Never set on handback; optional on retry only. Mutually exclusive with discard. */
+  clearUnusableWorktreePath?: boolean;
+  /**
+   * Required with clearUnusableWorktreePath. Must match the path shown by
+   * GET /worktree so a stale confirm cannot clear a different managed path.
+   */
+  expectedWorktreePath?: string;
 };
 
 export type RetryLoopResult = {
@@ -479,7 +531,24 @@ export type RetryLoopResult = {
   mode: string;
   resetAttempts: boolean;
   discardWorktreeChanges: boolean;
+  clearUnusableWorktreePath?: boolean;
   worktreeDiscard?: unknown;
+  worktreeClearUnusable?: unknown;
+};
+
+/** GET /loops/{sel}/worktree — retry/jump preflight. */
+export type LoopWorktreeStatus = {
+  loopId: string;
+  seq: number;
+  present: boolean;
+  worktreePath?: string | null;
+  branch?: string | null;
+  managed: boolean;
+  clean?: boolean | null;
+  dirty?: boolean | null;
+  reason?: string;
+  /** True on daemons that implement clearUnusableWorktreePath. */
+  supportsClearUnusablePath?: boolean;
 };
 
 export type StopActiveRunResult = {
@@ -523,16 +592,62 @@ export function pauseLoop(
   );
 }
 
-export function retryLoop(
+export function respondLoop(
+  selector: string,
+  answer: string,
+  signal?: AbortSignal,
+): Promise<Loop> {
+  return apiFetch<Loop>(
+    `/api/v1/loops/${encodeURIComponent(selector)}/respond`,
+    { method: "POST", body: JSON.stringify({ answer }), signal },
+  );
+}
+
+export function fetchLoopWorktree(
   selector: string,
   signal?: AbortSignal,
+): Promise<LoopWorktreeStatus> {
+  return apiFetch<LoopWorktreeStatus>(
+    `/api/v1/loops/${encodeURIComponent(selector)}/worktree`,
+    { signal },
+  );
+}
+
+export function retryLoop(
+  selector: string,
+  opts?: {
+    discardWorktreeChanges?: boolean;
+    clearUnusableWorktreePath?: boolean;
+    /** Required when clearUnusableWorktreePath is true. */
+    expectedWorktreePath?: string;
+    signal?: AbortSignal;
+  },
 ): Promise<RetryLoopResult> {
+  const clearUnusableWorktreePath = opts?.clearUnusableWorktreePath === true;
+  const expectedWorktreePath = opts?.expectedWorktreePath?.trim() ?? "";
+  if (clearUnusableWorktreePath && !expectedWorktreePath) {
+    return Promise.reject(
+      new Error(
+        "expectedWorktreePath is required when clearUnusableWorktreePath is true",
+      ),
+    );
+  }
+  const body: RetryLoopBody = {
+    ...RETRY_BODY,
+    ...(opts?.discardWorktreeChanges ? { discardWorktreeChanges: true } : {}),
+    ...(clearUnusableWorktreePath
+      ? {
+          clearUnusableWorktreePath: true,
+          expectedWorktreePath,
+        }
+      : {}),
+  };
   return apiFetch<RetryLoopResult>(
     `/api/v1/loops/${encodeURIComponent(selector)}/retry`,
     {
       method: "POST",
-      body: JSON.stringify(RETRY_BODY),
-      signal,
+      body: JSON.stringify(body),
+      signal: opts?.signal,
     },
   );
 }
