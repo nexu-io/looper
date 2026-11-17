@@ -81,3 +81,22 @@ the original Agent session. Ordinary conversation stays silent. Restart a host
 and check that saved events do not trigger another completed turn. Internal
 callback fixtures are useful regression coverage but do not substitute for
 this real Feishu test.
+
+## Standalone device presence
+
+The same Worker can store personal-device heartbeat times, without running
+loopernet. Apply `migrations/0002_device_presence.sql`, configure `PLANE_BASE_URL`
+with the fixed Plane origin, and install a separate `PRESENCE_TOKEN` secret.
+Plane uses that secret as `LOOPER_COLLAB_RELAY_TOKEN`; configure its
+`LOOPER_COLLAB_RELAY_URL` with this Worker's base URL (including the path prefix).
+
+`POST /devices/heartbeat` forwards the device's `Looper-Signature` and unchanged
+body to Plane's `/api/looper/devices/heartbeat/`. Only a successfully verified,
+active device refreshes its D1 timestamp. Redirects are not followed. The
+client cannot supply a verification origin. `GET /devices/<device-id>` requires
+the server-only presence bearer; the inbox poll bearer does not grant access.
+The Worker stores receipt time only; Plane computes online expiry and remains
+the authority for identity, revocation and task ownership.
+
+See [the collaboration relay guide](../../docs/collab-cf-relay.zh-CN.md) for the
+rollout, legacy compatibility and remaining onboarding limitations.

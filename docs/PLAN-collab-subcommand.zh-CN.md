@@ -205,3 +205,7 @@ Looper 协作副本已有独立 `looper collab` 宿主，可从终端派单，�
 - [产品交互、人的分工、验收交付与历史私测](feishu-private-test.zh-CN.md)
 - [抽取基线及耦合检查](extraction-review.zh-CN.md)
 - [原 Worker PR 持续跟进计划](PLAN-worker-shepherd-to-merge.md)
+
+## 2026-11-17：独立协作改用 CF 心跳
+
+根据本轮讨论，撤销“必须部署独立 loopernet 才能启用个人协作”的前置条件。独立协作复用现有 CF inbox 承载设备心跳，Plane 继续负责 code 配对、公钥身份、权限和任务派发。原 loopernet 仅保留兼容路径。协议、部署与明确未完成的身份授权事项见 [CF relay 说明](collab-cf-relay.zh-CN.md)。

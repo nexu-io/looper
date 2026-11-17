@@ -2,23 +2,19 @@
 
 本文面向运行本地 Agent 的研发同学。跑完后，应能在 Plane 派发一个任务，由 Agent 判断涉及哪些仓库，在飞书原话题沟通和验收，让原 Agent 继续修改同一个 PR，并观察 PR 最终结果。产品、设计和 QA 只需参与飞书沟通，不用安装本地服务。
 
-**当前为联调指南，尚非已发布的一键安装流程。** Looper 使用 [PR #696](https://github.com/nexu-io/looper/pull/696) 的 `feat/looper-collab-standalone`；Plane 使用 [配套分支](https://code.powerformer.net/core/plane/src/branch/feat/looper-collab-standalone-main)（提交 `6733d80`），迁移为 `0157_looper_collaboration_dispatch`，接在最新 main 的 `0156` 之后。仅下载 main 或旧版 Looper 不够。任务无需绑定单一代码仓库，Agent 根据任务和本机可用仓库判断，必要时问人。早期联调工作树的 `0137` 是临时迁移，不能复制进最新 main 的数据库迁移链。本次实际结果和未修问题见[端到端测试记录](E2E-collab-2026-11-16.zh-CN.md)。
+**当前为联调指南，尚非已发布的一键安装流程。** Looper 使用 [PR #696](https://github.com/nexu-io/looper/pull/696) 的 `feat/looper-collab-standalone`。Plane 的个人设备连接已随 #82 合并；本轮 CF 替代 loopernet 还需要配套 Plane 新分支 `feat/collab-cf-presence`，上线状态以相应 PR 为准。旧版 Looper 二进制未必包含 collab 子命令。
 
-## 个人连接入口（2026-11-17，需配套 Plane 版本）
+## 当前推荐：个人配对 + CF inbox / 心跳
 
-研发在 Plane **个人设置 → Developer → 我的 Looper** 连接自己的电脑，不再在各项目重复连接。项目设置仅保留协作启用及可选默认负责人；没有成员在线也可以先启用。
+研发在 Plane **个人设置 → Developer → 我的 Looper** 复制一次性 `looper plane connect … --code … --collab` 命令，执行后运行 `looper collab start`，再用 `looper plane doctor --collab` 自检。个人连接跨本人有执行权限的项目复用，无需在项目里重复连接，不绑定代码仓库。
 
-复制页面的一次性 `looper plane connect … --code … --collab` 命令执行，然后运行 `looper collab start`。首次连接由 Plane 提供一次性 loopernet 邀请，CLI 自动入网；不绑定代码仓库，也不再另要 Plane API key。Agent 根据任务选择一个或多个仓库。
+新链路不再要求同事入网或维护 loopernet 配置。维护者提供已配置好的 Plane、CF Worker 和飞书 bot 凭证，部署设置、故障验证与仍未完成的身份授权事项见 [CF relay 说明](collab-cf-relay.zh-CN.md)。目前不能据此宣称“只输入一条命令即可完成全新同事的所有授权”。
 
-`looper plane doctor --collab` 自动识别个人设备，检查签名项目目录与本人的在线宿主。个人设备在本人有执行权限的项目中自动复用；项目权限变化后动态更新。更换电脑在「我的 Looper」断开，正在运行的任务会收到停止请求。
+项目可以先启用协作，不要求成员在线或填全角色。Agent 根据任务选择一个或多个仓库、评估影响面和规划深度，在飞书原话题找人沟通，必要时问 owner。
 
-服务端新增 `LOOPERNET_ENROLL_CREDENTIAL_FILE`，用于申请一次性网络邀请；管理员凭证仅留在服务端，不能发给同事。仍需配置原有目录身份、网络标识、challenge 信任根及飞书应用。服务端未配置时明确报接入未完成，不要求同事自行找另一条入网命令。详细部署与验证记录见配套 Plane 的 `docs/integrations/looper-personal-device.zh-CN.md`。
+后文为旧项目绑定 / loopernet 的兼容 fixture 操作。新个人 CF 链路不应照着执行额外入网步骤。历次实测与未完成事项见 [端到端测试记录](E2E-collab-2026-11-16.zh-CN.md)。
 
-本地已实测：真实 CLI 个人配对；空网络身份的首次自动入网；同一独立 collab 实例接收两个项目任务，分别进入真实私测飞书话题并写回 Plane 至 completed。测试没有启动 Friday/完整 daemon，没有修改业务仓库或创建 PR。正式环境仍待部署配套 Plane、配置首次入网和正式 bot receiver，再验证真实产品任务。
-
-以下旧项目配置和手动加入测试网络的方式仍用于兼容已有 fixture，不是新个人入口的必经步骤。
-
-## 先理解要启动哪些东西
+## 旧网络 fixture：理解要启动哪些东西
 
 ```mermaid
 flowchart LR
@@ -31,7 +27,7 @@ flowchart LR
 
 推荐复用维护者准备的测试 Plane 和 loopernet，同事只在自己的电脑启动 collab。无需 Friday、完整 `looperd`，也无需单独的 Planner／Reviewer／Fixer 进程。Agent 仍会在执行中自行评估影响面、按需规划。
 
-loopernet 是设备连接基础设施，**当前 Plane 派发依赖它**；客户端随 collab 启动，不用同事另起本地客户端进程。纯终端派单可以不连接 Plane／loopernet，但那只能验证执行与飞书这一段。
+loopernet 是这套旧 fixture 的设备连接基础设施，**旧配对链路依赖它**；客户端随 collab 启动，不用同事另起本地客户端进程。纯终端派单可以不连接 Plane／loopernet，但那只能验证执行与飞书这一段。
 
 ## 1 准备测试环境和账号
 

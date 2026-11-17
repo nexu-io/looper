@@ -67,6 +67,8 @@ type planeEnrollment struct {
 }
 
 type planeConnectExchange struct {
+	Pairing      string           `json:"pairing"`
+	RelayURL     string           `json:"relay_url"`
 	Enrollment   *planeEnrollment `json:"enrollment"`
 	WebBaseURL   string           `json:"web_base_url"`
 	Personal     bool             `json:"personal"`
@@ -101,11 +103,8 @@ func (r *commandRuntime) planeConnect(cmd *cobra.Command, args []string) error {
 		return err
 	}
 	networkState, networkErr := networkclient.LoadState(networkclient.DefaultStatePath(homeDir))
-	if networkErr != nil && !os.IsNotExist(networkErr) {
-		return fmt.Errorf("read local Looper network identity: %w", networkErr)
-	}
-	exchangeInput := map[string]any{"code": connectCode}
-	if os.IsNotExist(networkErr) {
+	exchangeInput := map[string]any{"code": connectCode, "pairing": "device_v1"}
+	if networkErr != nil {
 		exchangeInput["needs_network"] = true
 	}
 	exchangeBody, _ := json.Marshal(exchangeInput)
@@ -114,6 +113,12 @@ func (r *commandRuntime) planeConnect(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("exchange Plane connection code: %w", err)
 	}
 
+	if exchange.Personal && exchange.Pairing == "device_v1" {
+		return r.connectPersonalPlane(cmd, planeOrigin, connectCode, exchange, networkclient.LocalState{})
+	}
+	if networkErr != nil && !os.IsNotExist(networkErr) {
+		return fmt.Errorf("read local Looper network identity: %w", networkErr)
+	}
 	if networkErr != nil {
 		if !exchange.Personal || exchange.Enrollment == nil {
 			return fmt.Errorf("Plane did not provide network enrollment for this connection; contact the Looper maintainer to configure server-side enrollment")

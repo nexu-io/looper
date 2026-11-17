@@ -11,6 +11,8 @@ import (
 // DeviceConnection is the account's pairing, independent of code repositories
 // and the projects it is currently allowed to execute in.
 type DeviceConnection struct {
+	Pairing        string `json:"pairing,omitempty"`
+	RelayURL       string `json:"relayUrl,omitempty"`
 	WebBaseURL     string `json:"webBaseUrl,omitempty"`
 	BaseURL        string `json:"baseUrl"`
 	DeviceID       string `json:"deviceId"`
@@ -28,6 +30,7 @@ type DeviceProject struct {
 }
 
 type DeviceProjects struct {
+	RelayURL string          `json:"relay_url,omitempty"`
 	State    string          `json:"state"`
 	Projects []DeviceProject `json:"projects"`
 }

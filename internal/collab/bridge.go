@@ -78,6 +78,8 @@ type bridgeHost struct {
 	personalPlane   *planestrict.DeviceConnection
 	personalClient  *planestrict.Client
 	personalSources map[string]planeSource
+	personalPath    string
+	planeStatus     PlaneStatus
 }
 
 func serveBridge(parent context.Context, options Options) error {
@@ -202,29 +204,36 @@ func serveBridge(parent context.Context, options Options) error {
 	if err := host.loadPersonalPlane(networkPath); err != nil {
 		return err
 	}
-	networkCfg := cfg
-	if host.personalPlane != nil {
-		networkCfg.Providers = append(append([]config.ProviderConfig(nil), cfg.Providers...), config.ProviderConfig{ID: "personal-plane", Kind: config.ProviderKindPlane, StrictDispatch: &config.PlaneStrictDispatchConfig{Enabled: true}})
-	}
-	network := networkclient.NewCollaborationManager(networkPath, networkCfg, repos, host.gh)
-	if err := network.Start(ctx); err != nil {
-		return err
-	}
-	defer network.Stop()
-	host.mu.Lock()
-	host.network = network
-	host.mu.Unlock()
+	host.personalPath = networkPath
 	host.sources, err = bridgePlaneSources(cfg)
 	if err != nil {
 		return err
 	}
 	host.legacySources = append([]planeSource(nil), host.sources...)
+	networkCfg := cfg
+	legacyPersonal := host.personalPlane != nil && host.personalPlane.Pairing != "device_v1"
+	if legacyPersonal {
+		networkCfg.Providers = append(append([]config.ProviderConfig(nil), cfg.Providers...), config.ProviderConfig{ID: "personal-plane", Kind: config.ProviderKindPlane, StrictDispatch: &config.PlaneStrictDispatchConfig{Enabled: true}})
+	}
+	if legacyPersonal || len(host.legacySources) > 0 {
+		network := networkclient.NewCollaborationManager(networkPath, networkCfg, repos, host.gh)
+		if err := network.Start(ctx); err != nil {
+			return err
+		}
+		defer network.Stop()
+		host.mu.Lock()
+		host.network = network
+		host.mu.Unlock()
+	}
 	peopleDone := make(chan struct{})
 	go func() {
 		defer close(peopleDone)
 		host.maintainPeople(ctx, appID)
 	}()
 	defer func() { cancel(); <-peopleDone }()
+	heartbeatDone := make(chan struct{})
+	go func() { defer close(heartbeatDone); host.maintainPersonalHeartbeat(ctx) }()
+	defer func() { cancel(); <-heartbeatDone }()
 	host.ready.Store(true)
 	// A bridge resume uses the native session recorded by upstream. No recovered
 	// OS PID is inspected or killed, and no synthetic human answer is generated.
@@ -240,7 +249,7 @@ func serveBridge(parent context.Context, options Options) error {
 	defer tick.Stop()
 	lastPlane, lastPR := time.Time{}, time.Time{}
 	for ctx.Err() == nil {
-		if time.Since(lastPlane) >= 10*time.Second && network.Status().CloudReachable {
+		if time.Since(lastPlane) >= 10*time.Second {
 			if err := host.pollPlane(ctx); err != nil {
 				host.warn("Plane dispatch poll failed", err)
 			}
@@ -532,7 +541,10 @@ func (h *bridgeHost) status(w http.ResponseWriter, r *http.Request) {
 	if h.ready.Load() {
 		state = "running"
 	}
-	writeJSON(w, Status{Service: "looper collab · feishu-codex-bridge", PID: os.Getpid(), State: state, ActiveExecutions: active, Tasks: tasks, Network: h.networkStatus()})
+	h.mu.Lock()
+	plane := h.planeStatus
+	h.mu.Unlock()
+	writeJSON(w, Status{Service: "looper collab · feishu-codex-bridge", PID: os.Getpid(), State: state, ActiveExecutions: active, Tasks: tasks, Network: h.networkStatus(), Plane: plane})
 }
 
 func (h *bridgeHost) resultPath(id string) string {

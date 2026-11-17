@@ -31,18 +31,36 @@ func (h *bridgeHost) loadPersonalPlane(networkPath string) error {
 	if err != nil {
 		return err
 	}
+	h.mu.Lock()
 	h.personalPlane, h.personalClient = &connection, client
+	h.planeStatus.DeviceID = connection.DeviceID
+	h.mu.Unlock()
 	h.personalSources = make(map[string]planeSource)
 	return nil
 }
 
 func (h *bridgeHost) refreshPersonalPlane(ctx context.Context) error {
 	if h.personalClient == nil {
-		return nil
+		if h.personalPath != "" {
+			if err := h.loadPersonalPlane(h.personalPath); err != nil {
+				return err
+			}
+		}
+		if h.personalClient == nil {
+			return nil
+		}
 	}
 	listing, err := h.personalClient.DeviceProjects(ctx)
+	h.mu.Lock()
+	h.planeStatus.Reachable = err == nil && listing.State == "active"
+	h.mu.Unlock()
 	if err != nil {
 		return err
+	}
+	if listing.RelayURL != "" {
+		h.mu.Lock()
+		h.personalPlane.RelayURL = listing.RelayURL
+		h.mu.Unlock()
 	}
 	allowed := make(map[string]bool)
 	if listing.State == "active" {
@@ -86,4 +104,38 @@ func (h *bridgeHost) refreshPersonalPlane(ctx context.Context) error {
 	h.sources = append(append([]planeSource(nil), h.legacySources...), sources...)
 	h.mu.Unlock()
 	return nil
+}
+
+func (h *bridgeHost) heartbeatPersonalPlane(ctx context.Context) error {
+	h.mu.Lock()
+	client, relayURL := h.personalClient, ""
+	if h.personalPlane != nil {
+		relayURL = h.personalPlane.RelayURL
+	}
+	h.mu.Unlock()
+	if client == nil || relayURL == "" {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	err := client.DeviceHeartbeat(ctx, relayURL)
+	h.mu.Lock()
+	h.planeStatus.RelayReachable = err == nil
+	h.mu.Unlock()
+	return err
+}
+
+func (h *bridgeHost) maintainPersonalHeartbeat(ctx context.Context) {
+	tick := time.NewTicker(15 * time.Second)
+	defer tick.Stop()
+	for ctx.Err() == nil {
+		if err := h.heartbeatPersonalPlane(ctx); err != nil {
+			h.warn("CF device heartbeat failed; Plane task polling continues", err)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+		}
+	}
 }

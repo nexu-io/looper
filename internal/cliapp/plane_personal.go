@@ -32,8 +32,7 @@ func (r *commandRuntime) connectPersonalPlane(cmd *cobra.Command, origin, code s
 	keyFile := filepath.Join(home, ".looper", "runtime", "plane-device-"+safeFileComponent(exchange.ConnectionID)+".pem")
 	pending := keyFile + ".pending"
 	if exchange.Status == "created" || exchange.Status == "cli_connected" {
-		// Reuse the pending key if a prior HTTP response was lost. Only the
-		// short-lived network challenge is refreshed, never the accepted key.
+		// Keep the same key when a prior HTTP response was lost.
 		var key ed25519.PrivateKey
 		if data, err := r.readFile(pending); err == nil {
 			block, _ := pem.Decode(data)
@@ -62,12 +61,6 @@ func (r *commandRuntime) connectPersonalPlane(cmd *cobra.Command, origin, code s
 				return err
 			}
 		}
-		body, key, err := r.buildPlaneLinkRequestWithKey(cmd.Context(), node, planeLinkProofIdentity{
-			WorkspaceID: exchange.WorkspaceID, ProjectID: exchange.ProjectID, MemberID: exchange.MemberID,
-		}, key)
-		if err != nil {
-			return err
-		}
 		encoded, err := x509.MarshalPKCS8PrivateKey(key)
 		if err != nil {
 			return err
@@ -78,17 +71,35 @@ func (r *commandRuntime) connectPersonalPlane(cmd *cobra.Command, origin, code s
 		if err := r.writeFile(pending, pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: encoded}), 0600); err != nil {
 			return err
 		}
-		var linked struct {
-			Binding planeLinkBinding `json:"binding"`
+		if exchange.Pairing == "device_v1" {
+			name, err := os.Hostname()
+			if err != nil {
+				return err
+			}
+			linked, err := planestrict.PairDevice(cmd.Context(), origin, exchange.Workspace, exchange.ProjectID, exchange.ConnectionID, code, name, key, planestrict.WithHTTPClient(r.httpClient()))
+			if err != nil {
+				return fmt.Errorf("pair personal Looper: %w; retry the same connection command", err)
+			}
+			exchange.DeviceID, exchange.NodeID = linked.Binding.ID, linked.Binding.NodeID
+		} else {
+			body, _, err := r.buildPlaneLinkRequestWithKey(cmd.Context(), node, planeLinkProofIdentity{
+				WorkspaceID: exchange.WorkspaceID, ProjectID: exchange.ProjectID, MemberID: exchange.MemberID,
+			}, key)
+			if err != nil {
+				return err
+			}
+			var linked struct {
+				Binding planeLinkBinding `json:"binding"`
+			}
+			if err := r.planeRawRequestWithHeaders(cmd.Context(), origin, "", http.MethodPost,
+				"/api/looper/connections/link/", planeLinkMediaType, body,
+				map[string]string{"X-Looper-Connect-Code": code, "X-Looper-Node-Name": node.NodeName}, &linked); err != nil {
+				return fmt.Errorf("pair personal Looper: %w; retry the same connection command", err)
+			}
+			exchange.DeviceID, exchange.NodeID = linked.Binding.ID, linked.Binding.NodeID
 		}
-		if err := r.planeRawRequestWithHeaders(cmd.Context(), origin, "", http.MethodPost,
-			"/api/looper/connections/link/", planeLinkMediaType, body,
-			map[string]string{"X-Looper-Connect-Code": code, "X-Looper-Node-Name": node.NodeName}, &linked); err != nil {
-			return fmt.Errorf("pair personal Looper: %w; the pending key is retained; retry the same connection command", err)
-		}
-		exchange.DeviceID, exchange.NodeID = linked.Binding.ID, linked.Binding.NodeID
 	}
-	if exchange.NodeID != node.NodeID || exchange.DeviceID == "" {
+	if (exchange.Pairing != "device_v1" && exchange.NodeID != node.NodeID) || exchange.DeviceID == "" || exchange.NodeID == "" {
 		return fmt.Errorf("the Plane device pairing does not belong to this local Looper")
 	}
 	if _, err := os.Stat(pending); err == nil {
@@ -97,7 +108,8 @@ func (r *commandRuntime) connectPersonalPlane(cmd *cobra.Command, origin, code s
 		}
 	}
 	connection := planestrict.DeviceConnection{BaseURL: origin, WebBaseURL: exchange.WebBaseURL, DeviceID: exchange.DeviceID,
-		MemberID: exchange.MemberID, NodeID: node.NodeID, Workspace: exchange.Workspace,
+		Pairing: exchange.Pairing, RelayURL: exchange.RelayURL,
+		MemberID: exchange.MemberID, NodeID: exchange.NodeID, Workspace: exchange.Workspace,
 		ProjectID: exchange.ProjectID, PrivateKeyFile: keyFile}
 	client, err := connection.Client(connection.Workspace, connection.ProjectID, planestrict.WithHTTPClient(r.httpClient()))
 	if err != nil {
@@ -128,9 +140,9 @@ func (r *commandRuntime) connectPersonalPlane(cmd *cobra.Command, origin, code s
 		}
 	}
 	if getBoolFlag(cmd, "json") {
-		return writeJSON(cmd.OutOrStdout(), map[string]any{"connected": true, "deviceId": connection.DeviceID, "node": node.NodeName, "next": "looper collab start"})
+		return writeJSON(cmd.OutOrStdout(), map[string]any{"connected": true, "deviceId": connection.DeviceID, "node": connection.NodeID, "next": "looper collab start"})
 	}
-	printSection(cmd.OutOrStdout(), "Personal Looper connected", [][2]any{{"node", node.NodeName}, {"deviceId", connection.DeviceID}, {"next", "Run looper collab start (restart an idle existing host). Your allowed projects are discovered automatically."}})
+	printSection(cmd.OutOrStdout(), "Personal Looper connected", [][2]any{{"deviceId", connection.DeviceID}, {"next", "Run looper collab start. An unconnected running host will discover this device automatically."}})
 	return nil
 }
 
@@ -196,9 +208,18 @@ func (r *commandRuntime) personalPlaneDoctor(ctx context.Context, cfg config.Con
 	}
 	var status struct {
 		Network networkclient.Status `json:"network"`
+		Plane   collab.PlaneStatus   `json:"plane"`
 	}
 	if err = json.Unmarshal(raw, &status); err != nil {
 		add("collab", "failed", err.Error(), "Restart the collaboration host.")
+		return
+	}
+	if device.Pairing == "device_v1" {
+		if status.Plane.DeviceID != device.DeviceID || !status.Plane.Reachable || !status.Plane.RelayReachable {
+			add("collab", "failed", "Plane connection or CF heartbeat is not ready", "Check looper collab status --json and the Plane/CF relay configuration.")
+		} else {
+			add("collab", "passed", "Plane connected · CF device heartbeat online", "")
+		}
 		return
 	}
 	if !status.Network.Configured || !status.Network.CloudReachable || status.Network.NodeID != device.NodeID || status.Network.IdentityDrift {
