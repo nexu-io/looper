@@ -537,19 +537,40 @@ func (r *FeishuLiveFeedsRepository) MessageByLoop(ctx context.Context, loopID st
 type EventsRepository struct{ q sqliteQuerier }
 
 func (r *EventsRepository) Append(ctx context.Context, record EventLogRecord) error {
-	_, err := r.q.ExecContext(ctx, `
+	return r.append(ctx, record, false)
+}
+
+func (r *EventsRepository) AppendOnce(ctx context.Context, record EventLogRecord) error {
+	return r.append(ctx, record, true)
+}
+
+func (r *EventsRepository) append(ctx context.Context, record EventLogRecord, once bool) error {
+	query := `
 		INSERT INTO event_logs (
 			id, event_type, project_id, loop_id, run_id, entity_type, entity_id,
 			correlation_id, causation_id, actor_type, actor_id, actor_display_name,
 			payload_json, created_at
 		)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, record.ID, record.EventType, record.ProjectID, record.LoopID, record.RunID, record.EntityType, record.EntityID, record.CorrelationID, record.CausationID, record.ActorType, record.ActorID, record.ActorDisplayName, record.PayloadJSON, record.CreatedAt)
+	`
+	if once {
+		query += " ON CONFLICT(id) DO NOTHING"
+	}
+	_, err := r.q.ExecContext(ctx, query, record.ID, record.EventType, record.ProjectID, record.LoopID, record.RunID, record.EntityType, record.EntityID, record.CorrelationID, record.CausationID, record.ActorType, record.ActorID, record.ActorDisplayName, record.PayloadJSON, record.CreatedAt)
 	if err != nil {
 		return fmt.Errorf("append event log: %w", err)
 	}
 
 	return nil
+}
+
+func (r *EventsRepository) ListByLoop(ctx context.Context, loopID string) ([]EventLogRecord, error) {
+	rows, err := r.q.QueryContext(ctx, `SELECT * FROM event_logs WHERE loop_id = ? ORDER BY created_at, rowid`, loopID)
+	if err != nil {
+		return nil, fmt.Errorf("list task events: %w", err)
+	}
+	defer rows.Close()
+	return scanEventLogs(rows)
 }
 
 func (r *EventsRepository) List(ctx context.Context, limit int64) ([]EventLogRecord, error) {
@@ -1330,6 +1351,15 @@ func (r *AgentExecutionsRepository) List(ctx context.Context) ([]AgentExecutionR
 	}
 	defer rows.Close()
 
+	return scanAgentExecutions(rows)
+}
+
+func (r *AgentExecutionsRepository) ListByRun(ctx context.Context, runID string) ([]AgentExecutionRecord, error) {
+	rows, err := r.q.QueryContext(ctx, `SELECT `+agentExecutionColumns+` FROM agent_executions WHERE run_id = ? ORDER BY started_at, id`, runID)
+	if err != nil {
+		return nil, fmt.Errorf("list run agent executions: %w", err)
+	}
+	defer rows.Close()
 	return scanAgentExecutions(rows)
 }
 

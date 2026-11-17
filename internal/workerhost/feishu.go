@@ -97,12 +97,20 @@ func PollPrivateFeishu(ctx context.Context, input FeishuPollInput) error {
 			if input.OnHITLAnswerDelivered != nil {
 				input.OnHITLAnswerDelivered(ctx, loop.ID, reply.Text)
 			}
+			trackingErr := eventlog.Track(ctx, input.Repos, eventlog.AppendInput{ID: "human.answered:" + loop.ID + ":" + ask.QuestionMessageID, EventType: "human.answered", ProjectID: &loop.ProjectID, LoopID: &loop.ID, Payload: map[string]any{"questionMessageId": ask.QuestionMessageID, "messageIds": reply.MessageIDs, "transport": "feishu"}})
 			// A reaction acknowledges receipt without interpreting the answer.
 			// Failure must not prevent the already-delivered reply from resuming.
 			ackCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
-			var ackErr error
+			ackErr := trackingErr
 			for _, id := range reply.MessageIDs {
-				ackErr = errors.Join(ackErr, client.MarkReplyProcessing(ackCtx, id))
+				receiptErr := client.MarkReplyProcessing(ackCtx, id)
+				ackErr = errors.Join(ackErr, receiptErr)
+				status := "sent"
+				if receiptErr != nil {
+					status = "failed"
+				}
+				trackErr := eventlog.Track(ctx, input.Repos, eventlog.AppendInput{ID: "feishu.receipt:" + id, EventType: "feishu.receipt", ProjectID: &loop.ProjectID, LoopID: &loop.ID, Payload: map[string]any{"messageId": id, "status": status, "transport": "feishu"}})
+				ackErr = errors.Join(ackErr, trackErr)
 			}
 			cancel()
 			if ackErr != nil {

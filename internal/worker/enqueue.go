@@ -72,7 +72,15 @@ func (r *Runner) Enqueue(ctx context.Context, input EnqueueInput) (storage.LoopR
 		id = "loop_plane_" + input.StrictDispatchID
 	}
 	service := loops.Service{DB: r.db, Repos: r.repos, Now: r.now}
-	return service.Create(ctx, loops.CreateInput{ID: id, ProjectID: project.ID, Type: domain.LoopTypeWorker, Target: target, Status: domain.LoopStatusQueued, MetadataJSON: &metadataJSON,
+	record, err := service.Create(ctx, loops.CreateInput{ID: id, ProjectID: project.ID, Type: domain.LoopTypeWorker, Target: target, Status: domain.LoopStatusQueued, MetadataJSON: &metadataJSON,
 		QueueItem: &storage.QueueItemRecord{ID: eventlog.NewEventID("queue"), Type: "worker", Repo: &configuredRepo, LockKey: key, PayloadJSON: &payloadJSON, Priority: storage.QueuePriorityWorker, Status: "queued", AvailableAt: now, MaxAttempts: r.retryMaxAttempts, CreatedAt: now, UpdatedAt: now},
 	})
+	if err == nil {
+		source := "manual"
+		if input.StrictDispatchID != "" {
+			source = "plane"
+		}
+		r.track(ctx, "task.received", record.ID, project.ID, record.ID, "", map[string]any{"source": source, "dispatchId": input.StrictDispatchID, "issueNumber": input.IssueNumber, "executionMode": work.ExecutionMode})
+	}
+	return record, err
 }

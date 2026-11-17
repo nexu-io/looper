@@ -12,6 +12,7 @@ import (
 )
 
 type AppendInput struct {
+	Once             bool
 	ID               string
 	EventType        string
 	ProjectID        *string
@@ -83,7 +84,7 @@ func Append(ctx context.Context, repositories *storage.Repositories, input Appen
 		actorDisplayName = stringPointer("looperd")
 	}
 
-	return repositories.Events.Append(ctx, storage.EventLogRecord{
+	record := storage.EventLogRecord{
 		ID:               id,
 		EventType:        input.EventType,
 		ProjectID:        input.ProjectID,
@@ -98,7 +99,11 @@ func Append(ctx context.Context, repositories *storage.Repositories, input Appen
 		ActorDisplayName: actorDisplayName,
 		PayloadJSON:      payloadJSON,
 		CreatedAt:        FormatJavaScriptISOString(createdAt),
-	})
+	}
+	if input.Once {
+		return repositories.Events.AppendOnce(ctx, record)
+	}
+	return repositories.Events.Append(ctx, record)
 }
 
 func stringPointer(value string) *string {

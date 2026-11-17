@@ -42,6 +42,7 @@ type Task struct {
 }
 
 type TurnEvent struct {
+ TurnID string `json:"turnId"`
 	RootMessageID string `json:"rootMessageId"`
 	Phase         string `json:"phase"`
 	ChatID        string `json:"chatId"`

@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { chmod, mkdir, unlink } from 'node:fs/promises';
 import { createServer, request } from 'node:http';
 import { dirname } from 'node:path';
@@ -28,8 +29,11 @@ const init = await new Promise<Init>((resolve, reject) => {
   input.once('close', () => reject(new Error('host closed before initialization')));
 });
 
+const turns = new Map<string, string>();
 async function report(event: TurnEvent): Promise<void> {
-  const body = JSON.stringify(event);
+  const key = `${event.chatId}:${event.rootMessageId}`;
+  if (event.phase === 'started' || !turns.has(key)) turns.set(key, randomUUID());
+  const body = JSON.stringify({ ...event, turnId: turns.get(key) });
   await new Promise<void>((resolve, reject) => {
     const req = request({ socketPath: init.callbackSocket, path: '/bridge/events',
       method: 'POST', headers: { 'content-type': 'application/json' } }, (res) => {
@@ -40,6 +44,7 @@ async function report(event: TurnEvent): Promise<void> {
     req.on('error', reject);
     req.end(body);
   });
+  if (event.phase === 'finished' || event.phase === 'failed') turns.delete(key);
 }
 
 const projects = await listProjects();

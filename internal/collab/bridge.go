@@ -20,6 +20,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/nexu-io/looper/internal/agent"
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/domain"
 	"github.com/nexu-io/looper/internal/eventlog"
@@ -41,18 +42,20 @@ import (
 // Outcome is the agent's task conclusion. Infrastructure never infers a PR
 // requirement from a task title or from the absence of commits.
 type Outcome struct {
-	State        string   `json:"state"`
-	Summary      string   `json:"summary"`
-	PullRequests []string `json:"pullRequests,omitempty"`
-	WaitingFor   []string `json:"waitingFor,omitempty"`
+	Repositories []agent.RepositoryReport `json:"repositories,omitempty"`
+	State        string                   `json:"state"`
+	Summary      string                   `json:"summary"`
+	PullRequests []string                 `json:"pullRequests,omitempty"`
+	WaitingFor   []string                 `json:"waitingFor,omitempty"`
 }
 
 type bridgeTask struct {
-	RootID    string  `json:"rootId,omitempty"`
-	ThreadID  string  `json:"threadId,omitempty"`
-	SessionID string  `json:"sessionId,omitempty"`
-	Outcome   Outcome `json:"outcome"`
-	Signal    string  `json:"signal,omitempty"`
+	TrackingRunID string  `json:"trackingRunId,omitempty"`
+	RootID        string  `json:"rootId,omitempty"`
+	ThreadID      string  `json:"threadId,omitempty"`
+	SessionID     string  `json:"sessionId,omitempty"`
+	Outcome       Outcome `json:"outcome"`
+	Signal        string  `json:"signal,omitempty"`
 }
 
 type bridgeHost struct {
@@ -209,6 +212,9 @@ func serveBridge(parent context.Context, options Options) error {
 		host.maintainPeople(ctx, appID)
 	}()
 	defer func() { cancel(); <-peopleDone }()
+	if err := host.interruptTrackedTurns(ctx); err != nil {
+		host.warn("prior turn tracking recovery failed", err)
+	}
 	host.ready.Store(true)
 	// A bridge resume uses the native session recorded by upstream. No recovered
 	// OS PID is inspected or killed, and no synthetic human answer is generated.
@@ -270,9 +276,13 @@ func (h *bridgeHost) enqueue(ctx context.Context, input worker.EnqueueInput) (st
 		id = "loop_plane_" + input.StrictDispatchID
 	}
 	service := loops.Service{DB: h.db, Repos: h.repos}
-	return service.Create(ctx, loops.CreateInput{ID: id, ProjectID: input.ProjectID,
+	loop, err := service.Create(ctx, loops.CreateInput{ID: id, ProjectID: input.ProjectID,
 		Type: domain.LoopTypeWorker, Target: domain.LoopTarget{TargetType: domain.LoopTargetTypeProject, ProjectID: input.ProjectID},
 		Status: domain.LoopStatusQueued, MetadataJSON: &metadataJSON})
+	if err == nil {
+		h.track(ctx, loop, "task.received", loop.ID, "", map[string]any{"source": "collab", "dispatchId": input.StrictDispatchID, "issueNumber": input.IssueNumber, "executionMode": "feishu_bridge"})
+	}
+	return loop, err
 }
 
 func readBridgeTask(loop storage.LoopRecord) (worker.EnqueueInput, bridgeTask, bool) {
@@ -400,6 +410,18 @@ func (h *bridgeHost) recordTurnEvent(ctx context.Context, event feishubridge.Tur
 		if !ok || loop.Status == "terminated" || !((event.ThreadID != "" && event.ThreadID == state.ThreadID) || (event.RootMessageID != "" && event.RootMessageID == state.RootID)) {
 			continue
 		}
+		if event.Phase != "started" && event.Phase != "bound" && event.Phase != "finished" && event.Phase != "failed" {
+			return "", fmt.Errorf("unknown turn phase %q", event.Phase)
+		}
+		if h.bridgeDuplicate(ctx, loop, event) {
+			return loop.ID, nil
+		}
+		if event.TurnID != "" && event.Phase != "started" && state.TrackingRunID != bridgeRunID(loop.ID, event.TurnID) {
+			state.TrackingRunID = ""
+		}
+		if event.Phase == "started" {
+			state.TrackingRunID = bridgeRunID(loop.ID, event.TurnID)
+		}
 		if event.ThreadID != "" {
 			state.ThreadID = event.ThreadID
 		}
@@ -452,6 +474,7 @@ func (h *bridgeHost) recordTurnEvent(ctx context.Context, event feishubridge.Tur
 		} else {
 			_, _ = h.db.ExecContext(ctx, `UPDATE loops SET metadata_json=json_remove(metadata_json,'$.hitl') WHERE id=?`, loop.ID)
 		}
+		h.trackTurn(ctx, loop, state, event, status)
 		return loop.ID, nil
 	}
 	return "", nil
@@ -467,6 +490,7 @@ func readOutcome(path string) (Outcome, error) {
 	if err := json.NewDecoder(io.LimitReader(file, 64<<10)).Decode(&outcome); err != nil {
 		return Outcome{}, err
 	}
+	outcome.Repositories = agent.ParseRepositoryReports(outcome.Repositories)
 	switch outcome.State {
 	case "completed", "needs_input", "monitoring_prs":
 		return outcome, nil
@@ -550,7 +574,7 @@ open_id 只适用于目录 app_id 对应的应用，不能搬用别的 bot 的 o
 格式：{"state":"needs_input","summary":"一句话进展","waitingFor":["负责人 open_id"],"pullRequests":["https://github.com/owner/repo/pull/123"]}
 summary 只写一句短进展（约 40 字），解释和证据放话题正文，不要复制整篇回复。
 waitingFor 中填写从当前应用目录查得的真实 open_id；不要把 owner、qa 或人名当作 open_id。不确定等谁时留空，在话题中问 owner。
-state 可为 needs_input（确实需要人回复）、monitoring_prs（PR 尚在推进或等待合并）、completed（任务已实际完成；有 PR 时应在收尾后）。pullRequests 记录任务涉及的全部仓库 PR，允许为空。
+state 可为 needs_input（确实需要人回复）、monitoring_prs（PR 尚在推进或等待合并）、completed（任务已实际完成；有 PR 时应在收尾后）。pullRequests 记录任务涉及的全部仓库 PR，允许为空。可选 repositories 数组记录实际选择的仓库：repo（HTTPS URL）、role（modify/consult/candidate）、branch、baseSha、prUrl、validationStatus（passed/failed/not_run/blocked）。这是 Agent 上报，不代表人工验收。
 继续原话题时沿用同一个任务文件。普通聊天只有 @bot 才触发你，不要自行轮询飞书抢另一条消息通道。
 `
 	return os.WriteFile(filepath.Join(dir, "AGENTS.md"), []byte(text), 0600)
@@ -636,7 +660,10 @@ func (h *bridgeHost) planeDispatch(ctx context.Context, client *forge.PlaneClien
 		if scope := dispatch.CollaborationScope; scope != nil {
 			input.ChatScope, input.ChatTitle, input.ChatURL = scope.Key, scope.Name, client.CollaborationURL(scope)
 		}
-		_, err = h.enqueue(ctx, input)
+		received, err := h.enqueue(ctx, input)
+		if err == nil {
+			h.track(ctx, received, "plane.dispatch.received", dispatch.ID, "", map[string]any{"dispatchId": dispatch.ID, "issueNumber": issue.Number, "projectId": project})
+		}
 		return err
 	}
 	_, state, ok := readBridgeTask(*loop)
@@ -675,7 +702,11 @@ func (h *bridgeHost) planeDispatch(ctx context.Context, client *forge.PlaneClien
 		status = loop.Status
 	}
 	if status != "" && dispatch.Health == "ok" && dispatch.State != status {
-		return client.TransitionStrictDispatch(ctx, dispatch.ID, status, wait)
+		if err := client.TransitionStrictDispatch(ctx, dispatch.ID, status, wait); err != nil {
+			return err
+		}
+		h.track(ctx, *loop, "plane.state.synced", eventlog.NewEventID("sync"), "", map[string]any{"dispatchId": dispatch.ID, "state": status})
+		return nil
 	}
 	return nil
 }

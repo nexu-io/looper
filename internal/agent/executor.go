@@ -222,11 +222,12 @@ type completionParse struct {
 	// completion marker (`{"summary":…,"productAsk":…}`) when a spec has a real
 	// product decision only a human product owner can make. Empty for the common
 	// case; only the planner is instructed to ever populate it.
-	ProductAsk   string
-	Artifacts    []string
-	ChangedFiles []string
-	Commits      []string
-	Lifecycle    *lifecycle.State
+	ProductAsk        string
+	Artifacts         []string
+	ChangedFiles      []string
+	Commits           []string
+	Lifecycle         *lifecycle.State
+	RepositoryReports []RepositoryReport
 }
 
 type Execution interface {
@@ -1091,6 +1092,12 @@ func (x *execution) run(ctx context.Context) {
 			"heartbeatCount":               result.HeartbeatCount,
 			"summary":                      result.Summary,
 		}, endedAtISO)
+		if len(completion.Artifacts) > 0 {
+			x.executor.appendLifecycleEvent("artifacts.reported", x.input, x.executionID, map[string]any{"source": "agent_report", "count": len(completion.Artifacts)}, endedAtISO)
+		}
+		for _, report := range completion.RepositoryReports {
+			x.executor.appendLifecycleEvent("repository.reported", x.input, x.executionID, map[string]any{"source": "agent_report", "repo": report.Repo, "role": report.Role, "branch": report.Branch, "baseSha": report.BaseSHA, "prUrl": report.PRURL, "validationStatus": report.ValidationStatus}, endedAtISO)
+		}
 	}
 
 	x.doneCh <- execOutcome{result: result, err: persistErr}
@@ -2705,11 +2712,12 @@ func parseCompletion(stdout, stderr string) completionParse {
 			return completionParse{ParseStatus: "invalid_json", CompletionSignal: CompletionMarkerPrefix}
 		}
 		result := completionParse{
-			ParseStatus:      "parsed",
-			CompletionSignal: CompletionMarkerPrefix,
-			Artifacts:        asStringSlice(parsed["artifacts"]),
-			ChangedFiles:     asStringSlice(parsed["changedFiles"]),
-			Commits:          asStringSlice(parsed["commits"]),
+			ParseStatus:       "parsed",
+			CompletionSignal:  CompletionMarkerPrefix,
+			Artifacts:         asStringSlice(parsed["artifacts"]),
+			RepositoryReports: parseRepositoryReports(parsed["repositories"]),
+			ChangedFiles:      asStringSlice(parsed["changedFiles"]),
+			Commits:           asStringSlice(parsed["commits"]),
 		}
 		if state, err := lifecycle.FromMap(parsed["git_pr_lifecycle"]); err == nil {
 			result.Lifecycle = state
@@ -2742,6 +2750,9 @@ func parseCompletion(stdout, stderr string) completionParse {
 		}
 		if len(primary.Artifacts) == 0 {
 			primary.Artifacts = result.Artifacts
+		}
+		if len(primary.RepositoryReports) == 0 {
+			primary.RepositoryReports = result.RepositoryReports
 		}
 		if strings.TrimSpace(primary.ProductAsk) == "" && strings.TrimSpace(result.ProductAsk) != "" {
 			primary.ProductAsk = result.ProductAsk
@@ -2912,6 +2923,7 @@ func (e *ConfiguredExecutor) appendLifecycleEvent(eventType string, input RunInp
 		ProjectID:        emptyToNil(input.ProjectID),
 		LoopID:           emptyToNil(input.LoopID),
 		RunID:            emptyToNil(input.RunID),
+		CorrelationID:    emptyToNil(input.LoopID),
 		EntityType:       stringPtr("agent_execution"),
 		EntityID:         &executionID,
 		ActorType:        stringPtr("agent"),

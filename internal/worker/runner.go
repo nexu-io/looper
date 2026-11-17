@@ -1270,6 +1270,9 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		return ProcessResult{}, err
 	}
 	run := resumedRun.Run
+	if strictDispatchID != "" {
+		r.track(ctx, "plane.state.synced", strictDispatchID+":running:"+run.ID, project.ID, loop.ID, run.ID, map[string]any{"dispatchId": strictDispatchID, "state": "running"})
+	}
 	checkpoint := resumedRun.Checkpoint
 	claimedLockKey := ""
 	acquiredClaimedLock := false
@@ -1451,6 +1454,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		if err := gateway.TransitionStrictDispatch(ctx, StrictDispatchTransitionInput{Repo: derefString(loop.Repo), CWD: project.RepoPath, DispatchID: strictDispatchID, State: "completed"}); err != nil {
 			return ProcessResult{}, fmt.Errorf("complete strict worker dispatch %s: %w", strictDispatchID, err)
 		}
+		r.track(ctx, "plane.state.synced", strictDispatchID+":completed:"+run.ID, project.ID, loop.ID, run.ID, map[string]any{"dispatchId": strictDispatchID, "state": "completed"})
 	}
 	if _, err := r.completeRun(ctx, run, "success", summary, "", checkpoint); err != nil {
 		return ProcessResult{}, err
@@ -3014,6 +3018,7 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 	if err := r.repos.Runs.Upsert(ctx, run); err != nil {
 		return resumedRunContext{}, err
 	}
+	r.track(ctx, "run.started", run.ID, loop.ProjectID, loop.ID, run.ID, map[string]any{"startStep": startStep, "resumed": resumed})
 	parsedCheckpoint, err := parseCheckpoint(run.CheckpointJSON)
 	if err != nil {
 		return resumedRunContext{}, err
@@ -3032,6 +3037,7 @@ func (r *Runner) persistStepStarted(ctx context.Context, run storage.RunRecord, 
 	if err := r.repos.Runs.Upsert(ctx, updated); err != nil {
 		return storage.RunRecord{}, err
 	}
+	r.track(ctx, "step.started", run.ID+":"+string(step), "", run.LoopID, run.ID, map[string]any{"step": step})
 	return updated, nil
 }
 
@@ -3051,6 +3057,7 @@ func (r *Runner) persistStepCompleted(ctx context.Context, run storage.RunRecord
 	if err := r.repos.Runs.Upsert(ctx, updated); err != nil {
 		return storage.RunRecord{}, err
 	}
+	r.track(ctx, "step.completed", run.ID+":"+string(step), "", run.LoopID, run.ID, map[string]any{"step": step})
 	return updated, nil
 }
 
@@ -3091,6 +3098,7 @@ func (r *Runner) completeRun(ctx context.Context, run storage.RunRecord, status,
 	if err := r.repos.Runs.Upsert(ctx, updated); err != nil {
 		return storage.RunRecord{}, err
 	}
+	r.track(ctx, "run.ended", run.ID, "", run.LoopID, run.ID, map[string]any{"status": status, "step": run.CurrentStep, "resumePolicy": checkpoint.ResumePolicy, "durationMs": elapsedMilliseconds(run.StartedAt, endedAt)})
 	return updated, nil
 }
 
@@ -3480,10 +3488,14 @@ func (r *Runner) updateLoop(ctx context.Context, loop storage.LoopRecord, mutate
 	if current != nil {
 		updated = *current
 	}
+	previousStatus := updated.Status
 	mutate(&updated)
 	updated.UpdatedAt = r.nowISO()
 	if err := r.repos.Loops.Upsert(ctx, updated); err != nil {
 		return storage.LoopRecord{}, err
+	}
+	if previousStatus != updated.Status {
+		r.track(ctx, "task.state_changed", updated.ID+":"+updated.UpdatedAt+":"+updated.Status, updated.ProjectID, updated.ID, "", map[string]any{"from": previousStatus, "to": updated.Status})
 	}
 	return updated, nil
 }
