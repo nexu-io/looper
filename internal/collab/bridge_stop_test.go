@@ -115,6 +115,12 @@ server.listen(init.socket);const stop=()=>server.close(()=>process.exit(0));proc
 	if saved.Status != "terminated" || h.active[loop.ID] {
 		t.Fatal("later callbacks resurrected stopped task")
 	}
+	body, _ := json.Marshal(feishubridge.TurnEvent{Phase: "started", ThreadID: "omt_unrelated"})
+	response := httptest.NewRecorder()
+	h.turnEvent(response, httptest.NewRequest("POST", "/bridge/events", bytes.NewReader(body)))
+	if response.Code != 200 {
+		t.Fatal("explicit task stop restricted an unrelated conversation")
+	}
 	// Completed tasks retain a native session too. Revocation and removal from
 	// a project must disable those conversations, without mistaking an outage
 	// for a permission change.

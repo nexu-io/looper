@@ -400,13 +400,11 @@ func (h *bridgeHost) turnEvent(w http.ResponseWriter, r *http.Request) {
 	}
 	id, err := h.recordTurnEvent(r.Context(), event)
 	if err != nil {
-		http.Error(w, err.Error(), 500)
-		return
-	}
-	if id == "" && event.Phase == "started" {
-		// Upstream awaits this callback before invoking the coding agent. A
-		// stopped task's persisted native session must not restart execution.
-		http.Error(w, "task is no longer active", http.StatusConflict)
+		code := http.StatusInternalServerError
+		if errors.Is(err, errBridgeTaskStopped) {
+			code = http.StatusConflict
+		}
+		http.Error(w, err.Error(), code)
 		return
 	}
 	// Feishu delivery can take seconds. Keep it out of the task-state lock.
@@ -415,6 +413,8 @@ func (h *bridgeHost) turnEvent(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, map[string]bool{"ok": true})
 }
+
+var errBridgeTaskStopped = errors.New("task has been stopped from Plane")
 
 func (h *bridgeHost) recordTurnEvent(ctx context.Context, event feishubridge.TurnEvent) (string, error) {
 	h.mu.Lock()
@@ -425,8 +425,16 @@ func (h *bridgeHost) recordTurnEvent(ctx context.Context, event feishubridge.Tur
 	}
 	for _, loop := range items {
 		input, state, ok := readBridgeTask(loop)
-		if !ok || loop.Status == "terminated" || !((event.ThreadID != "" && event.ThreadID == state.ThreadID) || (event.RootMessageID != "" && event.RootMessageID == state.RootID)) {
+		if !ok || !((event.ThreadID != "" && event.ThreadID == state.ThreadID) || (event.RootMessageID != "" && event.RootMessageID == state.RootID)) {
 			continue
+		}
+		if loop.Status == "terminated" {
+			// Upstream awaits this callback before invoking the coding agent.
+			// Reject only an explicitly stopped task, not unrelated conversations.
+			if event.Phase == "started" {
+				return "", errBridgeTaskStopped
+			}
+			return "", nil
 		}
 		if event.ThreadID != "" {
 			state.ThreadID = event.ThreadID
