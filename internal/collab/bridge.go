@@ -119,6 +119,10 @@ func serveBridge(parent context.Context, options Options) error {
 	if host.chats == nil {
 		return fmt.Errorf("configure the Feishu bot and owner before starting collaboration")
 	}
+	host.sources, err = bridgePlaneSources(cfg)
+	if err != nil {
+		return err
+	}
 	host.notify = notify.NewGateway(notify.Options{Config: cfg.Notifications, Repositories: repos,
 		FeishuCLI: workerhost.PrivateFeishuClient(&cfg), LogFilePath: LogPath(dir),
 		ResolveOwnerName:   host.ownerName,
@@ -214,10 +218,6 @@ func serveBridge(parent context.Context, options Options) error {
 	host.mu.Lock()
 	host.network = network
 	host.mu.Unlock()
-	host.sources, err = bridgePlaneSources(cfg)
-	if err != nil {
-		return err
-	}
 	telemetryDone := make(chan struct{})
 	go func() {
 		defer close(telemetryDone)

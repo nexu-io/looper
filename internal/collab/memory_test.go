@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/forge"
@@ -30,6 +31,47 @@ func TestMemoryMCPRegistrationRequiresExplicitOptIn(t *testing.T) {
 	h.sources = append(h.sources, planeSource{memoryEnabled: true})
 	if socket, script := h.memoryToolPaths(); socket != SocketPath(h.dir) || script != filepath.Join(h.dir, "workspace", "memory.py") {
 		t.Fatal("enabled memory tools not registered")
+	}
+}
+
+func TestMemoryBridgeStartupLoadsConnectionsBeforeInit(t *testing.T) {
+	if _, err := exec.LookPath("node"); err != nil {
+		t.Skip("Node.js unavailable")
+	}
+	cfg, dir := hostFixture(t, "#!/bin/sh\nexit 1\n")
+	_, private, _ := ed25519.GenerateKey(rand.Reader)
+	der, _ := x509.MarshalPKCS8PrivateKey(private)
+	key := filepath.Join(dir, "node.pem")
+	if err := os.WriteFile(key, pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der}), 0600); err != nil {
+		t.Fatal(err)
+	}
+	env, workspace, project := "MEMORY_STARTUP_API_KEY", "workspace", "33333333-4444-4555-8666-777777777777"
+	t.Setenv(env, "fixture")
+	t.Setenv("FEISHU_APP_ID", "fixture-app")
+	t.Setenv("FEISHU_APP_SECRET", "fixture-secret")
+	cfg.HITL.Enabled, cfg.HITL.AnswerTransport = true, "feishu"
+	cfg.HITL.Feishu = &config.HITLFeishuConfig{ChatID: "oc_fixture", OwnerOpenID: "ou_fixture"}
+	cfg.Projects[0].Provider = "plane"
+	cfg.Providers = []config.ProviderConfig{{ID: "plane", Kind: config.ProviderKindPlane, BaseURL: "http://127.0.0.1:1/api/v1", TokenEnv: &env, Workspace: &workspace, ProjectID: &project, StrictDispatch: &config.PlaneStrictDispatchConfig{Enabled: true, MemoryEnabled: true, BaseURL: "http://127.0.0.1:1", NodeID: "fixture", BindingID: "77777777-7777-4777-8777-777777777777", KeyRevision: 1, PrivateKeyFile: key}}}
+	capture := filepath.Join(dir, "init.json")
+	t.Setenv("COLLAB_MEMORY_INIT_CAPTURE", capture)
+	entry := filepath.Join(dir, "capture.mjs")
+	if err := os.WriteFile(entry, []byte(`import{createInterface}from'node:readline';import{writeFileSync}from'node:fs';createInterface({input:process.stdin}).once('line',line=>{const i=JSON.parse(line);writeFileSync(process.env.COLLAB_MEMORY_INIT_CAPTURE,JSON.stringify({socket:i.memorySocket,script:i.memoryScript}));process.exit(0)});`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_ = Serve(ctx, Options{Config: cfg, StateDir: dir, BridgeEntry: entry, NetworkStatePath: filepath.Join(dir, "unused-network.json")})
+	raw, err := os.ReadFile(capture)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]string
+	if err = json.Unmarshal(raw, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got["socket"] != SocketPath(dir) || got["script"] != filepath.Join(dir, "workspace", "memory.py") {
+		t.Fatalf("enabled connection missing from actual bridge init: %s", raw)
 	}
 }
 
