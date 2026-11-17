@@ -49,6 +49,8 @@ type CollaborationScope struct {
 }
 
 type Dispatch struct {
+	TaskContext         TaskContext         `json:"task_context,omitempty"`
+	TaskTimeline        []TaskEvent         `json:"task_timeline,omitempty"`
 	CollaborationScope  *CollaborationScope `json:"collaboration_scope,omitempty"`
 	ID                  string              `json:"id"`
 	IssueID             string              `json:"issue_id"`

@@ -1,0 +1,125 @@
+package collab
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+
+	"github.com/nexu-io/looper/internal/forge"
+	"github.com/nexu-io/looper/internal/planestrict"
+	"github.com/nexu-io/looper/internal/storage"
+)
+
+func (h *bridgeHost) savePlaneContext(dispatch planestrict.Dispatch) error {
+	data, err := json.MarshalIndent(struct {
+		Context  planestrict.TaskContext `json:"context"`
+		Timeline []planestrict.TaskEvent `json:"timeline"`
+	}{dispatch.TaskContext, dispatch.TaskTimeline}, "", "  ")
+	if err != nil {
+		return err
+	}
+	path := filepath.Join(h.dir, "workspace", "tasks", "loop_plane_"+dispatch.ID+".plane.json")
+	if err := os.WriteFile(path+".tmp", data, 0600); err != nil {
+		return err
+	}
+	return os.Rename(path+".tmp", path)
+}
+
+func (h *bridgeHost) publishPlaneContext(ctx context.Context, client *forge.PlaneClient, dispatch planestrict.Dispatch, loop storage.LoopRecord, state bridgeTask) error {
+	var metadata struct {
+		Worker struct {
+			Summary string `json:"summary"`
+		} `json:"worker"`
+	}
+	if loop.MetadataJSON != nil {
+		_ = json.Unmarshal([]byte(*loop.MetadataJSON), &metadata)
+	}
+	summary := state.Outcome.Summary
+	if loop.Status == "failed" {
+		summary = metadata.Worker.Summary
+	}
+	if summary == "" {
+		return nil // An accepted queue slot carries no new task conclusion yet.
+	}
+	input := planestrict.TaskContext{Summary: summary, NextStep: state.Outcome.NextStep,
+		Context: state.Outcome.Context, Links: append([]planestrict.TaskLink{}, state.Outcome.Links...),
+		Events: append([]planestrict.TaskEvent{}, state.Outcome.Events...)}
+	if input.Context == "" {
+		input.Context = dispatch.TaskContext.Context
+	}
+	chat, err := h.repos.FeishuThreads.ChatIDByLoop(ctx, loop.ID)
+	if err != nil {
+		return err
+	}
+	if chat != "" && state.ThreadID != "" {
+		input.ThreadURL = fmt.Sprintf("https://applink.feishu.cn/client/thread/open?open_chat_id=%s&open_thread_id=%s", chat, state.ThreadID)
+	}
+	for _, link := range state.Outcome.PullRequests {
+		found := false
+		for _, existing := range input.Links {
+			if existing.URL == link {
+				found = true
+				break
+			}
+		}
+		if !found {
+			input.Links = append(input.Links, planestrict.TaskLink{Title: "Pull Request", URL: link, Type: "pull_request"})
+		}
+	}
+	if len(input.Events) == 0 && summary != dispatch.TaskContext.Summary {
+		input.Events = append(input.Events, planestrict.TaskEvent{ID: "status:" + loop.UpdatedAt,
+			Title: summary, ActorName: "Looper", Kind: "progress", OccurredAt: loop.UpdatedAt})
+	}
+	// The existing outcome holds unsynced facts across turns and restarts.
+	// Publish bounded batches, then remove only acknowledged IDs from the latest
+	// row, so a reply arriving during HTTP delivery cannot lose its new events.
+	for len(input.Events) > 100 {
+		batch := input
+		batch.Events = input.Events[:100]
+		if err := client.PublishTaskContext(ctx, dispatch, batch); err != nil {
+			return err
+		}
+		if err := h.ackPlaneEvents(ctx, loop.ID, batch.Events); err != nil {
+			return err
+		}
+		input.Events = input.Events[100:]
+	}
+	if err := client.PublishTaskContext(ctx, dispatch, input); err != nil {
+		return err
+	}
+	return h.ackPlaneEvents(ctx, loop.ID, input.Events)
+}
+
+func (h *bridgeHost) ackPlaneEvents(ctx context.Context, id string, sent []planestrict.TaskEvent) error {
+	if len(sent) == 0 {
+		return nil
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	loop, err := h.repos.Loops.GetByID(ctx, id)
+	if err != nil || loop == nil {
+		return err
+	}
+	_, current, ok := readBridgeTask(*loop)
+	if !ok || len(current.Outcome.Events) == 0 {
+		return nil
+	}
+	ids := make(map[string]bool, len(sent))
+	for _, event := range sent {
+		ids[event.ID] = true
+	}
+	remaining := make([]planestrict.TaskEvent, 0, len(current.Outcome.Events))
+	for _, event := range current.Outcome.Events {
+		if !ids[event.ID] {
+			remaining = append(remaining, event)
+		}
+	}
+	data, err := json.Marshal(remaining)
+	if err != nil {
+		return err
+	}
+	_, err = h.db.ExecContext(ctx, `UPDATE loops SET metadata_json=json_set(metadata_json,'$.bridge.outcome.events',json(?)) WHERE id=? AND metadata_json=?`, string(data), id, *loop.MetadataJSON)
+	return err
+}
