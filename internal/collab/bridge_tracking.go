@@ -96,7 +96,7 @@ func (h *bridgeHost) saveTurn(ctx context.Context, loop storage.LoopRecord, stat
 	} else if terminal {
 		h.track(ctx, loop, "agent.completed", execID, id, payload)
 		h.track(ctx, loop, "run.ended", id, id, payload)
-		if event.Phase == "finished" && event.Terminal == "done" && taskStatus != "failed" {
+		if event.Phase == "finished" && event.Terminal == "done" && taskStatus != "failed" && state.Outcome.State != "" {
 			for i, report := range state.Outcome.Repositories {
 				h.track(ctx, loop, "repository.reported", fmt.Sprintf("%s:%d", id, i), id, report)
 			}

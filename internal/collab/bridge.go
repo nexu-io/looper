@@ -485,6 +485,7 @@ func (h *bridgeHost) recordTurnEvent(ctx context.Context, event feishubridge.Tur
 			state.SessionID = event.SessionID
 		}
 		status, summary := "running", "正在处理"
+		conclusionUpdated := false
 		if event.Phase == "started" {
 			h.active[loop.ID] = true
 			if err := os.Remove(h.resultPath(loop.ID)); err != nil && !os.IsNotExist(err) {
@@ -499,13 +500,19 @@ func (h *bridgeHost) recordTurnEvent(ctx context.Context, event feishubridge.Tur
 			status, summary = "failed", "执行中断，可以在原话题 @bot 继续"
 			if event.Phase == "finished" && event.Terminal == "done" {
 				outcome, readErr := readOutcome(h.resultPath(loop.ID))
+				if os.IsNotExist(readErr) && state.Outcome.State != "" {
+					// A text-only follow-up does not replace the last task conclusion.
+					outcome, readErr = state.Outcome, nil
+				} else if readErr == nil {
+					conclusionUpdated = true
+					if input.StrictDispatchID != "" {
+						outcome.Events = append(state.Outcome.Events, outcome.Events...)
+					}
+				}
 				if readErr != nil {
 					h.warn("agent task conclusion unavailable", readErr)
 					summary = "回复已送达，但任务状态未同步；在原话题 @bot 可继续"
 				} else {
-					if input.StrictDispatchID != "" {
-						outcome.Events = append(state.Outcome.Events, outcome.Events...)
-					}
 					state.Outcome = outcome
 					summary = outcome.Summary
 					switch outcome.State {
@@ -532,6 +539,9 @@ func (h *bridgeHost) recordTurnEvent(ctx context.Context, event feishubridge.Tur
 			}
 		} else {
 			_, _ = h.db.ExecContext(ctx, `UPDATE loops SET metadata_json=json_remove(metadata_json,'$.hitl') WHERE id=?`, loop.ID)
+		}
+		if !conclusionUpdated {
+			state.Outcome = Outcome{}
 		}
 		h.trackTurn(ctx, loop, state, event, status)
 		return loop.ID, nil

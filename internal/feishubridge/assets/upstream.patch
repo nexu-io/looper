@@ -332,3 +332,26 @@
      }
      flush();
      return result;
+--- a/src/agent/codex-appserver/backend.ts
++++ b/src/agent/codex-appserver/backend.ts
+@@ -689,6 +689,20 @@
+       developerInstructions: BRIDGE_DEVELOPER_INSTRUCTIONS,
+       ...(opts.model ? { model: opts.model } : {}),
+     });
++    try {
++      // Resume retains the original developer message in persisted history.
++      // Refresh guidance without replacing the user's native session.
++      await client.request('thread/inject_items', {
++        threadId: res.thread.id,
++        items: [{ type: 'message', role: 'developer', content: [{
++          type: 'input_text',
++          text: '以下是当前飞书桥交互约定，取代历史版本的同类约定：\n\n' + BRIDGE_DEVELOPER_INSTRUCTIONS,
++        }] }],
++      });
++    } catch (error) {
++      await client.close();
++      throw error;
++    }
+     return new CodexThread(client, res.thread.id, opts.model, opts.effort);
+   }
+ 

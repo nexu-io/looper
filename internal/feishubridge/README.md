@@ -9,8 +9,10 @@ are not added to this repository. `UPSTREAM-LICENSE` preserves its license.
 
 The patch exposes task submission, cancellation and native-session callbacks.
 Cards, streaming, message intake, reactions, run queues, file delivery and native
-Agent processes stay upstream. Go owns Plane dispatch, group scope, task records
-and PR observation. The neutral workspace lists available repositories; neither
+Agent processes stay upstream. Restoring a Codex session appends the current bridge
+guidance through `thread/inject_items`; the native session and task history stay
+intact. This requires a Codex app-server that supports that API. Go owns Plane
+dispatch, group scope, task records and PR observation. The neutral workspace lists available repositories; neither
 a task nor its Feishu topic is bound to one repository. Existing Worker/daemon
 callers retain their executor; CLI collaboration starts the new bridge path.
 
@@ -25,7 +27,7 @@ the files in `test/` into upstream `test/`. Run upstream's
 `npm ci --ignore-scripts`, `npm run typecheck`, and:
 
 ```sh
-npx vitest run test/external-dispatch.test.ts test/looper-inline-files.test.ts test/inline-files.test.ts test/outbound-files.test.ts \
+npx vitest run test/external-dispatch.test.ts test/looper-resume-instructions.test.ts test/app-server-liveness.test.ts test/looper-inline-files.test.ts test/inline-files.test.ts test/outbound-files.test.ts \
   test/message-queue-races.test.ts \
   test/run-card-stream.test.ts test/queued-card.test.ts test/run-process.test.ts
 ```
