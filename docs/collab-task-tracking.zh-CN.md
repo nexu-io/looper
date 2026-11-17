@@ -6,12 +6,12 @@ Looper 已有本地 SQLite 与日志落盘。本改动复用 `event_logs` 补充
 
 | Friday 追踪中需要回答的问题 | Looper 数据 |
 | --- | --- |
-| 哪条 Plane 任务、哪次派发 | `task.received`、`plane.dispatch.received`：Plane issue、dispatch、workspace/project、node；任务主体为 `loops.id` |
+| 哪条 Plane 任务、哪次派发 | `task.received`／Bridge 的 `plane.dispatch.received` 关联 dispatchId、issueNumber、本地 projectId；任务主体为 `loops.id`。workspace、Plane project、node 当前依赖配置，尚未固化为每次执行快照 |
 | 哪次执行／续跑、哪轮 Agent | `runs` → `agent_executions`，事件含 loopId/runId；统一 correlationId=loopId |
-| 卡在哪个阶段、各阶段起止 | `run.started`、`step.started/completed`、`run.ended`；结束事件含执行状态、时长与恢复策略 |
-| 等谁回复、消息是否接收 | `human.requested`、`human.answered`、`feishu.receipt`；只记录消息标识与状态，不复制问题／回复正文 |
+| 卡在哪个阶段、各阶段起止 | Worker 记录 `run.started`、`step.started/completed`、`run.ended` 和恢复策略；Bridge 记录真实 turn 起止。耗时由各自运行起止计算，不虚构 Bridge 内部阶段 |
+| 等谁回复、消息是否接收 | Worker 记录人工问答与 `feishu.receipt`；Bridge 记录人工等待及后续执行，SDK 消息收据尚未统一采集。事件不复制问题／回复正文 |
 | 哪些仓库、分支、PR、验证 | `repository.reported`：Agent 在完成标记的 repositories 数组上报；source=agent_report，与独立验证、人工验收区分 |
-| 交付产物与原始日志 | `artifacts.reported` 记录产物数量；原始输出及引用保留在对应 execution 的日志文件中 |
+| 交付产物与原始日志 | `artifacts.reported`：Worker 计完成标记中的 artifacts，Bridge 计 PR 引用；两种数量不能直接比较。Go executor 有本地捕获输出；Bridge 尚未导出 SDK 原生会话日志 |
 | Plane 状态是否回写成功 | `plane.state.synced` 只在远端状态转换成功后记录；失败保留运行错误和服务诊断 |
 | 任务状态何时变化 | `task.state_changed`；completed 表示当前执行流程结束，不等于验收、合并或发布 |
 
@@ -22,7 +22,7 @@ looper --config <配置> collab trace 3 --state-dir <协作状态目录>
 looper --config <配置> collab trace <loopId或runId> --state-dir <协作状态目录> --json
 ```
 
-命令直接以只读方式读取状态目录中的 `looper.sqlite`，无需启动服务，不执行迁移，也不创建缺失的库。JSON 含任务关联、全部运行／Agent 执行、时间线和原始日志路径；按 runId 查询时只保留该轮及任务级事件。
+命令直接以只读方式读取状态目录中的 `looper.sqlite`，无需启动服务，不执行迁移，也不创建缺失的库。JSON 含任务关联、全部运行／Agent 执行与时间线；已有 Go executor 输出记录时附日志路径，Bridge 日志路径为空；按 runId 查询时只保留该轮及任务级事件。
 
 新增事件使用稳定 ID 防止重复观察写出重复事实；已有事件不可被后来的同 ID 载荷覆盖。新增追踪字段不包含任务正文、回复正文、环境变量、完整命令或模型思考内容。旧版 `agent.invoked` 原始事件含 argv，trace 导出仅取允许的元数据字段，原始私有库／日志仍应按内部数据保管。
 
