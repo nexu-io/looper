@@ -30,12 +30,15 @@ type TaskEvent struct {
 }
 
 type TaskContext struct {
-	Summary   string      `json:"summary"`
-	NextStep  string      `json:"next_step"`
-	Context   string      `json:"context"`
-	ThreadURL string      `json:"thread_url,omitempty"`
-	Links     []TaskLink  `json:"links,omitempty"`
-	Events    []TaskEvent `json:"events,omitempty"`
+	Summary      string      `json:"summary"`
+	NextStep     string      `json:"next_step"`
+	Context      string      `json:"context"`
+	ThreadURL    string      `json:"thread_url,omitempty"`
+	ChatURL      string      `json:"chat_url,omitempty"`
+	ChatName     string      `json:"chat_name,omitempty"`
+	ChatScopeKey string      `json:"chat_scope_key,omitempty"`
+	Links        []TaskLink  `json:"links,omitempty"`
+	Events       []TaskEvent `json:"events,omitempty"`
 }
 
 func (c *Client) PublishTaskContext(ctx context.Context, dispatch Dispatch, input TaskContext) error {

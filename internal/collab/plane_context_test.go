@@ -48,6 +48,14 @@ func TestPlaneContextRetriesBeforeTerminalAndPreservesConcurrentReply(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err = h.repos.Loops.AssignFeishuChat(ctx, loop.ID, "oc_existing", "plane:project:module:module-1"); err != nil {
+		t.Fatal(err)
+	}
+	savedLoop, err := h.repos.Loops.GetByID(ctx, loop.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	loop = *savedLoop
 	_, state, _ := readBridgeTask(loop)
 	state.RootID = "om_root"
 	state.ThreadID = "omt_thread"
@@ -175,6 +183,9 @@ func TestPlaneContextRetriesBeforeTerminalAndPreservesConcurrentReply(t *testing
 		if event.ID != want.id || event.Kind != "delivery" || event.Body == "" || !reflect.DeepEqual(event.Links, want.links) {
 			t.Fatalf("delivery version or full artifact links lost after failed writeback and restart: %+v", event)
 		}
+	}
+	if got.ChatURL != "https://applink.feishu.cn/client/chat/open?openChatId=oc_existing" || got.ChatScopeKey != "plane:project:module:module-1" || got.ThreadURL == "" {
+		t.Fatalf("durable group or thread destination missing: %+v", got)
 	}
 	if got.Events[2].ActorOpenID != "ou_fixture" || got.Events[2].SourceURL == "" {
 		t.Fatal("human provenance lost")

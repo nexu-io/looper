@@ -63,18 +63,19 @@ lark-cli auth status --json --verify
 
 ### 安装团队技能
 
-协作 Agent 使用本机 Codex 原生的 `~/.agents/skills`，不需要启动额外服务，也不把技能全文塞进每条任务提示。先安装 [core/skills#129 的 repo-find](https://code.powerformer.net/core/skills/pulls/129)，让 Agent 自主定位单仓／跨仓任务；其他团队技能按需安装。
+协作 Agent 使用本机 Codex 原生的 `~/.agents/skills`，不需要启动额外服务，也不把技能全文塞进每条任务提示。安装 main 上的 `repo-find` 和 `task-delivery`：前者自主定位单仓／跨仓任务，后者准备可验收的交付并归档原 Plane 任务；其他团队技能按需安装。
 
-下面使用独立 checkout，不改变已有的团队技能开发工作树。当前 #129 未合并，先跟随其 PR 分支；如目录或链接已存在，先核对来源，不用强制覆盖。
+下面使用独立 checkout，不改变已有的团队技能开发工作树。这两个技能已合入 main；如目录或链接已存在，先核对来源，不用强制覆盖。
 
 ```sh
-git clone --single-branch --branch codex/repo-find-looper-20261116 \
+git clone --single-branch --branch main \
   https://code.powerformer.net/core/skills.git "$HOME/.looper/team-skills"
 mkdir -p "$HOME/.agents/skills"
 ln -s "$HOME/.looper/team-skills/skills/repo-find" "$HOME/.agents/skills/repo-find"
+ln -s "$HOME/.looper/team-skills/skills/task-delivery" "$HOME/.agents/skills/task-delivery"
 ```
 
-这与团队安装脚本采用同一种软链接方式，只安装本次需要的一个技能。选择安装更多技能时，使用该仓库已有的 `install_interactive.sh` 或 `install_skills.sh`，不要另外维护一份 Looper 技能副本。`looper collab` 不改变 `CODEX_HOME`；要在实际运行宿主的用户下安装，而不是装到另一位同学的 home。
+这与团队安装脚本采用同一种软链接方式，只安装本次需要的两个技能。选择安装更多技能时，使用该仓库已有的 `install_interactive.sh` 或 `install_skills.sh`，不要另外维护一份 Looper 技能副本。`looper collab` 不改变 `CODEX_HOME`；要在实际运行宿主的用户下安装，而不是装到另一位同学的 home。
 
 **更新已有技能**：在任务空闲时运行以下命令；软链接随后直接指向更新后的文件，不需要重新编译 Looper。新技能仍需通过原安装入口选择并链接。更新失败时保留当前可用版本，不能据此宣称已同步。
 
@@ -82,7 +83,7 @@ ln -s "$HOME/.looper/team-skills/skills/repo-find" "$HOME/.agents/skills/repo-fi
 git -C "$HOME/.looper/team-skills" pull --ff-only
 ```
 
-#129 合并后，将这个专用 checkout 一次性切到 `main`，后续更新跟随 `main`，不长期跟踪已结束的 PR 分支：
+如果之前跟踪 #129 的 PR 分支，将干净的专用 checkout 一次性切到 `main`，后续更新跟随 `main`，不长期跟踪已结束的 PR 分支：
 
 ```sh
 git -C "$HOME/.looper/team-skills" remote set-branches origin main

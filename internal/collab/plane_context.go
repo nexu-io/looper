@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 
 	"github.com/nexu-io/looper/internal/forge"
+	"github.com/nexu-io/looper/internal/loops"
 	"github.com/nexu-io/looper/internal/planestrict"
 	"github.com/nexu-io/looper/internal/storage"
 )
@@ -40,21 +41,35 @@ func (h *bridgeHost) publishPlaneContext(ctx context.Context, client *forge.Plan
 	if loop.Status == "failed" {
 		summary = metadata.Worker.Summary
 	}
-	if summary == "" {
-		return nil // An accepted queue slot carries no new task conclusion yet.
-	}
-	input := planestrict.TaskContext{Summary: summary, NextStep: state.Outcome.NextStep,
-		Context: state.Outcome.Context, Links: append([]planestrict.TaskLink{}, state.Outcome.Links...),
-		Events: append([]planestrict.TaskEvent{}, state.Outcome.Events...)}
-	if input.Context == "" {
-		input.Context = dispatch.TaskContext.Context
-	}
 	chat, err := h.repos.FeishuThreads.ChatIDByLoop(ctx, loop.ID)
 	if err != nil {
 		return err
 	}
+	if savedChat, _, ok := loops.ReadFeishuChat(loop.MetadataJSON); chat == "" && ok {
+		chat = savedChat
+	}
+	if summary == "" && chat == "" {
+		return nil // An accepted queue slot has no conclusion or destination yet.
+	}
+	hasOutcome := summary != ""
+	input := planestrict.TaskContext{Summary: summary, NextStep: state.Outcome.NextStep,
+		Context: state.Outcome.Context, Links: append([]planestrict.TaskLink{}, state.Outcome.Links...),
+		Events: append([]planestrict.TaskEvent{}, state.Outcome.Events...)}
+	if !hasOutcome {
+		input = dispatch.TaskContext
+		input.Events = append([]planestrict.TaskEvent{}, state.Outcome.Events...)
+	}
+	if input.Context == "" {
+		input.Context = dispatch.TaskContext.Context
+	}
 	if chat != "" && state.ThreadID != "" {
 		input.ThreadURL = fmt.Sprintf("https://applink.feishu.cn/client/thread/open?open_chat_id=%s&open_thread_id=%s", chat, state.ThreadID)
+	}
+	if chat != "" {
+		input.ChatURL = "https://applink.feishu.cn/client/chat/open?openChatId=" + chat
+		_, input.ChatScopeKey, _ = loops.ReadFeishuChat(loop.MetadataJSON)
+		workerInput, _, _ := readBridgeTask(loop)
+		input.ChatName = taskGroupContext(workerInput, input.ChatScopeKey).Name
 	}
 	for _, link := range state.Outcome.PullRequests {
 		found := false
@@ -68,7 +83,7 @@ func (h *bridgeHost) publishPlaneContext(ctx context.Context, client *forge.Plan
 			input.Links = append(input.Links, planestrict.TaskLink{Title: "Pull Request", URL: link, Type: "pull_request"})
 		}
 	}
-	if len(input.Events) == 0 && summary != dispatch.TaskContext.Summary {
+	if len(input.Events) == 0 && input.Summary != "" && input.Summary != dispatch.TaskContext.Summary {
 		input.Events = append(input.Events, planestrict.TaskEvent{ID: "status:" + loop.UpdatedAt,
 			Title: summary, ActorName: "Looper", Kind: "progress", OccurredAt: loop.UpdatedAt})
 	}
