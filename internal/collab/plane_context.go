@@ -90,21 +90,28 @@ func (h *bridgeHost) publishPlaneContext(ctx context.Context, client *forge.Plan
 	// The existing outcome holds unsynced facts across turns and restarts.
 	// Publish bounded batches, then remove only acknowledged IDs from the latest
 	// row, so a reply arriving during HTTP delivery cannot lose its new events.
+	publish := func(batch planestrict.TaskContext) error {
+		confirmed, err := client.PublishTaskContext(ctx, dispatch, batch)
+		if err != nil {
+			return err
+		}
+		// Keep the next native turn's recovery file aligned with the confirmed
+		// summary, including when completion removes this task from the inbox.
+		dispatch.TaskContext = confirmed
+		if err := h.savePlaneContext(dispatch); err != nil {
+			return err
+		}
+		return h.ackPlaneEvents(ctx, loop.ID, batch.Events)
+	}
 	for len(input.Events) > 100 {
 		batch := input
 		batch.Events = input.Events[:100]
-		if err := client.PublishTaskContext(ctx, dispatch, batch); err != nil {
-			return err
-		}
-		if err := h.ackPlaneEvents(ctx, loop.ID, batch.Events); err != nil {
+		if err := publish(batch); err != nil {
 			return err
 		}
 		input.Events = input.Events[100:]
 	}
-	if err := client.PublishTaskContext(ctx, dispatch, input); err != nil {
-		return err
-	}
-	return h.ackPlaneEvents(ctx, loop.ID, input.Events)
+	return publish(input)
 }
 
 func (h *bridgeHost) ackPlaneEvents(ctx context.Context, id string, sent []planestrict.TaskEvent) error {

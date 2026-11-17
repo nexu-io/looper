@@ -173,8 +173,9 @@ func TestClientSignsInboxClaimAndTransition(t *testing.T) {
 	if err != nil || roleRequest.RoleRequest.EligibleMemberName != "Product" {
 		t.Fatalf("CreateRoleRequest() = %#v, %v", roleRequest, err)
 	}
-	if err := client.PublishTaskContext(context.Background(), transitioned.Dispatch, TaskContext{Summary: "范围已确认", Context: "涉及两个仓库", Events: []TaskEvent{{ID: "decision-1", Title: "兼容旧名称", ActorOpenID: "ou_product", SourceURL: "https://applink.feishu.cn/example"}}}); err != nil {
-		t.Fatal(err)
+	confirmed, err := client.PublishTaskContext(context.Background(), transitioned.Dispatch, TaskContext{Summary: "范围已确认", Context: "涉及两个仓库", Events: []TaskEvent{{ID: "decision-1", Title: "兼容旧名称", ActorOpenID: "ou_product", SourceURL: "https://applink.feishu.cn/example"}}})
+	if err != nil || confirmed.Summary != "范围已确认" || confirmed.Context != "涉及两个仓库" {
+		t.Fatalf("PublishTaskContext() = %#v, %v", confirmed, err)
 	}
 	waitKind := "technical_spec_approval"
 	awaiting, err := client.Transition(context.Background(), transitioned.Dispatch, "awaiting_human", &waitKind)

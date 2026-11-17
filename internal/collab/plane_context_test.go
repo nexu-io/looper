@@ -132,7 +132,8 @@ func TestPlaneContextRetriesBeforeTerminalAndPreservesConcurrentReply(t *testing
 				t.Error(err)
 			}
 			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{}`))
+			body.Context.Events = nil // Plane stores events separately from the summary.
+			_ = json.NewEncoder(w).Encode(map[string]any{"context": body.Context})
 		case strings.HasSuffix(r.URL.Path, "/transition/"):
 			transitions++
 			_ = json.NewEncoder(w).Encode(planestrict.MutationResponse{Dispatch: dispatch})
@@ -161,6 +162,24 @@ func TestPlaneContextRetriesBeforeTerminalAndPreservesConcurrentReply(t *testing
 	}
 	if transitions != 0 {
 		t.Fatal("terminal state was published before context")
+	}
+	snapshotPath := filepath.Join(dir, "workspace", "tasks", loop.ID+".plane.json")
+	readContext := func() planestrict.TaskContext {
+		t.Helper()
+		data, err := os.ReadFile(snapshotPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var snapshot struct {
+			Context planestrict.TaskContext `json:"context"`
+		}
+		if err := json.Unmarshal(data, &snapshot); err != nil {
+			t.Fatal(err)
+		}
+		return snapshot.Context
+	}
+	if local := readContext(); local.Summary != dispatch.TaskContext.Summary {
+		t.Fatalf("failed publish replaced confirmed context: %+v", local)
 	}
 	saved, _ := h.repos.Loops.GetByID(ctx, loop.ID)
 	_, state, _ = readBridgeTask(*saved)
@@ -199,9 +218,8 @@ func TestPlaneContextRetriesBeforeTerminalAndPreservesConcurrentReply(t *testing
 	if len(state.Outcome.Events) != 1 || state.Outcome.Events[0].ID != "late-1" {
 		t.Fatalf("concurrent reply lost or ack failed: %+v", state.Outcome.Events)
 	}
-	snapshot, err := os.ReadFile(filepath.Join(dir, "workspace", "tasks", loop.ID+".plane.json"))
-	if err != nil || !strings.Contains(string(snapshot), dispatch.TaskContext.Context) {
-		t.Fatalf("recovery context missing: %s %v", snapshot, err)
+	if local := readContext(); local.Summary != outcome.Summary || local.Context != outcome.Context || !reflect.DeepEqual(local.Links, currentLinks) || len(local.Events) != 0 {
+		t.Fatalf("recovery file differs from confirmed Plane context: %+v", local)
 	}
 
 	// A later reply is durable, but the completed dispatch is no longer in the
@@ -219,5 +237,8 @@ func TestPlaneContextRetriesBeforeTerminalAndPreservesConcurrentReply(t *testing
 	}
 	if calls != 3 {
 		t.Fatal("acknowledged completed task kept polling context")
+	}
+	if local := readContext(); local.Summary != outcome.Summary || local.Context != outcome.Context {
+		t.Fatalf("completed dispatch left a stale recovery file: %+v", local)
 	}
 }

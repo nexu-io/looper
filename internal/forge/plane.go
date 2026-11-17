@@ -271,9 +271,9 @@ func (plane *PlaneClient) StrictDispatchInbox(ctx context.Context, contextDispat
 	return plane.strictClient.Inbox(ctx, "", contextDispatchIDs...)
 }
 
-func (plane *PlaneClient) PublishTaskContext(ctx context.Context, dispatch planestrict.Dispatch, input planestrict.TaskContext) error {
+func (plane *PlaneClient) PublishTaskContext(ctx context.Context, dispatch planestrict.Dispatch, input planestrict.TaskContext) (planestrict.TaskContext, error) {
 	if plane.strictClient == nil {
-		return errors.New("Plane strict dispatch is not configured")
+		return planestrict.TaskContext{}, errors.New("Plane strict dispatch is not configured")
 	}
 	return plane.strictClient.PublishTaskContext(ctx, dispatch, input)
 }
