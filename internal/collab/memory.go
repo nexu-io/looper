@@ -20,7 +20,7 @@ import (
 var memoryAssets embed.FS
 
 func (h *bridgeHost) memoryToolPaths() (string, string) {
-	for _, source := range h.sources {
+	for _, source := range h.legacySources {
 		if source.memoryEnabled {
 			return SocketPath(h.dir), filepath.Join(h.dir, "workspace", "memory.py")
 		}
@@ -29,7 +29,7 @@ func (h *bridgeHost) memoryToolPaths() (string, string) {
 }
 
 func (h *bridgeHost) memoryClient(inputProject string) *forge.PlaneClient {
-	for _, source := range h.sources {
+	for _, source := range h.legacySources {
 		if source.project.ID == inputProject && source.memoryEnabled {
 			return source.client
 		}

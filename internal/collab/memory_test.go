@@ -24,11 +24,11 @@ import (
 )
 
 func TestMemoryMCPRegistrationRequiresExplicitOptIn(t *testing.T) {
-	h := &bridgeHost{dir: t.TempDir(), sources: []planeSource{{memoryEnabled: false}}}
+	h := &bridgeHost{dir: t.TempDir(), legacySources: []planeSource{{memoryEnabled: false}}}
 	if socket, script := h.memoryToolPaths(); socket != "" || script != "" {
 		t.Fatal("disabled memory adds a Python MCP process to existing sessions")
 	}
-	h.sources = append(h.sources, planeSource{memoryEnabled: true})
+	h.legacySources = append(h.legacySources, planeSource{memoryEnabled: true})
 	if socket, script := h.memoryToolPaths(); socket != SocketPath(h.dir) || script != filepath.Join(h.dir, "workspace", "memory.py") {
 		t.Fatal("enabled memory tools not registered")
 	}
@@ -124,7 +124,7 @@ func TestMemoryHostScopesToolsAndRetainsAcknowledgements(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	h.sources = []planeSource{{project: cfg.Projects[0], client: client, memoryEnabled: true}}
+	h.legacySources = []planeSource{{project: cfg.Projects[0], client: client, memoryEnabled: true}}
 	loop, err := h.enqueue(ctx, worker.EnqueueInput{ProjectID: cfg.Projects[0].ID, Title: "task", Prompt: "goal", StrictDispatchID: "11111111-1111-4111-8111-111111111111"})
 	if err != nil {
 		t.Fatal(err)

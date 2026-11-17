@@ -81,3 +81,18 @@ the original Agent session. Ordinary conversation stays silent. Restart a host
 and check that saved events do not trigger another completed turn. Internal
 callback fixtures are useful regression coverage but do not substitute for
 this real Feishu test.
+
+## Standalone collaboration
+
+The Worker only receives Feishu callbacks and serves the durable inbox. It does
+not call Plane or track device presence. Local Looper sends signed heartbeats
+directly to its paired Plane, which records receipt time and computes expiry.
+No corporate-network exception or presence secret is needed for this Worker.
+
+The former `/devices/heartbeat` and `/devices/<device-id>` endpoints have been
+removed. Upgrade Plane and local clients before publishing this Worker. The
+historical `0002_device_presence.sql` migration can remain applied; its table is
+no longer used and is not needed for new installations. Existing events remain.
+
+See [the collaboration connection guide](../../docs/collab-cf-relay.zh-CN.md) for
+rollout, legacy compatibility and remaining onboarding limitations.

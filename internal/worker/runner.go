@@ -1651,6 +1651,7 @@ func buildShepherdPrompt(work workerInput, prNumber int64, sessionLost bool) str
 	repo := work.Repo
 	parts := []string{
 		fmt.Sprintf("You previously authored the implementation PR %s#%d. Keep driving it toward a clean merge — but a human colleague performs the final merge, not you.", repo, prNumber),
+		agent.DeliveryInstruction,
 	}
 	if sessionLost {
 		parts = append(parts, "NOTE: your previous session context could not be recovered. Rebuild your understanding from the PR diff and review threads before acting; do not assume prior memory.")
@@ -4185,7 +4186,7 @@ func buildWorkerPromptWithInstructions(repoRootPath string, projectID string, in
 		parts = append(parts, "This is a BUG. Work it in this order: (1) REPRODUCE it — write or run a failing test / concrete steps that show the wrong behaviour; (2) locate the ROOT CAUSE, not just the symptom; (3) fix the root cause and prove the reproduction now passes. Do not patch symptoms or skip the reproduction step.")
 	}
 	parts = append(parts, fmt.Sprintf("Repository: %s", work.Repo), fmt.Sprintf("Base branch: %s", work.BaseBranch))
-	parts = append(parts, taskAssessmentInstruction)
+	parts = append(parts, taskAssessmentInstruction, agent.DeliveryInstruction)
 	if work.ExecutionMode == "push-existing" && work.SpecPath != "" {
 		parts = append(parts, fmt.Sprintf("Do not modify the spec file at %s.", work.SpecPath))
 	}

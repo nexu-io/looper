@@ -16,6 +16,13 @@ type Status struct {
 	ActiveExecutions int                  `json:"activeExecutions"`
 	Tasks            []Task               `json:"tasks"`
 	Network          networkclient.Status `json:"network"`
+	Plane            PlaneStatus          `json:"plane"`
+}
+
+type PlaneStatus struct {
+	DeviceID           string `json:"deviceId,omitempty"`
+	Reachable          bool   `json:"reachable"`
+	HeartbeatReachable bool   `json:"heartbeatReachable"`
 }
 
 // Task is a presentation of existing loop records, not another task state.

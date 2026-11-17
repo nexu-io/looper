@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
 import { readFileSync } from 'node:fs';
-import { test } from 'node:test';
+import { test, mock } from 'node:test';
 import worker, { type Env } from './worker.ts';
 
 function setup() {
@@ -65,4 +65,19 @@ test('decrypts callbacks before verification and rejects another app', async () 
     const other = event('other'); other.header.app_id = 'other-app';
     assert.equal((await s.callback(other)).status, 403);
   } finally { s.db.close(); }
+});
+
+
+test('CF only relays Feishu messages and never calls Plane', async () => {
+  const s = setup();
+  const upstream = mock.method(globalThis, 'fetch', async () => { throw new Error('unexpected outbound request'); });
+  try {
+    assert.equal((await worker.fetch(new Request('https://test/devices/heartbeat', {
+      method: 'POST', headers: { 'Looper-Signature': 'old-client' }, body: '{}',
+    }), s.env)).status, 404);
+    assert.equal((await worker.fetch(new Request('https://test/devices/11111111-2222-4333-8444-555555555555'), s.env)).status, 404);
+    assert.equal((await s.callback(event('no-upstream'))).status, 200);
+    assert.equal(((await (await s.read()).json()) as any).events.length, 1);
+    assert.equal(upstream.mock.callCount(), 0);
+  } finally { upstream.mock.restore(); s.db.close(); }
 });

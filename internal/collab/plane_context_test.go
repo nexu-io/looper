@@ -50,7 +50,7 @@ func TestPlaneContextRetriesBeforeTerminalAndPreservesConcurrentReply(t *testing
 	_, state, _ := readBridgeTask(loop)
 	state.RootID = "om_root"
 	state.ThreadID = "omt_thread"
-	state.Outcome = Outcome{State: "needs_input", Summary: "已完成影响分析", Events: []planestrict.TaskEvent{{ID: "finding-1", Title: "影响范围已检查"}}}
+	state.Outcome = Outcome{State: "needs_input", Summary: "已完成影响分析", Events: []planestrict.TaskEvent{{ID: "finding-1", Title: "交付版本 fixture-v1 检测通过，人工验收待进行", Kind: "delivery", Body: "fixture-v1: actual checks passed; human acceptance pending", Links: []planestrict.TaskLink{{Title: "检测报告", URL: "https://artifacts.example.com/fixture-v1/verification.json", Type: "verification_report"}}}}}
 	if err = h.patch(ctx, loop.ID, "awaiting_human", state, state.Outcome.Summary); err != nil {
 		t.Fatal(err)
 	}
@@ -61,8 +61,8 @@ func TestPlaneContextRetriesBeforeTerminalAndPreservesConcurrentReply(t *testing
 		}
 	}
 	callback("started")
-	outcome := Outcome{State: "completed", Summary: "调查已完成", Context: "结论：不改存储协议", Events: []planestrict.TaskEvent{{ID: "reply-1", Title: "选择简短版", Kind: "decision", ActorName: "测试同事", ActorOpenID: "ou_fixture", SourceURL: "https://applink.feishu.cn/client/thread/open?fixture=1"}}}
-	outcome.Links = []planestrict.TaskLink{{Title: "Local file action", URL: "/tmp/report.md", Type: "artifact"}, {Title: "Delivered file", URL: "https://applink.feishu.cn/client/thread/open?fixture=1", Type: "artifact"}}
+	outcome := Outcome{State: "completed", Summary: "调查已完成", Context: "结论：不改存储协议", Links: []planestrict.TaskLink{{Title: "验收指南", URL: "https://artifacts.example.com/fixture-v1/ACCEPTANCE.md", Type: "acceptance_guide"}, {Title: "检测报告", URL: "https://artifacts.example.com/fixture-v1/verification.json", Type: "verification_report"}}, Events: []planestrict.TaskEvent{{ID: "reply-1", Title: "选择简短版", Kind: "decision", ActorName: "测试同事", ActorOpenID: "ou_fixture", SourceURL: "https://applink.feishu.cn/client/thread/open?fixture=1"}}}
+	outcome.Links = append(outcome.Links, planestrict.TaskLink{Title: "Local file action", URL: "/tmp/report.md", Type: "artifact"})
 	outcome.Events[0].Links = outcome.Links
 	data, _ := json.Marshal(outcome)
 	if err = os.WriteFile(h.resultPath(loop.ID), data, 0600); err != nil {
@@ -149,10 +149,13 @@ func TestPlaneContextRetriesBeforeTerminalAndPreservesConcurrentReply(t *testing
 	if calls != 2 || transitions != 1 || got.Context != outcome.Context || len(got.Events) < 2 {
 		t.Fatalf("retry did not publish task data: %+v", got)
 	}
+	if len(got.Links) != 2 || got.Links[0].Type != "acceptance_guide" || got.Links[1].Type != "verification_report" || got.Events[0].Kind != "delivery" || got.Events[0].Body == "" || len(got.Events[0].Links) != 1 || got.Events[0].Links[0].URL != got.Links[1].URL {
+		t.Fatalf("delivery guide, verdict or report lost after failed writeback and restart: %+v", got)
+	}
 	if got.Events[1].ActorOpenID != "ou_fixture" || got.Events[1].SourceURL == "" {
 		t.Fatal("human provenance lost")
 	}
-	if len(got.Links) != 1 || len(got.Events[1].Links) != 1 || got.Links[0].URL != outcome.Links[1].URL {
+	if len(got.Links) != 2 || len(got.Events[1].Links) != 2 || got.Links[0].URL != outcome.Links[0].URL {
 		t.Fatal("local file actions were exported as Plane web links")
 	}
 	saved, _ = h.repos.Loops.GetByID(ctx, loop.ID)

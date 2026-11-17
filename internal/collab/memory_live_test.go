@@ -57,6 +57,7 @@ func TestMemoryRealPlaneAgent(t *testing.T) {
 	if h.sources, err = bridgePlaneSources(cfg); err != nil {
 		t.Fatal(err)
 	}
+	h.legacySources = append([]planeSource(nil), h.sources...)
 	if err = h.writeWorkspace(filepath.Join(dir, "workspace")); err != nil {
 		t.Fatal(err)
 	}

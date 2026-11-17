@@ -2,9 +2,19 @@
 
 本文面向运行本地 Agent 的研发同学。跑完后，应能在 Plane 派发一个任务，由 Agent 判断涉及哪些仓库，在飞书原话题沟通和验收，让原 Agent 继续修改同一个 PR，并观察 PR 最终结果。产品、设计和 QA 只需参与飞书沟通，不用安装本地服务。
 
-**当前为联调指南，尚非已发布的一键安装流程。** Looper 使用 [PR #696](https://github.com/nexu-io/looper/pull/696) 的 `feat/looper-collab-standalone`；Plane 使用 [配套分支](https://code.powerformer.net/core/plane/src/branch/feat/looper-collab-standalone-main)（提交 `6733d80`），迁移为 `0157_looper_collaboration_dispatch`，接在最新 main 的 `0156` 之后。仅下载 main 或旧版 Looper 不够。任务无需绑定单一代码仓库，Agent 根据任务和本机可用仓库判断，必要时问人。早期联调工作树的 `0137` 是临时迁移，不能复制进最新 main 的数据库迁移链。本次实际结果和未修问题见[端到端测试记录](E2E-collab-2026-11-16.zh-CN.md)。
+**当前为联调指南，尚非已发布的一键安装流程。** Looper 使用 [PR #696](https://github.com/nexu-io/looper/pull/696) 的 `feat/looper-collab-standalone`。Plane 的个人设备连接已随 #82 合并；本轮 CF 替代 loopernet 还需要配套 Plane 新分支 `feat/collab-cf-presence`，上线状态以相应 PR 为准。旧版 Looper 二进制未必包含 collab 子命令。
 
-## 先理解要启动哪些东西
+## 当前推荐：个人配对 + CF inbox / 心跳
+
+研发在 Plane **个人设置 → Developer → 我的 Looper** 复制一次性 `looper plane connect … --code … --collab` 命令，执行后运行 `looper collab start`，再用 `looper plane doctor --collab` 自检。个人连接跨本人有执行权限的项目复用，无需在项目里重复连接，不绑定代码仓库。
+
+新链路不再要求同事入网或维护 loopernet 配置，心跳由本机直接发送给 Plane，CF 仅中转飞书消息。维护者提供已配置好的 Plane、CF Worker 和飞书 bot 凭证，部署设置、故障验证与仍未完成的身份授权事项见 [连接说明](collab-cf-relay.zh-CN.md)。目前不能据此宣称“只输入一条命令即可完成全新同事的所有授权”。
+
+项目可以先启用协作，不要求成员在线或填全角色。Agent 根据任务选择一个或多个仓库、评估影响面和规划深度，在飞书原话题找人沟通，必要时问 owner。
+
+后文为旧项目绑定 / loopernet 的兼容 fixture 操作。新个人 CF 链路不应照着执行额外入网步骤。历次实测与未完成事项见 [端到端测试记录](E2E-collab-2026-11-16.zh-CN.md)。
+
+## 旧网络 fixture：理解要启动哪些东西
 
 ```mermaid
 flowchart LR
@@ -17,7 +27,7 @@ flowchart LR
 
 推荐复用维护者准备的测试 Plane 和 loopernet，同事只在自己的电脑启动 collab。无需 Friday、完整 `looperd`，也无需单独的 Planner／Reviewer／Fixer 进程。Agent 仍会在执行中自行评估影响面、按需规划。
 
-loopernet 是设备连接基础设施，**当前 Plane 派发依赖它**；客户端随 collab 启动，不用同事另起本地客户端进程。纯终端派单可以不连接 Plane／loopernet，但那只能验证执行与飞书这一段。
+loopernet 是这套旧 fixture 的设备连接基础设施，**旧配对链路依赖它**；客户端随 collab 启动，不用同事另起本地客户端进程。纯终端派单可以不连接 Plane／loopernet，但那只能验证执行与飞书这一段。
 
 ## 1 准备测试环境和账号
 
@@ -50,6 +60,37 @@ lark-cli auth status --json --verify
 共享模式按本地已保存的任务话题归属路由，不按发消息的人猜设备。未归属话题／私聊不会任意发给某台 Looper。共享读取凭证可读整个应用收件箱，只分发给可信团队实例；这不是逐设备的数据隔离。维护者应提供统一 endpoint 和安全注入方式，不把 secret 写进仓库或群聊。
 
 先使用“本人 + bot”的私测群；需要 QA 时先邀请、确认已经入群，再 @。所有协作消息、图片和文件以 **bot** 发送。测试自动邀请时，应用还需有建群、邀请成员权限且目标同学在应用可见范围内。本次现场先遇到权限与可用范围失败；开通发布后，产品自动建群与邀请片段已实测通过。人工加人仍不能冒充自动邀请验证。
+
+### 安装团队技能
+
+协作 Agent 使用本机 Codex 原生的 `~/.agents/skills`，不需要启动额外服务，也不把技能全文塞进每条任务提示。先安装 [core/skills#129 的 repo-find](https://code.powerformer.net/core/skills/pulls/129)，让 Agent 自主定位单仓／跨仓任务；其他团队技能按需安装。
+
+下面使用独立 checkout，不改变已有的团队技能开发工作树。当前 #129 未合并，先跟随其 PR 分支；如目录或链接已存在，先核对来源，不用强制覆盖。
+
+```sh
+git clone --single-branch --branch codex/repo-find-looper-20261116 \
+  https://code.powerformer.net/core/skills.git "$HOME/.looper/team-skills"
+mkdir -p "$HOME/.agents/skills"
+ln -s "$HOME/.looper/team-skills/skills/repo-find" "$HOME/.agents/skills/repo-find"
+```
+
+这与团队安装脚本采用同一种软链接方式，只安装本次需要的一个技能。选择安装更多技能时，使用该仓库已有的 `install_interactive.sh` 或 `install_skills.sh`，不要另外维护一份 Looper 技能副本。`looper collab` 不改变 `CODEX_HOME`；要在实际运行宿主的用户下安装，而不是装到另一位同学的 home。
+
+**更新已有技能**：在任务空闲时运行以下命令；软链接随后直接指向更新后的文件，不需要重新编译 Looper。新技能仍需通过原安装入口选择并链接。更新失败时保留当前可用版本，不能据此宣称已同步。
+
+```sh
+git -C "$HOME/.looper/team-skills" pull --ff-only
+```
+
+#129 合并后，将这个专用 checkout 一次性切到 `main`，后续更新跟随 `main`，不长期跟踪已结束的 PR 分支：
+
+```sh
+git -C "$HOME/.looper/team-skills" remote set-branches origin main
+git -C "$HOME/.looper/team-skills" fetch origin
+git -C "$HOME/.looper/team-skills" switch --track origin/main
+```
+
+当前不在每次启动或任务执行中隐式 `git pull`，避免任务处理中途换规则及离线启动受阻。Codex 支持软链接和技能变更发现（[官方说明](https://developers.openai.com/codex/skills/)）；协作提示也要求新任务读取当前文件，续跑再次使用时重新读取。如更新未出现在宿主中，在无运行任务时重启 collab。仅发现技能不等于已调用：验收时让 Agent 报告实际读取的技能与引用路径，并用单仓、跨仓和含糊任务核对其判断，不要求为了验证而创建 PR。
 
 ## 2 编译并隔离本次运行
 

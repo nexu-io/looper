@@ -75,7 +75,7 @@ func (h *bridgeHost) maintainMemory(ctx context.Context) {
 		}
 		h.syncMemory(ctx)
 		if time.Since(lastScan) >= time.Hour {
-			for _, source := range h.sources {
+			for _, source := range h.legacySources {
 				if !source.memoryEnabled {
 					continue
 				}
@@ -109,7 +109,7 @@ func (h *bridgeHost) maintainMemory(ctx context.Context) {
 }
 
 func (h *bridgeHost) runMemoryReview(ctx context.Context) {
-	for _, source := range h.sources {
+	for _, source := range h.legacySources {
 		if !source.memoryEnabled {
 			continue
 		}
