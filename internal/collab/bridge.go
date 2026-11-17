@@ -704,8 +704,19 @@ func (h *bridgeHost) pollPlane(ctx context.Context) error {
 	if err := h.refreshPersonalPlane(ctx); err != nil {
 		failures = append(failures, err)
 	}
+	items, err := h.repos.Loops.List(ctx)
+	if err != nil {
+		return err
+	}
 	for _, source := range h.planeSources() {
-		inbox, err := source.client.StrictDispatchInbox(ctx)
+		var pendingContext []string
+		for _, loop := range items {
+			input, state, ok := readBridgeTask(loop)
+			if ok && loop.ProjectID == source.project.ID && input.StrictDispatchID != "" && len(state.Outcome.Events) > 0 {
+				pendingContext = append(pendingContext, input.StrictDispatchID)
+			}
+		}
+		inbox, err := source.client.StrictDispatchInbox(ctx, pendingContext...)
 		if err != nil {
 			failures = append(failures, err)
 			continue
@@ -768,6 +779,14 @@ func (h *bridgeHost) planeDispatch(ctx context.Context, client *forge.PlaneClien
 		}
 		if dispatch.State == "stop_requested" {
 			return client.TransitionStrictDispatch(ctx, dispatch.ID, "confirmed_stopped", nil)
+		}
+		return nil
+	}
+	// Completed executions may receive later questions or acceptance feedback.
+	// Archive their pending facts without claiming or reopening the execution.
+	if dispatch.State == "completed" || dispatch.State == "failed" {
+		if dispatch.Health == "ok" && dispatch.ExecutionAttemptID != nil && len(state.Outcome.Events) > 0 {
+			return h.publishPlaneContext(ctx, client, dispatch, *loop, state)
 		}
 		return nil
 	}

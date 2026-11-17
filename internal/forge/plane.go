@@ -264,11 +264,11 @@ func (plane *PlaneClient) ListOpenIssues(ctx context.Context, input ListIssuesIn
 	return issues, nil
 }
 
-func (plane *PlaneClient) StrictDispatchInbox(ctx context.Context) (planestrict.InboxResponse, error) {
+func (plane *PlaneClient) StrictDispatchInbox(ctx context.Context, contextDispatchIDs ...string) (planestrict.InboxResponse, error) {
 	if plane.strictClient == nil {
 		return planestrict.InboxResponse{}, errors.New("Plane strict dispatch is not configured")
 	}
-	return plane.strictClient.Inbox(ctx, "")
+	return plane.strictClient.Inbox(ctx, "", contextDispatchIDs...)
 }
 
 func (plane *PlaneClient) PublishTaskContext(ctx context.Context, dispatch planestrict.Dispatch, input planestrict.TaskContext) error {

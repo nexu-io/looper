@@ -261,7 +261,7 @@ func NewClient(baseURL, workspace, projectID string, credentials Credentials, op
 	return client, nil
 }
 
-func (c *Client) Inbox(ctx context.Context, cursor string) (InboxResponse, error) {
+func (c *Client) Inbox(ctx context.Context, cursor string, contextDispatchIDs ...string) (InboxResponse, error) {
 	if err := c.openSession(ctx); err != nil {
 		return InboxResponse{}, err
 	}
@@ -270,6 +270,9 @@ func (c *Client) Inbox(ctx context.Context, cursor string) (InboxResponse, error
 		"node_id":        {c.credentials.NodeID},
 		"session_id":     {UUIDString(c.credentials.SessionID)},
 		"instance_nonce": {base64.RawURLEncoding.EncodeToString(c.credentials.InstanceNonce[:])},
+	}
+	for _, id := range contextDispatchIDs {
+		query.Add("context_dispatch_id", id)
 	}
 	var response InboxResponse
 	err := c.do(ctx, http.MethodGet, c.projectPath("looper", "dispatch", "inbox"), query, nil, nil, &response)

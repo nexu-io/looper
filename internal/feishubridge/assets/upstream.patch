@@ -290,3 +290,45 @@
 +  const block = `[本条消息的发信人：${who}（open_id：${id}）]${source}`;
    return prependBlock(block, text);
  }
+--- a/src/agent/bridge-instructions.ts
++++ b/src/agent/bridge-instructions.ts
+@@ -14,9 +14,10 @@
+   '',
+   '本地文件交付：正常回复即可，用 [文件名](绝对路径) 引用真实存在的本地文件；路径含空格时用 [文件名](<绝对路径>)。',
+   '飞书桥会在文件引用的原位置提供蓝色可点击入口，用户点击后由桥直接发送原文件附件，不需要你调用工具上传。',
+-  '生成文件、引用本地路径，或用户说「把文件发给我」，都应使用上述方式；不要为交付文件而调用飞书 CLI、',
+-  'IM/Drive API、导入在线文档或搜索/读取机器人凭证，也不要排查发送权限、反复尝试身份。',
+-  '只有用户明确要求「上传到云盘 / 创建飞书在线文档 / 发到另一个指定会话」等外部操作时，才使用对应工具或 skill。',
++  '普通文件分享默认使用上述入口；任务需要主动归档、回读附件或把持久链接写回 Plane 时，',
++  '可在任务已授权的范围内使用对应工具或 skill，以 bot 上传到原话题或文档，核对实际附件内容后记录入口。',
++  '不要把本地文件按钮当作已上传或已归档；尚未上传时如实说明，必要时提供截图、录屏或正文说明。',
++  '不要搜索/读取机器人凭证、切换用户身份或反复尝试身份；权限不足时说明具体缺口。',
+   '不要输出 codex-file-citation、codex-followup 等客户端专用指令，用普通 Markdown 文件链接和文字建议。',
+   '',
+   '1) 图片：要配图时，用标准 Markdown 图片语法 ![说明](路径) 引用一个【真实存在】的图片，',
+--- a/src/card/inline-files.ts
++++ b/src/card/inline-files.ts
+@@ -60,7 +60,7 @@
+         if ((content.match(/(?<!\\)\*\*/g)?.length ?? 0) % 2) bold = !bold;
+         const balanced = (prefix + content + (bold ? '**' : ''))
+           .replace(/^(\*\*)(\s+)/, '$2$1').replace(/(\s+)(\*\*)$/, '$2$1');
+-        if (balanced.replace(/\*\*/g, '').trim() || (content.length > 0 && /^\s+$/.test(content))) {
++        if (balanced.replace(/\*\*/g, '').trim() && !/^[\s•、，,；;。]+$/.test(balanced)) {
+           const spaced = balanced.replace(/^ +| +$/g, (spaces) => '&nbsp;'.repeat(spaces.length));
+           pieces.push({ ...element, content: spaced, ...(textSize ? { text_size: textSize } : {}) });
+         }
+@@ -70,10 +70,10 @@
+         if (link) pieces.push(link);
+         else pushText(part);
+       }
+-      result.push(pieces.length === 1 ? pieces[0]! : columns(
+-        pieces.map((el) => ({ elements: [el], verticalAlign: 'center' })),
+-        { flexMode: 'flow', spacing: '0px' },
+-      ));
++      // Callback links cannot participate in Markdown's inline layout.
++      // Keep each piece full-width so prose cannot squeeze CJK labels into
++      // narrow columns (for example 验收 / 指南 next to a long sentence).
++      result.push(...pieces);
+     }
+     flush();
+     return result;

@@ -40,7 +40,7 @@ func TestPlaneContextRetriesBeforeTerminalAndPreservesConcurrentReply(t *testing
 		t.Fatal(err)
 	}
 	attempt := "66666666-6666-4666-8666-666666666666"
-	dispatch := planestrict.Dispatch{ID: "33333333-3333-4333-8333-333333333333", Revision: 1, StateVersion: 2, State: "running", Health: "ok", ExecutionAttemptID: &attempt, FencingToken: 1, TaskContext: planestrict.TaskContext{Summary: "范围已确认", Context: "不改存储协议"}}
+	dispatch := planestrict.Dispatch{ID: "33333333-3333-4333-8333-333333333333", Revision: 1, StateVersion: 2, State: "running", Health: "ok", RequestedMode: "collab", ActiveRole: "worker", ExecutionAttemptID: &attempt, FencingToken: 1, TaskContext: planestrict.TaskContext{Summary: "范围已确认", Context: "不改存储协议"}}
 	if err = h.repos.Projects.Upsert(ctx, storage.ProjectRecord{ID: cfg.Projects[0].ID, Name: "local", RepoPath: dir, CreatedAt: "2026-11-17T00:00:00Z", UpdatedAt: "2026-11-17T00:00:00Z"}); err != nil {
 		t.Fatal(err)
 	}
@@ -106,7 +106,11 @@ func TestPlaneContextRetriesBeforeTerminalAndPreservesConcurrentReply(t *testing
 			_ = json.NewDecoder(r.Body).Decode(&body)
 			_ = json.NewEncoder(w).Encode(map[string]any{"session_id": body["session_id"], "state": "active"})
 		case strings.HasSuffix(r.URL.Path, "/dispatch/inbox/"):
-			_ = json.NewEncoder(w).Encode(planestrict.InboxResponse{Dispatches: []planestrict.Dispatch{dispatch}})
+			rows := []planestrict.Dispatch{}
+			if dispatch.State != "completed" || r.URL.Query().Get("context_dispatch_id") == dispatch.ID {
+				rows = append(rows, dispatch)
+			}
+			_ = json.NewEncoder(w).Encode(planestrict.InboxResponse{Dispatches: rows})
 		case strings.HasSuffix(r.URL.Path, "/context/"):
 			calls++
 			var body struct {
@@ -198,5 +202,22 @@ func TestPlaneContextRetriesBeforeTerminalAndPreservesConcurrentReply(t *testing
 	snapshot, err := os.ReadFile(filepath.Join(dir, "workspace", "tasks", loop.ID+".plane.json"))
 	if err != nil || !strings.Contains(string(snapshot), dispatch.TaskContext.Context) {
 		t.Fatalf("recovery context missing: %s %v", snapshot, err)
+	}
+
+	// A later reply is durable, but the completed dispatch is no longer in the
+	// ordinary inbox. Rediscover only pending context, without claiming again.
+	dispatch.State, dispatch.StateVersion = "completed", dispatch.StateVersion+1
+	h.sources = sources
+	if err := h.pollPlane(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 3 || transitions != 1 || len(got.Events) != 1 || got.Events[0].ID != "late-1" {
+		t.Fatalf("completed reply was not published independently: calls=%d transitions=%d context=%+v", calls, transitions, got)
+	}
+	if err := h.pollPlane(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 3 {
+		t.Fatal("acknowledged completed task kept polling context")
 	}
 }

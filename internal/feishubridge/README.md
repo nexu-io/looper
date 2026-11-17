@@ -21,11 +21,12 @@ uses its private IPC shutdown endpoint; it never kills a recovered PID.
 For patch verification, unpack the pinned upstream source, apply
 `assets/upstream.patch`, overlay `assets/external.ts` to `src/bot/external.ts` and
 `assets/looper-entry.ts` to `src/looper-entry.ts`, and copy
-`test/external-dispatch.test.ts` into upstream `test/`. Run upstream's
+the files in `test/` into upstream `test/`. Run upstream's
 `npm ci --ignore-scripts`, `npm run typecheck`, and:
 
 ```sh
-npx vitest run test/external-dispatch.test.ts test/message-queue-races.test.ts \
+npx vitest run test/external-dispatch.test.ts test/looper-inline-files.test.ts test/inline-files.test.ts test/outbound-files.test.ts \
+  test/message-queue-races.test.ts \
   test/run-card-stream.test.ts test/queued-card.test.ts test/run-process.test.ts
 ```
 
