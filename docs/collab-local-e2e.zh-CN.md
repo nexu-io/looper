@@ -13,7 +13,7 @@ looper --version
 looper version --json
 ```
 
-预期 CLI 为 `0.16.3-beta.2`，构建提交 `4546116…`。本机已通过标准脚本安装，并用安装版跑通本地 Plane 配对/派发、自动私测群、原话题选择/续跑、HTML/截图附件及真实 sandbox PR/CI；最终合并收尾与正式环境结论见 [实测记录](E2E-collab-2026-11-16.zh-CN.md)。macOS 包为固定提交的本机原生构建，Linux 包为 CI 构建；release workflow 的 macOS runner 等待被取消，不称整条发布 CI 通过。不要同时启动使用同一 state 目录的源码宿主和安装版宿主。
+预期 CLI 为 `0.16.3-beta.2`，构建提交 `4546116…`。本机已通过标准脚本安装，并用安装版跑通本地 Plane 配对/派发、自动私测群、原话题选择/续跑、HTML/截图附件、真实 sandbox PR/CI、review 自动跟进及授权合并后的自动收尾，最终本机和 Plane 均 completed。正式环境和真人 QA 仍单独验收，详见 [实测记录](E2E-collab-2026-11-16.zh-CN.md)。macOS 包为固定提交的本机原生构建，Linux 包为 CI 构建；release workflow 的 macOS runner 等待被取消，不称整条发布 CI 通过。不要同时启动使用同一 state 目录的源码宿主和安装版宿主。
 
 ## 当前推荐：个人配对 + CF inbox / 心跳
 
