@@ -19,6 +19,15 @@ import (
 //go:embed memory/tool.py
 var memoryAssets embed.FS
 
+func (h *bridgeHost) memoryToolPaths() (string, string) {
+	for _, source := range h.sources {
+		if source.memoryEnabled {
+			return SocketPath(h.dir), filepath.Join(h.dir, "workspace", "memory.py")
+		}
+	}
+	return "", ""
+}
+
 func (h *bridgeHost) memoryClient(inputProject string) *forge.PlaneClient {
 	for _, source := range h.sources {
 		if source.project.ID == inputProject && source.memoryEnabled {

@@ -187,11 +187,12 @@ func serveBridge(parent context.Context, options Options) error {
 	if err != nil {
 		return err
 	}
+	memorySocket, memoryScript := host.memoryToolPaths()
 	host.client, err = feishubridge.Start(ctx, options.BridgeEntry, filepath.Join(dir, "bridge-state"), feishubridge.Init{
 		Socket: filepath.Join(dir, "bridge.sock"), CallbackSocket: SocketPath(dir), CWD: workspace,
 		AppID: appID, AppSecret: appSecret, OwnerOpenID: cfg.HITL.Feishu.OwnerOpenID,
 		ExternalEvents: inboxURL != "",
-		MemorySocket:   SocketPath(dir), MemoryScript: filepath.Join(workspace, "memory.py"),
+		MemorySocket:   memorySocket, MemoryScript: memoryScript,
 	}, log, inboxToken)
 	if err != nil {
 		return err

@@ -22,6 +22,17 @@ import (
 	"github.com/nexu-io/looper/internal/worker"
 )
 
+func TestMemoryMCPRegistrationRequiresExplicitOptIn(t *testing.T) {
+	h := &bridgeHost{dir: t.TempDir(), sources: []planeSource{{memoryEnabled: false}}}
+	if socket, script := h.memoryToolPaths(); socket != "" || script != "" {
+		t.Fatal("disabled memory adds a Python MCP process to existing sessions")
+	}
+	h.sources = append(h.sources, planeSource{memoryEnabled: true})
+	if socket, script := h.memoryToolPaths(); socket != SocketPath(h.dir) || script != filepath.Join(h.dir, "workspace", "memory.py") {
+		t.Fatal("enabled memory tools not registered")
+	}
+}
+
 func TestMemoryHostScopesToolsAndRetainsAcknowledgements(t *testing.T) {
 	ctx := context.Background()
 	cfg, dir := hostFixture(t, "#!/bin/sh\nexit 1\n")
