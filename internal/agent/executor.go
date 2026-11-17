@@ -993,6 +993,10 @@ func (x *execution) run(ctx context.Context) {
 		}
 		nativeFinalText = tr.assistantText()
 	}
+	if x.piJSONMode() {
+		nativeFinalText, _ = piJSONL(stdout)
+		completion = parseCompletion(nativeFinalText, stderr)
+	}
 	if status != "completed" {
 		completion = completionParse{ParseStatus: "missing"}
 	}
@@ -1509,6 +1513,9 @@ func (x *execution) maybeEmitProgress(now time.Time, stdout, stderr string) {
 		// Structured opencode feed (tool calls + text snippets) parsed from JSONL, so
 		// the card shows human activity rather than raw JSON events.
 		tail = openCodeActivityTail(stdout, liveProgressTailLines)
+	case x.piJSONMode():
+		_, activity := piJSONL(stdout)
+		tail = lastNonEmptyLines(strings.Join(activity, "\n"), liveProgressTailLines)
 	case x.claudeJSONMode():
 		// Structured claude feed (tool_use calls + text snippets) parsed from JSONL, so
 		// the card shows human activity rather than raw JSON events.
@@ -2232,6 +2239,9 @@ func resolveGrokArgs(cfg ExecutorConfig, args []string, workingDirectory string,
 // Looper already sets process cmd.Dir to the worktree. Fresh-run only.
 func resolvePiArgs(cfg ExecutorConfig, args []string, prompt string) []string {
 	resolved := prependModelFlag(args, cfg.Model, "--model", []string{"--model"})
+	if !hasAnyFlag(resolved, []string{"--mode"}) {
+		resolved = append([]string{"--mode", "json"}, resolved...)
+	}
 	if !hasAnyFlag(resolved, []string{"-p", "--print"}) {
 		// Operator-owned print/prompt: when -p/--print is already configured,
 		// do not append Looper's generated prompt (matches claude-code).
