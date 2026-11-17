@@ -159,6 +159,9 @@ func NewPlaneClientFromConfig(provider config.ProviderConfig, codeRepo string, o
 		return nil, err
 	}
 	if provider.WebBaseURL != nil && strings.TrimSpace(*provider.WebBaseURL) != "" {
+		if !config.IsHTTPOrigin(*provider.WebBaseURL) {
+			return nil, fmt.Errorf("plane client: webBaseUrl must be an HTTP(S) origin without credentials, path, query or fragment")
+		}
 		client.webBaseURL = strings.TrimRight(strings.TrimSpace(*provider.WebBaseURL), "/")
 	}
 	if strict := provider.StrictDispatch; strict != nil && strict.Enabled {

@@ -732,7 +732,7 @@ func (r *commandRuntime) planeCommandContext(args []string, strictBaseURLFlag st
 }
 
 func (r *commandRuntime) planeJSONRequest(ctx context.Context, baseURL, token, method, path, contentType string, body []byte, output any) error {
-	parsed, err := url.Parse(strings.TrimRight(baseURL, "/") + "/" + strings.TrimLeft(path, "/"))
+	parsed, err := url.Parse(strings.TrimRight(baseURL, "/") + "/" + strings.Trim(path, "/") + "/")
 	if err != nil {
 		return err
 	}

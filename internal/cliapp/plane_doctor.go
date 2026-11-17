@@ -2,6 +2,7 @@ package cliapp
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -31,7 +32,10 @@ type planeDoctorResult struct {
 }
 
 func (r *commandRuntime) planeDoctor(cmd *cobra.Command, args []string) error {
-	result := r.runPlaneDoctor(cmd.Context(), args, getBoolFlag(cmd, "collab"), getStringFlag(cmd, "state-dir"))
+	if getStringFlag(cmd, "state-dir") != "" && !getBoolFlag(cmd, "collab") {
+		return errors.New("--state-dir requires --collab")
+	}
+	result := r.runPlaneDoctor(cmd, args)
 	if getBoolFlag(cmd, "json") {
 		if err := writeJSON(cmd.OutOrStdout(), result); err != nil {
 			return err
@@ -40,12 +44,16 @@ func (r *commandRuntime) planeDoctor(cmd *cobra.Command, args []string) error {
 		return err
 	}
 	if !result.Ready {
+		if getBoolFlag(cmd, "collab") {
+			return errors.New("Plane readiness checks failed; follow the actions above and rerun `looper plane doctor --collab` with the same --config and --state-dir")
+		}
 		return errors.New("Plane readiness checks failed; follow the actions above and rerun `looper plane doctor`")
 	}
 	return nil
 }
 
-func (r *commandRuntime) runPlaneDoctor(ctx context.Context, args []string, collaboration bool, stateDir string) planeDoctorResult {
+func (r *commandRuntime) runPlaneDoctor(cmd *cobra.Command, args []string) planeDoctorResult {
+	ctx := cmd.Context()
 	result := planeDoctorResult{Ready: true}
 	add := func(name, status, detail, remediation string) {
 		result.Checks = append(result.Checks, planeDoctorCheck{Name: name, Status: status, Detail: detail, Remediation: remediation})
@@ -80,27 +88,39 @@ func (r *commandRuntime) runPlaneDoctor(ctx context.Context, args []string, coll
 	project := findPlaneDoctorProject(loaded.Config, provider.ID)
 	if project == nil {
 		add("repository", "failed", "no local project uses this Plane provider", "Reconnect from inside the GitHub checkout, or pass --project-path and --code-repo to `looper plane connect`.")
+	} else if getBoolFlag(cmd, "collab") {
+		add("project", "passed", project.ID+" · Plane connection namespace", "")
 	} else if info, statErr := os.Stat(project.RepoPath); statErr != nil || !info.IsDir() {
 		add("repository", "failed", fmt.Sprintf("%s is unavailable", project.RepoPath), "Restore the checkout or reconnect with the correct --project-path.")
 	} else {
 		add("repository", "passed", fmt.Sprintf("%s · GitHub %s", project.RepoPath, project.Repo), "")
 	}
 
-	r.planeDoctorToolChecks(ctx, loaded.Config, collaboration, add)
+	toolConfig := loaded.Config
+	if getBoolFlag(cmd, "collab") {
+		if resolved, ok := config.ResolveAgent(toolConfig, "", config.CodingRoleWorker); ok {
+			toolConfig.Agent.Vendor = &resolved.Vendor
+		}
+	}
+	r.planeDoctorToolChecks(ctx, toolConfig, add, getBoolFlag(cmd, "collab"))
 
 	tokenEnv := stringPointerValue(provider.TokenEnv)
 	token := strings.TrimSpace(os.Getenv(tokenEnv))
+	restart := "restart looperd"
+	if getBoolFlag(cmd, "collab") {
+		restart = "restart `looper collab` with the same --config and --state-dir"
+	}
 	if tokenEnv == "" {
 		add("plane-api-key", "failed", "provider tokenEnv is not configured", "Reconnect the provider with --plane-token-env PLANE_API_KEY.")
 	} else if token == "" {
-		add("plane-api-key", "failed", tokenEnv+" is empty", "Export the Plane API key in the receiving service environment, then restart that service.")
+		add("plane-api-key", "failed", tokenEnv+" is empty", "Export the Plane API key in the host environment, then "+restart+".")
 	} else {
 		var identity planeLinkIdentity
 		apiCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		err := r.planeJSONRequest(apiCtx, provider.BaseURL, token, "GET", "users/me/", "", nil, &identity)
+		err := r.planeJSONRequest(apiCtx, provider.BaseURL, token, "GET", "users/me", "", nil, &identity)
 		cancel()
 		if err != nil {
-			add("plane-api-key", "failed", err.Error(), "Refresh the Plane API key and restart the receiving service.")
+			add("plane-api-key", "failed", err.Error(), "Refresh the Plane API key and "+restart+".")
 		} else {
 			add("plane-api-key", "passed", "authenticated as member "+identity.ID, "")
 		}
@@ -139,16 +159,11 @@ func (r *commandRuntime) runPlaneDoctor(ctx context.Context, args []string, coll
 		}
 	}
 
-	if collaboration {
-		dir := collab.StateDir(loaded.Config, stateDir)
-		if _, err := collab.Request(ctx, dir, "GET", "/status", nil); err != nil {
-			add("collab", "failed", err.Error(), "Run `looper collab start` with the same config and --state-dir, then rerun `looper plane doctor --collab`.")
-		} else {
-			add("collab", "passed", "independent collaboration host is reachable", "")
-		}
+	if getBoolFlag(cmd, "collab") {
+		check := checkPlaneCollabHost(ctx, loaded.Config, getStringFlag(cmd, "state-dir"), provider)
+		add(check.Name, check.Status, check.Detail, check.Remediation)
 		return result
 	}
-
 	daemonCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	probe, probeErr := r.probeDaemonStatus(daemonCtx, r.apiClientFromLoaded(loaded))
 	cancel()
@@ -163,6 +178,64 @@ func (r *commandRuntime) runPlaneDoctor(ctx context.Context, args []string, coll
 	}
 
 	return result
+}
+
+func checkPlaneCollabHost(ctx context.Context, cfg config.Config, stateDir string, provider config.ProviderConfig) planeDoctorCheck {
+	check := planeDoctorCheck{Name: "collab", Status: "failed", Remediation: "Run `looper collab start` with the same --config and --state-dir; stop and restart it after changing Plane targets."}
+	dir, err := filepath.Abs(collab.StateDir(cfg, stateDir))
+	if err != nil {
+		check.Detail = err.Error()
+		return check
+	}
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	raw, err := collab.Request(ctx, dir, "GET", "/status", nil)
+	if err != nil {
+		check.Detail = err.Error()
+		return check
+	}
+	var status collab.Status
+	if err := json.Unmarshal(raw, &status); err != nil {
+		check.Detail = "invalid collaboration host status: " + err.Error()
+		return check
+	}
+	if (status.Service != "looper collab" && status.Service != "looper collab · feishu-codex-bridge") || status.State != "running" {
+		check.Detail = "collaboration host is not running"
+		return check
+	}
+	if !status.Network.Configured || !status.Network.CloudReachable || status.Network.IdentityDrift {
+		check.Detail = "collaboration host is offline or its network identity has drifted"
+		check.Remediation = "Check `looper collab status` and the existing loopernet connection; do not start a second host with this node identity."
+		return check
+	}
+	if provider.StrictDispatch == nil || status.Network.NodeID != provider.StrictDispatch.NodeID {
+		check.Detail = "collaboration host node does not match this Plane binding"
+		return check
+	}
+	var repositories []string
+	for _, project := range cfg.Projects {
+		if project.Provider != provider.ID {
+			continue
+		}
+		loaded := false
+		for _, target := range status.PlaneTargets {
+			if target.Workspace == stringPointerValue(provider.Workspace) && target.ProjectID == stringPointerValue(provider.ProjectID) && strings.EqualFold(strings.TrimSpace(project.Repo), target.Repo) {
+				loaded = true
+				break
+			}
+		}
+		if !loaded {
+			check.Detail = "collaboration host has not loaded this Plane project and repository: " + project.Repo
+			return check
+		}
+		repositories = append(repositories, project.Repo)
+	}
+	if len(repositories) == 0 {
+		check.Detail = "no configured repository uses this Plane provider"
+		return check
+	}
+	check.Status, check.Detail, check.Remediation = "passed", "standalone collab is online with Plane repositories loaded: "+strings.Join(repositories, ", "), ""
+	return check
 }
 
 func selectPlaneDoctorProvider(cfg config.Config, wanted string) (config.ProviderConfig, error) {
@@ -192,7 +265,7 @@ func findPlaneDoctorProject(cfg config.Config, providerID string) *config.Projec
 	return nil
 }
 
-func (r *commandRuntime) planeDoctorToolChecks(ctx context.Context, cfg config.Config, collaboration bool, add func(string, string, string, string)) {
+func (r *commandRuntime) planeDoctorToolChecks(ctx context.Context, cfg config.Config, add func(string, string, string, string), collabOnly bool) {
 	checkTool := func(name, configured, fallback, remediation string) string {
 		candidate := strings.TrimSpace(configured)
 		if candidate == "" {
@@ -218,7 +291,7 @@ func (r *commandRuntime) planeDoctorToolChecks(ctx context.Context, cfg config.C
 	}
 	checkTool("git", gitPath, "git", "Install Git, for example `brew install git`.")
 	ghPath = checkTool("github-cli", ghPath, "gh", "Install GitHub CLI and run `gh auth login`.")
-	if !collaboration {
+	if !collabOnly {
 		planePath = checkTool("plane-cli", planePath, "plane", "Install and authenticate the Plane CLI; Looper currently uses it for spec pages and links.")
 	} else {
 		planePath = ""

@@ -252,7 +252,7 @@ func Serve(parent context.Context, options Options) error {
 		if ctx.Err() != nil {
 			state = "stopping"
 		}
-		writeJSON(w, Status{Service: "looper collab", PID: os.Getpid(), State: state, ActiveExecutions: owner.LiveCount(), Network: network.Status(), Tasks: tasks})
+		writeJSON(w, Status{Service: "looper collab", PID: os.Getpid(), State: state, ActiveExecutions: owner.LiveCount(), Network: network.Status(), Tasks: tasks, PlaneTargets: configuredPlaneTargets(cfg)})
 	})
 	mux.HandleFunc("POST /run", func(w http.ResponseWriter, r *http.Request) {
 		var input worker.EnqueueInput

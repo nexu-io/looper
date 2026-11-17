@@ -19,6 +19,11 @@
 6. 给自己的一个测试 work item 派发任务，观察 `等待领取 → 队列中第 N 位 → 运行 → 等待决策/PR/QA → 完成`，并确认刷新页面后状态与产物链接仍在。
 7. 停掉本机 daemon，确认 Plane 显示离线且任务保持原 owner 等待恢复；重新启动后继续，不被其他人的 Looper 领取。
 
+独立协作入口使用 `plane connect --collab` → `collab start` → `plane doctor --collab`，
+不要求额外启动完整 daemon。显式指定时，连接、启动和诊断使用同一个 `--config`；启动和诊断还需使用同一个 `--state-dir`。
+doctor 会核对 collab 实际加载的 Plane／仓库目标及在线身份；更改绑定后重启 collab。
+第 6、7 步相应验证 collab 的真实派发、停止和重启，诊断通过不能替代实际任务与人工验收。
+
 ## 仍需外部准备的凭据
 
 浏览器连接已经自动补齐 Plane workspace/project/provider，但当前版本仍需要三类本机凭据：coding agent 登录、GitHub CLI 登录、Plane API key/CLI 登录。它们不写入项目配置，也不能由团队共享。`looper plane doctor` 会逐项指出缺失项。

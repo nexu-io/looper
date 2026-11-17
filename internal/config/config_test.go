@@ -636,6 +636,26 @@ func TestValidateTreatsPlaneCodeRepoAsGitHubIdentity(t *testing.T) {
 	}
 }
 
+func TestPlaneWebOriginSurvivesFileLoadingAndMigration(t *testing.T) {
+	partial, err := DecodePartialConfigFile("config.json", []byte(`{"providers":[{"id":"plane","kind":"plane","baseUrl":"http://127.0.0.1:18040/api/v1","webBaseUrl":"http://localhost:3000/","tokenEnv":"PLANE_TOKEN","workspace":"local","projectId":"project"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Normalize(t.TempDir(), CanonicalizePartialForMigration(partial))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Providers[0].WebBaseURL == nil || strings.TrimRight(*cfg.Providers[0].WebBaseURL, "/") != "http://localhost:3000" {
+		t.Fatalf("web origin lost: %#v", cfg.Providers[0])
+	}
+	for _, invalid := range []string{"javascript:alert(1)", "https://user:secret@example.test", "https://example.test/path", "https://example.test?q=secret"} {
+		cfg.Providers[0].WebBaseURL = &invalid
+		if err := ValidateWithOptions(cfg, ValidateOptions{DefaultWorktreeRoot: t.TempDir()}); err == nil || !strings.Contains(err.Error(), "webBaseUrl") {
+			t.Errorf("accepted invalid origin %q: %v", invalid, err)
+		}
+	}
+}
+
 func TestPlaneStrictDispatchConfigNormalizesAndValidates(t *testing.T) {
 	t.Parallel()
 

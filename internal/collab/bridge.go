@@ -493,7 +493,7 @@ func (h *bridgeHost) status(w http.ResponseWriter, r *http.Request) {
 	if h.ready.Load() {
 		state = "running"
 	}
-	writeJSON(w, Status{Service: "looper collab · feishu-codex-bridge", PID: os.Getpid(), State: state, ActiveExecutions: active, Tasks: tasks, Network: h.networkStatus()})
+	writeJSON(w, Status{Service: "looper collab · feishu-codex-bridge", PID: os.Getpid(), State: state, ActiveExecutions: active, Tasks: tasks, Network: h.networkStatus(), PlaneTargets: configuredPlaneTargets(h.cfg)})
 }
 
 func (h *bridgeHost) resultPath(id string) string {
