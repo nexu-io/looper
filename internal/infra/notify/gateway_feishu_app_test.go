@@ -919,8 +919,8 @@ func TestFeishuThreadHeaderCardLinksCheckpointIssueURL(t *testing.T) {
 		t.Fatalf("tags must stay together on the left: %v", tags)
 	}
 	columns := tags["columns"].([]any)
-	if len(columns) != 3 {
-		t.Fatalf("want status, issue and title on the same row, got %v", columns)
+	if len(columns) != 2 {
+		t.Fatalf("want status and issue on the metadata row, got %v", columns)
 	}
 	statusTag := columns[0].(map[string]any)["elements"].([]any)[0].(map[string]any)
 	issueColumn := columns[1].(map[string]any)
@@ -930,9 +930,9 @@ func TestFeishuThreadHeaderCardLinksCheckpointIssueURL(t *testing.T) {
 	if url != want || link["padding"] != "0px" || link["background_style"] != nil || issueTag["text_size"] != statusTag["text_size"] || !strings.HasPrefix(issueTag["content"].(string), "<text_tag ") {
 		t.Fatalf("issue must use the same native tag style with a Plane link: %v", issueColumn)
 	}
-	title := columns[2].(map[string]any)
-	if title["width"] != "weighted" || title["elements"].([]any)[0].(map[string]any)["content"] != "**High-fidelity export**" {
-		t.Fatalf("title must sit beside tags: %v", title)
+	title := rendered["body"].(map[string]any)["elements"].([]any)[1].(map[string]any)
+	if title["tag"] != "markdown" || title["content"] != "**High-fidelity export**" {
+		t.Fatalf("title must have its own full-width row: %v", title)
 	}
 }
 

@@ -15,6 +15,23 @@ import (
 	"github.com/nexu-io/looper/internal/infra/feishucli"
 )
 
+func TestOwnerAttributionForPersonalPlaneProject(t *testing.T) {
+	h := &bridgeHost{cfg: config.Config{HITL: config.HITLConfig{
+		Feishu: &config.HITLFeishuConfig{OwnerOpenID: "ou_local_owner"},
+	}}}
+	if got := h.ownerOpenID("personal-plane-dynamic-project"); got != "ou_local_owner" {
+		t.Fatalf("personal Plane project lost the local Looper owner: %q", got)
+	}
+	h.cfg.Projects = []config.ProjectRefConfig{{ID: "configured", Owner: &config.FeishuActorConfig{FeishuOpenID: "ou_project_owner"}}}
+	if got := h.ownerOpenID("configured"); got != "ou_project_owner" {
+		t.Fatalf("configured project owner lost precedence: %q", got)
+	}
+	h.cfg.HITL.Feishu = nil
+	if got := h.ownerOpenID("personal-plane-dynamic-project"); got != "" {
+		t.Fatalf("unconfigured owner was invented: %q", got)
+	}
+}
+
 func TestPeopleDirectoryRefreshJoinsNoIdentitiesAndRemovesOldMembers(t *testing.T) {
 	phase := "initial"
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

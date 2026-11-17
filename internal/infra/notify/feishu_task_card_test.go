@@ -84,10 +84,19 @@ func TestCollaborationCardShowsOnlyCurrentExecution(t *testing.T) {
 		t.Fatalf("completed card must retain named attribution without an @ notification: %s", raw)
 	}
 	columns := elements[0].(map[string]any)["columns"].([]any)
+	status := columns[0].(map[string]any)["elements"].([]any)[0].(map[string]any)["content"].(string)
+	if strings.Contains(status, "43s") || elements[1].(map[string]any)["content"] != "**确认称呼**" {
+		t.Fatal("duration must stay outside the status tag and title must have its own row")
+	}
 	owner := columns[len(columns)-1].(map[string]any)["elements"].([]any)[0].(map[string]any)
 	if owner["content"] != "<text_tag color='neutral'>杨瑾龙的 Looper</text_tag>" || owner["text_size"] != "notation" {
 		t.Fatalf("owner must be a compact tag at the right of the heading: %v", owner)
 	}
+	gateway.resolveOwnerName = nil
+	if attribution := gateway.looperAttribution(loop.ProjectID); strings.Contains(attribution, "<at ") || strings.Contains(attribution, "ou_owner") || !strings.Contains(attribution, "任务负责人的 Looper") {
+		t.Fatalf("missing directory name must not turn attribution into an @: %s", attribution)
+	}
+	gateway.resolveOwnerName = func(string) string { return "杨瑾龙" }
 	for _, status := range []string{"queued", "running", "awaiting_human", "completed", "failed"} {
 		loop.Status = status
 		if err := repos.Loops.Upsert(ctx, loop); err != nil {
