@@ -108,7 +108,7 @@ func (r *commandRuntime) connectPersonalPlane(cmd *cobra.Command, origin, code s
 		}
 	}
 	connection := planestrict.DeviceConnection{BaseURL: origin, WebBaseURL: exchange.WebBaseURL, DeviceID: exchange.DeviceID,
-		Pairing: exchange.Pairing, RelayURL: exchange.RelayURL,
+		Pairing:  exchange.Pairing,
 		MemberID: exchange.MemberID, NodeID: exchange.NodeID, Workspace: exchange.Workspace,
 		ProjectID: exchange.ProjectID, PrivateKeyFile: keyFile}
 	client, err := connection.Client(connection.Workspace, connection.ProjectID, planestrict.WithHTTPClient(r.httpClient()))
@@ -215,10 +215,10 @@ func (r *commandRuntime) personalPlaneDoctor(ctx context.Context, cfg config.Con
 		return
 	}
 	if device.Pairing == "device_v1" {
-		if status.Plane.DeviceID != device.DeviceID || !status.Plane.Reachable || !status.Plane.RelayReachable {
-			add("collab", "failed", "Plane connection or CF heartbeat is not ready", "Check looper collab status --json and the Plane/CF relay configuration.")
+		if status.Plane.DeviceID != device.DeviceID || !status.Plane.Reachable || !status.Plane.HeartbeatReachable {
+			add("collab", "failed", "Plane connection or device heartbeat is not ready", "Check looper collab status --json and the Plane connection.")
 		} else {
-			add("collab", "passed", "Plane connected · CF device heartbeat online", "")
+			add("collab", "passed", "Plane connected · device heartbeat online", "")
 		}
 		return
 	}

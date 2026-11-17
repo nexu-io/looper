@@ -18,9 +18,9 @@ type Status struct {
 }
 
 type PlaneStatus struct {
-	DeviceID       string `json:"deviceId,omitempty"`
-	Reachable      bool   `json:"reachable"`
-	RelayReachable bool   `json:"relayReachable"`
+	DeviceID           string `json:"deviceId,omitempty"`
+	Reachable          bool   `json:"reachable"`
+	HeartbeatReachable bool   `json:"heartbeatReachable"`
 }
 
 // Task is a presentation of existing loop records, not another task state.

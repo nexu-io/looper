@@ -8,7 +8,7 @@
 
 研发在 Plane **个人设置 → Developer → 我的 Looper** 复制一次性 `looper plane connect … --code … --collab` 命令，执行后运行 `looper collab start`，再用 `looper plane doctor --collab` 自检。个人连接跨本人有执行权限的项目复用，无需在项目里重复连接，不绑定代码仓库。
 
-新链路不再要求同事入网或维护 loopernet 配置。维护者提供已配置好的 Plane、CF Worker 和飞书 bot 凭证，部署设置、故障验证与仍未完成的身份授权事项见 [CF relay 说明](collab-cf-relay.zh-CN.md)。目前不能据此宣称“只输入一条命令即可完成全新同事的所有授权”。
+新链路不再要求同事入网或维护 loopernet 配置，心跳由本机直接发送给 Plane，CF 仅中转飞书消息。维护者提供已配置好的 Plane、CF Worker 和飞书 bot 凭证，部署设置、故障验证与仍未完成的身份授权事项见 [连接说明](collab-cf-relay.zh-CN.md)。目前不能据此宣称“只输入一条命令即可完成全新同事的所有授权”。
 
 项目可以先启用协作，不要求成员在线或填全角色。Agent 根据任务选择一个或多个仓库、评估影响面和规划深度，在飞书原话题找人沟通，必要时问 owner。
 

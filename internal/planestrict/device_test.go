@@ -1,13 +1,18 @@
 package planestrict
 
 import (
+	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/x509"
 	"encoding/pem"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestPersonalDeviceReusesKeyButKeepsSessionsPerProject(t *testing.T) {
@@ -49,5 +54,42 @@ func TestPersonalDeviceReusesKeyButKeepsSessionsPerProject(t *testing.T) {
 	}
 	if _, err = d.Client("team", "../../escape"); err == nil {
 		t.Fatal("remote project escaped the session directory")
+	}
+}
+
+func TestDeviceHeartbeatUsesSignedPlaneEndpoint(t *testing.T) {
+	publicKey, key, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	binding := mustUUID(t, "55555555-6666-4777-8888-999999999999")
+	now := time.Now().UTC()
+	for _, status := range []int{http.StatusOK, http.StatusUnauthorized, http.StatusServiceUnavailable} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodPost || r.URL.Path != "/api/looper/devices/heartbeat/" {
+					t.Errorf("unexpected heartbeat: %s %s", r.Method, r.URL.Path)
+				}
+				raw, err := io.ReadAll(r.Body)
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				verifyRequestSignature(t, r, raw, publicKey, binding, nil, now)
+				w.WriteHeader(status)
+				_, _ = w.Write([]byte(`{}`))
+			}))
+			defer server.Close()
+			client, err := NewClient(server.URL, "team", "project", Credentials{
+				BindingID: binding, KeyRevision: 2, PrivateKey: key, NodeID: "collab-session",
+			}, WithClock(func() time.Time { return now }))
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = client.DeviceHeartbeat(context.Background())
+			if (err == nil) != (status == http.StatusOK) {
+				t.Fatalf("status=%d error=%v", status, err)
+			}
+		})
 	}
 }

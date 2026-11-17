@@ -15,8 +15,6 @@ export interface Env {
   FEISHU_VERIFY_TOKEN: string;
   FEISHU_ENCRYPT_KEY?: string;
   POLL_TOKEN: string;
-  PLANE_BASE_URL?: string;
-  PRESENCE_TOKEN?: string;
   PATH_PREFIX?: string;
 }
 
@@ -61,55 +59,9 @@ export default {
     if (request.method === "GET" && path === "/healthz") {
       return json({ ok: true });
     }
-    if (request.method === "POST" && path === "/devices/heartbeat" && !url.search) {
-      return handleHeartbeat(request, env);
-    }
-    if (request.method === "GET" && /^\/devices\/[0-9a-f-]{36}$/.test(path)) {
-      return handlePresence(request, env, path.slice("/devices/".length));
-    }
     return new Response("not found", { status: 404 });
   },
 };
-
-async function handleHeartbeat(request: Request, env: Env): Promise<Response> {
-  if (!request.headers.get("Looper-Signature")) return json({ error: "unauthorized" }, 401);
-  let origin: URL;
-  try {
-    origin = new URL(env.PLANE_BASE_URL || "");
-    const local = origin.protocol === "http:" && ["127.0.0.1", "localhost"].includes(origin.hostname);
-    if ((!local && origin.protocol !== "https:") || origin.username || origin.password || origin.search || origin.hash || origin.pathname !== "/") throw new Error("invalid origin");
-  } catch {
-    return json({ error: "plane_not_configured" }, 503);
-  }
-  const body = await request.text();
-  if (body.length > 1024) return json({ error: "request_too_large" }, 413);
-  let result: Response;
-  try {
-    result = await fetch(new URL("/api/looper/devices/heartbeat/", origin), {
-      method: "POST", body, redirect: "manual", signal: AbortSignal.timeout(8000),
-      headers: { "Content-Type": "application/json", "Looper-Signature": request.headers.get("Looper-Signature")! },
-    });
-    if (!result.ok) return json({ error: "device_not_verified" }, result.status < 500 ? 401 : 503);
-    const identity: any = await result.json();
-    if (!/^[0-9a-f-]{36}$/.test(identity.device_id) || typeof identity.node_id !== "string" || !identity.node_id) throw new Error("invalid identity");
-    const now = new Date().toISOString();
-    await env.DB.prepare(`INSERT INTO devices (device_id, node_id, last_heartbeat_at) VALUES (?, ?, ?)
-      ON CONFLICT(device_id) DO UPDATE SET node_id=excluded.node_id,
-      last_heartbeat_at=MAX(devices.last_heartbeat_at, excluded.last_heartbeat_at)`)
-      .bind(identity.device_id, identity.node_id, now).run();
-    return json({ ok: true });
-  } catch (error) {
-    console.warn("Device heartbeat could not be recorded", error instanceof Error ? error.message : "unknown error");
-    return json({ error: "heartbeat_unavailable" }, 503);
-  }
-}
-
-async function handlePresence(request: Request, env: Env, id: string): Promise<Response> {
-  const token = (request.headers.get("Authorization") || "").replace(/^Bearer\s+/i, "").trim();
-  if (!env.PRESENCE_TOKEN || !timingSafeEqual(token, env.PRESENCE_TOKEN)) return json({ error: "unauthorized" }, 401);
-  const rows = await env.DB.prepare("SELECT device_id, node_id, last_heartbeat_at FROM devices WHERE device_id=?").bind(id).all();
-  return json(rows.results?.[0] || { device_id: id, node_id: null, last_heartbeat_at: null });
-}
 
 async function handleFeishuCallback(request: Request, env: Env): Promise<Response> {
   let body: any;

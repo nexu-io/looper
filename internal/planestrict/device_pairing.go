@@ -5,10 +5,7 @@ import (
 	"crypto/ed25519"
 	"encoding/base64"
 	"encoding/json"
-	"fmt"
 	"net/http"
-	"net/url"
-	"strings"
 )
 
 type PairedDevice struct {
@@ -43,18 +40,8 @@ func PairDevice(ctx context.Context, origin, workspace, project, connectionID, c
 	return result, err
 }
 
-// CF forwards this exact signed request to its configured Plane origin for
-// authentication. A client cannot nominate a different verification server.
-func (c *Client) DeviceHeartbeat(ctx context.Context, relayURL string) error {
-	relay, err := url.Parse(strings.TrimRight(relayURL, "/"))
-	if err != nil || relay.Host == "" || relay.User != nil || relay.RawQuery != "" || relay.Fragment != "" || (relay.Scheme != "https" && !(relay.Scheme == "http" && (relay.Hostname() == "127.0.0.1" || relay.Hostname() == "localhost"))) {
-		return fmt.Errorf("collaboration relay requires HTTPS (HTTP is allowed on localhost)")
-	}
-	request, err := c.signedRequest(ctx, http.MethodPost, "/api/looper/devices/heartbeat/", nil, []byte(`{}`), nil)
-	if err != nil {
-		return err
-	}
-	relay.Path += "/devices/heartbeat"
-	request.URL, request.Host = relay, relay.Host
-	return c.send(request, nil)
+// DeviceHeartbeat reports presence directly to the paired Plane origin using
+// the same device signature as task requests. CF only relays Feishu messages.
+func (c *Client) DeviceHeartbeat(ctx context.Context) error {
+	return c.do(ctx, http.MethodPost, "/api/looper/devices/heartbeat/", nil, map[string]any{}, nil, nil)
 }

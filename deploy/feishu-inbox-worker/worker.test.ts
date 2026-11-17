@@ -8,7 +8,6 @@ function setup() {
   const db = new DatabaseSync(':memory:');
   db.exec(readFileSync(new URL('./schema.sql', import.meta.url), 'utf8'));
   db.exec(readFileSync(new URL('./migrations/0001_raw_events.sql', import.meta.url), 'utf8'));
-  db.exec(readFileSync(new URL('./migrations/0002_device_presence.sql', import.meta.url), 'utf8'));
   const env: Env = { FEISHU_APP_ID: 'app', FEISHU_VERIFY_TOKEN: 'verify', POLL_TOKEN: 'poll', DB: {
     prepare(sql) { return { bind(...values) { return {
       async run() { return db.prepare(sql).run(...values as any[]); },
@@ -69,40 +68,16 @@ test('decrypts callbacks before verification and rejects another app', async () 
 });
 
 
-test('CF records only Plane-authenticated heartbeats and restricts directory reads', async () => {
+test('CF only relays Feishu messages and never calls Plane', async () => {
   const s = setup();
-  const id = '11111111-2222-4333-8444-555555555555';
-  s.env.PLANE_BASE_URL = 'https://plane.example';
-  s.env.PRESENCE_TOKEN = 'server-only';
-  const upstream = mock.method(globalThis, 'fetch', async (url: any, init: any) => {
-    assert.equal(String(url), 'https://plane.example/api/looper/devices/heartbeat/');
-    assert.equal(init.redirect, 'manual');
-    assert.equal(init.headers['Looper-Signature'], 'signed-device');
-    assert.equal(init.body, '{}');
-    return Response.json({ device_id: id, node_id: 'own-node' });
-  });
-  const beat = (signature = 'signed-device') => worker.fetch(new Request('https://test/devices/heartbeat', {
-    method: 'POST', headers: { 'Looper-Signature': signature }, body: '{}',
-  }), s.env);
-  const read = (token: string) => worker.fetch(new Request(`https://test/devices/${id}`, {
-    headers: { Authorization: `Bearer ${token}` },
-  }), s.env);
+  const upstream = mock.method(globalThis, 'fetch', async () => { throw new Error('unexpected outbound request'); });
   try {
-    assert.equal((await beat('')).status, 401);
+    assert.equal((await worker.fetch(new Request('https://test/devices/heartbeat', {
+      method: 'POST', headers: { 'Looper-Signature': 'old-client' }, body: '{}',
+    }), s.env)).status, 404);
+    assert.equal((await worker.fetch(new Request('https://test/devices/11111111-2222-4333-8444-555555555555'), s.env)).status, 404);
+    assert.equal((await s.callback(event('no-upstream'))).status, 200);
+    assert.equal(((await (await s.read()).json()) as any).events.length, 1);
     assert.equal(upstream.mock.callCount(), 0);
-    assert.equal((await beat()).status, 200);
-    assert.equal((await read('poll')).status, 401);
-    const presence: any = await (await read('server-only')).json();
-    assert.equal(presence.device_id, id);
-    assert.equal(presence.node_id, 'own-node');
-    assert.ok(Date.parse(presence.last_heartbeat_at));
-    upstream.mock.mockImplementation(async () => Response.json({ error: 'revoked' }, { status: 401 }));
-    assert.equal((await beat()).status, 401);
-    assert.deepEqual(await (await read('server-only')).json(), presence);
-    upstream.mock.mockImplementation(async () => { throw new Error('offline'); });
-    assert.equal((await beat()).status, 503);
-    assert.deepEqual(await (await read('server-only')).json(), presence);
-    s.env.PLANE_BASE_URL = 'https://plane.example/redirect';
-    assert.equal((await beat()).status, 503);
   } finally { upstream.mock.restore(); s.db.close(); }
 });

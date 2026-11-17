@@ -243,14 +243,14 @@ func writeCollabOutput(cmd *cobra.Command, result json.RawMessage) error {
 	if status.Service != "" {
 		fmt.Fprintf(cmd.OutOrStdout(), "%s · %s · PID %d · %d 个执行中\n", status.Service, status.State, status.PID, status.ActiveExecutions)
 		if status.Plane.DeviceID != "" {
-			plane, relay := "连接不可达", "尚未收到心跳确认"
+			plane, heartbeat := "连接不可达", "尚未收到心跳确认"
 			if status.Plane.Reachable {
 				plane = "已连接"
 			}
-			if status.Plane.RelayReachable {
-				relay = "在线"
+			if status.Plane.HeartbeatReachable {
+				heartbeat = "在线"
 			}
-			fmt.Fprintf(cmd.OutOrStdout(), "Plane · %s · CF 心跳 · %s\n", plane, relay)
+			fmt.Fprintf(cmd.OutOrStdout(), "Plane · %s · 设备心跳 · %s\n", plane, heartbeat)
 		} else if status.Network.Configured {
 			fmt.Fprintf(cmd.OutOrStdout(), "loopernet · %s · 在线 %t\n", status.Network.NodeName, status.Network.CloudReachable)
 		} else {

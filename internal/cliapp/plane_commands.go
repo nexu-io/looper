@@ -68,7 +68,6 @@ type planeEnrollment struct {
 
 type planeConnectExchange struct {
 	Pairing      string           `json:"pairing"`
-	RelayURL     string           `json:"relay_url"`
 	Enrollment   *planeEnrollment `json:"enrollment"`
 	WebBaseURL   string           `json:"web_base_url"`
 	Personal     bool             `json:"personal"`
