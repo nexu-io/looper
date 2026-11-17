@@ -47,6 +47,8 @@ type Outcome struct {
 	State        string                   `json:"state"`
 	Summary      string                   `json:"summary"`
 	PullRequests []string                 `json:"pullRequests,omitempty"`
+	WaitKind     string                   `json:"waitKind,omitempty"`
+	WaitRole     string                   `json:"waitRole,omitempty"`
 	WaitingFor   []string                 `json:"waitingFor,omitempty"`
 	NextStep     string                   `json:"nextStep,omitempty"`
 	Context      string                   `json:"context,omitempty"`
@@ -670,6 +672,7 @@ events 每项使用稳定且唯一的 id、title、body（Markdown 详情）、k
 关键发现、人的明确决策、验收反馈和交付应进入 events；普通聊天与工具调用不需要逐条搬运。人的协作原消息正文留在原平台，不要在 events.body 或 context 逐字搬运；保留分类、真实参与者、时间、原消息链接，工作摘要用自己的表述。人的结论须写真实发言人和飞书来源链接，无法确定时说明待确认，不能冒充 Plane 用户或把自己的推断当成人的决定。
 context 是当前有效的目标、范围、事实、依据和待办，按任务需要组织，不强制章节。不要记录密钥、token 或原始工具日志。每轮开始读提示中给出的 .plane.json；仅查看旧时间线，events 只提交本轮新增记录。同步由宿主处理，写回失败也继续本地执行，不把网络同步当成人工审批。
 summary 只写一句短进展（约 40 字），解释和证据放话题正文，不要复制整篇回复。
+needs_input 时可额外填写 waitKind（clarification/decision/review/acceptance/other）和 waitRole（owner/product/design/engineering/qa/other）；只标注实际等待原因和角色，不确定就省略，不代表审批完成。
 waitingFor 中填写从当前应用目录查得的真实 open_id；不要把 owner、qa 或人名当作 open_id。不确定等谁时留空，在话题中问 owner。
 state 可为 needs_input（确实需要人回复）、monitoring_prs（PR 尚在推进或等待合并）、completed（任务已实际完成；有 PR 时应在收尾后）。pullRequests 记录任务涉及的全部仓库 PR，允许为空。可选 repositories 数组记录实际选择的仓库：repo（HTTPS URL）、role（modify/consult/candidate）、branch、baseSha、prUrl、validationStatus（passed/failed/not_run/blocked）。这是 Agent 上报，不代表人工验收。
 继续原话题时沿用同一个任务文件。普通聊天只有 @bot 才触发你，不要自行轮询飞书抢另一条消息通道。

@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/nexu-io/looper/internal/eventlog"
@@ -107,10 +108,21 @@ func (h *bridgeHost) saveTurn(ctx context.Context, loop storage.LoopRecord, stat
 		h.track(ctx, loop, "task.state_changed", id+":"+event.Phase, id, map[string]any{"from": loop.Status, "to": taskStatus})
 	}
 	if taskStatus == "awaiting_human" {
-		h.track(ctx, loop, "human.requested", id, id, map[string]any{"transport": "feishu_bridge"})
+		attrs := map[string]any{"transport": "feishu_bridge"}
+		input, _, ok := readBridgeTask(loop)
+		if ok && input.StrictDispatchID != "" {
+			attrs = waitAttributes(state.Outcome, id)
+		}
+		h.track(ctx, loop, "human.requested", id, id, attrs)
 	}
 	if event.Phase == "started" && loop.Status == "awaiting_human" {
-		h.track(ctx, loop, "human.answered", id, id, map[string]any{"transport": "feishu_bridge"})
+		attrs := map[string]any{"transport": "feishu_bridge"}
+		input, previous, ok := readBridgeTask(loop)
+		if ok && input.StrictDispatchID != "" {
+			attrs = waitAttributes(previous.Outcome, previous.TrackingRunID)
+			attrs["source"] = "resume_started"
+		}
+		h.track(ctx, loop, "human.answered", id, id, attrs)
 	}
 	return nil
 }
@@ -124,4 +136,16 @@ func (h *bridgeHost) interruptTrackedTurns(ctx context.Context) error {
 	}
 	_, err = h.db.ExecContext(ctx, `UPDATE runs SET status='interrupted', ended_at=?,updated_at=? WHERE status='running' AND id LIKE 'run_bridge_%' AND loop_id IN (SELECT id FROM loops WHERE json_extract(metadata_json,'$.bridge') IS NOT NULL)`, now, now)
 	return err
+}
+
+// These are agent-reported diagnostics, never business approvals.
+func waitAttributes(outcome Outcome, reference string) map[string]any {
+	kind, role := outcome.WaitKind, outcome.WaitRole
+	if !slices.Contains([]string{"clarification", "decision", "review", "acceptance", "other"}, kind) {
+		kind = "unknown"
+	}
+	if !slices.Contains([]string{"owner", "product", "design", "engineering", "qa", "other"}, role) {
+		role = "unknown"
+	}
+	return map[string]any{"transport": "feishu_bridge", "reference": reference, "waitKind": kind, "role": role}
 }
