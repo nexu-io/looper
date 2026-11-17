@@ -87,8 +87,15 @@ func PollPrivateFeishu(ctx context.Context, input FeishuPollInput) error {
 		reply := feishucli.ReplyAfterQuestion(messages, replyConfig, ask.QuestionMessageID)
 		if reply.Text != "" {
 			nowISO := eventlog.FormatJavaScriptISOString(input.Now().UTC())
-			if err := loops.DeliverHITLAnswerForQuestion(ctx, input.Repos, nowISO, loop.ID, reply.Text, ask.QuestionMessageID); err != nil {
+			accepted, err := loops.DeliverHITLAnswerForQuestion(ctx, input.Repos, nowISO, loop.ID, reply.Text, ask.QuestionMessageID)
+			if err != nil {
 				return err
+			}
+			if !accepted {
+				continue
+			}
+			if input.OnHITLAnswerDelivered != nil {
+				input.OnHITLAnswerDelivered(ctx, loop.ID, reply.Text)
 			}
 			// A reaction acknowledges receipt without interpreting the answer.
 			// Failure must not prevent the already-delivered reply from resuming.
@@ -98,9 +105,6 @@ func PollPrivateFeishu(ctx context.Context, input FeishuPollInput) error {
 				ackErr = errors.Join(ackErr, client.MarkReplyProcessing(ackCtx, id))
 			}
 			cancel()
-			if input.OnHITLAnswerDelivered != nil {
-				input.OnHITLAnswerDelivered(ctx, loop.ID, reply.Text)
-			}
 			if ackErr != nil {
 				return fmt.Errorf("reply delivered; Feishu processing reaction failed: %w", ackErr)
 			}

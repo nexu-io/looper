@@ -122,7 +122,7 @@ func TestReplySeparatesBotDisplayNameFromHumanAnswer(t *testing.T) {
 func TestProcessingReactionUsesBotIdentity(t *testing.T) {
 	c := Client{}
 	c.Run = func(_ context.Context, _ string, _ []byte, args ...string) ([]byte, error) {
-		want := `im reactions create --params {"message_id":"om_answer"} --data {"reaction_type":{"emoji_type":"OnIt"}} --as bot`
+		want := `im reactions create --params {"message_id":"om_answer"} --data {"reaction_type":{"emoji_type":"Get"}} --as bot`
 		if strings.Join(args, " ") != want {
 			t.Fatalf("args = %v", args)
 		}

@@ -177,7 +177,7 @@ func TestPlaneIngestionFiltersBeforeClaimAndReplaysOriginalTask(t *testing.T) {
 	if good.State != "awaiting_human" {
 		t.Fatalf("HITL not synced: %s", good.State)
 	}
-	if err := loops.DeliverHITLAnswerForQuestion(ctx, repos, now, loop.ID, "1", "question"); err != nil {
+	if _, err := loops.DeliverHITLAnswerForQuestion(ctx, repos, now, loop.ID, "1", "question"); err != nil {
 		t.Fatal(err)
 	}
 	resumed, err := repos.Queue.GetByID(ctx, queue[0].ID)
@@ -258,7 +258,7 @@ func TestPlaneIngestionFiltersBeforeClaimAndReplaysOriginalTask(t *testing.T) {
 	if err := stopPlaneTask(ctx, &service, repos, owner, stopped); err != nil {
 		t.Fatal(err)
 	}
-	if err := loops.DeliverHITLAnswerForQuestion(ctx, repos, now, stopped.ID, "1", "late-question"); err != nil {
+	if _, err := loops.DeliverHITLAnswerForQuestion(ctx, repos, now, stopped.ID, "1", "late-question"); err != nil {
 		t.Fatal(err)
 	}
 	final, err := repos.Loops.GetByID(ctx, stopped.ID)

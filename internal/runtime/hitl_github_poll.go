@@ -267,5 +267,6 @@ func runGitHubHITLPoll(ctx context.Context, input defaultSchedulerTickInput, pro
 }
 
 func deliverHITLAnswerToLoopForQuestion(ctx context.Context, repos *storage.Repositories, nowISO, loopID, answer, expectedQuestionID string) error {
-	return loops.DeliverHITLAnswerForQuestion(ctx, repos, nowISO, loopID, answer, expectedQuestionID)
+	_, err := loops.DeliverHITLAnswerForQuestion(ctx, repos, nowISO, loopID, answer, expectedQuestionID)
+	return err
 }
