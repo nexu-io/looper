@@ -74,7 +74,16 @@
  import { registerVoiceConsole } from './voice-console';
  import { createVoiceService } from '../voice/service';
  import { ingestVoice, createIntakeQueue, type IngestedContext } from '../voice/inbound';
-@@ -514,6 +515,8 @@
+@@ -471,6 +472,8 @@
+ }
+ 
+ interface ActiveState {
++  /** Receipts for supplements accepted by this running turn. */
++  steerReactions?: RunReaction[];
+   steerReply?: { run: AgentRun; accept: (messageId: string, voice?: VoiceReply) => boolean };
+   /** Captured with the steer target so a late ACK cannot decorate another turn. */
+   voiceReply?: { run: AgentRun; add: (voice: VoiceReply) => void };
+@@ -514,6 +517,8 @@
  }
  
  export interface Orchestrator {
@@ -83,7 +92,7 @@
    onMessage: (msg: NormalizedMessage) => Promise<void>;
    /** `comment` event handler: @bot in a cloud-doc comment → reply in-thread. */
    onComment: (evt: CommentEvent) => Promise<void>;
-@@ -671,6 +674,7 @@
+@@ -671,6 +676,7 @@
    cfg: AppConfig,
    fallbackCwd: string,
    cliBridge?: CliBridgeRuntimeHooks,
@@ -91,22 +100,39 @@
  ): Orchestrator {
    /** Lazily-constructed backends by id — one instance per backend for the whole
     * bridge (mirrors the old single-instance shape; codex stays the default). */
-@@ -958,6 +962,14 @@
-           .catch(() => undefined);
-       }
+@@ -960,6 +966,14 @@
        return;
-+    }
-+
+     }
+ 
 +    const sender = msg.raw as { sender?: { sender_type?: string } } | undefined;
 +    if (sender?.sender?.sender_type === 'user') {
 +      // Observation failures must not replay a human command or block execution.
 +      void externalHooks?.onHuman?.({ chatId: msg.chatId, rootId: msg.rootId,
 +        threadId: msg.threadId, messageId: msg.messageId, participantId: msg.senderId,
 +        at: msg.createTime }).catch((err) => log.fail('looper-human-observation', err));
-     }
- 
++    }
++
      // 多维表格「发送消息卡片」等 card 2.0 交互卡片：推送事件 / 旧版 content 只给降级
-@@ -4134,7 +4146,13 @@
+     // 占位（SDK 归一化成 "[interactive card]"，或「请升级至最新版本客户端…」），真正的
+     // 卡片正文（含 Base 记录链接）要带 card_msg_content_type=raw_card_content 回查才拿得
+@@ -1334,6 +1348,8 @@
+       if (tid) {
+         const voiceReply = cur.voiceReply?.run === cur.run ? cur.voiceReply : undefined;
+         const steerReply = cur.steerReply?.run === cur.run ? cur.steerReply : undefined;
++        const receipt = runReaction(msg.messageId, false);
++        (cur.steerReactions ??= []).push(receipt);
+         try {
+           await steerWithDeadline(cur.thread, { text: woven.text, images }, tid);
+           const split = steerReply?.accept(msg.messageId, woven.voice);
+@@ -1341,6 +1357,7 @@
+           log.info('intake', 'steer', { tid, images: images?.length ?? 0 });
+           return;
+         } catch (err) {
++          receipt.done();
+           log.warn('intake', 'steer-failed', { err: String(err) });
+           if (!isRejectedSteer(err)) {
+             void channel.send(msg.chatId,
+@@ -4134,7 +4151,13 @@
  
      // M-3: 池满先排队（占位卡可见可取消）；null = 等待期被 ⏹ 取消，预订已释放。
      const slot = await acquireRunSlot(opts, state, activeKey, reaction);
@@ -121,7 +147,7 @@
      if (shuttingDown) {
        slot.release();
        active.delete(activeKey);
-@@ -4270,6 +4288,8 @@
+@@ -4270,6 +4293,8 @@
          const turnModel = rec?.model ?? opts.model;
          const turnEffort = rec?.effort ?? opts.effort;
          const modelDisp = getModelDisplay(cfg);
@@ -130,7 +156,7 @@
          const run = opts.thread.runStreamed(turnInput, { model: turnModel, effort: turnEffort });
          titleTurnAttempted = true;
          const turnStartAt = Date.now(); // turn/start 已在 runStreamed() 内发出（与下面的建卡并行）
-@@ -4310,6 +4330,8 @@
+@@ -4310,6 +4335,8 @@
                topicThreadId = key;
                rc.threadId = key;
                await persist(key);
@@ -139,7 +165,16 @@
              }
            } else {
              topicThreadId = activeKey;
-@@ -4678,6 +4700,9 @@
+@@ -4540,6 +4567,8 @@
+         }
+         clearInterval(cardClock);
+         cardClock = undefined;
++        for (const receipt of state.steerReactions ?? []) receipt.done();
++        state.steerReactions = undefined;
+         state.steerReply = undefined;
+         state.run = undefined; // completion-card I/O must queue, never steer into a finished turn
+         const doneAt = Date.now(); // codex stopped emitting / loop ended
+@@ -4678,6 +4707,9 @@
          replyTo = finalMsgId;
          replyInThread = !opts.flat; // stay in the topic for queued turns (single: stay flat)
          log.info('card', 'final', { terminal: render.terminal() });
@@ -149,7 +184,7 @@
  
          // A stop (⏹ graceful or forced / watchdog) or a dead process ends the
          // whole run — drop any queued follow-ups, but tell the user instead of
-@@ -4715,6 +4740,9 @@
+@@ -4715,6 +4747,9 @@
        // client before the next message resumes the persisted session.
        if (topicThreadId && sessions.get(topicThreadId) === opts.thread) sessions.delete(topicThreadId);
        await opts.thread.close().catch(() => undefined);
@@ -159,7 +194,16 @@
        log.fail('intake', err);
        await channel
          .send(opts.chatId, { markdown: runFailureMessage(err, dropped) }, { replyTo: opts.replyTo, replyInThread: !opts.flat })
-@@ -5669,7 +5697,55 @@
+@@ -4724,6 +4759,8 @@
+       // was in flight. Never delete another run's reservation.
+       if (active.get(activeKey) === state) active.delete(activeKey);
+       clearInterval(cardClock);
++      for (const receipt of state.steerReactions ?? []) receipt.done();
++      state.steerReactions = undefined;
+       state.steerReply = undefined;
+       state.voiceReply = undefined;
+       if (curCardKey) {
+@@ -5669,7 +5706,55 @@
      if (op.kind === 'setCompletionReminder') refreshCompletionReminderCards();
    };
  

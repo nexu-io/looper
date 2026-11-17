@@ -8,6 +8,8 @@ const fake = vi.hoisted(() => ({
   final: vi.fn(async () => true),
   createCard: vi.fn(async () => 'card'),
   send: vi.fn(async () => ({})),
+  reactionCreate: vi.fn(async (req: any) => ({ data: { reaction_id: `receipt-${req.path.message_id}` } })),
+  reactionDelete: vi.fn(async () => ({})),
   log: { info: vi.fn(), warn: vi.fn(), fail: vi.fn() },
 }));
 vi.mock('../src/core/logger', () => ({ log: fake.log, withTrace: (_ctx: unknown, fn: () => unknown) => fn() }));
@@ -84,7 +86,7 @@ function message(text: string): NormalizedMessage {
 function setup(showModel: 'off' | 'running' | 'always' = 'always') {
   const cfg: AppConfig = { accounts: { app: { id: 'app', secret: 'test', tenant: 'feishu' } }, preferences: { showModel, pendingPolicy: 'steer', access: { ownerOpenId: 'owner' }, completionReminder: { mode: 'manual' } } };
   const channel = { send: fake.send, rawClient: { im: { v1: { message: { get: async () => ({ data: { items: [{ thread_id: 'topic' }] } }) }, messageReaction: {
-    create: async () => ({ data: {} }), delete: async () => ({}),
+    create: fake.reactionCreate, delete: fake.reactionDelete,
   } } } } };
   orchestrator = createOrchestrator(channel as never, cfg, '/test', undefined, {onTurn: events});
   return orchestrator;
@@ -154,16 +156,26 @@ describe('Looper native dispatch seam', () => {
       await until(() => expect(events).toHaveBeenCalledWith(expect.objectContaining({phase:'bound',threadId:'topic'})));
       await receive('ordinary', 'Humans talking to each other', false);
       expect(run.t.steer).not.toHaveBeenCalled();
+      expect(fake.reactionCreate).not.toHaveBeenCalled();
       await receive('reply', '@_user_1 Also check compatibility', true);
       await until(() => expect(run.t.steer).toHaveBeenCalledTimes(1));
       expect(run.t.steer.mock.calls[0]![0].text).toContain('Also check compatibility');
       expect(run.t.steer.mock.calls[0]![0].text).toContain('message_id=reply');
       expect(run.t.steer.mock.calls[0]![0].text).toMatch(/发送时间=\d{4}-\d{2}-\d{2}T/);
       expect(run.t.abort).not.toHaveBeenCalled();
+      await until(() => expect(fake.reactionCreate).toHaveBeenCalledWith({
+        path: { message_id: 'reply' }, data: { reaction_type: { emoji_type: 'Typing' } },
+      }));
+      expect(fake.reactionDelete).not.toHaveBeenCalledWith({
+        path: { message_id: 'reply', reaction_id: 'receipt-reply' },
+      });
       await receive('reply', '@_user_1 Also check compatibility', true);
       expect(run.t.steer).toHaveBeenCalledTimes(1);
       run.turns[0]!.resolve();
       await first;
+      await until(() => expect(fake.reactionDelete).toHaveBeenCalledWith({
+        path: { message_id: 'reply', reaction_id: 'receipt-reply' },
+      }));
       await receive('followup', '@_user_1 Continue following the PR', true);
       await until(() => expect(run.consumed).toHaveLength(2));
       run.turns[1]!.resolve();
