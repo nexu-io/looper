@@ -2,7 +2,18 @@
 
 本文面向运行本地 Agent 的研发同学。跑完后，应能在 Plane 派发一个任务，由 Agent 判断涉及哪些仓库，在飞书原话题沟通和验收，让原 Agent 继续修改同一个 PR，并观察 PR 最终结果。产品、设计和 QA 只需参与飞书沟通，不用安装本地服务。
 
-**当前为联调指南，尚非已发布的一键安装流程。** Looper 使用 [PR #696](https://github.com/nexu-io/looper/pull/696) 的 `feat/looper-collab-standalone`。Plane 的个人设备连接已随 #82 合并；本轮 CF 替代 loopernet 还需要配套 Plane 新分支 `feat/collab-cf-presence`，上线状态以相应 PR 为准。旧版 Looper 二进制未必包含 collab 子命令。
+**当前为联调指南，已有固定测试版，尚非新同事的一键授权流程。** [v0.16.3-beta.2](https://github.com/nexu-io/looper/releases/tag/v0.16.3-beta.2) 基于 [PR #696](https://github.com/nexu-io/looper/pull/696) 的 `feat/looper-collab-standalone`，源提交 `4546116`。Plane 的个人设备连接已随 #82 合并；本轮 CF 替代 loopernet 还需要配套 Plane 新分支 `feat/collab-cf-presence`，上线状态以相应 PR 为准。旧版 Looper 二进制未必包含 collab 子命令。
+
+macOS arm64 的固定版安装与版本检查：
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/nexu-io/looper/v0.16.3-beta.2/scripts/install.sh -o /tmp/looper-beta-install.sh
+LOOPER_VERSION=v0.16.3-beta.2 sh /tmp/looper-beta-install.sh
+looper --version
+looper version --json
+```
+
+预期 CLI 为 `0.16.3-beta.2`，构建提交 `4546116…`。本机已通过标准脚本安装，并用安装版跑通本地 Plane 配对/派发、自动私测群、原话题选择/续跑、HTML/截图附件及真实 sandbox PR/CI；最终合并收尾与正式环境结论见 [实测记录](E2E-collab-2026-11-16.zh-CN.md)。macOS 包为固定提交的本机原生构建，Linux 包为 CI 构建；release workflow 的 macOS runner 等待被取消，不称整条发布 CI 通过。不要同时启动使用同一 state 目录的源码宿主和安装版宿主。
 
 ## 当前推荐：个人配对 + CF inbox / 心跳
 
@@ -54,6 +65,8 @@ lark-cli auth status --json --verify
 ```
 
 未安装 `lark-cli` 时，可运行 `npm install -g @larksuite/cli`，按团队的飞书应用配置方式执行 `lark-cli config init`。适配器的消息读取、发送、图片及回复回执统一使用同一个应用的 bot 身份。bot 缺 scope 要在应用后台开通，重新做用户登录不能代替开通 bot 权限。
+
+完整配置见 [Looper 飞书应用权限清单](collab-feishu-app-permissions.zh-CN.md)，涵盖消息/卡片、表情、建群邀请、公告、人员目录及文档交付，注明实际验证和待补权限。正式应用按清单单独核对，不沿用私测应用的授权结论。
 
 团队共用一个飞书应用时，先由维护者部署[共享入站](../deploy/feishu-inbox-worker/README.md)，配置并发布飞书的开发者服务器订阅。各本地实例启动前注入 `LOOPER_FEISHU_INBOX_URL` 和 `LOOPER_FEISHU_INBOX_TOKEN`；每人使用自己的独立状态目录与 Plane 身份，不复制正在运行的实例状态。未配置共享入站时仍用原 WebSocket，此模式同一 bot 只保留一个消费者，不能与共享模式混用。
 

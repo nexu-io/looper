@@ -1,0 +1,35 @@
+{
+  "scopes": {
+    "tenant": [
+      "im:message.group_at_msg:readonly",
+      "im:message.group_msg",
+      "im:message.p2p_msg:readonly",
+      "im:message:readonly",
+      "im:message:send_as_bot",
+      "im:message:update",
+      "cardkit:card:write",
+      "im:message.reactions:write_only",
+      "im:message.reactions:read",
+      "im:resource",
+      "im:chat:create",
+      "im:chat:read",
+      "im:chat:update",
+      "im:chat.members:write_only",
+      "im:chat.members:read",
+      "im:chat.announcement:read",
+      "im:chat.announcement:write_only",
+      "im:chat.top_notice:write_only",
+      "contact:contact.base:readonly",
+      "contact:user.base:readonly",
+      "docx:document:create",
+      "docx:document:write_only",
+      "docx:document:readonly",
+      "docx:document.block:convert",
+      "docs:document.media:upload",
+      "docs:document.media:download",
+      "docs:permission.member:create",
+      "docs:permission.member:retrieve"
+    ],
+    "user": []
+  }
+}
