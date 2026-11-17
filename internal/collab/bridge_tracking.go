@@ -75,7 +75,7 @@ func (h *bridgeHost) saveTurn(ctx context.Context, loop storage.LoopRecord, stat
 	if terminal {
 		run.Status, execution.Status = "failed", "failed"
 		if event.Phase == "finished" && event.Terminal == "done" {
-			run.Status, execution.Status = "completed", "completed"
+			run.Status, execution.Status = "success", "completed"
 		}
 		run.EndedAt, execution.EndedAt = &now, &now
 	}
@@ -115,7 +115,7 @@ func (h *bridgeHost) saveTurn(ctx context.Context, loop storage.LoopRecord, stat
 // Shutdown may miss a terminal callback; record uncertainty, never success.
 func (h *bridgeHost) interruptTrackedTurns(ctx context.Context) error {
 	now := eventlog.FormatJavaScriptISOString(time.Now())
-	_, err := h.db.ExecContext(ctx, `UPDATE agent_executions SET status='interrupted', ended_at=?,updated_at=? WHERE status='running' AND run_id IN (SELECT r.id FROM runs r JOIN loops l ON l.id=r.loop_id WHERE r.id LIKE 'run_bridge_%' AND json_extract(l.metadata_json,'$.bridge') IS NOT NULL)`, now, now)
+	_, err := h.db.ExecContext(ctx, `UPDATE agent_executions SET status='failed',error_message='Host restarted without a terminal callback; outcome unknown', ended_at=?,updated_at=? WHERE status='running' AND run_id IN (SELECT r.id FROM runs r JOIN loops l ON l.id=r.loop_id WHERE r.id LIKE 'run_bridge_%' AND json_extract(l.metadata_json,'$.bridge') IS NOT NULL)`, now, now)
 	if err != nil {
 		return err
 	}

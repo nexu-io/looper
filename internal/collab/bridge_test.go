@@ -106,7 +106,7 @@ func TestBridgeTaskCrossRepositoryConversation(t *testing.T) {
 		t.Fatalf("turn count: %d %v", len(runs), err)
 	}
 	for _, r := range runs {
-		if r.EndedAt == nil {
+		if r.EndedAt == nil || r.Status != "success" {
 			t.Fatal("ended turn left active")
 		}
 	}
@@ -123,6 +123,19 @@ func TestBridgeTaskCrossRepositoryConversation(t *testing.T) {
 	}
 	if id, err := h.recordTurnEvent(ctx, feishubridge.TurnEvent{Phase: "started", ThreadID: "omt_unrelated"}); err != nil || id != "" {
 		t.Fatalf("unrelated topic routed to task: %s %v", id, err)
+	}
+	turnID = "turn-3"
+	event("started", "om_followup", "omt_topic")
+	if err := h.interruptTrackedTurns(ctx); err != nil {
+		t.Fatal(err)
+	}
+	interrupted, err := repos.Runs.GetByID(ctx, bridgeRunID(loop.ID, turnID))
+	if err != nil || interrupted == nil || interrupted.Status != "interrupted" || interrupted.EndedAt == nil {
+		t.Fatalf("lost crash evidence: %+v %v", interrupted, err)
+	}
+	executions, err := repos.AgentExecutions.ListByRun(ctx, interrupted.ID)
+	if err != nil || len(executions) != 1 || executions[0].Status != "failed" {
+		t.Fatalf("crash execution: %+v %v", executions, err)
 	}
 }
 
