@@ -750,6 +750,15 @@ func (h *bridgeHost) stopBridgeTask(ctx context.Context, loop storage.LoopRecord
 	if h.active[loop.ID] {
 		return false, nil // Only the actual turn-end callback proves exit.
 	}
+	// A turn may finish while the bridge handles the stop request. Preserve
+	// its latest conclusion and human context when marking the task stopped.
+	current, err := h.repos.Loops.GetByID(ctx, loop.ID)
+	if err != nil {
+		return false, err
+	}
+	if current != nil {
+		_, state, _ = readBridgeTask(*current)
+	}
 	return true, h.patch(ctx, loop.ID, "terminated", state, "已从 Plane 停止")
 }
 
