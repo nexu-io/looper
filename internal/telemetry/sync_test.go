@@ -110,12 +110,22 @@ func TestSyncOptInSignedMetadataAndRetry(t *testing.T) {
 	ctx := context.Background()
 	calls := 0
 	fail := true
+	var receivedRevision int64
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls++
 		if r.URL.Path != "/api/workspaces/workspace/projects/project-id/looper/telemetry/batches/" || r.Header.Get("Looper-Signature") == "" {
 			t.Error("unsigned or wrong telemetry endpoint")
 		}
 		raw, _ := io.ReadAll(r.Body)
+		var received struct {
+			Task struct {
+				Revision int64 `json:"revision"`
+			} `json:"task"`
+		}
+		if err := json.Unmarshal(raw, &received); err != nil {
+			t.Error(err)
+		}
+		receivedRevision = received.Task.Revision
 		if strings.Contains(string(raw), "PRIVATE_") {
 			t.Error("private data uploaded")
 		}
@@ -124,7 +134,11 @@ func TestSyncOptInSignedMetadataAndRetry(t *testing.T) {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		io.WriteString(w, `{"taskId":"loop-1","revision":1,"storedRevision":1}`)
+		storedRevision := receivedRevision
+		if storedRevision < 7 {
+			storedRevision = 7
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"taskId": "loop-1", "revision": receivedRevision, "storedRevision": storedRevision})
 	}))
 	defer server.Close()
 	cfg.Providers[0].StrictDispatch.BaseURL = server.URL
@@ -147,5 +161,11 @@ func TestSyncOptInSignedMetadataAndRetry(t *testing.T) {
 	db.DB().QueryRow(`SELECT status FROM loops WHERE id='loop-1'`).Scan(&status)
 	if status != "running" {
 		t.Fatal("telemetry changed task execution state")
+	}
+	if _, err := db.DB().Exec(`UPDATE loops SET status='completed' WHERE id='loop-1'`); err != nil {
+		t.Fatal(err)
+	}
+	if result, err := Sync(ctx, db.DB(), cfg, true); err != nil || result.Uploaded != 1 || receivedRevision != 8 {
+		t.Fatal("restored checkpoint could not advance beyond the server revision", receivedRevision, result, err)
 	}
 }

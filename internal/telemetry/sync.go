@@ -73,7 +73,7 @@ func Sync(ctx context.Context, db *sql.DB, cfg config.Config, force bool) (Resul
 				err = fmt.Errorf("invalid telemetry acknowledgement")
 			}
 			if err == nil {
-				_, err = db.ExecContext(ctx, `UPDATE telemetry_checkpoints SET acknowledged=1 WHERE destination=? AND loop_id=? AND revision=?`, destination, loop.ID, revision)
+				_, err = db.ExecContext(ctx, `UPDATE telemetry_checkpoints SET acknowledged=1,revision=? WHERE destination=? AND loop_id=? AND revision=?`, ack.StoredRevision, destination, loop.ID, revision)
 			}
 			if err != nil {
 				failures = append(failures, fmt.Errorf("task %s upload: %w", loop.ID, err))
