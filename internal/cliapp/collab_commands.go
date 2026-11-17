@@ -38,6 +38,7 @@ func (r *commandRuntime) collabCommand() *cobra.Command {
 			}}),
 			newCommand(commandSpec{use: "run", short: "Explicitly dispatch a task", args: cobra.NoArgs, runE: r.collabRun, localFlags: []flagSpec{stringFlag("project", "id", "Plane connection / local record namespace (does not bind a repository)"), stringFlag("module", "name", "Optional module collaboration scope"), stringFlag("title", "text", "Human-readable task title"), stringFlag("prompt-file", "path|-", "Task prompt file; - reads stdin"), stringFlag("issue", "number", "Source issue or Plane sequence number"), stringFlag("issue-url", "url", "Source task link")}}),
 			newCommand(commandSpec{use: "logs [task|run]", short: "Show host or task execution logs", args: cobra.MaximumNArgs(1), runE: r.collabLogs, localFlags: []flagSpec{boolFlag("stderr", "Show task stderr"), stringFlag("tail", "count", "Show the last N task log lines"), boolFlag("full", "Show all retained output up to 16 MiB")}}),
+			newCommand(commandSpec{use: "dashboard", short: "Serve a read-only local task dashboard", args: cobra.NoArgs, runE: r.collabDashboard, localFlags: []flagSpec{stringFlag("port", "number", "Loopback HTTP port (default 18090)")}}),
 			newCommand(commandSpec{use: "trace <task|run>", short: "Read a metadata-only task timeline offline", args: cobra.ExactArgs(1), runE: r.collabTrace}),
 			newCommand(commandSpec{use: "stop", short: "Drain executions and stop the service", args: cobra.NoArgs, runE: r.collabStop}),
 		},
