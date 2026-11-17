@@ -86,6 +86,8 @@ func collabDashboardHandler(db *sql.DB) http.Handler {
 		var result any
 		var err error
 		switch {
+		case r.URL.Path == "/api/memory":
+			result, err = collabMemoryOverview(r.Context(), db)
 		case r.URL.Path == "/api/overview":
 			result, err = collabOverview(r.Context(), db)
 		case strings.HasPrefix(r.URL.Path, "/api/tasks/"):

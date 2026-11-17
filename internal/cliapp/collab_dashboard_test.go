@@ -23,6 +23,7 @@ func TestCollabDashboardIsReadOnlyAndDoesNotExportTaskBodies(t *testing.T) {
 	}{
 		{"GET", "/", "127.0.0.1:18090", 200}, {"GET", "/app.js", "localhost:18090", 200},
 		{"GET", "/api/overview", "127.0.0.1:18090", 200}, {"GET", "/api/tasks/8", "127.0.0.1:18090", 200},
+		{"GET", "/api/memory", "127.0.0.1:18090", 200}, {"POST", "/api/memory", "localhost", 405},
 		{"POST", "/api/overview", "127.0.0.1:18090", 405}, {"GET", "/api/overview", "attacker.example", 403},
 		{"GET", "/config.json", "localhost", 404}, {"GET", "/design.md", "localhost", 404},
 	} {

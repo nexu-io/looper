@@ -63,3 +63,12 @@ $("#refresh").onclick=refresh;
 $("#close-detail").onclick=()=>$("#detail").close();
 $("#detail").onclick=e=>{if(e.target===$("#detail"))$("#detail").close();};
 refresh();setInterval(refresh,5000);
+
+async function refreshMemory() {
+ try {
+ const m=await get('/api/memory');
+ $('#memory-health').textContent=m.enabled ? `本机数据 · 最近 500 条事件内，原文取用 ${m.bodyReadTasks} 个任务，声明采用 ${m.adoptionTasks} 个任务；待补传 ${m.pendingUploads} 条，上传异常 ${m.uploadErrors} 条；最近补传 ${m.lastUploadAt||'未知'}。费用未知。` : '记忆采集尚未启用';
+ $('#memory-events').innerHTML=m.events.map(e=>`<tr><td>${esc(e.type)}</td><td>${esc(e.taskId)}<small>${esc(e.memoryId||'')} ${e.revision?'v'+esc(e.revision):''}</small></td><td>${date(e.at)}</td></tr>`).join('')||'<tr><td colspan="3">尚无记忆活动；不等于没有适用记忆。</td></tr>';
+ } catch {$('#memory-health').textContent='本机记忆数据暂不可用';}
+}
+void refreshMemory();setInterval(refreshMemory,15000);
