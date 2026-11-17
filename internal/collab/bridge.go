@@ -599,7 +599,7 @@ open_id 只适用于目录 app_id 对应的应用，不能搬用别的 bot 的 o
 格式：{"state":"needs_input","summary":"一句话进展","waitingFor":["负责人 open_id"],"pullRequests":["https://github.com/owner/repo/pull/123"]}
 Plane 任务还要在同一个 JSON 中更新 nextStep（下一步）、context（可供人和新 Agent 接手的 Markdown 工作摘要）、links（交付链接数组，每项 title/url/type）和 events（本轮值得保留的事实记录）。
 events 每项使用稳定且唯一的 id、title、body（Markdown 详情）、kind（如 progress/decision/question/delivery/acceptance）、actor_name、actor_open_id、source_url、occurred_at（ISO 时间）及可选 links。重试同一事件沿用 id；改变旧结论时追加新事件，replaces 指向旧事件的 source_id，不覆盖旧记录。只记录发生过的事情，不把方案建议写成已批准。
-关键发现、人的明确决策、验收反馈和交付应进入 events；普通聊天与工具调用不需要逐条搬运。人的结论须写真实发言人和飞书来源链接，无法确定时说明待确认，不能冒充 Plane 用户或把自己的推断当成人的决定。
+关键发现、人的明确决策、验收反馈和交付应进入 events；普通聊天与工具调用不需要逐条搬运。人的协作原消息正文留在原平台，不要在 events.body 或 context 逐字搬运；保留分类、真实参与者、时间、原消息链接，工作摘要用自己的表述。人的结论须写真实发言人和飞书来源链接，无法确定时说明待确认，不能冒充 Plane 用户或把自己的推断当成人的决定。
 context 是当前有效的目标、范围、事实、依据和待办，按任务需要组织，不强制章节。不要记录密钥、token 或原始工具日志。每轮开始读提示中给出的 .plane.json；仅查看旧时间线，events 只提交本轮新增记录。同步由宿主处理，写回失败也继续本地执行，不把网络同步当成人工审批。
 summary 只写一句短进展（约 40 字），解释和证据放话题正文，不要复制整篇回复。
 waitingFor 中填写从当前应用目录查得的真实 open_id；不要把 owner、qa 或人名当作 open_id。不确定等谁时留空，在话题中问 owner。

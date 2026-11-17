@@ -1,6 +1,6 @@
 # 上传协作任务元数据到 Plane
 
-Plane 需同时部署 `core/plane` 的 Looper telemetry 接收端及迁移 0158；旧版本不会接受新接口。
+Plane 需同时部署 `core/plane` 的 Looper telemetry 接收端及迁移 0159；旧版本不会接受新接口。
 
 ## 使用
 
@@ -42,3 +42,5 @@ Plane 工作空间侧栏的 Looper 页面分别展示团队／本人设备、执
 原始 Plane work item、派发、Looper 执行任务、run、Agent 与消息使用不同分母；评论不会增加执行次数。设备按成员 + node ID 去重，不从上传时间猜测在线。`completed` 是执行状态，不代表人工验收、PR 合并或发布。Token、成本和未观测到的时间保持未知；不把缺失数据填成零。
 
 页面遵守现有 WorkspaceMember + ProjectMember 的读取权限。遥测数据只是执行观察，不改变 Plane 派发、角色、协作快照或验收的业务权威。
+
+配套 Plane 基线为 `feat/looper-task-context`（0158）；本轮遥测迁移为 0159。上游 Agent 工作摘要回写使用独立业务接口，遥测上传器不读取 outcome 的 Markdown 或原评论正文。
