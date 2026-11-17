@@ -22,6 +22,7 @@ import (
 	"github.com/nexu-io/looper/internal/feishubridge"
 	networkclient "github.com/nexu-io/looper/internal/network/client"
 	"github.com/nexu-io/looper/internal/storage"
+	"github.com/nexu-io/looper/internal/telemetry"
 	"github.com/nexu-io/looper/internal/worker"
 	"github.com/spf13/cobra"
 )
@@ -40,10 +41,29 @@ func (r *commandRuntime) collabCommand() *cobra.Command {
 			newCommand(commandSpec{use: "logs [task|run]", short: "Show host or task execution logs", args: cobra.MaximumNArgs(1), runE: r.collabLogs, localFlags: []flagSpec{boolFlag("stderr", "Show task stderr"), stringFlag("tail", "count", "Show the last N task log lines"), boolFlag("full", "Show all retained output up to 16 MiB")}}),
 			newCommand(commandSpec{use: "dashboard", short: "Serve a read-only local task dashboard", args: cobra.NoArgs, runE: r.collabDashboard, localFlags: []flagSpec{stringFlag("port", "number", "Loopback HTTP port (default 18090)")}}),
 			newCommand(commandSpec{use: "trace <task|run>", short: "Read a metadata-only task timeline offline", args: cobra.ExactArgs(1), runE: r.collabTrace}),
+			newCommand(commandSpec{use: "sync", short: "Upload connected Plane task metadata; retry retained revisions", args: cobra.NoArgs, runE: r.collabSync}),
 			newCommand(commandSpec{use: "stop", short: "Drain executions and stop the service", args: cobra.NoArgs, runE: r.collabStop}),
 		},
 	})
 	return command
+}
+
+func (r *commandRuntime) collabSync(cmd *cobra.Command, _ []string) error {
+	cfg, dir, err := r.collabConfig(cmd)
+	if err != nil {
+		return err
+	}
+	dsn := url.URL{Scheme: "file", Path: filepath.Join(dir, "looper.sqlite"), RawQuery: "mode=rw&_busy_timeout=5000"}
+	db, err := sql.Open(storage.DriverName, dsn.String())
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	result, err := telemetry.Sync(cmd.Context(), db, cfg, true)
+	if err != nil {
+		return err
+	}
+	return writeJSON(cmd.OutOrStdout(), result)
 }
 
 func (r *commandRuntime) collabConfig(cmd *cobra.Command) (config.Config, string, error) {

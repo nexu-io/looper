@@ -35,6 +35,7 @@ import (
 	"github.com/nexu-io/looper/internal/planestrict"
 	"github.com/nexu-io/looper/internal/projects"
 	"github.com/nexu-io/looper/internal/storage"
+	"github.com/nexu-io/looper/internal/telemetry"
 	"github.com/nexu-io/looper/internal/worker"
 	"github.com/nexu-io/looper/internal/workerhost"
 )
@@ -209,6 +210,12 @@ func serveBridge(parent context.Context, options Options) error {
 	if err != nil {
 		return err
 	}
+	telemetryDone := make(chan struct{})
+	go func() {
+		defer close(telemetryDone)
+		telemetry.Maintain(ctx, coordinator.DB(), cfg, func(err error) { host.warn("Plane telemetry sync failed; retained locally", err) })
+	}()
+	defer func() { cancel(); <-telemetryDone }()
 	peopleDone := make(chan struct{})
 	go func() {
 		defer close(peopleDone)
