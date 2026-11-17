@@ -228,10 +228,12 @@ func TestRunDefaultSchedulerTickClaimsQueuedWorkBeforeDiscovery(t *testing.T) {
 		t.Fatalf("Queue.Upsert() error = %v", err)
 	}
 
+	deferred := &deferredSchedulerRunner{}
 	plannerRunner := &queueStatusCheckingPlannerScheduler{t: t, repos: repos, queueItemID: "queue_worker_claim_first"}
 
 	if err := runDefaultSchedulerTick(context.Background(), defaultSchedulerTickInput{
 		Repos:             repos,
+		AsyncRunner:       deferred,
 		Now:               func() time.Time { return now },
 		MaxConcurrentRuns: 1,
 		Planner:           plannerRunner,
@@ -242,6 +244,10 @@ func TestRunDefaultSchedulerTickClaimsQueuedWorkBeforeDiscovery(t *testing.T) {
 	if !plannerRunner.checkedClaimedStatus {
 		t.Fatal("planner discovery did not verify claimed queue item status")
 	}
+	for _, run := range deferred.pending {
+		run()
+	}
+
 }
 
 func TestRunDefaultSchedulerTickSkipsCoordinatorWhenDisabled(t *testing.T) {
@@ -1953,3 +1959,8 @@ func (s stubAgentExecution) Wait(context.Context) (agent.Result, error) {
 func (s stubAgentExecution) Kill(string) error {
 	return nil
 }
+
+// Keep this ordering test deterministic and finish DB writes before TempDir cleanup.
+type deferredSchedulerRunner struct{ pending []func() }
+
+func (r *deferredSchedulerRunner) Go(fn func()) { r.pending = append(r.pending, fn) }
