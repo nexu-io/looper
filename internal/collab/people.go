@@ -76,7 +76,7 @@ func (h *bridgeHost) syncPeople(ctx context.Context, appID string, client feishu
 			directory.Feishu.Error = err.Error()
 		}
 	}
-	for _, source := range h.sources {
+	for _, source := range h.planeSources() {
 		people := PlanePeople{Connection: source.project.Provider, Members: []forge.PlaneMember{}}
 		members, err := source.client.ProjectMembers(ctx)
 		if err != nil {

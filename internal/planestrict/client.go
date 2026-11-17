@@ -49,6 +49,7 @@ type CollaborationScope struct {
 }
 
 type Dispatch struct {
+	Issue               *DispatchIssue      `json:"issue,omitempty"`
 	TaskContext         TaskContext         `json:"task_context,omitempty"`
 	TaskTimeline        []TaskEvent         `json:"task_timeline,omitempty"`
 	CollaborationScope  *CollaborationScope `json:"collaboration_scope,omitempty"`
@@ -67,6 +68,13 @@ type Dispatch struct {
 	ExecutionAttemptID  *string             `json:"execution_attempt_id"`
 	FencingToken        uint64              `json:"fencing_token"`
 	ClaimLeaseExpiresAt *time.Time          `json:"claim_lease_expires_at"`
+}
+
+type DispatchIssue struct {
+	Title  string `json:"title"`
+	Body   string `json:"body"`
+	Number int64  `json:"number"`
+	Path   string `json:"path"`
 }
 
 type InboxResponse struct {

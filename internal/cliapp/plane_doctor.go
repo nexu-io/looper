@@ -64,6 +64,20 @@ func (r *commandRuntime) runPlaneDoctor(ctx context.Context, args []string, coll
 		return result
 	}
 	add("config", "passed", loaded.Metadata.ConfigPath, "")
+	if len(args) == 0 {
+		home, homeErr := r.homeDir()
+		if homeErr == nil {
+			device, deviceErr := planestrict.LoadDeviceConnection(filepath.Join(home, ".looper", "plane-device.json"))
+			if deviceErr == nil {
+				r.personalPlaneDoctor(ctx, loaded.Config, device, stateDir, add)
+				return result
+			}
+			if !os.IsNotExist(deviceErr) {
+				add("personal-device", "failed", deviceErr.Error(), "Reconnect from My Looper in your personal Plane settings.")
+				return result
+			}
+		}
+	}
 
 	wanted := ""
 	if len(args) == 1 {

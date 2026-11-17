@@ -60,20 +60,24 @@ type bridgeTask struct {
 }
 
 type bridgeHost struct {
-	options Options
-	cfg     config.Config
-	dir     string
-	db      *sql.DB
-	repos   *storage.Repositories
-	chats   *taskChatManager
-	notify  *notify.Gateway
-	client  *feishubridge.Client
-	gh      *githubinfra.Gateway
-	mu      sync.Mutex // Serialize local task patches, never hold during Agent execution.
-	active  map[string]bool
-	ready   atomic.Bool
-	network *networkclient.Manager
-	sources []planeSource
+	options         Options
+	cfg             config.Config
+	dir             string
+	db              *sql.DB
+	repos           *storage.Repositories
+	chats           *taskChatManager
+	notify          *notify.Gateway
+	client          *feishubridge.Client
+	gh              *githubinfra.Gateway
+	mu              sync.Mutex // Serialize local task patches, never hold during Agent execution.
+	active          map[string]bool
+	ready           atomic.Bool
+	network         *networkclient.Manager
+	sources         []planeSource
+	legacySources   []planeSource
+	personalPlane   *planestrict.DeviceConnection
+	personalClient  *planestrict.Client
+	personalSources map[string]planeSource
 }
 
 func serveBridge(parent context.Context, options Options) error {
@@ -195,7 +199,14 @@ func serveBridge(parent context.Context, options Options) error {
 		}
 		networkPath = networkclient.DefaultStatePath(home)
 	}
-	network := networkclient.NewCollaborationManager(networkPath, cfg, repos, host.gh)
+	if err := host.loadPersonalPlane(networkPath); err != nil {
+		return err
+	}
+	networkCfg := cfg
+	if host.personalPlane != nil {
+		networkCfg.Providers = append(append([]config.ProviderConfig(nil), cfg.Providers...), config.ProviderConfig{ID: "personal-plane", Kind: config.ProviderKindPlane, StrictDispatch: &config.PlaneStrictDispatchConfig{Enabled: true}})
+	}
+	network := networkclient.NewCollaborationManager(networkPath, networkCfg, repos, host.gh)
 	if err := network.Start(ctx); err != nil {
 		return err
 	}
@@ -207,6 +218,7 @@ func serveBridge(parent context.Context, options Options) error {
 	if err != nil {
 		return err
 	}
+	host.legacySources = append([]planeSource(nil), host.sources...)
 	peopleDone := make(chan struct{})
 	go func() {
 		defer close(peopleDone)
@@ -228,14 +240,14 @@ func serveBridge(parent context.Context, options Options) error {
 	defer tick.Stop()
 	lastPlane, lastPR := time.Time{}, time.Time{}
 	for ctx.Err() == nil {
-		if err := host.dispatchQueued(ctx); err != nil {
-			host.warn("bridge task dispatch failed", err)
-		}
 		if time.Since(lastPlane) >= 10*time.Second && network.Status().CloudReachable {
 			if err := host.pollPlane(ctx); err != nil {
 				host.warn("Plane dispatch poll failed", err)
 			}
 			lastPlane = time.Now()
+		}
+		if err := host.dispatchQueued(ctx); err != nil {
+			host.warn("bridge task dispatch failed", err)
 		}
 		if time.Since(lastPR) >= time.Minute {
 			host.pollPullRequests(ctx)
@@ -391,6 +403,12 @@ func (h *bridgeHost) turnEvent(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), 500)
 		return
 	}
+	if id == "" && event.Phase == "started" {
+		// Upstream awaits this callback before invoking the coding agent. A
+		// stopped task's persisted native session must not restart execution.
+		http.Error(w, "task is no longer active", http.StatusConflict)
+		return
+	}
 	// Feishu delivery can take seconds. Keep it out of the task-state lock.
 	if id != "" && h.notify != nil {
 		h.notify.RefreshThreadHeader(r.Context(), id, nil, 0)
@@ -543,6 +561,12 @@ func (h *bridgeHost) writeWorkspace(dir string) error {
 ` + repos.String() + `
 并行修改时按需为各仓创建独立 worktree；不要覆盖别人正在做的修改。当前目录是协作上下文，不是目标代码仓库。
 
+## 团队技能
+
+团队技能来源是 core/skills（https://code.powerformer.net/core/skills），通过软链接安装到 ~/.agents/skills，由 Codex 原生发现。不要在本工作目录复制或内嵌一份技能。
+定位任务仓库时先使用 repo-find，读取 ~/.agents/skills/repo-find/SKILL.md 及其引用的仓库地图，再核对实际代码；其他技能按任务需要选用，不要求逐个执行。
+每个新任务使用磁盘上的当前技能内容；续跑中需要再次使用技能时也重新读取，不依赖会话中记住的旧版本。技能未安装或暂时读不到时照常调查，必要时问 owner，不把技能安装变成人工审批或执行门禁。
+
 ## 工作方式
 
 小修复也先检查原因、调用方和影响面；复杂任务按需拆分、列计划或写技术设计，不强制每项写文档。
@@ -616,7 +640,10 @@ func (h *bridgeHost) networkStatus() networkclient.Status {
 
 func (h *bridgeHost) pollPlane(ctx context.Context) error {
 	var failures []error
-	for _, source := range h.sources {
+	if err := h.refreshPersonalPlane(ctx); err != nil {
+		failures = append(failures, err)
+	}
+	for _, source := range h.planeSources() {
 		inbox, err := source.client.StrictDispatchInbox(ctx)
 		if err != nil {
 			failures = append(failures, err)
@@ -667,24 +694,18 @@ func (h *bridgeHost) planeDispatch(ctx context.Context, client *forge.PlaneClien
 	if !ok {
 		return nil
 	}
-	if dispatch.State == "stop_requested" {
-		key := state.ThreadID
-		if key == "" {
-			key = "pending:" + state.RootID
+	if dispatch.State == "stop_requested" || dispatch.State == "confirmed_stopped" {
+		if loop.Status == "terminated" && dispatch.State == "confirmed_stopped" {
+			return nil
 		}
-		if err := h.client.Request(ctx, http.MethodPost, "/stop-task", map[string]string{"threadId": key}); err != nil {
+		stopped, err := h.stopBridgeTask(ctx, *loop)
+		if err != nil || !stopped {
 			return err
 		}
-		h.mu.Lock()
-		active := h.active[loop.ID]
-		h.mu.Unlock()
-		if active {
-			return nil // The actual turn-end callback, not the stop request, proves exit.
+		if dispatch.State == "stop_requested" {
+			return client.TransitionStrictDispatch(ctx, dispatch.ID, "confirmed_stopped", nil)
 		}
-		if err := h.patch(ctx, loop.ID, "terminated", state, "已从 Plane 停止"); err != nil {
-			return err
-		}
-		return client.TransitionStrictDispatch(ctx, dispatch.ID, "confirmed_stopped", nil)
+		return nil
 	}
 	status := ""
 	var wait *string
@@ -710,6 +731,26 @@ func (h *bridgeHost) planeDispatch(ctx context.Context, client *forge.PlaneClien
 		return h.publishPlaneContext(ctx, client, dispatch, *loop, state)
 	}
 	return nil
+}
+
+func (h *bridgeHost) stopBridgeTask(ctx context.Context, loop storage.LoopRecord) (bool, error) {
+	_, state, ok := readBridgeTask(loop)
+	if !ok || loop.Status == "terminated" {
+		return true, nil
+	}
+	key := state.ThreadID
+	if key == "" {
+		key = "pending:" + state.RootID
+	}
+	if err := h.client.Request(ctx, http.MethodPost, "/stop-task", map[string]string{"threadId": key}); err != nil {
+		return false, err
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.active[loop.ID] {
+		return false, nil // Only the actual turn-end callback proves exit.
+	}
+	return true, h.patch(ctx, loop.ID, "terminated", state, "已从 Plane 停止")
 }
 
 func (h *bridgeHost) pollPullRequests(ctx context.Context) {
