@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 
@@ -44,8 +45,11 @@ func (h *bridgeHost) publishPlaneContext(ctx context.Context, client *forge.Plan
 		return nil // An accepted queue slot carries no new task conclusion yet.
 	}
 	input := planestrict.TaskContext{Summary: summary, NextStep: state.Outcome.NextStep,
-		Context: state.Outcome.Context, Links: append([]planestrict.TaskLink{}, state.Outcome.Links...),
+		Context: state.Outcome.Context, Links: planeWebLinks(state.Outcome.Links),
 		Events: append([]planestrict.TaskEvent{}, state.Outcome.Events...)}
+	for i := range input.Events {
+		input.Events[i].Links = planeWebLinks(input.Events[i].Links)
+	}
 	if input.Context == "" {
 		input.Context = dispatch.TaskContext.Context
 	}
@@ -90,6 +94,18 @@ func (h *bridgeHost) publishPlaneContext(ctx context.Context, client *forge.Plan
 		return err
 	}
 	return h.ackPlaneEvents(ctx, loop.ID, input.Events)
+}
+
+// Local file actions belong to the Feishu thread; Plane links must open on the web.
+func planeWebLinks(links []planestrict.TaskLink) []planestrict.TaskLink {
+	result := []planestrict.TaskLink{}
+	for _, link := range links {
+		u, err := url.Parse(link.URL)
+		if err == nil && (u.Scheme == "http" || u.Scheme == "https") && u.Hostname() != "" {
+			result = append(result, link)
+		}
+	}
+	return result
 }
 
 func (h *bridgeHost) ackPlaneEvents(ctx context.Context, id string, sent []planestrict.TaskEvent) error {
