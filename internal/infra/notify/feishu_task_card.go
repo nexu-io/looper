@@ -35,8 +35,6 @@ func (g *Gateway) feishuCollaborationCard(ctx context.Context, loop *storage.Loo
 	label = strings.ReplaceAll(label, "Looper ", "")
 	if loop.Status == "awaiting_human" {
 		label = "待回复"
-	} else if elapsed > 0 {
-		label += " · " + humanizeElapsedSeconds(elapsed)
 	}
 	heading := []any{map[string]any{"tag": "column", "width": "auto", "vertical_align": "center", "elements": []any{
 		taskCardMarkdown("<text_tag color='"+color+"'>"+label+"</text_tag>", "notation"),
@@ -48,16 +46,20 @@ func (g *Gateway) feishuCollaborationCard(ctx context.Context, loop *storage.Loo
 				"elements":  []any{taskCardMarkdown("<text_tag color='blue'>"+sourceLabel+" ↗</text_tag>", "notation")}},
 		}})
 	}
-	heading = append(heading, map[string]any{"tag": "column", "width": "weighted", "weight": 1, "vertical_align": "center", "elements": []any{
-		taskCardMarkdown("**"+title+"**", "normal"),
-	}})
+	if elapsed > 0 && loop.Status != "awaiting_human" {
+		heading = append(heading, map[string]any{"tag": "column", "width": "auto", "vertical_align": "center", "elements": []any{
+			taskCardMarkdown("<font color='grey'>· "+humanizeElapsedSeconds(elapsed)+"</font>", "notation"),
+		}})
+	}
 	if owner := g.looperAttribution(loop.ProjectID); owner != "" {
+		heading = append(heading, map[string]any{"tag": "column", "width": "weighted", "weight": 1, "elements": []any{}})
 		heading = append(heading, map[string]any{"tag": "column", "width": "auto", "vertical_align": "center", "elements": []any{
 			taskCardMarkdown(owner, "notation"),
 		}})
 	}
 	elements := []any{
 		map[string]any{"tag": "column_set", "flex_mode": "none", "horizontal_align": "left", "horizontal_spacing": "8px", "columns": heading},
+		taskCardMarkdown("**"+title+"**", "normal"),
 		map[string]any{"tag": "column_set", "flex_mode": "none", "columns": []any{
 			map[string]any{"tag": "column", "width": "weighted", "weight": 1, "background_style": "grey-50", "padding": "10px", "vertical_spacing": "4px", "elements": []any{
 				taskCardMarkdown(taskCardExcerpt(brief, 180), "normal"),
@@ -126,17 +128,14 @@ func (g *Gateway) feishuCollaborationCard(ctx context.Context, loop *storage.Loo
 }
 
 func (g *Gateway) looperAttribution(projectID string) string {
-	identity := ""
 	if id := g.ownerOpenID(projectID); id != "" {
-		identity = taskCardPerson(id)
+		name := "任务负责人"
 		if g.resolveOwnerName != nil {
-			if name := strings.TrimSpace(g.resolveOwnerName(id)); name != "" {
-				return "<text_tag color='neutral'>" + html.EscapeString(name) + "的 Looper</text_tag>"
+			if resolved := strings.TrimSpace(g.resolveOwnerName(id)); resolved != "" {
+				name = resolved
 			}
 		}
-	}
-	if identity != "" {
-		return identity + "的 Looper"
+		return "<text_tag color='neutral'>" + html.EscapeString(name) + "的 Looper</text_tag>"
 	}
 	return ""
 }
