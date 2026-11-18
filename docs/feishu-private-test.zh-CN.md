@@ -6,7 +6,7 @@
 
 ## 当前 Looper collab 群路由
 
-群名标明实际协作范围：Module 群为「Looper · Module · 名称」，需求群为「Looper · 需求 · 名称」，无归属任务使用「Looper · 默认协作」。名称前缀可用 `chatNamePrefix` 配置；正式 Plane 接入不应沿用私测配置中的测试字样。既有群改名不改变群 ID、任务话题或派发归属。
+群名优先显示名称，避免会话列表缩略时看不出协作范围：Module 群为「名称 · Module · Looper」，需求群为「名称 · 需求 · Looper」，无归属任务使用「Looper · 默认协作」。末尾的应用标识沿用 `chatNamePrefix` 配置；正式 Plane 接入不应沿用私测配置中的测试字样。既有群改名不改变群 ID、任务话题或派发归属。
 
 独立 `looper collab` 入口现在支持在任务入队时自动准备飞书协作群：带 issue 或
 显式 `module` 的任务使用稳定 key 创建／复用独立群；没有 item 归属的运行使用配置的

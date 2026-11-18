@@ -41,7 +41,7 @@ func TestTaskChatManagerSharesScopeBeforeAnyThreadIsPosted(t *testing.T) {
 	client.Run = func(_ context.Context, _ string, input []byte, args ...string) ([]byte, error) {
 		calls = append(calls, strings.Join(args, " "))
 		if strings.Contains(strings.Join(args, " "), "+chat-create") {
-			if len(args) < 4 || args[2] != "--name" || args[3] != "Looper · Module · Fix search" {
+			if len(args) < 4 || args[2] != "--name" || args[3] != "Fix search · Module · Looper" {
 				t.Fatalf("group name must identify its scope: %v", args)
 			}
 			// A stop can arrive while the network request is in flight.

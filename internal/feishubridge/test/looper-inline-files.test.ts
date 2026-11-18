@@ -14,3 +14,14 @@ it('keeps Chinese attachment labels full-width beside long prose', () => {
   expect(result.some((element) => element.tag === 'column_set')).toBe(false);
   expect(result.map((element) => element.content)).not.toContain('•&nbsp;');
 });
+
+it('keeps an internal skill reference from splitting Chinese prose into columns', () => {
+  const result = renderFileAnswer({
+    text: '已补齐预览 HTML，保留首页和社区模板入口，通过 SKILL 提交 [PR #9530](https://github.com/nexu-io/open-design/pull/9530)。',
+    links: [{ token: 'SKILL', element: { tag: 'interactive_container',
+      elements: [{ tag: 'markdown', content: 'Odcrew 技能' }] } }],
+  });
+  expect(result.some((element) => element.tag === 'column_set')).toBe(false);
+  expect(result.filter((element) => element.tag === 'interactive_container')).toHaveLength(1);
+  expect(JSON.stringify(result)).toContain('https://github.com/nexu-io/open-design/pull/9530');
+});
