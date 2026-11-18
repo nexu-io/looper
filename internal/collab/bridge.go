@@ -729,14 +729,15 @@ func (h *bridgeHost) pollPlane(ctx context.Context) error {
 		return err
 	}
 	for _, source := range h.planeSources() {
-		var pendingContext []string
+		var trackedDispatches []string
 		for _, loop := range items {
 			input, state, ok := readBridgeTask(loop)
-			if ok && loop.ProjectID == source.project.ID && input.StrictDispatchID != "" && len(state.Outcome.Events) > 0 {
-				pendingContext = append(pendingContext, input.StrictDispatchID)
+			resumable := loop.Status == "running" || loop.Status == "shepherding" || loop.Status == "awaiting_human"
+			if ok && loop.ProjectID == source.project.ID && input.StrictDispatchID != "" && (len(state.Outcome.Events) > 0 || resumable) {
+				trackedDispatches = append(trackedDispatches, input.StrictDispatchID)
 			}
 		}
-		inbox, err := source.client.StrictDispatchInbox(ctx, pendingContext...)
+		inbox, err := source.client.StrictDispatchInbox(ctx, trackedDispatches...)
 		if err != nil {
 			failures = append(failures, err)
 			continue
@@ -800,6 +801,15 @@ func (h *bridgeHost) planeDispatch(ctx context.Context, client *forge.PlaneClien
 		if dispatch.State == "stop_requested" {
 			return client.TransitionStrictDispatch(ctx, dispatch.ID, "confirmed_stopped", nil)
 		}
+		return nil
+	}
+	// A failed native turn can resume in the same conversation and attempt.
+	// Report that real continuation before publishing its next outcome.
+	if dispatch.State == "failed" && dispatch.Health == "ok" && (loop.Status == "running" || loop.Status == "shepherding" || loop.Status == "awaiting_human") {
+		if err := client.TransitionStrictDispatch(ctx, dispatch.ID, "running", nil); err != nil {
+			return err
+		}
+		h.track(ctx, *loop, "plane.state.synced", eventlog.NewEventID("sync"), "", map[string]any{"dispatchId": dispatch.ID, "state": "running"})
 		return nil
 	}
 	// Completed executions may receive later questions or acceptance feedback.

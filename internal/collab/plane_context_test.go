@@ -107,7 +107,7 @@ func TestPlaneContextRetriesBeforeTerminalAndPreservesConcurrentReply(t *testing
 			_ = json.NewEncoder(w).Encode(map[string]any{"session_id": body["session_id"], "state": "active"})
 		case strings.HasSuffix(r.URL.Path, "/dispatch/inbox/"):
 			rows := []planestrict.Dispatch{}
-			if dispatch.State != "completed" || r.URL.Query().Get("context_dispatch_id") == dispatch.ID {
+			if (dispatch.State != "completed" && dispatch.State != "failed") || r.URL.Query().Get("context_dispatch_id") == dispatch.ID {
 				rows = append(rows, dispatch)
 			}
 			_ = json.NewEncoder(w).Encode(planestrict.InboxResponse{Dispatches: rows})
@@ -135,6 +135,13 @@ func TestPlaneContextRetriesBeforeTerminalAndPreservesConcurrentReply(t *testing
 			body.Context.Events = nil // Plane stores events separately from the summary.
 			_ = json.NewEncoder(w).Encode(map[string]any{"context": body.Context})
 		case strings.HasSuffix(r.URL.Path, "/transition/"):
+			var body struct {
+				State string `json:"state"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Error(err)
+			}
+			dispatch.State, dispatch.StateVersion = body.State, dispatch.StateVersion+1
 			transitions++
 			_ = json.NewEncoder(w).Encode(planestrict.MutationResponse{Dispatch: dispatch})
 		default:
@@ -240,5 +247,22 @@ func TestPlaneContextRetriesBeforeTerminalAndPreservesConcurrentReply(t *testing
 	}
 	if local := readContext(); local.Summary != outcome.Summary || local.Context != outcome.Context {
 		t.Fatalf("completed dispatch left a stale recovery file: %+v", local)
+	}
+
+	// A native session can resume after a failed turn. Keep its original
+	// dispatch/attempt instead of leaving Plane failed while it is running.
+	dispatch.State, dispatch.StateVersion = "failed", dispatch.StateVersion+1
+	if err := h.pollPlane(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if transitions != 1 {
+		t.Fatal("failed dispatch reopened without a native continuation")
+	}
+	callback("started")
+	if err := h.pollPlane(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if transitions != 2 || dispatch.State != "running" {
+		t.Fatalf("resumed native execution did not reopen its failed dispatch: transitions=%d", transitions)
 	}
 }

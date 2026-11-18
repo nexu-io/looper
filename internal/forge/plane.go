@@ -400,7 +400,7 @@ func (plane *PlaneClient) TransitionStrictDispatch(ctx context.Context, dispatch
 	if plane.strictClient == nil {
 		return errors.New("Plane strict dispatch is not configured")
 	}
-	inbox, err := plane.strictClient.Inbox(ctx, "")
+	inbox, err := plane.strictClient.Inbox(ctx, "", dispatchID)
 	if err != nil {
 		return err
 	}
