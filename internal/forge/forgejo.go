@@ -359,6 +359,8 @@ type Issue struct {
 }
 
 type PullRequest struct {
+	Merged    bool
+	MergedAt  string
 	Number    int64
 	Title     string
 	Body      string
@@ -1170,6 +1172,8 @@ type forgejoIssue struct {
 }
 
 type forgejoPullRequest struct {
+	Merged    bool           `json:"merged"`
+	MergedAt  string         `json:"merged_at"`
 	Number    int64          `json:"number"`
 	Title     string         `json:"title"`
 	Body      string         `json:"body"`
@@ -1260,7 +1264,7 @@ func convertIssue(input forgejoIssue) Issue {
 }
 
 func convertPullRequest(input forgejoPullRequest) PullRequest {
-	return PullRequest{Number: input.Number, Title: input.Title, Body: input.Body, State: input.State, IsDraft: input.Draft, HTMLURL: input.HTMLURL, UpdatedAt: input.UpdatedAt, User: convertUser(input.User), Head: convertBranch(input.Head), Base: convertBranch(input.Base), Labels: convertLabels(input.Labels), Assignees: convertUsers(input.Assignees), Reviewers: convertUsers(input.Reviewers), Mergeable: input.Mergeable}
+	return PullRequest{Merged: input.Merged, MergedAt: input.MergedAt, Number: input.Number, Title: input.Title, Body: input.Body, State: input.State, IsDraft: input.Draft, HTMLURL: input.HTMLURL, UpdatedAt: input.UpdatedAt, User: convertUser(input.User), Head: convertBranch(input.Head), Base: convertBranch(input.Base), Labels: convertLabels(input.Labels), Assignees: convertUsers(input.Assignees), Reviewers: convertUsers(input.Reviewers), Mergeable: input.Mergeable}
 }
 
 func convertPullRequestReview(input forgejoPullRequestReview) PullRequestReview {

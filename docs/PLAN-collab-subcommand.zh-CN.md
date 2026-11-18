@@ -211,3 +211,9 @@ Looper 协作副本已有独立 `looper collab` 宿主，可从终端派单，�
 ## 2026-11-17：独立协作不再要求 loopernet
 
 撤销“必须部署独立 loopernet 才能启用个人协作”的前置条件。经过正式网络验证后，进一步删除 CF 心跳转发：本机直接向 Plane 发送签名心跳，由 Plane 在设备记录保存最近收到时间；CF 仅承载现有飞书 inbox，不主动访问内部 Plane。旧 loopernet 保留兼容路径。通信、升级顺序及身份授权缺口见 [连接说明](collab-cf-relay.zh-CN.md)。
+
+#### 2026-11-18：补齐独立入口的 Forgejo PR 跟进
+
+OPEND-5380 暴露独立入口误用 GitHub 专用 URL/观察器，Forgejo review 被全部跳过。现改为按 PR URL 复用 GitHub Gateway 或 ForgejoClient＋tea/provider 登录，任务可跨平台、跨仓，不绑定本地目录。两端统一将 review/行内意见、CI、head/base/mergeable、批准、预览及合并/关闭变化交回原 Agent；等待人工验收也继续监听。沿用原 Signal/状态和并发保护，不新增任务层级或角色校验。读取失败在原话题可见，原 Agent决定处理；合并仍遵守原授权。
+
+网页交付优先本地真实页面截图/录屏，关键效果直接发飞书原话题，Plane 同版留档。远程预览慢不作为停止独立可做工作的理由；技术检查、截图和人工验收结论分开。回归及真实链路验证进度见 [E2E 记录 E71/E72](E2E-collab-2026-11-16.zh-CN.md)，尚未完成的真实验证不能以 GitHub 或 fixture 代替。

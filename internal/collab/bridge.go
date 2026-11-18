@@ -54,6 +54,8 @@ type Outcome struct {
 	Links        []planestrict.TaskLink   `json:"links,omitempty"`
 }
 
+const localVisualDeliveryInstruction = "网页或 Landing 改动先尝试按仓库说明本地启动，用真实页面截图或录屏展示准确版本和操作路径；页面截图应包含足够上下文，录屏展示相关交互，不用孤立组件或测试夹具冒充完整页面。远程自动预览部署慢、CI 排队或全量检查受外部 CMS 下载超时影响时，继续能独立完成的本地验证和可视化交付，不只回复等预览。飞书原话题是当前协作和验收的主要展示面，Plane 时间轴用于同版留档与追溯；不能只归档后让人去找附件。关键截图直接以 bot 图片消息发到原话题，录屏以 bot 视频消息发送，可安装包或其他交付产物提供可直接下载的附件/入口，配一两句说明实际改变和版本；不要把关键截图或录屏藏在 ZIP 中，也不要仅用下载链接代替可以直接展示的图片/视频。本机路径、未确认可访问的按钮或资料 ZIP 不能代替效果展示。不自行暴露本机公网；本地也无法启动时说明实际失败、尝试合适替代证据及剩余未验范围。截图/录屏不代替完整交互验收，远程 CI 和部署仍要继续跟进。"
+
 type bridgeTask struct {
 	TrackingRunID string  `json:"trackingRunId,omitempty"`
 	RootID        string  `json:"rootId,omitempty"`
@@ -73,6 +75,7 @@ type bridgeHost struct {
 	notify          *notify.Gateway
 	client          *feishubridge.Client
 	gh              *githubinfra.Gateway
+	prObserver      *pullRequestObserver
 	mu              sync.Mutex // Serialize local task patches, never hold during Agent execution.
 	active          map[string]bool
 	ready           atomic.Bool
@@ -661,6 +664,7 @@ open_id 只适用于目录 app_id 对应的应用，不能搬用别的 bot 的 o
 飞书读写、附件和表情全部显式使用 bot，禁止 --as user，权限不足不能切换用户身份。在已获任务授权范围内邀请和发问，不必为同一授权下的每次 API 操作重复请 owner 确认。
 ` + agent.DeliveryInstruction + `
 自测或 PR 创建不是协作交付的终点。开发任务应主动组织验收：结合任务、参与者和人员目录找合适的人，QA 负责功能回归，产品或设计按需要确认预期与体验。角色未填写不构成停点；有合理线索就主动联系相关同学，询问能否协助复现或回归、是否应找其他人，不必先让 owner 批准验收人。确实找不到人、职责有分歧或需要业务判断时再问 owner，不要求 Plane 填满角色。
+` + localVisualDeliveryInstruction + `
 提供对方能访问的准确版本、简短步骤、证据和未验项，先邀请入群并确认，再在原话题 @ 提出具体请求。面向人的入口先展示效果和怎么验；指南、脚本、报告等技术资料归档 Plane，不把资料压缩包当作默认验收入口或修复安装包。还没有可验版本时，继续准备预览、构建或合适的替代证据，说明剩余验证范围，不把截图当作完整交互验收，也不只留一句“待验收”。
 等待人时继续推进独立可做的 PR、CI 和修复；收到问题就在原任务返工并重新交付。按仓库现有授权推进合并、发布和实际版本回归，区分自测、CI、人工验收、合并和上线，不能互相代替或替人签通过。只有确实需要人判断且没有独立可推进工作时才等待。
 Plane 交付时，在本任务状态 JSON 的顶层 links 保留当前版本的入口，并在 events 为每次版本交付追加 kind=delivery 的记录；该事件自己的 links 必须包含本版本全部产物、验收指南、检测报告及相关 PR 的已归档入口，不能只填顶层 links 或只上传附件。title/body 写版本、实际检测结果和未验项；失败也如实记录。重试沿用同一事件 ID，新版本或已发布记录的更正使用新 ID（更正可用 replaces 关联原 source_id），不要覆盖旧事件。人的验收反馈另记 acceptance，不能把交付或自测当作验收通过。沿用现有写回重试；本地 JSON 不是 Plane 已接收证明，未读回确认时不要声称已归档 Plane。正常自动回写不在 summary 或最终答复里例行添加“待宿主同步”“已写状态文件”等内部过程；它们不是业务进展或交付阻塞。只有出现明确的同步错误时才说明实际失败及影响。Bridge 本地文件按钮可能点击后才上传，不能作为已归档的证明。
@@ -879,7 +883,7 @@ func (h *bridgeHost) stopBridgeTask(ctx context.Context, loop storage.LoopRecord
 }
 
 func (h *bridgeHost) pollPullRequests(ctx context.Context) {
-	items, err := h.repos.Loops.ListByStatuses(ctx, []string{"shepherding"})
+	items, err := h.repos.Loops.ListByStatuses(ctx, []string{"shepherding", "awaiting_human"})
 	if err != nil {
 		return
 	}
@@ -889,28 +893,20 @@ func (h *bridgeHost) pollPullRequests(ctx context.Context) {
 			continue
 		}
 		var signals, notes []string
-		allClosed, actionable := true, false
+		if h.prObserver == nil {
+			h.prObserver = &pullRequestObserver{cfg: &h.cfg, github: h.gh}
+		}
 		for _, link := range state.Outcome.PullRequests {
-			repo, number, err := parsePullRequestURL(link)
-			if err != nil {
-				h.warn("invalid agent PR reference", err)
-				allClosed = false
-				continue
-			}
-			pr, err := h.gh.ViewPullRequestForReviewer(ctx, githubinfra.ViewPullRequestInput{Repo: repo, PRNumber: number})
+			pr, err := h.prObserver.view(ctx, link)
 			if err != nil {
 				h.warn("PR status read failed", err)
-				allClosed = false
+				// Surface a stable read failure once in the original conversation;
+				// keep polling so recovered credentials/API access also wakes it.
+				notes = append(notes, fmt.Sprintf("%s\n读取失败，不能视为 CI 通过或 PR 结束：%v", link, err))
+				signals = append(signals, link+":error:"+err.Error())
 				continue
 			}
-			signal := workerhost.FoldShepherdSignal(pr)
-			signals = append(signals, link+":"+signal)
-			if !strings.EqualFold(pr.State, "MERGED") && !strings.EqualFold(pr.State, "CLOSED") {
-				allClosed = false
-			}
-			if workerhost.ShepherdNeedsPass(pr) {
-				actionable = true
-			}
+			signals = append(signals, link+":"+pullRequestSignal(pr))
 			// Pass the fetched evidence, not only a wake marker. An agent's
 			// managed PR CLI may expose metadata without reviews or CI logs.
 			evidence, err := json.Marshal(pr)
@@ -922,19 +918,19 @@ func (h *bridgeHost) pollPullRequests(ctx context.Context) {
 		}
 		sort.Strings(signals)
 		signal := strings.Join(signals, "\n")
-		if signal == state.Signal || (!actionable && !allClosed) {
+		if signal == state.Signal {
 			continue
 		}
 		// Wake the same agent even when every PR closes: the agent reconciles
 		// the task outcome, rather than treating any closed PR as a business pass.
-		prompt := "原任务的 PR 状态有变化。以下是已读取的 PR 现场，包含 Reviews／Comments 原文及 Checks；逐项核对和处理，不因其他 CLI 摘要缺少字段而忽略这些内容。检查冲突及合并队列；若全部 PR 已结束，核实实际交付结论。不要替人合并。用简短中文说明进展，不贴原始快照。\n\n" + strings.Join(notes, "\n\n") + "\n\n本任务状态文件：" + h.resultPath(loop.ID)
+		prompt := "原任务的 PR 状态有变化。以下是已读取的 PR 现场，包含 Reviews／Comments 原文及 Checks；逐项核对和处理，不因其他 CLI 摘要缺少字段而忽略这些内容。检查冲突及合并队列（平台支持时）；Mergeable=false 不等于确认冲突，应在目标仓库核对准确 base/head。CI 转绿或预览可用后继续交付和验收，已有验收请求尚未答复时不重复催问；若全部 PR 已结束，核实实际交付结论。读取失败时说明缺失，不把它当通过或已结束。" + localVisualDeliveryInstruction + "不要替人合并。用简短中文说明进展，不贴原始快照。\n\n" + strings.Join(notes, "\n\n") + "\n\n本任务状态文件：" + h.resultPath(loop.ID)
 		chat, err := h.repos.FeishuThreads.ChatIDByLoop(ctx, loop.ID)
 		if err != nil {
 			continue
 		}
 		h.mu.Lock()
 		fresh, err := h.repos.Loops.GetByID(ctx, loop.ID)
-		if err != nil || fresh == nil || fresh.Status != "shepherding" || h.active[loop.ID] {
+		if err != nil || fresh == nil || (fresh.Status != "shepherding" && fresh.Status != "awaiting_human") || h.active[loop.ID] {
 			h.mu.Unlock()
 			continue
 		}
@@ -958,7 +954,7 @@ func (h *bridgeHost) pollPullRequests(ctx context.Context) {
 			h.mu.Lock()
 			delete(h.active, loop.ID)
 			state.Signal = current.Signal
-			_ = h.patch(ctx, loop.ID, "shepherding", state, current.Outcome.Summary)
+			_ = h.patch(ctx, loop.ID, fresh.Status, state, current.Outcome.Summary)
 			h.mu.Unlock()
 			h.warn("PR follow-up dispatch failed", err)
 			continue
