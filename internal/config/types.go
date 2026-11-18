@@ -222,6 +222,7 @@ type ProviderConfig struct {
 }
 
 type PlaneStrictDispatchConfig struct {
+	MemoryEnabled    bool   `json:"memoryEnabled,omitempty"`
 	TelemetryEnabled bool   `json:"telemetryEnabled,omitempty"`
 	Enabled          bool   `json:"enabled"`
 	BaseURL          string `json:"baseUrl"`

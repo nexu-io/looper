@@ -23,7 +23,7 @@ export interface TurnEvent {
 }
 
 export interface ExternalHooks {
-  onTurn?: (event: TurnEvent) => Promise<void>;
+  onTurn?: (event: TurnEvent) => Promise<string | void>;
   onHuman?: (event: HumanEvent) => Promise<void>;
 }
 

@@ -1018,3 +1018,11 @@ func (p *planeCommentPage) UnmarshalJSON(data []byte) error {
 	type alias planeCommentPage
 	return json.Unmarshal(trimmed, (*alias)(p))
 }
+
+// Memory uses the same signed project binding; no Plane credentials reach the Agent.
+func (plane *PlaneClient) Memory(ctx context.Context, input map[string]any) (json.RawMessage, error) {
+	if plane.strictClient == nil {
+		return nil, fmt.Errorf("memory requires a signed Plane binding")
+	}
+	return plane.strictClient.Memory(ctx, input)
+}

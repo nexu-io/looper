@@ -19,6 +19,8 @@ import (
 )
 
 type Init struct {
+	MemorySocket   string `json:"memorySocket,omitempty"`
+	MemoryScript   string `json:"memoryScript,omitempty"`
 	Socket         string `json:"socket"`
 	CallbackSocket string `json:"callbackSocket"`
 	CWD            string `json:"cwd"`
