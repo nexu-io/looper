@@ -69,6 +69,7 @@ type bridgeTask struct {
 }
 
 type bridgeHost struct {
+	lifetime        context.Context // Service cancellation pauses work; Plane stops terminate tasks.
 	options         Options
 	cfg             config.Config
 	dir             string
@@ -125,7 +126,7 @@ func serveBridge(parent context.Context, options Options) error {
 	if err := projectService.SyncConfigured(ctx, cfg, time.Now()); err != nil {
 		return err
 	}
-	host := &bridgeHost{options: options, cfg: cfg, dir: dir, db: coordinator.DB(), repos: repos,
+	host := &bridgeHost{lifetime: ctx, options: options, cfg: cfg, dir: dir, db: coordinator.DB(), repos: repos,
 		chats: newTaskChatManager(cfg, repos, dir), active: make(map[string]bool),
 		gh: githubinfra.New(githubinfra.Options{GHPath: value(cfg.Tools.GHPath), GitPath: value(cfg.Tools.GitPath)})}
 	if host.chats == nil {
@@ -214,7 +215,7 @@ func serveBridge(parent context.Context, options Options) error {
 	if err != nil {
 		return err
 	}
-	defer host.client.Close()
+	defer func() { cancel(); _ = host.client.Close() }()
 	networkPath := options.NetworkStatePath
 	if networkPath == "" {
 		home, err := os.UserHomeDir()
@@ -445,6 +446,8 @@ func (h *bridgeHost) turnEvent(w http.ResponseWriter, r *http.Request) {
 		code := http.StatusInternalServerError
 		if errors.Is(err, errBridgeTaskStopped) {
 			code = http.StatusConflict
+		} else if errors.Is(err, errBridgeHostStopping) {
+			code = http.StatusServiceUnavailable
 		}
 		http.Error(w, err.Error(), code)
 		return
@@ -457,6 +460,7 @@ func (h *bridgeHost) turnEvent(w http.ResponseWriter, r *http.Request) {
 }
 
 var errBridgeTaskStopped = errors.New("task has been stopped from Plane")
+var errBridgeHostStopping = errors.New("collaboration service is stopping; task will resume on restart")
 
 func (h *bridgeHost) recordTurnEvent(ctx context.Context, event feishubridge.TurnEvent) (string, error) {
 	h.mu.Lock()
@@ -477,6 +481,9 @@ func (h *bridgeHost) recordTurnEvent(ctx context.Context, event feishubridge.Tur
 				return "", errBridgeTaskStopped
 			}
 			return "", nil
+		}
+		if event.Phase == "started" && h.lifetime != nil && h.lifetime.Err() != nil {
+			return "", errBridgeHostStopping
 		}
 		if event.Phase != "started" && event.Phase != "bound" && event.Phase != "finished" && event.Phase != "failed" {
 			return "", fmt.Errorf("unknown turn phase %q", event.Phase)
@@ -511,6 +518,11 @@ func (h *bridgeHost) recordTurnEvent(ctx context.Context, event feishubridge.Tur
 		} else {
 			delete(h.active, loop.ID)
 			status, summary = "failed", "执行中断，可以在原话题 @bot 继续"
+			if h.lifetime != nil && h.lifetime.Err() != nil {
+				// Reuse the existing restart queue and native session. A normal
+				// done callback below still owns its actual task conclusion.
+				status, summary = "queued", "服务已暂停，重启后继续原任务"
+			}
 			if event.Phase == "finished" && event.Terminal == "done" {
 				outcome, readErr := readOutcome(h.resultPath(loop.ID))
 				if os.IsNotExist(readErr) && state.Outcome.State != "" {
@@ -901,6 +913,9 @@ func (h *bridgeHost) pollPullRequests(ctx context.Context) {
 		}
 		for _, link := range state.Outcome.PullRequests {
 			pr, err := h.prObserver.view(ctx, link)
+			if ctx.Err() != nil {
+				return // Service shutdown is not a new PR failure or human question.
+			}
 			if err != nil {
 				h.warn("PR status read failed", err)
 				// Surface a stable read failure once in the original conversation;

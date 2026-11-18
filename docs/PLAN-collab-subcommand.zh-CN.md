@@ -217,3 +217,8 @@ Looper 协作副本已有独立 `looper collab` 宿主，可从终端派单，�
 OPEND-5380 暴露独立入口误用 GitHub 专用 URL/观察器，Forgejo review 被全部跳过。现改为按 PR URL 复用 GitHub Gateway 或 ForgejoClient＋tea/provider 登录，任务可跨平台、跨仓，不绑定本地目录。两端统一将 review/行内意见、CI、head/base/mergeable、批准、预览及合并/关闭变化交回原 Agent；等待人工验收也继续监听。沿用原 Signal/状态和并发保护，不新增任务层级或角色校验。读取失败在原话题可见，原 Agent决定处理；合并仍遵守原授权。
 
 网页交付优先本地真实页面截图/录屏，关键效果直接发飞书原话题，Plane 同版留档。远程预览慢不作为停止独立可做工作的理由；技术检查、截图和人工验收结论分开。回归及真实链路验证进度见 [E2E 记录 E71/E72](E2E-collab-2026-11-16.zh-CN.md)，尚未完成的真实验证不能以 GitHub 或 fixture 代替。
+
+
+#### 服务关闭与任务停止
+
+`collab stop` 用于停止本地服务，不等于人在 Plane 停止任务，也不承诺等所有业务工作自然结束。Bridge 活跃回合因关闭被打断时保留中断审计，复用现有队列及 native session，在下一次 `collab start` 继续原话题；已完成的结论不重跑。Plane 明确停止的任务仍保持停止，原生 Agent 在正常服务期间失败也不因此自动重试。安装版升级复验边界及本次中断事故见 [E2E 记录 E74](E2E-collab-2026-11-16.zh-CN.md)。

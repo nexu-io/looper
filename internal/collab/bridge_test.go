@@ -143,6 +143,17 @@ func TestBridgeTaskCrossRepositoryConversation(t *testing.T) {
 	}
 	turnID = "turn-3"
 	event("started", "om_followup", "omt_topic")
+	// Only a service shutdown is resumable without a new message. A genuine
+	// native interruption while the service is healthy remains a failure.
+	if _, err := h.recordTurnEvent(ctx, feishubridge.TurnEvent{TurnID: turnID, Phase: "finished", Terminal: "interrupted", ThreadID: "omt_topic"}); err != nil {
+		t.Fatal(err)
+	}
+	saved, _ = repos.Loops.GetByID(ctx, loop.ID)
+	if saved.Status != "failed" {
+		t.Fatal("native failure was silently retried")
+	}
+	turnID = "turn-4"
+	event("started", "om_followup", "omt_topic")
 	if err := h.interruptTrackedTurns(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -160,6 +171,21 @@ func TestBridgeTaskCrossRepositoryConversation(t *testing.T) {
 	preserved, _ := repos.Runs.GetByID(ctx, interrupted.ID)
 	if preserved.Status != "interrupted" {
 		t.Fatal("late legacy callback replaced terminal evidence")
+	}
+	// A completion racing service shutdown still owns the real outcome.
+	turnID = "turn-5"
+	event("started", "om_followup", "omt_topic")
+	lifetime, stop := context.WithCancel(ctx)
+	h.lifetime = lifetime
+	stop()
+	writeResult(Outcome{State: "completed", Summary: "Completed before service exit"})
+	event("finished", "om_followup", "omt_topic")
+	saved, _ = repos.Loops.GetByID(ctx, loop.ID)
+	if saved.Status != "completed" {
+		t.Fatal("service shutdown requeued a completed task")
+	}
+	if _, err := h.recordTurnEvent(ctx, feishubridge.TurnEvent{TurnID: "late-start", Phase: "started", ThreadID: "omt_topic"}); err != errBridgeHostStopping {
+		t.Fatalf("closing service accepted new work: %v", err)
 	}
 }
 

@@ -30,7 +30,7 @@ import (
 func (r *commandRuntime) collabCommand() *cobra.Command {
 	command := newCommand(commandSpec{use: "collab", short: "Run the independent Feishu collaboration service", helpWhenNoArgs: true,
 		persistentFlags: []flagSpec{stringFlag("state-dir", "path", "Independent collaboration state directory")},
-		helpSubcommands: []helpSubcommand{{name: "start", description: "Start once; stay available across tasks"}, {name: "status", description: "Show service and task progress"}, {name: "people", description: "Read the automatically refreshed people directory"}, {name: "run", description: "Dispatch a task; the agent determines its repositories"}, {name: "logs", description: "Show collaboration host logs"}, {name: "stop", description: "Drain executions and stop the service"}},
+		helpSubcommands: []helpSubcommand{{name: "start", description: "Start once; stay available across tasks"}, {name: "status", description: "Show service and task progress"}, {name: "people", description: "Read the automatically refreshed people directory"}, {name: "run", description: "Dispatch a task; the agent determines its repositories"}, {name: "logs", description: "Show collaboration host logs"}, {name: "stop", description: "Stop the service; unfinished bridge tasks resume on start"}},
 		subcommands: []*cobra.Command{
 			newCommand(commandSpec{use: "start", short: "Start once; stay available across tasks", args: cobra.NoArgs, runE: r.collabStart, localFlags: []flagSpec{boolFlag("foreground", "Run in the current terminal"), stringFlag("bridge-entry", "path", "Use a prebuilt bridge entry instead of preparing the pinned runtime")}}),
 			newCommand(commandSpec{use: "status", short: "Show service and task progress", args: cobra.NoArgs, runE: r.collabStatus}),
@@ -42,7 +42,7 @@ func (r *commandRuntime) collabCommand() *cobra.Command {
 			newCommand(commandSpec{use: "dashboard", short: "Serve a read-only local task dashboard", args: cobra.NoArgs, runE: r.collabDashboard, localFlags: []flagSpec{stringFlag("port", "number", "Loopback HTTP port (default 18090)")}}),
 			newCommand(commandSpec{use: "trace <task|run>", short: "Read a metadata-only task timeline offline", args: cobra.ExactArgs(1), runE: r.collabTrace}),
 			newCommand(commandSpec{use: "sync", short: "Upload connected Plane task metadata; retry retained revisions", args: cobra.NoArgs, runE: r.collabSync}),
-			newCommand(commandSpec{use: "stop", short: "Drain executions and stop the service", args: cobra.NoArgs, runE: r.collabStop}),
+			newCommand(commandSpec{use: "stop", short: "Stop the service; unfinished bridge tasks resume on start", args: cobra.NoArgs, runE: r.collabStop}),
 		},
 	})
 	return command

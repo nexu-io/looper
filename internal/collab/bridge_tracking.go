@@ -79,6 +79,10 @@ func (h *bridgeHost) saveTurn(ctx context.Context, loop storage.LoopRecord, stat
 		run.Status, execution.Status = "failed", "failed"
 		if event.Phase == "finished" && event.Terminal == "done" {
 			run.Status, execution.Status = "success", "completed"
+		} else if taskStatus == "queued" {
+			run.Status = "interrupted"
+			message := "Service stopped during turn; task queued for restart"
+			execution.ErrorMessage = &message
 		}
 		run.EndedAt, execution.EndedAt = &now, &now
 	}
