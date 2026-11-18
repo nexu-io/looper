@@ -2,20 +2,20 @@
 
 本文面向运行本地 Agent 的研发同学。跑完后，应能在 Plane 派发一个任务，由 Agent 判断涉及哪些仓库，在飞书原话题沟通和验收，让原 Agent 继续修改同一个 PR，并观察 PR 最终结果。产品、设计和 QA 只需参与飞书沟通，不用安装本地服务。
 
-**当前为联调指南，已有固定测试版，尚非新同事的一键授权流程。** [v0.16.3-beta.2](https://github.com/nexu-io/looper/releases/tag/v0.16.3-beta.2) 基于 [PR #696](https://github.com/nexu-io/looper/pull/696) 的 `feat/looper-collab-standalone`，源提交 `4546116`。Plane 的个人设备连接已随 #82 合并；本轮 CF 替代 loopernet 还需要配套 Plane 新分支 `feat/collab-cf-presence`，上线状态以相应 PR 为准。旧版 Looper 二进制未必包含 collab 子命令。
+**当前为联调指南，已有固定测试版，尚非新同事的一键授权流程。** [v0.16.3-beta.3](https://github.com/nexu-io/looper/releases/tag/v0.16.3-beta.3) 基于 [PR #696](https://github.com/nexu-io/looper/pull/696) 的 `feat/looper-collab-standalone`，源提交 `79c446c`。Plane 的个人设备连接已随 #82 合并；本轮 CF 替代 loopernet 还需要配套 Plane 新分支 `feat/collab-cf-presence`，上线状态以相应 PR 为准。旧版 Looper 二进制未必包含 collab 子命令。
 
 macOS arm64 的固定版安装与版本检查：
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/nexu-io/looper/v0.16.3-beta.2/scripts/install.sh -o /tmp/looper-beta-install.sh
-LOOPER_VERSION=v0.16.3-beta.2 sh /tmp/looper-beta-install.sh
+curl -fsSL https://raw.githubusercontent.com/nexu-io/looper/v0.16.3-beta.3/scripts/install.sh -o /tmp/looper-beta-install.sh
+LOOPER_VERSION=v0.16.3-beta.3 sh /tmp/looper-beta-install.sh
 looper --version
 looper version --json
 ```
 
-预期 CLI 为 `0.16.3-beta.2`，构建提交 `4546116…`。本机已通过标准脚本安装，并用安装版跑通本地 Plane 配对/派发、自动私测群、原话题选择/续跑、HTML/截图附件、真实 sandbox PR/CI、review 自动跟进及授权合并后的自动收尾，最终本机和 Plane 均 completed。正式环境和真人 QA 仍单独验收，详见 [实测记录](E2E-collab-2026-11-16.zh-CN.md)。macOS 包为固定提交的本机原生构建，Linux 包为 CI 构建；release workflow 的 macOS runner 等待被取消，不称整条发布 CI 通过。不要同时启动使用同一 state 目录的源码宿主和安装版宿主。
+预期 CLI 为 `0.16.3-beta.3`，构建提交 `79c446c…`。本机已通过标准脚本安装 beta.3，安装二进制 SHA-256 与发布资产一致；[完整发布 CI](https://github.com/nexu-io/looper/actions/runs/44247811062) 成功，包含全量 Go 检查和六个平台资产构建。beta.3 已接续正式 Plane 设备和原任务状态，doctor 自检通过，正式 Looper bot 已能在原话题发消息。此前 beta.2 安装版的本地 Plane、飞书、sandbox PR/CI/review 与授权合并后收尾结果仍保留在 [实测记录](E2E-collab-2026-11-16.zh-CN.md)；不能把历史结果当作 beta.3 正式 bot 的自主性或真人 QA 验收。不要同时启动使用同一 state 目录的源码宿主和安装版宿主。
 
-## 当前推荐：个人配对 + CF inbox / 心跳
+## 当前推荐：个人配对 + 共享飞书 inbox + 本机心跳
 
 研发在 Plane **个人设置 → Developer → 我的 Looper** 复制一次性 `looper plane connect … --code … --collab` 命令，执行后运行 `looper collab start`，再用 `looper plane doctor --collab` 自检。个人连接跨本人有执行权限的项目复用，无需在项目里重复连接，不绑定代码仓库。
 
