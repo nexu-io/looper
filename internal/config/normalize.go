@@ -339,6 +339,11 @@ func mergePartialReviewerRoleDiscoveryWithCanonicalPriority(canonical *PartialRe
 }
 
 func mergeConfig(config *Config, partial PartialConfig) {
+	if partial.Collab != nil {
+		collab := *partial.Collab
+		config.Collab = &collab
+	}
+
 	if partial.Server != nil {
 		mergeServerConfig(&config.Server, *partial.Server)
 	}
@@ -1791,6 +1796,10 @@ func cloneStrings(values []string) []string {
 
 func clonePartialConfig(partial PartialConfig) PartialConfig {
 	cloned := partial
+	if partial.Collab != nil {
+		collab := *partial.Collab
+		cloned.Collab = &collab
+	}
 	if partial.Identities != nil {
 		identities := make(map[string]HostingIdentityConfig, len(*partial.Identities))
 		for name, definition := range *partial.Identities {

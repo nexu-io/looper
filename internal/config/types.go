@@ -222,6 +222,7 @@ type ProviderConfig struct {
 }
 
 type PlaneStrictDispatchConfig struct {
+	MemoryEnabled    bool   `json:"memoryEnabled,omitempty"`
 	TelemetryEnabled bool   `json:"telemetryEnabled,omitempty"`
 	Enabled          bool   `json:"enabled"`
 	BaseURL          string `json:"baseUrl"`
@@ -805,7 +806,13 @@ type PartialProviderConfig struct {
 	StrictDispatch *PlaneStrictDispatchConfig `json:"strictDispatch,omitempty"`
 }
 
+type CollabConfig struct {
+	MemoryEnabled bool `json:"memoryEnabled"`
+}
+
 type Config struct {
+	Collab *CollabConfig `json:"collab,omitempty"`
+
 	Identities map[string]HostingIdentityConfig `json:"identities,omitempty"`
 
 	Server        ServerConfig       `json:"server"`
@@ -1301,6 +1308,8 @@ type PartialRoleConfigs struct {
 }
 
 type PartialConfig struct {
+	Collab *CollabConfig `json:"collab,omitempty"`
+
 	Identities *map[string]HostingIdentityConfig `json:"identities,omitempty"`
 
 	Server         *PartialServerConfig       `json:"server,omitempty"`

@@ -47,6 +47,8 @@ type Outcome struct {
 	State        string                   `json:"state"`
 	Summary      string                   `json:"summary"`
 	PullRequests []string                 `json:"pullRequests,omitempty"`
+	WaitKind     string                   `json:"waitKind,omitempty"`
+	WaitRole     string                   `json:"waitRole,omitempty"`
 	WaitingFor   []string                 `json:"waitingFor,omitempty"`
 	NextStep     string                   `json:"nextStep,omitempty"`
 	Context      string                   `json:"context,omitempty"`
@@ -138,6 +140,11 @@ func serveBridge(parent context.Context, options Options) error {
 	if host.chats == nil {
 		return fmt.Errorf("configure the Feishu bot and owner before starting collaboration")
 	}
+	host.sources, err = bridgePlaneSources(cfg)
+	if err != nil {
+		return err
+	}
+	host.legacySources = append([]planeSource(nil), host.sources...)
 	host.notify = notify.NewGateway(notify.Options{Config: cfg.Notifications, Repositories: repos,
 		FeishuCLI: workerhost.PrivateFeishuClient(&cfg), LogFilePath: LogPath(dir),
 		ResolveOwnerName:   host.ownerName,
@@ -161,6 +168,7 @@ func serveBridge(parent context.Context, options Options) error {
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /bridge/events", host.turnEvent)
+	mux.HandleFunc("POST /memory/", host.memoryTool)
 	mux.HandleFunc("POST /bridge/human", host.humanEvent)
 	mux.HandleFunc("GET /status", host.status)
 	mux.HandleFunc("GET /people", host.people)
@@ -213,15 +221,6 @@ func serveBridge(parent context.Context, options Options) error {
 	if err != nil {
 		return err
 	}
-	host.client, err = feishubridge.Start(ctx, options.BridgeEntry, filepath.Join(dir, "bridge-state"), feishubridge.Init{
-		Socket: filepath.Join(dir, "bridge.sock"), CallbackSocket: SocketPath(dir), CWD: workspace,
-		AppID: appID, AppSecret: appSecret, OwnerOpenID: cfg.HITL.Feishu.OwnerOpenID,
-		ExternalEvents: inboxURL != "",
-	}, log, inboxToken)
-	if err != nil {
-		return err
-	}
-	defer func() { cancel(); _ = host.client.Close() }()
 	networkPath := options.NetworkStatePath
 	if networkPath == "" {
 		home, err := os.UserHomeDir()
@@ -234,11 +233,17 @@ func serveBridge(parent context.Context, options Options) error {
 		return err
 	}
 	host.personalPath = networkPath
-	host.sources, err = bridgePlaneSources(cfg)
+	memorySocket, memoryScript := host.memoryToolPaths()
+	host.client, err = feishubridge.Start(ctx, options.BridgeEntry, filepath.Join(dir, "bridge-state"), feishubridge.Init{
+		Socket: filepath.Join(dir, "bridge.sock"), CallbackSocket: SocketPath(dir), CWD: workspace,
+		AppID: appID, AppSecret: appSecret, OwnerOpenID: cfg.HITL.Feishu.OwnerOpenID,
+		ExternalEvents: inboxURL != "",
+		MemorySocket:   memorySocket, MemoryScript: memoryScript,
+	}, log, inboxToken)
 	if err != nil {
 		return err
 	}
-	host.legacySources = append([]planeSource(nil), host.sources...)
+	defer func() { cancel(); _ = host.client.Close() }()
 	networkCfg := cfg
 	legacyPersonal := host.personalPlane != nil && host.personalPlane.Pairing != "device_v1"
 	if legacyPersonal {
@@ -283,6 +288,9 @@ func serveBridge(parent context.Context, options Options) error {
 	}
 	tick := time.NewTicker(time.Second)
 	defer tick.Stop()
+	memoryDone := make(chan struct{})
+	go func() { defer close(memoryDone); host.maintainMemory(ctx) }()
+	defer func() { cancel(); <-memoryDone }()
 	lastPlane, lastPR := time.Time{}, time.Time{}
 	for ctx.Err() == nil {
 		if time.Since(lastPlane) >= 10*time.Second {
@@ -462,7 +470,11 @@ func (h *bridgeHost) turnEvent(w http.ResponseWriter, r *http.Request) {
 	if id != "" && h.notify != nil {
 		h.notify.RefreshThreadHeader(r.Context(), id, nil, 0)
 	}
-	writeJSON(w, map[string]bool{"ok": true})
+	memoryContext := ""
+	if id != "" && event.Phase == "started" {
+		memoryContext = h.memoryContext(r.Context(), id)
+	}
+	writeJSON(w, map[string]any{"ok": true, "memoryContext": memoryContext})
 }
 
 var errBridgeTaskStopped = errors.New("task has been stopped from Plane")
@@ -575,6 +587,7 @@ func (h *bridgeHost) recordTurnEvent(ctx context.Context, event feishubridge.Tur
 			state.Outcome = Outcome{}
 		}
 		h.trackTurn(ctx, loop, state, event, status)
+		// maintainMemory queues completed tasks outside this task-state lock.
 		return loop.ID, nil
 	}
 	return "", nil
@@ -692,6 +705,7 @@ open_id 只适用于目录 app_id 对应的应用，不能搬用别的 bot 的 o
 ` + localVisualDeliveryInstruction + `
 提供对方能访问的准确版本、简短步骤、证据和未验项，先邀请入群并确认，再在原话题 @ 提出具体请求。面向人的入口先展示效果和怎么验；指南、脚本、报告等技术资料归档 Plane，不把资料压缩包当作默认验收入口或修复安装包。还没有可验版本时，继续准备预览、构建或合适的替代证据，说明剩余验证范围，不把截图当作完整交互验收，也不只留一句“待验收”。
 Plane 交付时，在本任务状态 JSON 的顶层 links 保留当前版本的少量主要入口，并在 events 为每次版本交付追加 kind=delivery 的记录。顶层和事件 links 优先放验收说明、关键效果/可用版本及相关 PR，不逐项平铺日志、交付清单、包检查和更正记录；这些技术资料收进同版验收说明的“详细证据”目录，用链接保留追溯。小修复尽量一份简短说明，不为流程另造多篇报告或源码包。交付事件自身也保留本版本主要入口，不能只填顶层 links 或只上传附件。title/body 写版本、实际检测结果和未验项；失败也如实记录。重试沿用同一事件 ID，新版本或已发布记录的更正使用新 ID（更正可用 replaces 关联原 source_id），不要覆盖旧事件。人的验收反馈另记 acceptance，不能把交付或自测当作验收通过。沿用现有写回重试；本地 JSON 不是 Plane 已接收证明，未读回确认时不要声称已归档 Plane。正常自动回写不在 summary 或最终答复里例行添加“待宿主同步”“已写状态文件”等内部过程；它们不是业务进展或交付阻塞。只有出现明确的同步错误时才说明实际失败及影响。Bridge 本地文件按钮可能点击后才上传，不能作为已归档的证明。
+Plane 的 links 和 events[].links 只填写可打开的 http/https 地址；本机文件路径保留在飞书文件入口，不作为 Plane 链接。
 只读调查、解释和文档任务可以正常完成，不强求代码修改或 PR。开发任务创建所需各仓 PR，持续处理 review、CI、冲突和合并队列。未获授权不要代替人合并。
 
 ## 每轮任务结论
@@ -703,10 +717,14 @@ events 每项使用稳定且唯一的 id、title、body（Markdown 详情）、k
 关键发现、人的明确决策、验收反馈和交付应进入 events；普通聊天与工具调用不需要逐条搬运。人的协作原消息正文留在原平台，不要在 events.body 或 context 逐字搬运；保留分类、真实参与者、时间、原消息链接，工作摘要用自己的表述。人的结论须写真实发言人和飞书来源链接，无法确定时说明待确认，不能冒充 Plane 用户或把自己的推断当成人的决定。
 context 是当前有效的目标、范围、事实、依据和待办，按任务需要组织，不强制章节。不要记录密钥、token 或原始工具日志。每轮开始读提示中给出的 .plane.json；仅查看旧时间线，events 只提交本轮新增记录。同步由宿主处理，写回失败也继续本地执行，不把网络同步当成人工审批。
 summary 只写一句短进展（约 40 字），解释和证据放话题正文，不要复制整篇回复。
+needs_input 时可额外填写 waitKind（clarification/decision/review/acceptance/other）和 waitRole（owner/product/design/engineering/qa/other）；只标注实际等待原因和角色，不确定就省略，不代表审批完成。
 waitingFor 中填写从当前应用目录查得的真实 open_id；不要把 owner、qa 或人名当作 open_id。不确定等谁时留空，在话题中问 owner。
 state 可为 needs_input（确实需要人回复；说明已向谁请求什么，PR 仍会继续监听）、monitoring_prs（仍未完成，现已没有可独立推进工作，交回宿主等待 PR 外部变化）、completed（上述实际完成条件已满足）。只要仍有可做的调查、修复或交付准备，就先做，不用写等待状态代替行动。pullRequests 记录任务涉及的全部仓库 PR，允许为空。可选 repositories 数组记录实际选择的仓库：repo（HTTPS URL）、role（modify/consult/candidate）、branch、baseSha、prUrl、validationStatus（passed/failed/not_run/blocked）。这是 Agent 上报，不代表人工验收。
 继续原话题时沿用同一个任务文件。普通聊天只有 @bot 才触发你，不要自行轮询飞书抢另一条消息通道。
 `
+	if err := h.writeMemoryTool(dir); err != nil {
+		return err
+	}
 	return os.WriteFile(filepath.Join(dir, "AGENTS.md"), []byte(text), 0600)
 }
 
@@ -731,7 +749,7 @@ func bridgePlaneSources(cfg config.Config) ([]planeSource, error) {
 			if err != nil {
 				return nil, err
 			}
-			result = append(result, planeSource{project: project, client: client, nodeID: provider.StrictDispatch.NodeID})
+			result = append(result, planeSource{project: project, client: client, nodeID: provider.StrictDispatch.NodeID, memoryEnabled: provider.StrictDispatch.MemoryEnabled})
 			break // One connection per Plane provider, regardless of repository count.
 		}
 	}

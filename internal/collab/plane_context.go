@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 
@@ -71,6 +72,10 @@ func (h *bridgeHost) publishPlaneContext(ctx context.Context, client *forge.Plan
 		workerInput, _, _ := readBridgeTask(loop)
 		input.ChatName = taskGroupContext(workerInput, input.ChatScopeKey).Name
 	}
+	input.Links = planeWebLinks(input.Links)
+	for i := range input.Events {
+		input.Events[i].Links = planeWebLinks(input.Events[i].Links)
+	}
 	for _, link := range state.Outcome.PullRequests {
 		found := false
 		for _, existing := range input.Links {
@@ -112,6 +117,18 @@ func (h *bridgeHost) publishPlaneContext(ctx context.Context, client *forge.Plan
 		input.Events = input.Events[100:]
 	}
 	return publish(input)
+}
+
+// Local file actions belong to the Feishu thread; Plane links must open on the web.
+func planeWebLinks(links []planestrict.TaskLink) []planestrict.TaskLink {
+	result := []planestrict.TaskLink{}
+	for _, link := range links {
+		u, err := url.Parse(link.URL)
+		if err == nil && (u.Scheme == "http" || u.Scheme == "https") && u.Hostname() != "" {
+			result = append(result, link)
+		}
+	}
+	return result
 }
 
 func (h *bridgeHost) ackPlaneEvents(ctx context.Context, id string, sent []planestrict.TaskEvent) error {

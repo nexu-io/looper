@@ -85,7 +85,7 @@ func (h *bridgeHost) refreshPersonalPlane(ctx context.Context) error {
 			if err != nil {
 				return err
 			}
-			source = planeSource{project: config.ProjectRefConfig{ID: "personal-plane-" + project.ID, Provider: project.Workspace + ":" + project.ID}, client: client, nodeID: h.personalPlane.NodeID}
+			source = planeSource{memoryEnabled: h.cfg.Collab != nil && h.cfg.Collab.MemoryEnabled, project: config.ProjectRefConfig{ID: "personal-plane-" + project.ID, Provider: project.Workspace + ":" + project.ID}, client: client, nodeID: h.personalPlane.NodeID}
 			now := time.Now().UTC().Format(time.RFC3339Nano)
 			if err := h.repos.Projects.Upsert(ctx, storage.ProjectRecord{ID: source.project.ID, Name: project.Name,
 				RepoPath: filepath.Join(h.dir, "workspace"), CreatedAt: now, UpdatedAt: now}); err != nil {

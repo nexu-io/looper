@@ -147,12 +147,13 @@
      if (shuttingDown) {
        slot.release();
        active.delete(activeKey);
-@@ -4270,6 +4293,8 @@
+@@ -4270,6 +4293,9 @@
          const turnModel = rec?.model ?? opts.model;
          const turnEffort = rec?.effort ?? opts.effort;
          const modelDisp = getModelDisplay(cfg);
-+        await externalHooks?.onTurn?.({ phase: 'started', rootMessageId: opts.replyTo, chatId: opts.chatId,
++        const memoryContext = await externalHooks?.onTurn?.({ phase: 'started', rootMessageId: opts.replyTo, chatId: opts.chatId,
 +          threadId: topicThreadId, sessionId: opts.thread.sessionId, cwd: runCwd });
++        if (memoryContext) turnInput.text += '\n\n' + memoryContext;
          const run = opts.thread.runStreamed(turnInput, { model: turnModel, effort: turnEffort });
          titleTurnAttempted = true;
          const turnStartAt = Date.now(); // turn/start 已在 runStreamed() 内发出（与下面的建卡并行）
@@ -355,3 +356,25 @@
      return new CodexThread(client, res.thread.id, opts.model, opts.effort);
    }
  
+--- a/src/agent/codex-appserver/app-server-client.ts
++++ b/src/agent/codex-appserver/app-server-client.ts
+@@ -110,7 +110,18 @@
+     // Launch via cross-spawn (platform/spawn) so a Windows `.cmd` codex shim
+     // runs instead of throwing EINVAL (CVE-2024-27980). With stdio all-piped the
+     // streams are non-null, so the cast to *WithoutNullStreams is sound.
+-    const child = spawnProcess(this.opts.bin, ['app-server', '--listen', 'stdio://'], {
++    const args = ['app-server', '--listen', 'stdio://'];
++    const memoryScript = process.env.LOOPER_MEMORY_MCP_SCRIPT;
++    const memorySocket = process.env.LOOPER_MEMORY_MCP_SOCKET;
++    if (memoryScript && memorySocket) {
++      args.push('-c', 'mcp_servers.looper_memory.command="python3"',
++        '-c', 'mcp_servers.looper_memory.args=' + JSON.stringify([memoryScript, '--socket', memorySocket, '--mcp']));
++      // Only these task-scoped tools are preauthorized; publishing and business mutations are absent.
++      for (const name of ['list_for_item', 'get', 'feedback', 'propose']) {
++        args.push('-c', `mcp_servers.looper_memory.tools.${name}.approval_mode="approve"`);
++      }
++    }
++    const child = spawnProcess(this.opts.bin, args, {
+       cwd: this.opts.cwd,
+       env: mergeProcessEnv(process.env, { ...this.opts.env, FEISHU_CODEX_BRIDGE: '1' }),
+       stdio: ['pipe', 'pipe', 'pipe'],

@@ -87,6 +87,8 @@ func TestPlaneContextRetriesBeforeTerminalAndPreservesConcurrentReply(t *testing
 			{ID: "delivery:fixture-v2", Title: "交付 fixture-v2，待验收", Kind: "delivery", Body: "fixture-v2: actual checks passed; human acceptance pending", Links: currentLinks},
 			{ID: "reply-1", Title: "选择简短版", Kind: "decision", ActorName: "测试同事", ActorOpenID: "ou_fixture", SourceURL: "https://applink.feishu.cn/client/thread/open?fixture=1"},
 		}}
+	outcome.Links = append(outcome.Links, planestrict.TaskLink{Title: "Local file action", URL: "/tmp/report.md", Type: "artifact"})
+	outcome.Events[0].Links = outcome.Links
 	data, _ := json.Marshal(outcome)
 	if err = os.WriteFile(h.resultPath(loop.ID), data, 0600); err != nil {
 		t.Fatal(err)
@@ -219,6 +221,9 @@ func TestPlaneContextRetriesBeforeTerminalAndPreservesConcurrentReply(t *testing
 	}
 	if got.Events[2].ActorOpenID != "ou_fixture" || got.Events[2].SourceURL == "" {
 		t.Fatal("human provenance lost")
+	}
+	if len(got.Links) != len(currentLinks) || len(got.Events[1].Links) != len(currentLinks) || got.Links[0].URL != outcome.Links[0].URL {
+		t.Fatal("local file actions were exported as Plane web links")
 	}
 	saved, _ = h.repos.Loops.GetByID(ctx, loop.ID)
 	_, state, _ = readBridgeTask(*saved)
