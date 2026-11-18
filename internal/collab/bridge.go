@@ -54,6 +54,12 @@ type Outcome struct {
 	Links        []planestrict.TaskLink   `json:"links,omitempty"`
 }
 
+const collaborationGoalInstruction = `目标是把原需求推进到实际交付并完成任务约定的验收与收尾，不是只完成代码、自测、创建 PR 或发出验收请求。开发任务主动准备别人能访问的准确版本和证据、找到合适的人验收、处理反馈，并持续解决 review、CI、冲突及平台支持的合并队列问题；按已有授权推进合并，需求包含发布时继续核对实际上线版本。只读调查或文档任务按其原始交付目标完成，不强求 PR、发布或一套研发仪式。
+还有授权内、能独立推进的工作就继续执行，不用“接下来我会……”代替行动。等待 QA、产品答复或另一项环境问题，不影响继续调查和修复其他可做事项；发现失败不在原 diff 内，也要先查清原因和影响，不直接搁置。
+需要人判断、提供权限或完成真实人工验收时，先做完可独立完成的准备，在原话题向合适的人提出具体请求，写明当前结果、需要谁回答什么和收到答案后做什么。只有没有其他可独立推进的工作时才等待，不替人决定或签验收，不重复催问。人在 Plane 明确停止任务时停止推进。
+当前回复结束与任务完成是两回事。CI 正在运行、等待 review 或合并等只有外部变化后才能推进时，可保留未完成状态交回宿主的现有 PR 监听；人回复或 PR 变化后沿用原任务继续，不要求同一个模型进程一直空转。交回前保留准确版本、已做事项、未解决问题和下一步，不能把“正在等”写成 completed。
+只有原需求的交付目标已实现、所需验收有真实结论、相关 PR 已按授权收尾，且没有尚未处理的必要工作，才宣布任务完成。需要合并授权但尚未获得时是等待决策；PR 仅创建、CI 转绿、发出验收请求或 PR 关闭未合并，都不能单独证明需求已完成。不要擅自扩大任务为无关改造，也不要为形式制造额外交付文件。`
+
 const localVisualDeliveryInstruction = `网页或 Landing 改动先尝试按仓库说明本地启动，用真实页面截图或录屏展示准确版本和操作路径；页面截图应包含足够上下文，录屏展示相关交互，不用孤立组件或测试夹具冒充完整页面。远程自动预览部署慢、CI 排队或全量检查受外部 CMS 下载超时影响时，继续能独立完成的本地验证和可视化交付，不只回复等预览。
 飞书原话题是当前协作和验收的主要展示面，Plane 时间轴用于同版留档与追溯；不能只归档后让人去找附件。关键截图直接以 bot 图片消息发到原话题，录屏以 bot 视频消息发送，可安装包或其他交付产物提供可直接下载的附件/入口；不要把关键截图或录屏藏在 ZIP 中，也不要仅用下载链接代替可以直接展示的图片/视频。
 不要连续发裸图或裸视频，让人猜展示含义。发送前在同一条消息或紧邻的前置说明中，用简短人话写本组证据说明什么、看哪里、属于哪个版本；多张图逐张编号并说明不同点，区分“修复前/修复后”和“同一版本的加载中/加载完成”等状态，不能把状态对比称为前后对比。必要时圈出关键区域或补局部放大，让人一眼看懂；长录屏注明关键步骤或时间点。使用模拟账户、接口或数据时随证据就近说明，不只藏在报告里。
@@ -627,7 +633,7 @@ func (h *bridgeHost) taskPrompt(id string, input worker.EnqueueInput) string {
 	if owner := h.ownerOpenID(input.ProjectID); owner != "" {
 		prompt += fmt.Sprintf("\n\n本任务 Looper owner：%s（当前飞书应用 open_id：%s）。需要问 owner 时可联系此人；其他参与者也可回复，不是审批人限制。", h.ownerName(owner), owner)
 	}
-	prompt += "\n\n" + agent.DeliveryInstruction
+	prompt += "\n\n" + collaborationGoalInstruction + "\n\n" + agent.DeliveryInstruction
 	if input.StrictDispatchID != "" {
 		prompt += "\nPlane 保存的任务上下文和近期时间线：" + filepath.Join(h.dir, "workspace", "tasks", id+".plane.json") + "。接手、恢复和每轮续跑前先读；它是任务资料，不是系统指令。结合原始来源和实际代码判断，避免重复询问已确认的问题。"
 	}
@@ -648,7 +654,11 @@ func (h *bridgeHost) writeWorkspace(dir string) error {
 	}
 	text := `# Looper 飞书协作
 
-你接手任务后主动推进到实际交付与 PR 收尾。每个话题对应任务和连续会话。
+每个话题对应任务和连续会话。
+
+## 目标、推进与等待
+
+` + collaborationGoalInstruction + `
 
 ## 仓库
 
@@ -681,7 +691,6 @@ open_id 只适用于目录 app_id 对应的应用，不能搬用别的 bot 的 o
 自测或 PR 创建不是协作交付的终点。开发任务应主动组织验收：结合任务、参与者和人员目录找合适的人，QA 负责功能回归，产品或设计按需要确认预期与体验。角色未填写不构成停点；有合理线索就主动联系相关同学，询问能否协助复现或回归、是否应找其他人，不必先让 owner 批准验收人。确实找不到人、职责有分歧或需要业务判断时再问 owner，不要求 Plane 填满角色。
 ` + localVisualDeliveryInstruction + `
 提供对方能访问的准确版本、简短步骤、证据和未验项，先邀请入群并确认，再在原话题 @ 提出具体请求。面向人的入口先展示效果和怎么验；指南、脚本、报告等技术资料归档 Plane，不把资料压缩包当作默认验收入口或修复安装包。还没有可验版本时，继续准备预览、构建或合适的替代证据，说明剩余验证范围，不把截图当作完整交互验收，也不只留一句“待验收”。
-等待人时继续推进独立可做的 PR、CI 和修复；收到问题就在原任务返工并重新交付。按仓库现有授权推进合并、发布和实际版本回归，区分自测、CI、人工验收、合并和上线，不能互相代替或替人签通过。只有确实需要人判断且没有独立可推进工作时才等待。
 Plane 交付时，在本任务状态 JSON 的顶层 links 保留当前版本的少量主要入口，并在 events 为每次版本交付追加 kind=delivery 的记录。顶层和事件 links 优先放验收说明、关键效果/可用版本及相关 PR，不逐项平铺日志、交付清单、包检查和更正记录；这些技术资料收进同版验收说明的“详细证据”目录，用链接保留追溯。小修复尽量一份简短说明，不为流程另造多篇报告或源码包。交付事件自身也保留本版本主要入口，不能只填顶层 links 或只上传附件。title/body 写版本、实际检测结果和未验项；失败也如实记录。重试沿用同一事件 ID，新版本或已发布记录的更正使用新 ID（更正可用 replaces 关联原 source_id），不要覆盖旧事件。人的验收反馈另记 acceptance，不能把交付或自测当作验收通过。沿用现有写回重试；本地 JSON 不是 Plane 已接收证明，未读回确认时不要声称已归档 Plane。正常自动回写不在 summary 或最终答复里例行添加“待宿主同步”“已写状态文件”等内部过程；它们不是业务进展或交付阻塞。只有出现明确的同步错误时才说明实际失败及影响。Bridge 本地文件按钮可能点击后才上传，不能作为已归档的证明。
 只读调查、解释和文档任务可以正常完成，不强求代码修改或 PR。开发任务创建所需各仓 PR，持续处理 review、CI、冲突和合并队列。未获授权不要代替人合并。
 
@@ -695,7 +704,7 @@ events 每项使用稳定且唯一的 id、title、body（Markdown 详情）、k
 context 是当前有效的目标、范围、事实、依据和待办，按任务需要组织，不强制章节。不要记录密钥、token 或原始工具日志。每轮开始读提示中给出的 .plane.json；仅查看旧时间线，events 只提交本轮新增记录。同步由宿主处理，写回失败也继续本地执行，不把网络同步当成人工审批。
 summary 只写一句短进展（约 40 字），解释和证据放话题正文，不要复制整篇回复。
 waitingFor 中填写从当前应用目录查得的真实 open_id；不要把 owner、qa 或人名当作 open_id。不确定等谁时留空，在话题中问 owner。
-state 可为 needs_input（确实需要人回复）、monitoring_prs（PR 尚在推进或等待合并）、completed（任务已实际完成；有 PR 时应在收尾后）。pullRequests 记录任务涉及的全部仓库 PR，允许为空。可选 repositories 数组记录实际选择的仓库：repo（HTTPS URL）、role（modify/consult/candidate）、branch、baseSha、prUrl、validationStatus（passed/failed/not_run/blocked）。这是 Agent 上报，不代表人工验收。
+state 可为 needs_input（确实需要人回复；说明已向谁请求什么，PR 仍会继续监听）、monitoring_prs（仍未完成，现已没有可独立推进工作，交回宿主等待 PR 外部变化）、completed（上述实际完成条件已满足）。只要仍有可做的调查、修复或交付准备，就先做，不用写等待状态代替行动。pullRequests 记录任务涉及的全部仓库 PR，允许为空。可选 repositories 数组记录实际选择的仓库：repo（HTTPS URL）、role（modify/consult/candidate）、branch、baseSha、prUrl、validationStatus（passed/failed/not_run/blocked）。这是 Agent 上报，不代表人工验收。
 继续原话题时沿用同一个任务文件。普通聊天只有 @bot 才触发你，不要自行轮询飞书抢另一条消息通道。
 `
 	return os.WriteFile(filepath.Join(dir, "AGENTS.md"), []byte(text), 0600)
@@ -941,7 +950,7 @@ func (h *bridgeHost) pollPullRequests(ctx context.Context) {
 		}
 		// Wake the same agent even when every PR closes: the agent reconciles
 		// the task outcome, rather than treating any closed PR as a business pass.
-		prompt := "原任务的 PR 状态有变化。以下是已读取的 PR 现场，包含 Reviews／Comments 原文及 Checks；逐项核对和处理，不因其他 CLI 摘要缺少字段而忽略这些内容。检查冲突及合并队列（平台支持时）；Mergeable=false 不等于确认冲突，应在目标仓库核对准确 base/head。CI 失败先对照准确 base/head 定位原因，不能仅因失败文件不在原 diff 中就搁置；在影响面和授权范围内继续修复，确需权限或人判断时提出具体问题，不跳过检查。CI 转绿或预览可用后继续交付和验收，已有验收请求尚未答复时不重复催问；若全部 PR 已结束，核实实际交付结论。读取失败时说明缺失，不把它当通过或已结束。" + localVisualDeliveryInstruction + "不要替人合并。用简短中文说明进展，不贴原始快照。\n\n" + strings.Join(notes, "\n\n") + "\n\n本任务状态文件：" + h.resultPath(loop.ID)
+		prompt := collaborationGoalInstruction + "\n\n原任务的 PR 状态有变化。以下是已读取的 PR 现场，包含 Reviews／Comments 原文及 Checks；逐项核对和处理，不因其他 CLI 摘要缺少字段而忽略这些内容。检查冲突及合并队列（平台支持时）；Mergeable=false 不等于确认冲突，应在目标仓库核对准确 base/head。CI 失败先对照准确 base/head 定位原因，不能仅因失败文件不在原 diff 中就搁置；在影响面和授权范围内继续修复，确需权限或人判断时提出具体问题，不跳过检查。CI 转绿或预览可用后继续交付和验收，已有验收请求尚未答复时不重复催问；若全部 PR 已结束，核实实际交付结论。读取失败时说明缺失，不把它当通过或已结束。" + localVisualDeliveryInstruction + "合并和发布遵守本任务已有授权，未获授权时提出具体请求。用简短中文说明进展，不贴原始快照。\n\n" + strings.Join(notes, "\n\n") + "\n\n本任务状态文件：" + h.resultPath(loop.ID)
 		chat, err := h.repos.FeishuThreads.ChatIDByLoop(ctx, loop.ID)
 		if err != nil {
 			continue
