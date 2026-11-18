@@ -203,7 +203,7 @@ func (m *taskChatManager) groupName(loop storage.LoopRecord, input worker.Enqueu
 	if title == "" {
 		title = key
 	}
-	return trimRunes(prefix+" · "+title, 60)
+	return trimRunes(prefix+" · "+taskGroupContext(input, key).Kind+" · "+title, 60)
 }
 
 func (m *taskChatManager) defaultGroupName() string {
