@@ -28,7 +28,9 @@
       "docs:document.media:upload",
       "docs:document.media:download",
       "docs:permission.member:create",
-      "docs:permission.member:retrieve"
+      "docs:permission.member:retrieve",
+      "drive:file:upload",
+      "drive:file:download"
     ],
     "user": []
   }
