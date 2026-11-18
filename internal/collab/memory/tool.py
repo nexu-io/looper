@@ -40,7 +40,7 @@ def mcp(socket_path, bound_task):
         'list_for_item': '查看当前 Plane item 的项目和 module 记忆索引，支持明确分页及展开同项目其他 module。',
         'get': '读取指定发布修订的记忆原文，保留出处、内容 hash 和实际返回范围。',
         'feedback': '声明采用用途或反馈错误、不适用、有帮助；声明不代表独立验证。',
-        'propose': '提出有来源的经验或调整候选；不能冒充人工或直接覆盖正式知识。',
+        'propose': '需配套 Plane 个人记忆接口：提交有来源的个人经验，完整内容可供本人后续任务参考；不能共享或覆盖项目知识。',
     }
     tools = []
     for name, (properties, required) in schemas.items():
