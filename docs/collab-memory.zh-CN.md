@@ -1,6 +1,6 @@
 # Plane 任务记忆
 
-本功能依赖 Plane 的 `0160_looper_memory` 和记忆 API；下述个人隔离、完整经验自动启用和贡献审核还需 `0161_looper_memory_visibility` 及配套 API，旧版服务不能据此视为具备这些能力。记忆目录由 Plane project、module 和来源 item 组织；个人正文保留在 Plane 的账号权限范围内，关联的飞书知识源保留可编辑原文，Plane 保存已启用修订的不可变正文快照。Agent 每次开始或续跑时获得适用目录，再自行选择原文；Looper 不替 Agent 预选仓库或记忆。
+本功能依赖 Plane 的 `0160_looper_memory` 和记忆 API；下述个人隔离、完整经验自动启用和贡献审核还需 `0162_looper_memory_visibility` 及配套 API，旧版服务不能据此视为具备这些能力。记忆目录由 Plane project、module 和来源 item 组织；个人正文保留在 Plane 的账号权限范围内，关联的飞书知识源保留可编辑原文，Plane 保存已启用修订的不可变正文快照。Agent 每次开始或续跑时获得适用目录，再自行选择原文；Looper 不替 Agent 预选仓库或记忆。
 
 ## 开启
 
