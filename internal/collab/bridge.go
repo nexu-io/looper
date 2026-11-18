@@ -682,7 +682,7 @@ open_id 只适用于目录 app_id 对应的应用，不能搬用别的 bot 的 o
 ` + localVisualDeliveryInstruction + `
 提供对方能访问的准确版本、简短步骤、证据和未验项，先邀请入群并确认，再在原话题 @ 提出具体请求。面向人的入口先展示效果和怎么验；指南、脚本、报告等技术资料归档 Plane，不把资料压缩包当作默认验收入口或修复安装包。还没有可验版本时，继续准备预览、构建或合适的替代证据，说明剩余验证范围，不把截图当作完整交互验收，也不只留一句“待验收”。
 等待人时继续推进独立可做的 PR、CI 和修复；收到问题就在原任务返工并重新交付。按仓库现有授权推进合并、发布和实际版本回归，区分自测、CI、人工验收、合并和上线，不能互相代替或替人签通过。只有确实需要人判断且没有独立可推进工作时才等待。
-Plane 交付时，在本任务状态 JSON 的顶层 links 保留当前版本的入口，并在 events 为每次版本交付追加 kind=delivery 的记录；该事件自己的 links 必须包含本版本全部产物、验收指南、检测报告及相关 PR 的已归档入口，不能只填顶层 links 或只上传附件。title/body 写版本、实际检测结果和未验项；失败也如实记录。重试沿用同一事件 ID，新版本或已发布记录的更正使用新 ID（更正可用 replaces 关联原 source_id），不要覆盖旧事件。人的验收反馈另记 acceptance，不能把交付或自测当作验收通过。沿用现有写回重试；本地 JSON 不是 Plane 已接收证明，未读回确认时不要声称已归档 Plane。正常自动回写不在 summary 或最终答复里例行添加“待宿主同步”“已写状态文件”等内部过程；它们不是业务进展或交付阻塞。只有出现明确的同步错误时才说明实际失败及影响。Bridge 本地文件按钮可能点击后才上传，不能作为已归档的证明。
+Plane 交付时，在本任务状态 JSON 的顶层 links 保留当前版本的少量主要入口，并在 events 为每次版本交付追加 kind=delivery 的记录。顶层和事件 links 优先放验收说明、关键效果/可用版本及相关 PR，不逐项平铺日志、交付清单、包检查和更正记录；这些技术资料收进同版验收说明的“详细证据”目录，用链接保留追溯。小修复尽量一份简短说明，不为流程另造多篇报告或源码包。交付事件自身也保留本版本主要入口，不能只填顶层 links 或只上传附件。title/body 写版本、实际检测结果和未验项；失败也如实记录。重试沿用同一事件 ID，新版本或已发布记录的更正使用新 ID（更正可用 replaces 关联原 source_id），不要覆盖旧事件。人的验收反馈另记 acceptance，不能把交付或自测当作验收通过。沿用现有写回重试；本地 JSON 不是 Plane 已接收证明，未读回确认时不要声称已归档 Plane。正常自动回写不在 summary 或最终答复里例行添加“待宿主同步”“已写状态文件”等内部过程；它们不是业务进展或交付阻塞。只有出现明确的同步错误时才说明实际失败及影响。Bridge 本地文件按钮可能点击后才上传，不能作为已归档的证明。
 只读调查、解释和文档任务可以正常完成，不强求代码修改或 PR。开发任务创建所需各仓 PR，持续处理 review、CI、冲突和合并队列。未获授权不要代替人合并。
 
 ## 每轮任务结论
@@ -941,7 +941,7 @@ func (h *bridgeHost) pollPullRequests(ctx context.Context) {
 		}
 		// Wake the same agent even when every PR closes: the agent reconciles
 		// the task outcome, rather than treating any closed PR as a business pass.
-		prompt := "原任务的 PR 状态有变化。以下是已读取的 PR 现场，包含 Reviews／Comments 原文及 Checks；逐项核对和处理，不因其他 CLI 摘要缺少字段而忽略这些内容。检查冲突及合并队列（平台支持时）；Mergeable=false 不等于确认冲突，应在目标仓库核对准确 base/head。CI 转绿或预览可用后继续交付和验收，已有验收请求尚未答复时不重复催问；若全部 PR 已结束，核实实际交付结论。读取失败时说明缺失，不把它当通过或已结束。" + localVisualDeliveryInstruction + "不要替人合并。用简短中文说明进展，不贴原始快照。\n\n" + strings.Join(notes, "\n\n") + "\n\n本任务状态文件：" + h.resultPath(loop.ID)
+		prompt := "原任务的 PR 状态有变化。以下是已读取的 PR 现场，包含 Reviews／Comments 原文及 Checks；逐项核对和处理，不因其他 CLI 摘要缺少字段而忽略这些内容。检查冲突及合并队列（平台支持时）；Mergeable=false 不等于确认冲突，应在目标仓库核对准确 base/head。CI 失败先对照准确 base/head 定位原因，不能仅因失败文件不在原 diff 中就搁置；在影响面和授权范围内继续修复，确需权限或人判断时提出具体问题，不跳过检查。CI 转绿或预览可用后继续交付和验收，已有验收请求尚未答复时不重复催问；若全部 PR 已结束，核实实际交付结论。读取失败时说明缺失，不把它当通过或已结束。" + localVisualDeliveryInstruction + "不要替人合并。用简短中文说明进展，不贴原始快照。\n\n" + strings.Join(notes, "\n\n") + "\n\n本任务状态文件：" + h.resultPath(loop.ID)
 		chat, err := h.repos.FeishuThreads.ChatIDByLoop(ctx, loop.ID)
 		if err != nil {
 			continue
