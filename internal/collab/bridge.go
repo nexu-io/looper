@@ -512,6 +512,7 @@ func (h *bridgeHost) recordTurnEvent(ctx context.Context, event feishubridge.Tur
 		}
 		status, summary := "running", "正在处理"
 		conclusionUpdated := false
+		conclusionError := ""
 		if event.Phase == "started" {
 			h.active[loop.ID] = true
 			if err := os.Remove(h.resultPath(loop.ID)); err != nil && !os.IsNotExist(err) {
@@ -542,6 +543,10 @@ func (h *bridgeHost) recordTurnEvent(ctx context.Context, event feishubridge.Tur
 				}
 				if readErr != nil {
 					h.warn("agent task conclusion unavailable", readErr)
+					conclusionError = "conclusion_unavailable"
+					if os.IsNotExist(readErr) {
+						conclusionError = "conclusion_missing"
+					}
 					summary = "回复已送达，但任务状态未同步；在原话题 @bot 可继续"
 				} else {
 					state.Outcome = outcome
@@ -575,6 +580,10 @@ func (h *bridgeHost) recordTurnEvent(ctx context.Context, event feishubridge.Tur
 			state.Outcome = Outcome{}
 		}
 		h.trackTurn(ctx, loop, state, event, status)
+		if conclusionError != "" {
+			h.track(ctx, loop, "diagnostic.agent.conclusion.failed", eventlog.NewEventID("conclusion"), state.TrackingRunID,
+				map[string]string{"errorKind": conclusionError})
+		}
 		return loop.ID, nil
 	}
 	return "", nil
@@ -827,18 +836,14 @@ func (h *bridgeHost) planeDispatch(ctx context.Context, client *forge.PlaneClien
 			return err
 		}
 		if dispatch.State == "stop_requested" {
-			return client.TransitionStrictDispatch(ctx, dispatch.ID, "confirmed_stopped", nil)
+			return h.transitionTrackedDispatch(ctx, client, *loop, dispatch.ID, "confirmed_stopped", nil)
 		}
 		return nil
 	}
 	// A failed native turn can resume in the same conversation and attempt.
 	// Report that real continuation before publishing its next outcome.
 	if dispatch.State == "failed" && dispatch.Health == "ok" && (loop.Status == "running" || loop.Status == "shepherding" || loop.Status == "awaiting_human") {
-		if err := client.TransitionStrictDispatch(ctx, dispatch.ID, "running", nil); err != nil {
-			return err
-		}
-		h.track(ctx, *loop, "plane.state.synced", eventlog.NewEventID("sync"), "", map[string]any{"dispatchId": dispatch.ID, "state": "running"})
-		return nil
+		return h.transitionTrackedDispatch(ctx, client, *loop, dispatch.ID, "running", nil)
 	}
 	// Completed executions may receive later questions or acceptance feedback.
 	// Archive their pending facts without claiming or reopening the execution.
@@ -865,11 +870,7 @@ func (h *bridgeHost) planeDispatch(ctx context.Context, client *forge.PlaneClien
 		if err := h.publishPlaneContext(ctx, client, dispatch, *loop, state); err != nil {
 			return err
 		}
-		if err := client.TransitionStrictDispatch(ctx, dispatch.ID, status, wait); err != nil {
-			return err
-		}
-		h.track(ctx, *loop, "plane.state.synced", eventlog.NewEventID("sync"), "", map[string]any{"dispatchId": dispatch.ID, "state": status})
-		return nil
+		return h.transitionTrackedDispatch(ctx, client, *loop, dispatch.ID, status, wait)
 	}
 	if dispatch.Health == "ok" && dispatch.ExecutionAttemptID != nil {
 		return h.publishPlaneContext(ctx, client, dispatch, *loop, state)

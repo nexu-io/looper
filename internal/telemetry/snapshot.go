@@ -49,6 +49,10 @@ func snapshot(ctx context.Context, repos *storage.Repositories, loop storage.Loo
 	events := []map[string]any{}
 	coverage := "partial_legacy"
 	for _, record := range records {
+		// Diagnostic events are reserved for the local support bundle.
+		if strings.HasPrefix(record.EventType, "diagnostic.") {
+			continue
+		}
 		if record.EventType == "task.received" {
 			coverage = "tracking_enabled"
 		}

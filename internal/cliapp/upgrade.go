@@ -287,7 +287,7 @@ func shouldSkipAutoUpgrade(cmd *cobra.Command) bool {
 		}
 	}
 	path := strings.TrimSpace(cmd.CommandPath())
-	return path == "looper" || path == "looper upgrade"
+	return path == "looper" || path == "looper upgrade" || path == "looper collab export"
 }
 
 func newAutoUpgradeCommand(parent *cobra.Command) *cobra.Command {

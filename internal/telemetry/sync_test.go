@@ -63,11 +63,18 @@ func fixture(t *testing.T) (*storage.SQLiteCoordinator, config.Config) {
 func TestPendingRevisionSurvivesChangesAndAcknowledgementLoss(t *testing.T) {
 	db, _ := fixture(t)
 	ctx := context.Background()
+	loopID := "loop-1"
+	if err := storage.NewRepositories(db.DB()).Events.Append(ctx, storage.EventLogRecord{
+		ID: "local-diagnostic", EventType: "diagnostic.plane.sync.failed", LoopID: &loopID,
+		PayloadJSON: `{"httpStatus":503}`, CreatedAt: "2026-11-17T00:00:01.000Z",
+	}); err != nil {
+		t.Fatal(err)
+	}
 	first, revision, err := pending(ctx, db.DB(), "destination", "loop-1")
 	if err != nil || revision != 1 {
 		t.Fatalf("pending: revision=%d %v", revision, err)
 	}
-	for _, secret := range []string{"PRIVATE_PROMPT", "PRIVATE_ARGV", "secret@example", "stdoutLogPath"} {
+	for _, secret := range []string{"PRIVATE_PROMPT", "PRIVATE_ARGV", "secret@example", "stdoutLogPath", "diagnostic.plane.sync.failed"} {
 		if strings.Contains(string(first), secret) {
 			t.Fatalf("leaked %s", secret)
 		}
