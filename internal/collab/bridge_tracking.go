@@ -3,12 +3,15 @@ package collab
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"slices"
 	"time"
 
 	"github.com/nexu-io/looper/internal/eventlog"
 	"github.com/nexu-io/looper/internal/feishubridge"
+	"github.com/nexu-io/looper/internal/forge"
+	"github.com/nexu-io/looper/internal/planestrict"
 	"github.com/nexu-io/looper/internal/storage"
 )
 
@@ -99,6 +102,10 @@ func (h *bridgeHost) saveTurn(ctx context.Context, loop storage.LoopRecord, stat
 		h.track(ctx, loop, "run.started", id, id, payload)
 		h.track(ctx, loop, "agent.started", execID, id, payload)
 	} else if terminal {
+		switch event.Terminal {
+		case "done", "error", "interrupted":
+			payload["terminal"] = event.Terminal
+		}
 		h.track(ctx, loop, "agent.completed", execID, id, payload)
 		h.track(ctx, loop, "run.ended", id, id, payload)
 		if event.Phase == "finished" && event.Terminal == "done" && taskStatus != "failed" && state.Outcome.State != "" {
@@ -152,4 +159,29 @@ func waitAttributes(outcome Outcome, reference string) map[string]any {
 		role = "unknown"
 	}
 	return map[string]any{"transport": "feishu_bridge", "reference": reference, "waitKind": kind, "role": role}
+}
+
+func (h *bridgeHost) transitionTrackedDispatch(ctx context.Context, client *forge.PlaneClient, loop storage.LoopRecord, dispatchID, state string, wait *string) error {
+	if err := client.TransitionStrictDispatch(ctx, dispatchID, state, wait); err != nil {
+		h.trackPlaneSyncFailure(ctx, loop, dispatchID, "transition", state, err)
+		return err
+	}
+	h.track(ctx, loop, "plane.state.synced", eventlog.NewEventID("sync"), "", map[string]any{"dispatchId": dispatchID, "state": state})
+	return nil
+}
+
+func (h *bridgeHost) trackPlaneSyncFailure(ctx context.Context, loop storage.LoopRecord, dispatchID, operation, state string, err error) {
+	// Strict API details may include request content. Record the HTTP status
+	// or failure category, without the response body or a rendered error.
+	payload := map[string]any{"dispatchId": dispatchID, "operation": operation, "state": state, "errorKind": "request_failed"}
+	var apiError *planestrict.APIError
+	switch {
+	case errors.As(err, &apiError):
+		payload["errorKind"], payload["httpStatus"] = "plane_api_error", apiError.StatusCode
+	case errors.Is(err, context.DeadlineExceeded):
+		payload["errorKind"] = "timeout"
+	case errors.Is(err, context.Canceled):
+		payload["errorKind"] = "cancelled"
+	}
+	h.track(ctx, loop, "diagnostic.plane.sync.failed", eventlog.NewEventID("sync"), "", payload)
 }

@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/nexu-io/looper/internal/eventlog"
 	"github.com/nexu-io/looper/internal/forge"
 	"github.com/nexu-io/looper/internal/loops"
 	"github.com/nexu-io/looper/internal/planestrict"
@@ -98,7 +99,15 @@ func (h *bridgeHost) publishPlaneContext(ctx context.Context, client *forge.Plan
 	publish := func(batch planestrict.TaskContext) error {
 		confirmed, err := client.PublishTaskContext(ctx, dispatch, batch)
 		if err != nil {
+			if len(batch.Events) > 0 {
+				h.trackPlaneSyncFailure(ctx, loop, dispatch.ID, "context", loop.Status, err)
+			}
 			return err
+		}
+		// Periodic snapshots with no new timeline facts would flood the history.
+		if len(batch.Events) > 0 {
+			h.track(ctx, loop, "diagnostic.plane.context.synced", eventlog.NewEventID("sync"), "",
+				map[string]any{"dispatchId": dispatch.ID, "count": len(batch.Events)})
 		}
 		// Keep the next native turn's recovery file aligned with the confirmed
 		// summary, including when completion removes this task from the inbox.

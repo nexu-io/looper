@@ -44,6 +44,10 @@ func collabTraceReport(ctx context.Context, repos *storage.Repositories, selecto
 	if err != nil {
 		return nil, err
 	}
+	return collabTraceForLoop(ctx, repos, resolved, false)
+}
+
+func collabTraceForLoop(ctx context.Context, repos *storage.Repositories, resolved loopSelectorResult, export bool) (map[string]any, error) {
 	records, err := repos.Events.ListByLoop(ctx, resolved.Loop.ID)
 	if err != nil {
 		return nil, err
@@ -61,8 +65,12 @@ func collabTraceReport(ctx context.Context, repos *storage.Repositories, selecto
 		if resolved.SelectorKind == "runId" && record.RunID != nil && *record.RunID != resolved.Run.ID {
 			continue
 		}
+		payload := tracePayload(record.PayloadJSON)
+		if export {
+			payload = collabExportPayload(payload, record)
+		}
 		events = append(events, map[string]any{"eventId": record.ID, "type": record.EventType, "at": record.CreatedAt,
-			"runId": record.RunID, "entityId": record.EntityID, "actor": record.ActorID, "payload": tracePayload(record.PayloadJSON)})
+			"runId": record.RunID, "entityId": record.EntityID, "actor": record.ActorID, "payload": payload})
 	}
 	attempts := []map[string]any{}
 	for _, run := range runs {
@@ -75,16 +83,28 @@ func collabTraceReport(ctx context.Context, repos *storage.Repositories, selecto
 		}
 		executions := []map[string]any{}
 		for _, a := range agents {
-			var output map[string]json.RawMessage
-			if a.OutputJSON != nil {
-				_ = json.Unmarshal([]byte(*a.OutputJSON), &output)
+			execution := map[string]any{"executionId": a.ID, "vendor": a.Vendor, "status": a.Status,
+				"startedAt": a.StartedAt, "endedAt": a.EndedAt, "durationMs": traceDuration(a.StartedAt, a.EndedAt)}
+			if export {
+				execution["errorKind"] = collabErrorKind(a.Status, a.ErrorMessage)
+				execution["parseStatus"] = a.ParseStatus
+				execution["nativeResumeStatus"] = a.NativeResumeStatus
+			} else {
+				var output map[string]json.RawMessage
+				if a.OutputJSON != nil {
+					_ = json.Unmarshal([]byte(*a.OutputJSON), &output)
+				}
+				execution["stdoutLogPath"], execution["stderrLogPath"] = output["stdoutLogPath"], output["stderrLogPath"]
 			}
-			executions = append(executions, map[string]any{"executionId": a.ID, "vendor": a.Vendor, "status": a.Status,
-				"startedAt": a.StartedAt, "endedAt": a.EndedAt, "durationMs": traceDuration(a.StartedAt, a.EndedAt),
-				"stdoutLogPath": output["stdoutLogPath"], "stderrLogPath": output["stderrLogPath"]})
+			executions = append(executions, execution)
 		}
-		attempts = append(attempts, map[string]any{"runId": run.ID, "status": run.Status, "currentStep": run.CurrentStep,
-			"startedAt": run.StartedAt, "endedAt": run.EndedAt, "durationMs": traceDuration(run.StartedAt, run.EndedAt), "agents": executions})
+		attempt := map[string]any{"runId": run.ID, "status": run.Status, "currentStep": run.CurrentStep,
+			"startedAt": run.StartedAt, "endedAt": run.EndedAt, "durationMs": traceDuration(run.StartedAt, run.EndedAt), "agents": executions}
+		if export {
+			attempt["lastCompletedStep"] = run.LastCompletedStep
+			attempt["errorKind"] = collabErrorKind(run.Status, run.ErrorMessage)
+		}
+		attempts = append(attempts, attempt)
 	}
 	var metadata struct {
 		Worker struct {
@@ -112,7 +132,7 @@ func tracePayload(raw string) map[string]any {
 	var source map[string]any
 	_ = json.Unmarshal([]byte(raw), &source)
 	result := map[string]any{}
-	for _, key := range strings.Fields("source workspace planeProjectId dispatchId issueId issueNumber nodeId routingRepo executionMode step startStep resumed status from to durationMs resumePolicy state waitKind transport askedAt questionMessageId messageIds messageId elapsedRuntimeSeconds timeoutType parseStatus repo role branch baseSha prUrl validationStatus count reference") {
+	for _, key := range strings.Fields("source workspace planeProjectId dispatchId issueId issueNumber nodeId routingRepo executionMode step startStep resumed status from to durationMs resumePolicy state waitKind transport askedAt questionMessageId messageIds messageId elapsedRuntimeSeconds timeoutType parseStatus repo role branch baseSha prUrl validationStatus count reference operation httpStatus errorKind terminal configuredIdleTimeoutSeconds configuredMaxRuntimeSeconds lastProgressAt heartbeatCount") {
 		if value, ok := source[key]; ok {
 			result[key] = value
 		}

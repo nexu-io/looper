@@ -12,7 +12,7 @@ Looper 已有本地 SQLite 与日志落盘。本改动复用 `event_logs` 补充
 | 等谁回复、消息是否接收 | Worker 记录人工问答与 `feishu.receipt`；Bridge 记录人工等待及后续执行，SDK 消息收据尚未统一采集。事件不复制问题／回复正文 |
 | 哪些仓库、分支、PR、验证 | `repository.reported`：Agent 在完成标记的 repositories 数组上报；source=agent_report，与独立验证、人工验收区分 |
 | 交付产物与原始日志 | `artifacts.reported`：Worker 计完成标记中的 artifacts，Bridge 计 PR 引用；两种数量不能直接比较。Go executor 有本地捕获输出；Bridge 尚未导出 SDK 原生会话日志 |
-| Plane 状态是否回写成功 | `plane.state.synced` 只在远端状态转换成功后记录；失败保留运行错误和服务诊断 |
+| Plane 状态是否回写成功 | `plane.state.synced` 只在远端状态转换成功后记录；原生 Bridge 用 `diagnostic.plane.sync.failed` 记录状态回写及带时间线事件的上下文写入失败，用 `diagnostic.plane.context.synced` 记录上下文事件得到确认 |
 | 任务状态何时变化 | `task.state_changed`；completed 表示当前执行流程结束，不等于验收、合并或发布 |
 
 ## 查看
@@ -25,6 +25,20 @@ looper --config <配置> collab trace <loopId或runId> --state-dir <协作状态
 命令直接以只读方式读取状态目录中的 `looper.sqlite`，无需启动服务，不执行迁移，也不创建缺失的库。JSON 含任务关联、全部运行／Agent 执行与时间线；已有 Go executor 输出记录时附日志路径，Bridge 日志路径为空；按 runId 查询时只保留该轮及任务级事件。
 
 新增事件使用稳定 ID 防止重复观察写出重复事实；已有事件不可被后来的同 ID 载荷覆盖。新增追踪字段不包含任务正文、回复正文、环境变量、完整命令或模型思考内容。旧版 `agent.invoked` 原始事件含 argv，trace 导出仅取允许的元数据字段，原始私有库／日志仍应按内部数据保管。
+
+## 导出单个 Plane 任务的排障包
+
+```sh
+looper collab export OPEND-123 --output ./OPEND-123-diagnostics.zip
+```
+
+有独立协作状态目录时，传入原来的 `--state-dir`。同一任务编号对应多个 Plane 任务，或者旧派发只存了 UUID 时，用完整任务链接代替编号。命令离线读取同一个 SQLite 快照，按保存的 Plane 任务链接匹配本地派发，包含本机保留的多次派发、重试和续跑。输出路径须指向一个新文件。
+
+- `summary.md` 列出每次派发的状态、最后确认的步骤，以及之后尚未观察到成功确认的 Plane 回写错误。
+- `trace.json` 包含所有匹配派发、运行轮次和已采集事件及其覆盖情况。
+- `diagnostics.json` 包含可安全分享的结构化错误，例如 Agent 中断、结论缺失及 Plane 写入的 HTTP 状态。
+
+其他设备的历史、缺少任务链接的旧派发和此前未采集的事件可能缺失。原始会话、stdout、stderr、任务和聊天正文保留在原执行设备。结构化错误只提供已记录的状态和分类。
 
 ## 边界与代价
 

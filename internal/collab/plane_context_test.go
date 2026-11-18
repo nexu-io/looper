@@ -204,6 +204,31 @@ func TestPlaneContextRetriesBeforeTerminalAndPreservesConcurrentReply(t *testing
 	if calls != 2 || transitions != 1 || got.Context != outcome.Context || len(got.Events) != 3 {
 		t.Fatalf("retry did not publish task data: %+v", got)
 	}
+	tracked, err := h.repos.Events.ListByLoop(ctx, loop.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var syncSteps []string
+	for _, event := range tracked {
+		switch event.EventType {
+		case "diagnostic.plane.sync.failed":
+			var diagnostic struct {
+				Operation  string `json:"operation"`
+				HTTPStatus int    `json:"httpStatus"`
+			}
+			if err := json.Unmarshal([]byte(event.PayloadJSON), &diagnostic); err != nil ||
+				diagnostic.Operation != "context" || diagnostic.HTTPStatus != 503 ||
+				strings.Contains(event.PayloadJSON, "temporary failure") {
+				t.Fatalf("unsafe or missing writeback diagnostic: %s", event.PayloadJSON)
+			}
+			fallthrough
+		case "diagnostic.plane.context.synced", "plane.state.synced":
+			syncSteps = append(syncSteps, event.EventType)
+		}
+	}
+	if want := []string{"diagnostic.plane.sync.failed", "diagnostic.plane.context.synced", "plane.state.synced"}; !reflect.DeepEqual(syncSteps, want) {
+		t.Fatalf("writeback trace = %v; want %v", syncSteps, want)
+	}
 	if !reflect.DeepEqual(got.Links, currentLinks) {
 		t.Fatalf("current entry links lost or kept an old version: %+v", got.Links)
 	}
