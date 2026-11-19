@@ -42,5 +42,12 @@
     { "id": "opus", "label": "Opus" },
     { "id": "haiku", "label": "Haiku" },
     { "id": "openai/gpt-5.4", "label": "OpenAI GPT-5.4" }
+  ],
+  "agy": [
+    { "id": "gemini-4-neon-high", "label": "Gemini 4 Neon (High)" },
+    { "id": "gemini-4-carbon-high", "label": "Gemini 4 Carbon (High)" },
+    { "id": "gemini-3.8-flash-high", "label": "Gemini 3.8 Flash (High)" },
+    { "id": "claude-sonnet-5-5-high", "label": "Claude Sonnet 5.5 (High)" },
+    { "id": "claude-opus-5-5-high", "label": "Claude Opus 5.5 (High)" }
   ]
 }

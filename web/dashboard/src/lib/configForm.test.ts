@@ -182,6 +182,7 @@ describe("config form contract", () => {
       "grok-build",
       "pi",
       "omp",
+      "agy",
     ] as const;
     expect([...AGENT_VENDOR_OPTIONS]).toEqual([...supportedVendors]);
     expect(configSelectOptions("agent.vendor")).toEqual([...supportedVendors]);

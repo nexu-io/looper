@@ -2,6 +2,7 @@ package modelcatalog
 
 import (
 	"encoding/json"
+	"regexp"
 	"strings"
 )
 
@@ -135,6 +136,55 @@ func parseOmpModels(stdout []byte) ([]Model, error) {
 		out = append(out, Model{ID: id, Label: label, Source: SourceProbe})
 	}
 	return out, nil
+}
+
+var agyANSIEscapeRe = regexp.MustCompile("\x1b\\[[0-9;?]*[ -/]*[@-~]")
+
+// parseAgyModels parses `agy models` aligned two-column output:
+//
+//	gemini-4-neon-high             Gemini 4 Neon (High)
+//	claude-sonnet-5-5-high         Claude Sonnet 5.5 (High)
+//
+// Terminal spinner frames separated by '\r' on the same line are discarded,
+// and ANSI escape sequences are stripped before column splitting.
+func parseAgyModels(stdout []byte) []Model {
+	normalized := strings.ReplaceAll(string(stdout), "\r\n", "\n")
+	lines := strings.Split(normalized, "\n")
+	out := make([]Model, 0, len(lines))
+	seen := make(map[string]struct{})
+	for _, line := range lines {
+		if idx := strings.LastIndexByte(line, '\r'); idx >= 0 {
+			line = line[idx+1:]
+		}
+		if strings.Contains(line, "\x1b") {
+			line = agyANSIEscapeRe.ReplaceAllString(line, "")
+		}
+		line = strings.TrimSpace(line)
+		if line == "" || shouldSkipDecorLine(line) {
+			continue
+		}
+		columns := splitPiTableColumns(line)
+		if len(columns) == 0 {
+			continue
+		}
+		id := columns[0]
+		if strings.EqualFold(id, "id") || strings.EqualFold(id, "model") {
+			continue
+		}
+		if strings.ContainsAny(id, " \t") || strings.HasSuffix(id, ":") || !looksLikeModelID(id) {
+			continue
+		}
+		label := ""
+		if len(columns) >= 2 {
+			label = columns[1]
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		out = append(out, Model{ID: id, Label: label, Source: SourceProbe})
+	}
+	return out
 }
 
 // parseLineModels is the shared text parser used by cursor/grok-style output.

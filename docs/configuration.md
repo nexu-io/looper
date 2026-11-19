@@ -449,6 +449,21 @@ For fresh unattended runs, Looper supplies `-p` with the generated task prompt, 
 
 Oh My Pi support is fresh-run only. Daemon native resume and interactive takeover through `looper resume` are unsupported. A retry uses a fresh checkpoint prompt.
 
+## Antigravity CLI (agy)
+
+Use `agy` as the `agent.vendor` identifier. Looper invokes the [Antigravity CLI](https://antigravity.google/docs/cli/reference) executable as `agy`:
+
+```toml
+[agent]
+vendor = "agy"
+```
+
+Authenticate via Antigravity CLI's own login/settings (`~/.gemini/antigravity-cli/`). Prefer vendor authentication over storing secrets in Looper configuration.
+
+For fresh unattended runs, Looper supplies `-p` with the generated task prompt and `--dangerously-skip-permissions`. Configured `agent.params.args` override these defaults: if `-p`, `--print`, or `--prompt` (including `--print=...`/`--prompt=...`) is already present, Looper does not append its prompt (operator owns print/prompt); if `--dangerously-skip-permissions` or `--mode` (including `--mode=...`) is present, Looper does not add `--dangerously-skip-permissions`. There is no `--cwd` flag—Looper sets the process working directory to the worktree.
+
+Antigravity CLI support is fresh-run only. Daemon native resume and interactive takeover through `looper resume` are unsupported. A retry uses a fresh checkpoint prompt, and Looper never uses ambient `-c`/`--continue`.
+
 ## Hosting bot identities
 
 Define reusable hosting accounts in `identities`, select a default with a project's

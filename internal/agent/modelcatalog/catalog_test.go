@@ -43,6 +43,7 @@ func TestLoadStaticCatalog(t *testing.T) {
 		config.AgentVendorGrokBuild,
 		config.AgentVendorPi,
 		config.AgentVendorOmp,
+		config.AgentVendorAgy,
 	} {
 		if len(catalog[vendor]) == 0 {
 			t.Fatalf("static catalog empty for %s", vendor)
@@ -205,6 +206,67 @@ func TestParseOmpModelsFixture(t *testing.T) {
 	}
 	if got[3].ID != "sonnet" || got[3].Label != "Sonnet alias" {
 		t.Fatalf("bare id entry = %#v", got[3])
+	}
+}
+
+func TestParseAgyModelsFixture(t *testing.T) {
+	got := parseAgyModels(readTestdata(t, "agy_models.txt"))
+	want := []string{"gemini-4-neon-high", "gemini-3.8-flash-high", "claude-sonnet-5-5-high", "gpt-oss-120b-medium"}
+	if !reflect.DeepEqual(modelIDs(got), want) {
+		t.Fatalf("agy ids = %#v, want %#v", modelIDs(got), want)
+	}
+	if got[0].Label != "Gemini 4 Neon (High)" {
+		t.Fatalf("label = %q, want Gemini 4 Neon (High)", got[0].Label)
+	}
+	for _, m := range got {
+		if m.Source != SourceProbe {
+			t.Fatalf("source = %q, want probe", m.Source)
+		}
+	}
+}
+
+func TestParseAgyModelsSkipsSpinnerAndNoise(t *testing.T) {
+	raw := []byte("\r⠋ Fetching available models...\r⠙ Fetching available models...\r\x1b[Kgemini-4-neon-high             Gemini 4 Neon (High)\r\nNot logged in\nERROR:  authentication required\nMODEL  NAME\ngemini-4-neon-high             Duplicate Label\ngemini-3.8-flash-low\n")
+	got := parseAgyModels(raw)
+	want := []Model{
+		{ID: "gemini-4-neon-high", Label: "Gemini 4 Neon (High)", Source: SourceProbe},
+		{ID: "gemini-3.8-flash-low", Source: SourceProbe},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("parseAgyModels() = %#v, want %#v", got, want)
+	}
+}
+
+func TestListAgyProbesModels(t *testing.T) {
+	var sawName string
+	var sawArgs []string
+	svc := NewService(Options{
+		Runner: runnerFunc(func(_ context.Context, _ []string, name string, args ...string) ([]byte, error) {
+			sawName = name
+			sawArgs = append([]string(nil), args...)
+			return readTestdata(t, "agy_models.txt"), nil
+		}),
+		LookPath: func(s string) (string, error) { return "/usr/local/bin/" + s, nil },
+		Now:      func() time.Time { return time.Date(2026, 11, 19, 12, 0, 0, 0, time.UTC) },
+	})
+	got, err := svc.List(context.Background(), ListOptions{Vendor: config.AgentVendorAgy})
+	if err != nil {
+		t.Fatalf("List() error = %v", err)
+	}
+	if sawName != "/usr/local/bin/agy" || !reflect.DeepEqual(sawArgs, []string{"models"}) {
+		t.Fatalf("probe invoked (%q, %#v), want (/usr/local/bin/agy, [models])", sawName, sawArgs)
+	}
+	if got.Sources.Probe != ProbeOK {
+		t.Fatalf("probe = %q, want ok", got.Sources.Probe)
+	}
+	found := false
+	for _, m := range got.Models {
+		if m.ID == "gpt-oss-120b-medium" && m.Label == "GPT-OSS 120B (Medium)" && m.Source == SourceProbe {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected probed model gpt-oss-120b-medium in %#v", got.Models)
 	}
 }
 
