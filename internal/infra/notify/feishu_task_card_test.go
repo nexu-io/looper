@@ -122,6 +122,18 @@ func TestCollaborationCardShowsOnlyCurrentExecution(t *testing.T) {
 	if brief != "是否接受当前交付？" {
 		t.Fatalf("waiting brief=%q", brief)
 	}
+	// An explicit stop without a structured question must not look like an
+	// unexplained "waiting for reply" state. The card tells the operator how to
+	// resume, while preserving the durable awaiting_human status.
+	stopMeta := `{"bridge":{"outcome":{"summary":"保持停止，未确认验收发布","nextStep":"保持停止，等待用户明确恢复后核对实际发布与人工验收。"}}}`
+	loop.MetadataJSON = &stopMeta
+	if err := repos.Loops.Upsert(ctx, loop); err != nil {
+		t.Fatal(err)
+	}
+	stopCard, _ := gateway.feishuThreadHeaderCard(ctx, loop.ID)
+	if !strings.Contains(stopCard, "已暂停") || !strings.Contains(stopCard, "已按停止要求暂停") || !strings.Contains(stopCard, "@bot 回复「继续」") {
+		t.Fatalf("explicit stop card is not actionable: %s", stopCard)
+	}
 	// Resuming must not retain the prior run's success summary or elapsed time.
 	loop.Status = "running"
 	brief, elapsed := gateway.feishuTaskUpdate(ctx, &loop, []string{"✅ go test ./..."})

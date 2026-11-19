@@ -33,8 +33,13 @@ func (g *Gateway) feishuCollaborationCard(ctx context.Context, loop *storage.Loo
 		color = "neutral"
 	}
 	label = strings.ReplaceAll(label, "Looper ", "")
+	resumeOnly := loop.Status == "awaiting_human" && loopAwaitingExplicitResume(loop.MetadataJSON)
 	if loop.Status == "awaiting_human" {
-		label = "待回复"
+		if resumeOnly {
+			label = "已暂停"
+		} else {
+			label = "待回复"
+		}
 	}
 	heading := []any{map[string]any{"tag": "column", "width": "auto", "vertical_align": "center", "elements": []any{
 		taskCardMarkdown("<text_tag color='"+color+"'>"+label+"</text_tag>", "notation"),
@@ -81,8 +86,12 @@ func (g *Gateway) feishuCollaborationCard(ctx context.Context, loop *storage.Loo
 				mentions = append(mentions, taskCardPerson(owner))
 			}
 		}
-		if len(mentions) > 0 {
-			waiting = "等待 " + strings.Join(mentions, "、") + " 回复"
+		if resumeOnly {
+			waiting = "已按停止要求暂停；如需继续，请在话题 @bot 回复「继续」"
+		} else if len(mentions) > 0 {
+			waiting = "等待 " + strings.Join(mentions, "、") + " 回复；请在话题 @bot 直接写结论或选择"
+		} else {
+			waiting = "请在话题 @bot 回复「继续」或写明你的决定"
 		}
 		elements = append(elements, taskCardMarkdown(waiting, "notation"))
 	}
@@ -125,6 +134,28 @@ func (g *Gateway) feishuCollaborationCard(ctx context.Context, loop *storage.Loo
 	}
 	raw, err := json.Marshal(map[string]any{"schema": "2.0", "config": map[string]any{"update_multi": true, "width_mode": "default", "summary": map[string]any{"content": label + " · " + title}}, "body": map[string]any{"direction": "vertical", "padding": "12px", "vertical_spacing": "8px", "elements": elements}})
 	return string(raw), err == nil
+}
+
+// loopAwaitingExplicitResume identifies a human-requested stop that has not
+// been explicitly resumed yet. It is presentation-only: the durable loop
+// status remains the authority for whether work can run.
+func loopAwaitingExplicitResume(metadataJSON *string) bool {
+	if metadataJSON == nil || strings.TrimSpace(*metadataJSON) == "" {
+		return false
+	}
+	var meta struct {
+		Bridge struct {
+			Outcome struct {
+				Summary  string `json:"summary"`
+				NextStep string `json:"nextStep"`
+			} `json:"outcome"`
+		} `json:"bridge"`
+	}
+	if err := json.Unmarshal([]byte(*metadataJSON), &meta); err != nil {
+		return false
+	}
+	text := strings.TrimSpace(meta.Bridge.Outcome.Summary + "\n" + meta.Bridge.Outcome.NextStep)
+	return strings.Contains(text, "保持停止") || strings.Contains(text, "停止要求") || strings.Contains(text, "明确恢复")
 }
 
 func (g *Gateway) looperAttribution(projectID string) string {

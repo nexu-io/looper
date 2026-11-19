@@ -53,6 +53,7 @@ func TestGatewayHumanAttentionUsesSystemNotification(t *testing.T) {
 	osascriptCalls := string(osascriptCallsBytes)
 	assertContains(t, osascriptCalls, "display notification")
 	assertContains(t, osascriptCalls, "Looper Needs Attention")
+	assertContains(t, osascriptCalls, "@bot 回复")
 	assertContains(t, osascriptCalls, "sound name")
 	if strings.Contains(osascriptCalls, "display dialog") {
 		t.Fatalf("human-attention notification must not open a dialog: %q", osascriptCalls)
