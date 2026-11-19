@@ -2017,7 +2017,7 @@ func shellSingleQuote(s string) string {
 // ResolveCommand returns the agent binary used for spawn for vendor + params.
 // When params["command"] is a non-empty string it wins; otherwise vendor defaults
 // apply (claude, codex, opencode, agent for cursor-cli, grok for grok-build,
-// pi for pi, omp for omp).
+// pi for pi, omp for omp, agy for agy).
 // Same resolution as process spawn — callers may LookPath for an absolute path.
 func ResolveCommand(vendor config.AgentVendor, params map[string]any) string {
 	return resolveCommand(ExecutorConfig{Vendor: vendor, Params: params})
@@ -2035,7 +2035,7 @@ func resolveCommand(cfg ExecutorConfig) string {
 	case config.AgentVendorGrokBuild:
 		return "grok"
 	default:
-		// pi, omp, codex, opencode, and any future vendor whose id matches the binary.
+		// pi, omp, agy, codex, opencode, and any future vendor whose id matches the binary.
 		return string(cfg.Vendor)
 	}
 }
@@ -2057,6 +2057,8 @@ func resolveArgs(cfg ExecutorConfig, workingDirectory string, prompt string) []s
 		return resolvePiArgs(cfg, resolvedArgs, prompt)
 	case config.AgentVendorOmp:
 		return resolveOmpArgs(cfg, resolvedArgs, workingDirectory, prompt)
+	case config.AgentVendorAgy:
+		return resolveAgyArgs(cfg, resolvedArgs, prompt)
 	default:
 		return append([]string{}, resolvedArgs...)
 	}
@@ -2162,6 +2164,20 @@ func resolveOmpArgs(cfg ExecutorConfig, args []string, workingDirectory string, 
 	}
 	if !hasAnyFlag(resolved, []string{"--auto-approve", "--approval-mode"}) {
 		resolved = append(resolved, "--auto-approve")
+	}
+	return resolved
+}
+
+// resolveAgyArgs builds argv for the Google Antigravity CLI (agy).
+// -p/--print/--prompt runs a single prompt non-interactively. No --cwd flag —
+// Looper already sets process cmd.Dir to the worktree. Fresh-run only.
+func resolveAgyArgs(cfg ExecutorConfig, args []string, prompt string) []string {
+	resolved := prependModelFlag(args, cfg.Model, "--model", []string{"--model"})
+	if !hasAnyFlag(resolved, []string{"-p", "--print", "--prompt"}) {
+		resolved = append(resolved, "-p", prompt)
+	}
+	if !hasAnyFlag(resolved, []string{"--dangerously-skip-permissions", "--mode"}) {
+		resolved = append(resolved, "--dangerously-skip-permissions")
 	}
 	return resolved
 }

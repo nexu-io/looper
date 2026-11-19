@@ -402,6 +402,34 @@ func TestHandlerAgentModelsCrossVendorStripsParamsCommand(t *testing.T) {
 	}
 }
 
+func TestHandlerAgentModelsAgy(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	h := NewHandler(Context{Config: cfg, Runtime: rt})
+	h.modelCatalog = modelcatalog.NewService(modelcatalog.Options{
+		Runner: modelCatalogRunnerFunc(func(_ context.Context, _ []string, name string, args ...string) ([]byte, error) {
+			if name != "/usr/local/bin/agy" || len(args) != 1 || args[0] != "models" {
+				t.Fatalf("probe = (%q, %#v), want (/usr/local/bin/agy, [models])", name, args)
+			}
+			return []byte("gemini-4-neon-high             Gemini 4 Neon (High)\ngpt-oss-120b-medium            GPT-OSS 120B (Medium)\n"), nil
+		}),
+		LookPath: func(s string) (string, error) { return "/usr/local/bin/" + s, nil },
+		Now:      func() time.Time { return time.Date(2026, 11, 19, 12, 0, 0, 0, time.UTC) },
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/agent/models?vendor=agy", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	data := parseJSONMap(t, rec.Body.Bytes())["data"].(map[string]any)
+	assertEqual(t, data["vendor"], "agy")
+	sources := data["sources"].(map[string]any)
+	assertEqual(t, sources["static"], true)
+	assertEqual(t, sources["probe"], "ok")
+}
+
 type modelCatalogRunnerFunc func(ctx context.Context, env []string, name string, args ...string) ([]byte, error)
 
 func (f modelCatalogRunnerFunc) Run(ctx context.Context, env []string, name string, args ...string) ([]byte, error) {

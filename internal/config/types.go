@@ -10,6 +10,7 @@ const (
 	AgentVendorGrokBuild  AgentVendor = "grok-build"
 	AgentVendorPi         AgentVendor = "pi"
 	AgentVendorOmp        AgentVendor = "omp"
+	AgentVendorAgy        AgentVendor = "agy"
 )
 
 type LogLevel string

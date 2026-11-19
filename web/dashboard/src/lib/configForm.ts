@@ -40,6 +40,7 @@ export const AGENT_VENDOR_OPTIONS = [
   "grok-build",
   "pi",
   "omp",
+  "agy",
 ] as const;
 
 const agentProfileLeafPath = /^agent\.profiles\.[A-Za-z0-9_-]+\.(vendor|model)$/;

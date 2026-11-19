@@ -53,6 +53,10 @@ For Pi ([pi.dev](https://pi.dev)), configure `agent.vendor = "pi"`; Looper runs 
 
 For Oh My Pi ([omp.sh](https://omp.sh)), configure `agent.vendor = "omp"` (not `oh-my-pi`); Looper runs the `omp` executable. Authenticate with omp's own login/config. Looper defaults to `-p <prompt> --cwd <worktree> --auto-approve`. Configured print, cwd, or approval flags (`--auto-approve` / `--approval-mode`) override those defaults. Oh My Pi has no daemon native resume or interactive `looper resume` takeover.
 
+### Antigravity CLI (agy)
+
+For Google Antigravity CLI, configure `agent.vendor = "agy"`; Looper runs the `agy` executable. Authenticate with Antigravity CLI's own login/settings. Looper defaults to `-p <prompt> --dangerously-skip-permissions` for unattended fresh runs. Configured `-p`/`--print`/`--prompt` means you own the prompt; `--dangerously-skip-permissions` or `--mode` skips the default permission override. Antigravity CLI has no daemon native resume or interactive `looper resume` takeover; retries use a fresh checkpoint prompt and Looper never uses ambient `-c`/`--continue`.
+
 ## 1a. Local-only vs Routed projects
 
 Looper supports two project modes:

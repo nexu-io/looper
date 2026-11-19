@@ -1,0 +1,4 @@
+gemini-4-neon-high             Gemini 4 Neon (High)
+gemini-3.8-flash-high          Gemini 3.8 Flash (High)
+claude-sonnet-5-5-high         Claude Sonnet 5.5 (High)
+gpt-oss-120b-medium            GPT-OSS 120B (Medium)

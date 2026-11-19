@@ -315,6 +315,12 @@ func (s *Service) probe(ctx context.Context, vendor config.AgentVendor, binary s
 			return nil, err
 		}
 		return parseOmpModels(out)
+	case config.AgentVendorAgy:
+		out, err := s.runner.Run(runCtx, env, binary, "models")
+		if err != nil {
+			return nil, err
+		}
+		return parseAgyModels(out), nil
 	default:
 		return nil, errors.New("probe unsupported")
 	}
