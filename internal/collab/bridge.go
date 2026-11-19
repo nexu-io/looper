@@ -880,6 +880,9 @@ func (h *bridgeHost) planeDispatch(ctx context.Context, client *forge.PlaneClien
 	// A failed native turn can resume in the same conversation and attempt.
 	// Report that real continuation before publishing its next outcome.
 	if dispatch.State == "failed" && dispatch.Health == "ok" && (loop.Status == "running" || loop.Status == "shepherding" || loop.Status == "awaiting_human") {
+		if bridgeTaskExplicitlyStopped(state) {
+			return nil
+		}
 		return h.transitionTrackedDispatch(ctx, client, *loop, dispatch.ID, "running", nil)
 	}
 	// Completed executions may receive later questions or acceptance feedback.
@@ -954,6 +957,15 @@ func (h *bridgeHost) pollPullRequests(ctx context.Context) {
 		if !ok || len(state.Outcome.PullRequests) == 0 {
 			continue
 		}
+		// A human's explicit stop is stronger than an external PR signal. The
+		// PR observer still keeps the durable signal for a later explicit
+		// resume, but it must not start a new Agent turn while the task is
+		// paused. Without this guard a changing Forgejo/GitHub response (for
+		// example a base SHA or transient review snapshot) repeatedly wakes an
+		// awaiting_human task and emits duplicate Feishu cards.
+		if bridgeTaskExplicitlyStopped(state) {
+			continue
+		}
 		var signals, notes []string
 		if h.prObserver == nil {
 			h.prObserver = &pullRequestObserver{cfg: &h.cfg, github: h.gh}
@@ -1025,6 +1037,23 @@ func (h *bridgeHost) pollPullRequests(ctx context.Context) {
 			continue
 		}
 	}
+}
+
+// bridgeTaskExplicitlyStopped is intentionally narrow. A normal HITL decision
+// or QA wait may continue to listen for PR changes; only an outcome that records
+// a human-requested stop and requires an explicit resume suppresses observers.
+// The marker is persisted in the Agent outcome so it survives host restarts and
+// does not add another state machine or gate.
+func bridgeTaskExplicitlyStopped(state bridgeTask) bool {
+	if !strings.EqualFold(strings.TrimSpace(state.Outcome.State), "needs_input") {
+		return false
+	}
+	text := strings.ToLower(strings.TrimSpace(state.Outcome.Summary + "\n" + state.Outcome.NextStep + "\n" + state.Outcome.Context))
+	if text == "" {
+		return false
+	}
+	return (strings.Contains(text, "保持停止") || strings.Contains(text, "停止要求") || strings.Contains(text, "明确恢复")) &&
+		(strings.Contains(text, "恢复") || strings.Contains(text, "继续") || strings.Contains(text, "等待用户"))
 }
 
 func parsePullRequestURL(link string) (string, int64, error) {
