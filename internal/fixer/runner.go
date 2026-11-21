@@ -5615,7 +5615,7 @@ func (r *Runner) ensureLoopForPullRequest(ctx context.Context, project storage.P
 				return loopUpsertResult{}, err
 			} else if resumed {
 				updatedLoop = updated
-			} else if resumed, updated, err := r.resumePausedRiskyConflictLoop(ctx, updatedLoop, headSHA, fixItemsStateHash); err != nil {
+			} else if resumed, updated, err := r.resumePausedRiskyConflictLoop(ctx, updatedLoop, headSHA, fixItems); err != nil {
 				return loopUpsertResult{}, err
 			} else if !resumed {
 				return loopUpsertResult{record: updatedLoop, created: false}, nil
@@ -5777,7 +5777,7 @@ func (r *Runner) resumePausedNoopResolveLoop(ctx context.Context, loop storage.L
 	return true, updated, nil
 }
 
-func (r *Runner) resumePausedRiskyConflictLoop(ctx context.Context, loop storage.LoopRecord, headSHA, fixItemsStateHash string) (bool, storage.LoopRecord, error) {
+func (r *Runner) resumePausedRiskyConflictLoop(ctx context.Context, loop storage.LoopRecord, headSHA string, fixItems []FixItem) (bool, storage.LoopRecord, error) {
 	if loop.Status != "paused" || r.repos == nil || r.repos.Runs == nil {
 		return false, loop, nil
 	}
@@ -5793,9 +5793,14 @@ func (r *Runner) resumePausedRiskyConflictLoop(ctx context.Context, loop storage
 	if !ok || strings.TrimSpace(pause.Reason) != string(checkpointPauseReasonRiskyConflict) || !pause.Recoverable {
 		return false, loop, nil
 	}
-	previousHeadSHA := strings.TrimSpace(pause.HeadSHA)
-	previousStateHash := strings.TrimSpace(pause.FixItemsStateHash)
-	if previousHeadSHA == strings.TrimSpace(headSHA) && previousStateHash == strings.TrimSpace(fixItemsStateHash) {
+	// A risky-conflict hold can only make progress when the head moves, the
+	// conflict is gone, or risky fixes were enabled: any other fix-item change
+	// hits the same conflict guard in repair again. Comparing fix-item state
+	// hashes here re-queued the loop on every discovery pass, because discovery
+	// hashes all actionable items while the pause stores the checkpoint's
+	// post-suppression items, so the two never matched once a thread was
+	// suppressed (nexu-io/looper#689).
+	if !r.allowRiskyFixes && strings.TrimSpace(pause.HeadSHA) == strings.TrimSpace(headSHA) && fixItemsHaveConflict(fixItems) {
 		return false, loop, nil
 	}
 	updated, err := r.updateLoop(ctx, loop, func(updated *storage.LoopRecord) {
@@ -5807,6 +5812,15 @@ func (r *Runner) resumePausedRiskyConflictLoop(ctx context.Context, loop storage
 		return false, storage.LoopRecord{}, err
 	}
 	return true, updated, nil
+}
+
+func fixItemsHaveConflict(items []FixItem) bool {
+	for _, item := range items {
+		if item.Type == "conflict" {
+			return true
+		}
+	}
+	return false
 }
 
 func unresolvedThreadIDsFromCheckpoint(checkpoint fixerCheckpoint, loopMetadataJSON *string, headSHA string) []string {
