@@ -1,32 +1,48 @@
-# Prompt — 帮我配置并启动 looper(飞书 HITL)
+# Prompt — set up looper (Plane/GitHub HITL + Feishu notifications)
 
-把下面这段整段发给你的 coding agent(Claude Code / codex / …),在**解压后的这个目录里**运行它。
+Send the whole block below to your coding agent (Claude Code / codex / …) and run it **inside this unzipped directory**.
 
 ---
 
-你在帮我配置并启动 **looper** —— 一个自主开发 agent 的守护进程 —— 以及它的「人在环(HITL)」飞书集成。**交互式**地陪我做:任何对外(GitHub / 飞书)或不可逆的操作前先跟我确认。
+You are helping me set up and start **looper** — a daemon that runs an autonomous dev agent. Plane/GitHub hold all decisions; Feishu is a one-way notification channel. Work **interactively**: confirm with me before any outward-facing (GitHub / Feishu) or irreversible action.
 
-## 这个包里有什么
-- `config.hitl.example.json` —— 带占位符的配置模板。
-- `hitl.env` —— 团队**共享**的飞书 / Worker secret(已填好;**不要打印、不要写进 git、不要贴进聊天**)。
-- `GUIDE-hitl-setup.md` —— 参考文档,先读它。
+## What's in this bundle
+- `config.hitl.example.json` — the config template, with placeholders.
+- `hitl.env` — the team's shared Feishu app credentials (already filled; **do not print it, do not commit it to git, do not paste it into chat**).
+- `GUIDE-hitl-setup.md` — reference doc; read it first.
 
-## 按这个来
-1. **查前置条件**,缺什么告诉我:
-   - `looperd` 和 `looper` 在 PATH 上(没有就问我路径 / 怎么装或编译)。
-   - 我的 coding agent 二进制(`codex` 或 `claude`)已安装且**已登录/授权**(跑一下确认能用)。
-   - 我要 looper 处理的那个 GitHub 仓库,本地已 clone。
-2. **收集我的设置**(问我,别猜):
-   - GitHub 仓库(`owner/repo`)+ 本地 clone 的**绝对路径**。
-   - 我的飞书**群 chat id**(`oc_...`)和我的 **open_id**(`ou_...`)。我不知道就告诉我怎么拿(飞书开放平台调试台,或某条消息事件里的 `sender.open_id`)。
-   - 我的 coding agent 二进制的绝对路径。
-   - looper 数据/日志放哪(默认 `~/.looper`)。
-3. **写我的配置**:把 `config.hitl.example.json` 复制到 `~/.looper/config.json`,把所有 `REPLACE_...` / `/ABSOLUTE/...` / `OWNER/REPO` 占位符替换成上面的值。改完把最终配置**给我看一遍**确认(它没有 secret,可以直接展示)。
-4. **加载共享 secret**:`source` 这个包里的 `hitl.env`。**不要**把 secret 的值打印出来,也**不要**抄进配置文件(配置里只放变量名)。
-5. **启动 looperd**:`source <包路径>/hitl.env && looperd --config ~/.looper/config.json`(后台跑,或按 `GUIDE-hitl-setup.md` 装成常驻守护进程)。确认活着:`looper --config ~/.looper/config.json status`。
-6. **冒烟**(先问我):在我的仓库建一个带 `looper:plan` 标签的小 issue,确认 looper 接住、并在(有歧义时)往我的飞书群发一张决策卡 @我。
+## Do this
+1. **Check prerequisites** and tell me what's missing:
+   - `looperd` and `looper` are on PATH (if not, ask me for the path / how to install or build them).
+   - My coding-agent binary (`codex` or `claude`) is installed and **logged in / authorized** (run it once to confirm it works).
+   - The GitHub repo I want looper to work on is already cloned locally.
+2. **Collect my settings** (ask me, don't guess). First open `config.hitl.example.json` and see which fields are still `REPLACE_...` placeholders — the distributor may have **pre-filled** some (typically the Feishu **group chat id** and the `productOwner` / `qa` open_ids). Whatever is already filled, **leave it as-is**; only collect what's still a placeholder:
+   - GitHub repo (`owner/repo`) plus the **absolute path** of its local clone.
+   - My Feishu **group chat id** (`oc_...`) — only if it's still a placeholder.
+   - The `productOwner` and `qa` open_ids (**team-wide**; only if still placeholders — otherwise the distributor already set them).
+   - **You don't need to hunt for my own open_id** — step 5 grabs it automatically via `looper login` (a quick browser authorization; it writes it into the project `owner`, and prints it so you can also set `notifications.webhook.mentionOpenIds`).
+   - The absolute path of my coding-agent binary, and whether I use `codex` or `opencode` (see "Backend" below).
+   - Where looper keeps its data/logs (default `~/.looper`).
+   - If the group chat id is pre-filled to a **shared** team group, make sure I'm actually a member of it (otherwise I won't see the cards or get @-mentioned).
+3. **Write my config**: copy `config.hitl.example.json` to `~/.looper/config.json` and replace every **remaining** `REPLACE_...` / `/ABSOLUTE/...` / `OWNER/REPO` / `FILLED_BY_looper_login_...` placeholder with the values above — do not touch fields the distributor already filled (leave the `owner` one for now — `looper login` fills it in the next step). When done, **show me the final config** to confirm (it holds no secrets, so it's safe to display).
+   - **Backend**: the template defaults to `codex` (`-c model=gpt-5.4 …`). If I use `opencode`, change `agent.vendor` to `opencode`, point `command` at the opencode binary, set `model` to `openai/gpt-5.4`, and replace `args` with `["--pure","--dangerously-skip-permissions"]` (codex's `-c/-s` flags mean different things in opencode — don't mix them up).
+4. **Load the shared secrets**: `source` the `hitl.env` in this bundle. **Do not** print the secret values, and **do not** copy them into the config file (the config only references variable names).
+5. **Log into Feishu to get my open_id** (automatic; `source hitl.env` first so the app credentials are in the shell):
+   ```sh
+   source <bundle-path>/hitl.env                  # app_id/secret etc. enter this shell
+   looper login --config ~/.looper/config.json    # browser authorization; writes my open_id into projects[].owner and prints it
+   ```
+   `looper login` writes only the project `owner.feishuOpenId`. Take the open_id it prints and also put it in `notifications.webhook.mentionOpenIds` (replace the `REPLACE_WITH_YOUR_OPEN_ID_ou_xxx` placeholder) so decision cards actually @-mention me. Then show me the final config to confirm.
+   (Prerequisite: the shared Feishu app already has `http://127.0.0.1:53682/callback` in its "redirect URL allowlist" — that's a **one-time, app-level** setup the distributor does, not your concern; if you hit `20029 redirect URL is invalid`, ask the distributor to add it.)
+6. **Install it as a resident service and start it** (so it auto-restarts on sleep/wake, reboot, or crash — don't run it bare with `nohup`):
+   ```sh
+   looper daemon install
+   looper daemon start --config ~/.looper/config.json --daemon-restart-policy on-failure
+   ```
+   Confirm it's alive: `looper daemon status --config ~/.looper/config.json`. (The secrets come from the `hitl.env` you sourced above and get baked into the launchd service, so they survive restarts.)
+7. **Smoke test** (ask me first): create a small issue with the `looper:plan` label and confirm an ambiguity is written to Plane/GitHub, while Feishu only sends an @-mention and deep link to that exact location. Do not configure any Feishu callback or event subscription.
 
-## 护栏
-- 永远不要把 `hitl.env` 或配置提交进 git;永远不要把 secret 贴进聊天。
-- 建 GitHub issue/PR、往飞书发东西之前**先问我**。
-- 前置条件缺了就停下来告诉我,别假装装好了。
+## Guardrails
+- Never commit `hitl.env` or the config into git; never paste secrets into chat.
+- **Ask me first** before creating a GitHub issue/PR or posting anything to Feishu.
+- If a prerequisite is missing, stop and tell me — don't pretend it's set up.

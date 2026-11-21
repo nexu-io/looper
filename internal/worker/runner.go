@@ -25,6 +25,7 @@ import (
 	"github.com/nexu-io/looper/internal/forge"
 	"github.com/nexu-io/looper/internal/hostingidentity"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
+	"github.com/nexu-io/looper/internal/infra/planedoc"
 	"github.com/nexu-io/looper/internal/infra/shell"
 	"github.com/nexu-io/looper/internal/infra/specpr"
 	"github.com/nexu-io/looper/internal/lifecycle"
@@ -44,11 +45,18 @@ const (
 	stepExecute         WorkerStep = "execute"
 	stepValidate        WorkerStep = "validate"
 	stepOpenPR          WorkerStep = "open-pr"
+	// stepShepherd is the self-repeating terminal step: once the impl PR is open
+	// under looper:auto, each reconciler-woken pass runs one shepherd sweep (watch
+	// → fix → enable auto-merge) resuming the worker's own session. It is last in
+	// workerStepSequence so nextWorkerStep(stepShepherd)=="" (one pass per enqueue);
+	// the start-step resolver forces it via the durable `$.shepherd.active` marker.
+	stepShepherd WorkerStep = "shepherd"
 
-	FailureRetryableTransient   QueueFailureKind = "retryable_transient"
-	FailureRetryableAfterResume QueueFailureKind = "retryable_after_resume"
-	FailureNonRetryable         QueueFailureKind = "non_retryable"
-	FailureManualIntervention   QueueFailureKind = "manual_intervention"
+	FailureRetryableTransient   = failureclass.RetryableTransient
+	FailureRetryableAfterResume = failureclass.RetryableAfterResume
+	FailureRecoverableInfra     = failureclass.RecoverableInfra
+	FailureNonRetryable         = failureclass.NonRetryable
+	FailureManualIntervention   = failureclass.ManualIntervention
 
 	defaultAgentTimeout = time.Hour
 	defaultClaimTTL     = 10 * time.Minute
@@ -70,6 +78,11 @@ var (
 	workerStructuredResultMessagePattern = regexp.MustCompile(`^Worker completed without a valid structured result \(parse status: ([a-z_]+)\)\. See Looper logs for details\.$`)
 )
 
+// workerStepSequence is the linear impl flow and deliberately ENDS at stepOpenPR
+// so a normal worker run stops there exactly as before. stepShepherd is NOT part
+// of this sequence — it is reached only when the start-step resolver forces it
+// (via the durable `$.shepherd.active` marker), and stepsFrom/nextWorkerStep
+// special-case it so it runs as a standalone self-repeating pass.
 var workerStepSequence = []WorkerStep{
 	stepPrepareWork,
 	stepPrepareWorktree,
@@ -81,7 +94,7 @@ var workerStepSequence = []WorkerStep{
 
 type WorkerStep string
 
-type QueueFailureKind string
+type QueueFailureKind = failureclass.Kind
 
 type PullRequestSummary struct {
 	Number      int64
@@ -92,14 +105,15 @@ type PullRequestSummary struct {
 }
 
 type IssueSummary struct {
-	Number        int64
-	Title         string
-	Body          string
-	URL           string
-	Author        string
-	Assignees     []string
-	AssigneeUsers []networkpolicy.GitHubUser
-	Labels        []string
+	Number           int64
+	Title            string
+	Body             string
+	URL              string
+	Author           string
+	Assignees        []string
+	AssigneeUsers    []networkpolicy.GitHubUser
+	Labels           []string
+	StrictDispatchID string
 }
 
 type PullRequestDetail struct {
@@ -263,6 +277,18 @@ type GitHubGateway interface {
 	AddPullRequestLabels(context.Context, PullRequestLabelsInput) error
 	RemovePullRequestLabels(context.Context, PullRequestLabelsInput) error
 	AddPullRequestReviewers(context.Context, PullRequestReviewersInput) error
+}
+
+type StrictDispatchTransitionInput struct {
+	Repo       string
+	CWD        string
+	DispatchID string
+	State      string
+	WaitKind   *string
+}
+
+type strictDispatchGateway interface {
+	TransitionStrictDispatch(context.Context, StrictDispatchTransitionInput) error
 }
 
 type CreateWorktreeInput struct {
@@ -446,6 +472,117 @@ type RunCompletedInput struct {
 
 type RunCompletedFunc func(context.Context, RunCompletedInput) error
 
+// PlaneDocResolver returns a project's Plane spec-document gateway + Plane project
+// UUID, or ok=false for non-Plane projects.
+type PlaneDocResolver func(projectID string) (*planedoc.Gateway, string, bool)
+
+// planeSpecBlock returns the product + tech spec (from the work item's linked Plane
+// pages) as a prompt block, or "" for github/forgejo projects, unresolvable work
+// items, or when no spec is linked. Best-effort — a Plane hiccup returns "" so the
+// worker still runs against the repo-file spec (flowchart node I, additive).
+func (r *Runner) planeSpecBlock(ctx context.Context, projectID, issueURL string) string {
+	if r.planeDoc == nil {
+		return ""
+	}
+	gateway, planeProjectID, ok := r.planeDoc(projectID)
+	if !ok || gateway == nil {
+		return ""
+	}
+	workItemID := planedoc.WorkItemIDFromURL(issueURL)
+	if workItemID == "" {
+		return ""
+	}
+	parts := make([]string, 0, 2)
+	if product, found, err := gateway.ReadSpec(ctx, planeProjectID, workItemID, planedoc.ProductSpecLinkTitle); err == nil && found && strings.TrimSpace(product) != "" {
+		parts = append(parts, "Product spec (from Plane):\n"+product)
+	}
+	if tech, found, err := gateway.ReadSpec(ctx, planeProjectID, workItemID, planedoc.TechSpecLinkTitle); err == nil && found && strings.TrimSpace(tech) != "" {
+		parts = append(parts, "Tech spec (from Plane):\n"+tech)
+	}
+	return strings.Join(parts, "\n\n")
+}
+
+// attachmentImageExts are the image types looper materializes into the worktree for
+// the coding agent to view. Anything else in an attachment dir is ignored.
+var attachmentImageExts = map[string]struct{}{
+	".png": {}, ".jpg": {}, ".jpeg": {}, ".gif": {}, ".webp": {},
+}
+
+// resolveAttachmentsRoot returns the directory under which per-work-item screenshot
+// folders live (keyed by Plane work-item UUID). Falls back to <looper-home>/attachments.
+func resolveAttachmentsRoot(configured string) string {
+	if trimmed := strings.TrimSpace(configured); trimmed != "" {
+		return trimmed
+	}
+	home, err := config.DefaultLooperHome()
+	if err != nil || strings.TrimSpace(home) == "" {
+		return ""
+	}
+	return filepath.Join(home, "attachments")
+}
+
+// attachTaskScreenshots copies any screenshots co-located with this work item into
+// the agent's worktree and returns a prompt block telling the (vision-capable) coding
+// agent to Read them. Convention: image files dropped at
+// <attachmentsRoot>/<plane-work-item-uuid>/ are copied to ./.looper-attachments/ in
+// the worktree. This is the deterministic channel for a locally-running looper because
+// Plane sanitizes inline <img> data/external srcs out of a work item's description and
+// its own asset URLs need auth. Best-effort: any error (no dir, no images, copy
+// failure) returns "" so the worker runs normally against text alone.
+func (r *Runner) attachTaskScreenshots(work workerInput, worktreeDir string) string {
+	if r == nil || strings.TrimSpace(r.attachmentsRoot) == "" || strings.TrimSpace(worktreeDir) == "" {
+		return ""
+	}
+	workItemID := planedoc.WorkItemIDFromURL(work.IssueURL)
+	if workItemID == "" {
+		return ""
+	}
+	srcDir := filepath.Join(r.attachmentsRoot, workItemID)
+	entries, err := os.ReadDir(srcDir)
+	if err != nil {
+		return ""
+	}
+	rels := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		if _, ok := attachmentImageExts[strings.ToLower(filepath.Ext(name))]; !ok {
+			continue
+		}
+		if err := copyRegularFile(filepath.Join(srcDir, name), filepath.Join(worktreeDir, ".looper-attachments", name)); err != nil {
+			continue
+		}
+		rels = append(rels, "./.looper-attachments/"+name)
+	}
+	if len(rels) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("Screenshots for this task have been saved into the working directory. The bug/behaviour is shown in these images — you MUST use the Read tool to view EACH one before implementing, because key details are visual and are not fully described in text:\n")
+	for _, rel := range rels {
+		b.WriteString("- ")
+		b.WriteString(rel)
+		b.WriteString("\n")
+	}
+	b.WriteString("These files are reference material only — do NOT git add or commit the .looper-attachments/ directory.")
+	return b.String()
+}
+
+// copyRegularFile copies src to dest (creating dest's parent dir, overwriting dest).
+// Sized for small screenshot files, so it reads the whole file into memory.
+func copyRegularFile(src, dest string) error {
+	data, err := os.ReadFile(src)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(dest, data, 0o644)
+}
+
 type Options struct {
 	DB                              *sql.DB
 	Repos                           *storage.Repositories
@@ -461,12 +598,13 @@ type Options struct {
 	ClaimTTL                        time.Duration
 	ValidationCommands              []string
 	ValidationRunner                ValidationRunner
-	// ContainmentTracker registers validation shell handles with the Execution
-	// Supervisor for shutdown drain / retain-storage (#577). Nil in tests or
-	// when the runner is not daemon-owned.
-	ContainmentTracker      processcontainment.LiveTracker
-	AllowAutoCommit         bool
-	AllowAutoPush           bool
+	// ContainmentTracker registers validation shell handles with the execution supervisor.
+	ContainmentTracker processcontainment.LiveTracker
+	AllowAutoCommit    bool
+	AllowAutoPush      bool
+	// ShepherdEnabled opts a worker into shepherding its own impl PR to merge
+	// after open-pr. This applies to every PR opened by that runner.
+	ShepherdEnabled         bool
 	OpenPRStrategy          config.OpenPRStrategy
 	Disclosure              *config.DisclosureConfig
 	AgentRuntime            string
@@ -480,6 +618,15 @@ type Options struct {
 	DiscoveryPolicy         DiscoveryPolicy
 	OnQueueItemEnqueued     func()
 	Network                 NetworkStatusGateway
+	// PlaneDoc resolves a Plane spec-document gateway + Plane project UUID for a
+	// project whose task source is Plane, so the worker can read the product/tech
+	// spec from Plane pages (flowchart node I). nil / (…,false) → repo-file spec path.
+	PlaneDoc PlaneDocResolver
+	// AttachmentsRoot is the directory under which per-work-item screenshot folders
+	// live (keyed by Plane work-item UUID). Empty → <looper-home>/attachments. Images
+	// dropped at <AttachmentsRoot>/<work-item-uuid>/ are copied into the agent's
+	// worktree so the vision-capable coding agent can Read the bug screenshots.
+	AttachmentsRoot string
 	// HITLEnabled gates the mid-run human-in-the-loop feature. When false (the
 	// default) none of the HITL code paths run and the worker behaves exactly as
 	// before. HITLNotify, when set, sends the ask-card to the human channel.
@@ -556,6 +703,7 @@ type Runner struct {
 	containmentTracker      processcontainment.LiveTracker
 	allowAutoCommit         bool
 	allowAutoPush           bool
+	shepherdEnabled         bool
 	githubCLIAvailable      bool
 	githubCLICheck          func(context.Context, string, string) bool
 	openPRStrategy          config.OpenPRStrategy
@@ -572,6 +720,8 @@ type Runner struct {
 	discoveryPolicy         DiscoveryPolicy
 	onQueueItemEnqueued     func()
 	network                 NetworkStatusGateway
+	planeDoc                PlaneDocResolver
+	attachmentsRoot         string
 	hitlEnabled             bool
 	hitlNotify              HITLNotifyFunc
 	hitlAnswerTransport     string
@@ -616,16 +766,21 @@ type DiscoveryResult struct {
 }
 
 type workerInput struct {
-	Title    string `json:"title,omitempty"`
-	Prompt   string `json:"prompt,omitempty"`
-	SpecPath string `json:"specPath,omitempty"`
-	Repo     string `json:"repo,omitempty"`
+	Title     string `json:"title,omitempty"`
+	Prompt    string `json:"prompt,omitempty"`
+	SpecPath  string `json:"specPath,omitempty"`
+	Repo      string `json:"repo,omitempty"`
+	ChatScope string `json:"chatScope,omitempty"`
+	ChatTitle string `json:"chatTitle,omitempty"`
+	ChatURL   string `json:"chatUrl,omitempty"`
+	Module    string `json:"module,omitempty"`
 	// IssueRepo is the source issue repository, which may differ from Repo for cross-repo closing references.
-	IssueRepo     string `json:"issueRepo,omitempty"`
-	BaseBranch    string `json:"baseBranch,omitempty"`
-	ExecutionMode string `json:"executionMode,omitempty"`
-	IssueNumber   int64  `json:"issueNumber,omitempty"`
-	IssueURL      string `json:"issueUrl,omitempty"`
+	IssueRepo        string `json:"issueRepo,omitempty"`
+	BaseBranch       string `json:"baseBranch,omitempty"`
+	ExecutionMode    string `json:"executionMode,omitempty"`
+	IssueNumber      int64  `json:"issueNumber,omitempty"`
+	IssueURL         string `json:"issueUrl,omitempty"`
+	StrictDispatchID string `json:"strictDispatchId,omitempty"`
 	// TriggerLogin is who created/assigned the source issue (GitHub login), shown
 	// as attribution on the HITL ask card so a human knows whose task this is.
 	TriggerLogin         string   `json:"triggerLogin,omitempty"`
@@ -634,6 +789,7 @@ type workerInput struct {
 	Branch               string   `json:"branch,omitempty"`
 	HeadSHA              string   `json:"headSha,omitempty"`
 	AutoDiscovered       bool     `json:"autoDiscovered,omitempty"`
+	Labels               []string `json:"labels,omitempty"`
 	RoutedClaimMatchMode string   `json:"routedClaimMatchMode,omitempty"`
 	Reviewers            []string `json:"reviewers,omitempty"`
 }
@@ -831,6 +987,7 @@ func New(options Options) *Runner {
 		containmentTracker:      options.ContainmentTracker,
 		allowAutoCommit:         options.AllowAutoCommit,
 		allowAutoPush:           options.AllowAutoPush,
+		shepherdEnabled:         options.ShepherdEnabled,
 		githubCLIAvailable:      githubCLIAvailable,
 		githubCLICheck:          options.GitHubCLIAutoPROpeningAvailable,
 		openPRStrategy:          strategy,
@@ -847,6 +1004,8 @@ func New(options Options) *Runner {
 		discoveryPolicy:         policy,
 		onQueueItemEnqueued:     options.OnQueueItemEnqueued,
 		network:                 options.Network,
+		planeDoc:                options.PlaneDoc,
+		attachmentsRoot:         resolveAttachmentsRoot(options.AttachmentsRoot),
 		hitlEnabled:             options.HITLEnabled,
 		hitlNotify:              options.HITLNotify,
 		hitlAnswerTransport:     options.HITLAnswerTransport,
@@ -918,15 +1077,16 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 	}
 	result := DiscoveryResult{}
 	for _, issue := range issues {
-		if domain.IsAutoLaneHeld(domain.LoopTypeWorker, issue.Labels) {
+		strictDispatch := strings.TrimSpace(issue.StrictDispatchID) != ""
+		if !strictDispatch && domain.IsAutoLaneHeld(domain.LoopTypeWorker, issue.Labels) {
 			result.Skipped++
 			continue
 		}
-		if !shouldClaimWorkerIssue(issue, login, policy) {
+		if !strictDispatch && !shouldClaimWorkerIssue(issue, login, policy) {
 			result.Skipped++
 			continue
 		}
-		if requiredTargetLabel != "" && !hasLabel(issue.Labels, requiredTargetLabel) {
+		if !strictDispatch && requiredTargetLabel != "" && !hasLabel(issue.Labels, requiredTargetLabel) {
 			result.Skipped++
 			continue
 		}
@@ -938,7 +1098,7 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 		if loopResult.created {
 			result.CreatedLoopIDs = append(result.CreatedLoopIDs, loopResult.record.ID)
 		}
-		if loopResult.skipEnqueue || loopResult.record.Status == "paused" || loopResult.record.Status == "human_takeover" || loopResult.record.Status == "completed" || loopResult.record.Status == "failed" || loopResult.record.Status == "awaiting_human" {
+		if loopResult.skipEnqueue || loopResult.record.Status == "paused" || loopResult.record.Status == "human_takeover" || loopResult.record.Status == "completed" || loopResult.record.Status == "failed" || loopResult.record.Status == "awaiting_human" || loopResult.record.Status == "shepherding" {
 			result.Skipped++
 			continue
 		}
@@ -1026,10 +1186,36 @@ func (r *Runner) recoverClaimedItem(ctx context.Context, queueItem storage.Queue
 	if err := r.reconcileRecoveredLoop(ctx, queueItem, failedQueue, failure.kind); err != nil {
 		return nil, err
 	}
+	r.transitionTerminalStrictDispatchFailure(ctx, queueItem, failedQueue)
 	if shouldNotifyCompletedRun(failure.kind, failedQueue) {
 		r.notifyRecoveredRunCompleted(ctx, queueItem, failure)
 	}
 	return &ProcessResult{LoopID: derefString(queueItem.LoopID), QueueItemID: queueItem.ID, Status: "failed", Summary: failure.message, FailureKind: failure.kind}, nil
+}
+
+func (r *Runner) transitionTerminalStrictDispatchFailure(ctx context.Context, queueItem storage.QueueItemRecord, failedQueue *storage.QueueItemRecord) {
+	if failedQueue == nil || (failedQueue.Status != "failed" && failedQueue.Status != "manual_intervention") {
+		return
+	}
+	dispatchID := strings.TrimSpace(stringFromAnyDefault(parseJSONObject(queueItem.PayloadJSON)["strictDispatchId"]))
+	if dispatchID == "" {
+		return
+	}
+	gateway, ok := r.github.(strictDispatchGateway)
+	if !ok {
+		return
+	}
+	cwd := ""
+	if queueItem.ProjectID != nil {
+		if project, err := r.repos.Projects.GetByID(ctx, *queueItem.ProjectID); err == nil && project != nil {
+			cwd = project.RepoPath
+		}
+	}
+	transitionCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	defer cancel()
+	if err := gateway.TransitionStrictDispatch(transitionCtx, StrictDispatchTransitionInput{Repo: derefString(queueItem.Repo), CWD: cwd, DispatchID: dispatchID, State: "failed"}); err != nil && r.logger != nil {
+		r.logger.Warn("worker: mark terminal strict dispatch failed", map[string]any{"dispatchId": dispatchID, "queueItemId": queueItem.ID, "error": err.Error()})
+	}
 }
 
 func (r *Runner) reconcileRecoveredLoop(ctx context.Context, queueItem storage.QueueItemRecord, failedQueue *storage.QueueItemRecord, failureKind QueueFailureKind) error {
@@ -1085,18 +1271,38 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 	if project == nil {
 		return ProcessResult{}, fmt.Errorf("project not found: %s", loop.ProjectID)
 	}
-	if err := r.revalidateRoutedWorkerClaim(ctx, *project, *loop, queueItem); err != nil {
-		return ProcessResult{}, err
+	strictDispatchID := strings.TrimSpace(stringFromAnyDefault(parseJSONObject(queueItem.PayloadJSON)["strictDispatchId"]))
+	if strictDispatchID == "" {
+		if err := r.revalidateRoutedWorkerClaim(ctx, *project, *loop, queueItem); err != nil {
+			return ProcessResult{}, err
+		}
+	} else {
+		gateway, ok := r.github.(strictDispatchGateway)
+		if !ok {
+			return ProcessResult{}, fmt.Errorf("strict dispatch gateway is not configured")
+		}
+		if err := gateway.TransitionStrictDispatch(ctx, StrictDispatchTransitionInput{Repo: derefString(loop.Repo), CWD: project.RepoPath, DispatchID: strictDispatchID, State: "running"}); err != nil {
+			return ProcessResult{}, fmt.Errorf("start strict worker dispatch %s: %w", strictDispatchID, err)
+		}
 	}
 	resumedRun, err := r.createRunContext(ctx, *loop)
 	if err != nil {
 		return ProcessResult{}, err
 	}
 	run := resumedRun.Run
+	if strictDispatchID != "" {
+		r.track(ctx, "plane.state.synced", strictDispatchID+":running:"+run.ID, project.ID, loop.ID, run.ID, map[string]any{"dispatchId": strictDispatchID, "state": "running"})
+	}
 	checkpoint := resumedRun.Checkpoint
 	claimedLockKey := ""
 	acquiredClaimedLock := false
-	if resumedRun.StartStep != stepPrepareWork {
+	// A shepherd pass manages its own pr:<repo>:<n> lock under a stable
+	// shepherd:<loopID> owner (held across passes, not per-pass). It must NOT take
+	// the normal per-pass claim-lock path: checkpoint.ClaimedLockKey was retargeted
+	// to pr:<repo>:<n> after open-pr, so reacquiring it under this queue item id
+	// would collide with the shepherd owner and fail every pass ("lock already
+	// held"), and the defer would release the shepherd's coordination lock.
+	if resumedRun.StartStep != stepPrepareWork && resumedRun.StartStep != stepShepherd {
 		claimedLockKey = checkpoint.ClaimedLockKey
 	}
 	if claimedLockKey != "" {
@@ -1179,6 +1385,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		}); err != nil {
 			return ProcessResult{}, err
 		}
+		r.transitionTerminalStrictDispatchFailure(ctx, queueItem, failedQueue)
 		return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "failed", Summary: failure.message, FailureKind: failure.kind}, nil
 	}
 
@@ -1224,6 +1431,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			}); err != nil {
 				return ProcessResult{}, err
 			}
+			r.transitionTerminalStrictDispatchFailure(ctx, queueItem, failedQueue)
 			r.syncIssueClaim(ctx, stepInput{Project: *project, Loop: *loop, Run: run, QueueItem: queueItem}, &latest, issueClaimStatusForFailure(latest, failedQueue, failure.kind), failure.message)
 			return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "failed", Summary: failure.message, FailureKind: failure.kind}, nil
 		}
@@ -1240,7 +1448,34 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		}
 	}
 
+	// A shepherd pass does not "complete" the loop between passes: it parks back
+	// into shepherding for the reconciler to re-wake on the next PR signal, unless
+	// the PR reached a terminal outcome (merged/closed) which runShepherdStep
+	// stamps into $.shepherd.outcome. (Inert until $.shepherd.active is set, since
+	// only a marked loop is ever routed to stepShepherd.)
+	if resumedRun.StartStep == stepShepherd {
+		return r.finishShepherdPass(ctx, project, loop, run, queueItem, checkpoint)
+	}
+	// First entry into shepherding: a normal impl run just opened the PR (and
+	// shepherding is opted in via config). Instead of completing, mark the loop
+	// shepherding so the reconciler drives the PR toward merge — a human colleague
+	// performs the final merge, the bot only fixes + watches. Gated by config
+	// (shepherdEnabled) ALONE: any worker-opened PR shepherds, whether the item was
+	// dispatched via looper:auto (auto-intake) or looper:worker-ready (manual/plan).
+	// The old per-issue looper:auto activation gate (stage E) stranded worker-ready
+	// PRs as completed-while-open, so a late review round landed with no shepherding
+	// loop watching and the bot never followed up.
+	if r.shepherdEnabled && checkpoint.SkipReason == "" && checkpoint.PullRequest != nil {
+		return r.enterShepherding(ctx, project, loop, run, queueItem, checkpoint)
+	}
 	summary := r.buildSuccessSummary(*loop, checkpoint)
+	if strictDispatchID != "" {
+		gateway := r.github.(strictDispatchGateway)
+		if err := gateway.TransitionStrictDispatch(ctx, StrictDispatchTransitionInput{Repo: derefString(loop.Repo), CWD: project.RepoPath, DispatchID: strictDispatchID, State: "completed"}); err != nil {
+			return ProcessResult{}, fmt.Errorf("complete strict worker dispatch %s: %w", strictDispatchID, err)
+		}
+		r.track(ctx, "plane.state.synced", strictDispatchID+":completed:"+run.ID, project.ID, loop.ID, run.ID, map[string]any{"dispatchId": strictDispatchID, "state": "completed"})
+	}
 	if _, err := r.completeRun(ctx, run, "success", summary, "", checkpoint); err != nil {
 		return ProcessResult{}, err
 	}
@@ -1311,9 +1546,247 @@ func (r *Runner) executeStep(ctx context.Context, step WorkerStep, input stepInp
 		return r.runValidateStep(ctx, input)
 	case stepOpenPR:
 		return r.runOpenPRStep(ctx, input)
+	case stepShepherd:
+		return r.runShepherdStep(ctx, input)
 	default:
 		return input.Checkpoint, fmt.Errorf("unsupported worker step: %s", step)
 	}
+}
+
+// runShepherdStep runs one shepherd sweep for a worker loop that has opened its
+// impl PR under looper:auto (watch CI/reviews/conflicts → fix → enable
+// auto-merge, resuming the worker's own session). Stage A: inert no-op park —
+// nothing sets `$.shepherd.active` yet, so the start-step resolver never routes
+// here and this returns the checkpoint unchanged. The real sweep lands in a
+// later stage.
+// shepherdLockTTL is deliberately long so the pr:<repo>:<n> coordination lock
+// survives idle time between passes; the reconciler refreshes it every tick
+// (tick << TTL) and each pass refreshes it too, so a same-account fixer's
+// discovery keeps skipping the PR.
+const shepherdLockTTL = 20 * time.Minute
+
+func shepherdLockOwner(loopID string) string { return "shepherd:" + loopID }
+
+// holdShepherdLock acquires (if free/expired) or refreshes (if already ours) the
+// PR coordination lock under the stable shepherd:<loopID> owner. Best-effort:
+// losing the lock does not fail the pass (worst case a same-account fixer could
+// briefly contend), so we only log.
+func (r *Runner) holdShepherdLock(ctx context.Context, loopID string, checkpoint workerCheckpoint) {
+	key := shepherdPRLockKey(checkpoint)
+	if key == "" || r.repos == nil || r.repos.Locks == nil {
+		return
+	}
+	owner := shepherdLockOwner(loopID)
+	reason := "shepherd"
+	nowISO := r.nowISO()
+	expiresAt := eventlog.FormatJavaScriptISOString(r.now().Add(shepherdLockTTL))
+	if refreshed, err := r.repos.Locks.Refresh(ctx, storage.LockRecord{Key: key, Owner: owner, Reason: &reason, ExpiresAt: expiresAt, UpdatedAt: nowISO}); err == nil && refreshed {
+		return
+	}
+	if _, err := r.repos.Locks.Acquire(ctx, storage.LockRecord{Key: key, Owner: owner, Reason: &reason, ExpiresAt: expiresAt, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil && r.logger != nil {
+		r.logger.Warn("shepherd lock hold failed", map[string]any{"loopId": loopID, "lockKey": key, "error": err.Error()})
+	}
+}
+
+// runShepherdStep runs one shepherd sweep for a worker loop driving its own impl
+// PR toward merge under looper:auto. It resumes the WORKER's own agent session
+// (so the code author's context is retained) and hands it the pr-autopilot
+// recipe to fix reviews/CI/conflicts via gh+git. It NEVER merges and NEVER
+// approves — a human colleague performs the final merge; the reconciler detects
+// MERGED and terminates. finishShepherdStep (the completion tail) parks the loop
+// back into shepherding for the next reconciler wake.
+func (r *Runner) runShepherdStep(ctx context.Context, input stepInput) (workerCheckpoint, error) {
+	checkpoint := input.Checkpoint
+	if checkpoint.PullRequest == nil || checkpoint.Work == nil {
+		// Defensive: a shepherd run must carry a PR checkpoint. Without one there
+		// is nothing to drive — leave the marker for a human/reconciler to inspect.
+		return checkpoint, nil
+	}
+	r.holdShepherdLock(ctx, input.Loop.ID, checkpoint)
+
+	worktree, err := requireWorktree(checkpoint)
+	if err != nil {
+		return checkpoint, err
+	}
+	worktree, err = r.ensureWorkerWorktreeUsable(ctx, input, &checkpoint, *checkpoint.Work, worktree)
+	if err != nil {
+		return checkpoint, err
+	}
+
+	agentVendor, _, _, _, _ := r.identityFromRun(input.Run)
+	sessionID := r.latestNativeSessionID(ctx, input.Loop.ID, agentVendor)
+	sessionLost := strings.TrimSpace(sessionID) == ""
+	if sessionLost {
+		r.stampShepherd(ctx, &input.Loop, func(s *loops.Shepherd) { s.SessionLost = true })
+	}
+	prompt := buildShepherdPrompt(*checkpoint.Work, checkpoint.PullRequest.Number, sessionLost)
+
+	r.stampShepherd(ctx, &input.Loop, func(s *loops.Shepherd) {
+		s.Phase = "fixing"
+		s.PassCount++
+	})
+
+	executionID := eventlog.NewEventID("agent")
+	metadata := map[string]any{"loopType": "worker", "step": "shepherd", "repo": checkpoint.Work.Repo, "prNumber": checkpoint.PullRequest.Number}
+	execution, err := r.agentExecutor.Start(ctx, AgentRunInput{ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID, Prompt: prompt, NativeResumePrompt: prompt, NativeSessionID: sessionID, WorkingDirectory: worktree.Path, Timeout: r.agentTimeout, HeartbeatTimeout: r.agentIdleTimeout, Metadata: metadata, IdempotencyKey: fmt.Sprintf("shepherd:%s:%d", input.Loop.ID, checkpoint.PullRequest.Number)})
+	if err != nil {
+		return checkpoint, err
+	}
+	if _, err := execution.Wait(ctx); err != nil {
+		return checkpoint, err
+	}
+	// The agent committed+pushed any fix itself. The tail parks the loop back into
+	// shepherding; the reconciler re-wakes on the next PR signal change and
+	// detects MERGED (by a human) to terminate. Nothing is merged here.
+	return checkpoint, nil
+}
+
+// stampShepherd merges a mutation into the loop's $.shepherd marker and persists
+// it. Best-effort: a failed stamp only degrades card phase/cap accuracy.
+func (r *Runner) stampShepherd(ctx context.Context, loop *storage.LoopRecord, mutate func(*loops.Shepherd)) {
+	if r.repos == nil || r.repos.Loops == nil {
+		return
+	}
+	fresh, err := r.repos.Loops.GetByID(ctx, loop.ID)
+	if err != nil || fresh == nil {
+		return
+	}
+	s, _ := loops.ReadShepherd(fresh.MetadataJSON)
+	mutate(&s)
+	newMeta, err := loops.WriteShepherd(fresh.MetadataJSON, s)
+	if err != nil {
+		return
+	}
+	if _, err := r.updateLoop(ctx, *fresh, func(updated *storage.LoopRecord) {
+		updated.MetadataJSON = &newMeta
+	}); err == nil {
+		loop.MetadataJSON = &newMeta
+	}
+}
+
+// buildShepherdPrompt embeds the pr-autopilot sweep (pure gh+git, run by the
+// resumed author session) with the hard guardrails: never merge, never approve,
+// be conservative about a peer reviewer's change requests.
+func buildShepherdPrompt(work workerInput, prNumber int64, sessionLost bool) string {
+	repo := work.Repo
+	parts := []string{
+		fmt.Sprintf("You previously authored the implementation PR %s#%d. Keep driving it toward a clean merge — but a human colleague performs the final merge, not you.", repo, prNumber),
+		agent.DeliveryInstruction,
+	}
+	if sessionLost {
+		parts = append(parts, "NOTE: your previous session context could not be recovered. Rebuild your understanding from the PR diff and review threads before acting; do not assume prior memory.")
+	}
+	parts = append(parts,
+		"Run ONE sweep now, then stop:",
+		fmt.Sprintf("1. Snapshot live state (never act on stale data): `gh pr view %d -R %s --json state,isDraft,mergeable,mergeStateStatus,reviewDecision,statusCheckRollup,latestReviews`. If state==MERGED or CLOSED, stop and report — you are done.", prNumber, repo),
+		"2. Unresolved review threads (GraphQL, since gh pr view can't see resolution): for each, OPEN the file at file:line and VERIFY the claim against current source before acting. Real defect → make the scoped fix, commit, push, reply on the thread, resolve it. Phantom (cannot reproduce) → reply with evidence and resolve. The reviewer is a peer teammate: be conservative — default to implementing the requested change; only decline (with a concise written reason) when you are confident it is wrong or out of scope; when in doubt, ask a human via `.looper/ask.json`.",
+		"3. Failing CI: `gh pr checks` + `gh run view <id> --log-failed`; reproduce with the repo's own scoped validation, fix, commit, push. A non-required check failing does not block — note it, don't spin.",
+		"4. Merge conflicts (mergeable==CONFLICTING): merge the base into this worktree, resolve, run the relevant checks, push. NEVER force-push, never rewrite others' commits, never delete the base branch.",
+		"5. After ANY push, re-request the reviewer(s) so they re-review the new head: `gh pr edit "+fmt.Sprintf("%d", prNumber)+" -R "+repo+" --add-reviewer <login>`.",
+		"HARD RULES (never violate): NEVER merge this PR — do NOT run `gh pr merge`, do NOT enable auto-merge (`--auto`), do NOT enqueue to a merge queue. NEVER submit an approving review of your own PR. NEVER use --admin to bypass a check. The final merge is a human colleague's action; your job ends at a healthy, review-ready, green, conflict-free PR.",
+		"When approved + all required checks green + mergeable + every thread resolved, there is nothing left to do: report that the PR is ready for a human to merge, and stop.",
+		"Commit with a fresh subject summarizing this round's repair; push the current branch; do not open a new PR.",
+	)
+	return strings.Join(parts, "\n\n")
+}
+
+// enterShepherding transitions a just-opened impl PR loop into the shepherding
+// steady state: it sets the durable $.shepherd.active marker (source of control
+// truth), moves the loop to status shepherding (not completed), and acquires the
+// pr coordination lock so a same-account fixer skips the PR. The reconciler then
+// drives the PR toward merge; a human performs the final merge.
+func (r *Runner) enterShepherding(ctx context.Context, project *storage.ProjectRecord, loop *storage.LoopRecord, run storage.RunRecord, queueItem storage.QueueItemRecord, checkpoint workerCheckpoint) (ProcessResult, error) {
+	summary := r.buildSuccessSummary(*loop, checkpoint)
+	if _, err := r.completeRun(ctx, run, "success", summary, "", checkpoint); err != nil {
+		return ProcessResult{}, err
+	}
+	if err := r.repos.Queue.Complete(ctx, queueItem.ID, r.nowISO()); err != nil && !errors.Is(err, storage.ErrQueueItemNotActive) {
+		return ProcessResult{}, err
+	}
+	marker, _ := loops.ReadShepherd(loop.MetadataJSON)
+	marker.Active = true
+	if strings.TrimSpace(marker.Phase) == "" {
+		marker.Phase = "reviewing"
+	}
+	newMeta, err := loops.WriteShepherd(loop.MetadataJSON, marker)
+	if err != nil {
+		return ProcessResult{}, err
+	}
+	if _, err := r.updateLoop(ctx, *loop, func(updated *storage.LoopRecord) {
+		updated.Status = "shepherding"
+		updated.LastRunAt = stringPtr(r.nowISO())
+		updated.NextRunAt = nil
+		updated.MetadataJSON = &newMeta
+	}); err != nil {
+		return ProcessResult{}, err
+	}
+	loop.MetadataJSON = &newMeta
+	r.holdShepherdLock(ctx, loop.ID, checkpoint)
+	if r.logger != nil {
+		r.logger.Info("worker entered shepherding — driving PR to merge (human merges)", map[string]any{"loopId": loop.ID, "repo": checkpoint.Work.Repo, "prNumber": pullRequestNumber(checkpoint.PullRequest)})
+	}
+	return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "success", Summary: summary, PullRequestNumber: pullRequestNumber(checkpoint.PullRequest)}, nil
+}
+
+// shepherdPRLockKey is the coordination lock a shepherding loop holds so a
+// same-account fixer's discovery (which checks this lock) skips the PR.
+func shepherdPRLockKey(checkpoint workerCheckpoint) string {
+	if checkpoint.Work == nil || checkpoint.PullRequest == nil || checkpoint.Work.Repo == "" || checkpoint.PullRequest.Number <= 0 {
+		return ""
+	}
+	return fmt.Sprintf("pr:%s:%d", checkpoint.Work.Repo, checkpoint.PullRequest.Number)
+}
+
+// finishShepherdPass closes out one shepherd pass. Unless runShepherdStep stamped
+// a terminal outcome into $.shepherd.outcome (PR merged/closed), the loop parks
+// back into shepherding — the reconciler re-wakes it on the next PR signal — with
+// no "delivered" notification (the card animates via the shepherd phase). On a
+// terminal outcome the loop reaches completed, the marker is cleared, the
+// coordination lock is released, and the completion is notified once.
+func (r *Runner) finishShepherdPass(ctx context.Context, project *storage.ProjectRecord, loop *storage.LoopRecord, run storage.RunRecord, queueItem storage.QueueItemRecord, checkpoint workerCheckpoint) (ProcessResult, error) {
+	summary := r.buildSuccessSummary(*loop, checkpoint)
+	if _, err := r.completeRun(ctx, run, "success", summary, "", checkpoint); err != nil {
+		return ProcessResult{}, err
+	}
+	prNumber := pullRequestNumber(checkpoint.PullRequest)
+	if err := r.repos.Queue.Complete(ctx, queueItem.ID, r.nowISO()); err != nil && !errors.Is(err, storage.ErrQueueItemNotActive) {
+		return ProcessResult{}, err
+	}
+	// Re-read fresh metadata: runShepherdStep persists the marker (phase/outcome)
+	// via updateLoop mid-pass, so the in-scope loop record here is stale.
+	meta := loop.MetadataJSON
+	if fresh, err := r.repos.Loops.GetByID(ctx, loop.ID); err == nil && fresh != nil {
+		meta = fresh.MetadataJSON
+	}
+	marker, _ := loops.ReadShepherd(meta)
+	if marker.Outcome != "" {
+		marker.Active = false
+		newMeta, err := loops.WriteShepherd(meta, marker)
+		if err != nil {
+			return ProcessResult{}, err
+		}
+		if _, err := r.updateLoop(ctx, *loop, func(updated *storage.LoopRecord) {
+			updated.Status = "completed"
+			updated.LastRunAt = stringPtr(r.nowISO())
+			updated.NextRunAt = nil
+			updated.MetadataJSON = &newMeta
+		}); err != nil {
+			return ProcessResult{}, err
+		}
+		if key := shepherdPRLockKey(checkpoint); key != "" {
+			_ = r.repos.Locks.Release(context.Background(), key)
+		}
+		r.notifyRunCompleted(ctx, buildRunCompletedInput(*project, *loop, run, checkpoint, statusForCheckpoint(checkpoint), "", summary))
+		return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "success", Summary: summary, PullRequestNumber: prNumber}, nil
+	}
+	if _, err := r.updateLoop(ctx, *loop, func(updated *storage.LoopRecord) {
+		updated.Status = "shepherding"
+		updated.LastRunAt = stringPtr(r.nowISO())
+		updated.NextRunAt = nil
+	}); err != nil {
+		return ProcessResult{}, err
+	}
+	return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "success", Summary: summary, PullRequestNumber: prNumber}, nil
 }
 
 func (r *Runner) reacquireClaimedLock(ctx context.Context, claimedLockKey string, owner string) (bool, error) {
@@ -1342,6 +1815,13 @@ func (r *Runner) reacquireClaimedLock(ctx context.Context, claimedLockKey string
 }
 
 func (r *Runner) stopObsoleteResumedIssueRun(ctx context.Context, project storage.ProjectRecord, loop storage.LoopRecord, run storage.RunRecord, queueItem storage.QueueItemRecord, checkpoint *workerCheckpoint, claimedLockKey *string) (ProcessResult, bool, error) {
+	// A shepherding loop is EXPECTED to see its source issue closed (a merge
+	// closes the issue) while the PR is still live — that is not obsolescence, it
+	// is the goal. Never abort a shepherd here: doing so would release the
+	// shepherd's own pr:<repo>:<n> coordination lock and hand the PR to a fixer.
+	if loops.ShepherdActive(loop.MetadataJSON) {
+		return ProcessResult{}, false, nil
+	}
 	if checkpoint == nil || checkpoint.Work == nil || checkpoint.Work.ExecutionMode != "create-pr" || checkpoint.Work.IssueNumber <= 0 || r.github == nil {
 		return ProcessResult{}, false, nil
 	}
@@ -1822,6 +2302,19 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 		if err != nil {
 			return checkpoint, err
 		}
+		// Flowchart node I: on a Plane project, read the product + tech spec from Plane
+		// pages (linked to the work item) and add them to the prompt, so the worker
+		// implements against the Plane specs rather than only the repo file.
+		if planeSpec := r.planeSpecBlock(ctx, input.Project.ID, work.IssueURL); planeSpec != "" {
+			prompt += "\n\n" + planeSpec
+		}
+		// Materialize any screenshots co-located with this work item into the worktree
+		// so the vision-capable coding agent can Read them. Plane strips inline images
+		// from a work item's description, so a local drop-dir keyed by the work-item
+		// UUID is how a bug's screenshots reach the agent.
+		if shots := r.attachTaskScreenshots(work, worktree.Path); shots != "" {
+			prompt += "\n\n" + shots
+		}
 		// HITL (gated): let the agent pause to ask a human, and on resume feed the
 		// human's answer back into the same agent session.
 		nativeResumePrompt := ""
@@ -1829,6 +2322,9 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 		if r.hitlEnabled {
 			prompt += hitlPromptInstruction
 			nativeResumePrompt, nativeSessionID = r.pendingHumanAnswer(ctx, &input.Loop, agentVendor)
+			if strings.EqualFold(r.hitlAnswerTransport, "feishu") {
+				prompt += feishuCollaborationInstruction
+			}
 			if nativeResumePrompt != "" {
 				prompt += "\n\n" + nativeResumePrompt
 			}
@@ -1841,6 +2337,9 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 				nativeSessionID = takeoverSession
 				prompt += "\n\n" + takeoverPrompt
 			}
+		}
+		if nativeResumePrompt != "" && strings.EqualFold(r.hitlAnswerTransport, "feishu") {
+			nativeResumePrompt += feishuCollaborationInstruction
 		}
 		// Free-text human messages queued in the thread at any time (a follow-up
 		// question, a new instruction, or an answer to interpret) — drain them into
@@ -1859,6 +2358,7 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 				}
 				msgs.WriteString("\nRead them in context and respond appropriately: if a message answers a question you asked, proceed using it; if it is a follow-up question or a new instruction, address it — and if you still need a human decision, ask again (write .looper/ask.json) with your response to what they said. Do not ignore these messages.")
 				prompt += "\n\n" + msgs.String()
+				nativeResumePrompt += "\n\n" + msgs.String()
 				if nativeSessionID == "" {
 					nativeSessionID = r.latestNativeSessionID(ctx, input.Loop.ID, agentVendor)
 				}
@@ -1897,7 +2397,7 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 		// the run so a human can answer. Returned as a typed error the step loop
 		// converts into an awaiting_human suspension (not a failure).
 		if r.hitlEnabled && result.Status == "completed" {
-			if awaiting, awaitErr := r.detectHumanAsk(ctx, input, worktree.Path, executionID); awaitErr != nil {
+			if awaiting, awaitErr := r.detectHITLAskSentinel(ctx, input, worktree.Path, executionID); awaitErr != nil {
 				return checkpoint, awaitErr
 			} else if awaiting != nil {
 				return checkpoint, awaiting
@@ -2061,6 +2561,21 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 		checkpoint.ResumePolicy = failure.resumePolicy
 		return checkpoint, &loopError{message: failure.message, kind: failure.kind}
 	}
+	// PR existence is authoritative in GitHub, while the local worktree is only a
+	// recreatable cache. Reconcile the durable PR reference before touching that
+	// cache: a previous attempt may have opened the PR and then died before the
+	// open-pr step checkpoint was committed. Persisting the reference first makes
+	// the rest of this step restart-safe and lets the caller enter shepherding
+	// without recreating or pushing a worktree merely to rediscover the same PR.
+	if work.ExecutionMode == "create-pr" && r.openPRStrategy != config.OpenPRStrategyManual && checkpoint.PullRequest == nil && input.Loop.PRNumber == nil {
+		adopted, adoptErr := r.adoptOpenPullRequestBeforeWorktree(ctx, input, &checkpoint, work)
+		if adoptErr != nil {
+			return checkpoint, adoptErr
+		}
+		if adopted {
+			return checkpoint, nil
+		}
+	}
 	worktree, err := requireWorktree(checkpoint)
 	if err != nil {
 		return checkpoint, err
@@ -2196,7 +2711,6 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 		return checkpoint, nil
 	}
 	if r.openPRStrategy == config.OpenPRStrategyManual {
-		checkpoint.SkipReason = fmt.Sprintf("Worker completed; PR opening is manual for %s", input.Loop.ID)
 		checkpoint.ResumePolicy = loops.ResumePolicyAdvanceFromCheckpoint
 		return checkpoint, nil
 	}
@@ -2212,7 +2726,7 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 		checkpoint.ResumePolicy = loops.ResumePolicyManualIntervention
 		return checkpoint, &loopError{message: message, kind: FailureManualIntervention}
 	}
-	aliases := buildWorkerBranchAliases(work, input.Loop.ID)
+	aliases := workerPullRequestBranchCandidates(work, input.Loop.ID, checkpoint)
 	worktreeRoot, rootErr := workerWorktreeRoot(input.Project)
 	if rootErr != nil {
 		return checkpoint, rootErr
@@ -2268,16 +2782,22 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 		checkpoint.ResumePolicy = loops.ResumePolicyAdvanceFromCheckpoint
 		return checkpoint, nil
 	}
-	if existing, err := r.findOpenPullRequestForBranch(ctx, work.Repo, aliases, work.BaseBranch, input.Project.RepoPath); err != nil && hostingKindForContext(ctx) != "" {
-		return checkpoint, err
-	} else if err == nil && existing != nil {
+	existing, findErr := r.findOpenPullRequestForBranch(ctx, work.Repo, aliases, work.BaseBranch, input.Project.RepoPath)
+	if findErr != nil {
+		return checkpoint, &loopError{message: fmt.Sprintf("Worker could not verify whether branch %s already has an open pull request: %v", worktree.Branch, findErr), kind: FailureRetryableAfterResume}
+	}
+	if existing != nil {
 		adoptedWork := workerWorkForPullRequest(work, *existing)
+		pr := checkpointPullPR{Number: existing.Number, URL: existing.URL}
+		checkpoint.PullRequest = &pr
+		checkpoint.markLifecyclePushAndPR(firstNonEmpty(existing.HeadRefName, worktree.Branch), work.BaseBranch, existing.Number, existing.URL, true, true)
 		if held, summary, err := r.workerHoldSummaryForWork(ctx, input.Project, adoptedWork, true); err != nil {
 			return checkpoint, err
 		} else if held {
-			checkpoint.PullRequest = &checkpointPullPR{Number: existing.Number, URL: existing.URL}
-			checkpoint.markLifecyclePushAndPR(firstNonEmpty(existing.HeadRefName, worktree.Branch), work.BaseBranch, existing.Number, existing.URL, true, true)
 			return checkpoint, &holdSkipError{summary: summary}
+		}
+		if err := r.persistPullRequestReference(ctx, input.Loop, input.QueueItem, work.Repo, pr); err != nil {
+			return checkpoint, err
 		}
 		if err := r.assignReviewersIfNeeded(ctx, work, existing.Number, input.Project.RepoPath); err != nil && hostingKindForContext(ctx) != "" {
 			return checkpoint, err
@@ -2285,11 +2805,6 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 		if err := r.normalizePullRequestDisclosure(ctx, input.Run, work.Repo, existing.Number, input.Project.RepoPath, true); err != nil {
 			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 		}
-		if err := r.persistPullRequestReference(ctx, input.Loop, input.QueueItem, work.Repo, checkpointPullPR{Number: existing.Number, URL: existing.URL}); err != nil {
-			return checkpoint, err
-		}
-		checkpoint.PullRequest = &checkpointPullPR{Number: existing.Number, URL: existing.URL}
-		checkpoint.markLifecyclePushAndPR(firstNonEmpty(existing.HeadRefName, worktree.Branch), work.BaseBranch, existing.Number, existing.URL, true, true)
 		checkpoint.ResumePolicy = "advance_from_checkpoint"
 		r.syncIssueClaim(ctx, input, &checkpoint, issueClaimStatusPRLinked, "")
 		return checkpoint, nil
@@ -2323,6 +2838,7 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 	}
 	checkpoint.PullRequest = &pr
 	checkpoint.markLifecyclePushAndPR(worktree.Branch, work.BaseBranch, created.Number, created.URL, true, false)
+	_ = r.assignReviewersIfNeeded(ctx, work, created.Number, input.Project.RepoPath)
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
 	r.syncIssueClaim(ctx, input, &checkpoint, issueClaimStatusPRLinked, "")
 	return checkpoint, nil
@@ -2451,7 +2967,7 @@ func (r *Runner) resolveWorkerInput(ctx context.Context, project storage.Project
 	projectMetadata := parseJSONObject(project.MetadataJSON)
 	repo := firstNonEmpty(stringFromAnyDefault(source["repo"]), derefString(loop.Repo), stringFromAnyDefault(projectMetadata["repo"]))
 	baseBranch := firstNonEmpty(stringFromAnyDefault(source["baseBranch"]), stringFromAnyDefault(metadata["baseBranch"]), derefString(project.BaseBranch), "main")
-	work := workerInput{Title: firstNonEmpty(stringFromAnyDefault(source["title"]), "Worker run"), Prompt: stringFromAnyDefault(source["prompt"]), SpecPath: stringFromAnyDefault(source["specPath"]), Repo: repo, IssueRepo: stringFromAnyDefault(source["issueRepo"]), BaseBranch: baseBranch, ExecutionMode: executionMode, IssueNumber: int64FromAny(source["issueNumber"]), IssueURL: stringFromAnyDefault(source["issueUrl"]), TriggerLogin: stringFromAnyDefault(source["triggerLogin"]), PRNumber: int64FromAny(source["prNumber"]), Branch: stringFromAnyDefault(source["branch"]), HeadSHA: stringFromAnyDefault(source["headSha"]), AutoDiscovered: boolFromAny(source["autoDiscovered"]), Reviewers: stringSliceFromAny(source["reviewers"])}
+	work := workerInput{Title: firstNonEmpty(stringFromAnyDefault(source["title"]), "Worker run"), Prompt: stringFromAnyDefault(source["prompt"]), SpecPath: stringFromAnyDefault(source["specPath"]), Repo: repo, Module: stringFromAnyDefault(source["module"]), IssueRepo: stringFromAnyDefault(source["issueRepo"]), BaseBranch: baseBranch, ExecutionMode: executionMode, IssueNumber: int64FromAny(source["issueNumber"]), IssueURL: stringFromAnyDefault(source["issueUrl"]), StrictDispatchID: stringFromAnyDefault(source["strictDispatchId"]), TriggerLogin: stringFromAnyDefault(source["triggerLogin"]), PRNumber: int64FromAny(source["prNumber"]), Branch: stringFromAnyDefault(source["branch"]), HeadSHA: stringFromAnyDefault(source["headSha"]), AutoDiscovered: boolFromAny(source["autoDiscovered"]), Labels: stringSliceFromAny(source["labels"]), Reviewers: stringSliceFromAny(source["reviewers"])}
 	if work.IssueNumber == 0 && loop.TargetType == "issue" {
 		work.IssueNumber = parseIssueNumberFromTargetID(derefString(loop.TargetID))
 	}
@@ -2552,7 +3068,17 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 	}
 	startStep := stepPrepareWork
 	resumedCheckpoint := checkpoint
-	if latestRun != nil && (latestRun.Status == "failed" || latestRun.Status == "interrupted") && !loops.IsManualHoldResumePolicy(checkpoint.ResumePolicy) && lastCompletedStep != "" {
+	// DURABLE-MARKER CONTROL: once the impl PR is open and $.shepherd.active is
+	// set, EVERY run drives that PR to merge via stepShepherd — regardless of
+	// loop.Status (the failure/HITL/human-message paths may transiently move it to
+	// queued/paused/running) and regardless of the failed/interrupted resume gate.
+	// The full checkpoint (PullRequest/Work/Lifecycle/Worktree) is carried
+	// forward. This is the source of control truth; loop.Status is display only.
+	shepherdRun := loops.ShepherdActive(loop.MetadataJSON) && checkpoint.PullRequest != nil
+	switch {
+	case shepherdRun:
+		startStep = stepShepherd
+	case latestRun != nil && (latestRun.Status == "failed" || latestRun.Status == "interrupted") && !loops.IsManualHoldResumePolicy(checkpoint.ResumePolicy) && lastCompletedStep != "":
 		if restartFromDiscover {
 			startStep = stepPrepareWork
 			resumedCheckpoint = workerCheckpoint{ResumePolicy: loops.ResumePolicyReplayStep}
@@ -2563,7 +3089,7 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 			startStep = next
 		}
 	}
-	resumed := latestRun != nil && (latestRun.Status == "failed" || latestRun.Status == "interrupted") && startStep != stepPrepareWork
+	resumed := shepherdRun || (latestRun != nil && (latestRun.Status == "failed" || latestRun.Status == "interrupted") && startStep != stepPrepareWork)
 	// stickySnapshot: any continuation of a failed/interrupted predecessor, including first-step retries.
 	stickySnapshot := latestRun != nil && (latestRun.Status == "failed" || latestRun.Status == "interrupted")
 	nowISO := r.nowISO()
@@ -2578,14 +3104,15 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 	}
 	run.AgentSnapshotJSON = snapshotJSON
 	if resumed {
-		if restartFromDiscover {
+		switch {
+		case restartFromDiscover:
 			run.LastCompletedStep = nil
-		} else if shouldReplayExecuteOnResume(latestRun.Status, failedStep, checkpoint) {
+		case shouldReplayExecuteOnResume(latestRun.Status, failedStep, checkpoint):
 			if prev := previousWorkerStep(startStep); prev != "" {
 				value := string(prev)
 				run.LastCompletedStep = &value
 			}
-		} else if lastCompletedStep != "" {
+		case lastCompletedStep != "":
 			value := string(lastCompletedStep)
 			run.LastCompletedStep = &value
 		}
@@ -2605,6 +3132,7 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 		}
 		return resumedRunContext{}, err
 	}
+	r.track(ctx, "run.started", run.ID, loop.ProjectID, loop.ID, run.ID, map[string]any{"startStep": startStep, "resumed": resumed})
 	parsedCheckpoint, err := parseCheckpoint(run.CheckpointJSON)
 	if err != nil {
 		return resumedRunContext{}, err
@@ -2623,6 +3151,7 @@ func (r *Runner) persistStepStarted(ctx context.Context, run storage.RunRecord, 
 	if err := r.repos.Runs.Upsert(ctx, updated); err != nil {
 		return storage.RunRecord{}, err
 	}
+	r.track(ctx, "step.started", run.ID+":"+string(step), "", run.LoopID, run.ID, map[string]any{"step": step})
 	return updated, nil
 }
 
@@ -2642,6 +3171,7 @@ func (r *Runner) persistStepCompleted(ctx context.Context, run storage.RunRecord
 	if err := r.repos.Runs.Upsert(ctx, updated); err != nil {
 		return storage.RunRecord{}, err
 	}
+	r.track(ctx, "step.completed", run.ID+":"+string(step), "", run.LoopID, run.ID, map[string]any{"step": step})
 	return updated, nil
 }
 
@@ -2682,6 +3212,7 @@ func (r *Runner) completeRun(ctx context.Context, run storage.RunRecord, status,
 	if err := r.repos.Runs.Upsert(ctx, updated); err != nil {
 		return storage.RunRecord{}, err
 	}
+	r.track(ctx, "run.ended", run.ID, "", run.LoopID, run.ID, map[string]any{"status": status, "step": run.CurrentStep, "resumePolicy": checkpoint.ResumePolicy, "durationMs": elapsedMilliseconds(run.StartedAt, endedAt)})
 	return updated, nil
 }
 
@@ -2824,6 +3355,56 @@ func containsAnyValidationHint(message string, hints []string) bool {
 	return false
 }
 
+func (r *Runner) adoptOpenPullRequestBeforeWorktree(ctx context.Context, input stepInput, checkpoint *workerCheckpoint, work workerInput) (bool, error) {
+	if checkpoint == nil {
+		return false, nil
+	}
+	branches := workerPullRequestBranchCandidates(work, input.Loop.ID, *checkpoint)
+	branch := firstNonEmpty(branches...)
+	existing, err := r.findOpenPullRequestForBranch(ctx, work.Repo, branches, work.BaseBranch, input.Project.RepoPath)
+	if err != nil {
+		return false, &loopError{message: fmt.Sprintf("Worker could not verify whether branch %s already has an open pull request: %v", branch, err), kind: FailureRetryableAfterResume}
+	}
+	if existing == nil {
+		return false, nil
+	}
+
+	pr := checkpointPullPR{Number: existing.Number, URL: existing.URL}
+	checkpoint.PullRequest = &pr
+	checkpoint.markLifecyclePushAndPR(firstNonEmpty(existing.HeadRefName, branch), work.BaseBranch, existing.Number, existing.URL, true, true)
+	adoptedWork := workerWorkForPullRequest(work, *existing)
+	if held, summary, err := r.workerHoldSummaryForWork(ctx, input.Project, adoptedWork, true); err != nil {
+		return false, err
+	} else if held {
+		return false, &holdSkipError{summary: summary}
+	}
+	// This loop+queue transaction is intentionally the first local side effect
+	// after GitHub proves the PR exists. If the process dies below, the next run
+	// resumes from this durable reference instead of attempting another PR create.
+	if err := r.persistPullRequestReference(ctx, input.Loop, input.QueueItem, work.Repo, pr); err != nil {
+		return false, err
+	}
+	checkpoint.ResumePolicy = loops.ResumePolicyAdvanceFromCheckpoint
+	_ = r.assignReviewersIfNeeded(ctx, work, existing.Number, input.Project.RepoPath)
+	if err := r.normalizePullRequestDisclosure(ctx, input.Run, work.Repo, existing.Number, input.Project.RepoPath, true); err != nil {
+		return false, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+	}
+	r.syncIssueClaim(ctx, input, checkpoint, issueClaimStatusPRLinked, "")
+	return true, nil
+}
+
+func workerPullRequestBranchCandidates(work workerInput, loopID string, checkpoint workerCheckpoint) []string {
+	branches := buildWorkerBranchAliases(work, loopID)
+	branches = appendUniqueStrings(branches, work.Branch)
+	if checkpoint.Worktree != nil {
+		branches = appendUniqueStrings(branches, checkpoint.Worktree.Branch)
+	}
+	if checkpoint.Lifecycle != nil {
+		branches = appendUniqueStrings(branches, checkpoint.Lifecycle.ActiveBranch, checkpoint.Lifecycle.Branch, checkpoint.Lifecycle.PlannedBranch, checkpoint.Lifecycle.AgentBranch)
+	}
+	return branches
+}
+
 func (r *Runner) findOpenPullRequestForBranch(ctx context.Context, repo string, branches []string, baseBranch, cwd string) (*PullRequestSummary, error) {
 	if r.github == nil {
 		return nil, nil
@@ -2956,7 +3537,7 @@ func (r *Runner) ensureLoopForDiscoveredIssue(ctx context.Context, project stora
 	work := workerInput{Title: firstNonEmpty(issue.Title, buildDefaultIssueWorkerTitle(repo, issue.Number)), SpecPath: specPath, Repo: repo, BaseBranch: baseBranch, ExecutionMode: "create-pr", IssueNumber: issue.Number, IssueURL: issue.URL, TriggerLogin: issue.Author, AutoDiscovered: true}
 	for _, existing := range existingLoops {
 		if workerLoopTracksIssue(existing, project.ID, repo, issue.Number) {
-			pausedOrCompleted := existing.Status == "paused" || existing.Status == "human_takeover" || existing.Status == "completed" || existing.Status == "awaiting_human"
+			pausedOrCompleted := existing.Status == "paused" || existing.Status == "human_takeover" || existing.Status == "completed" || existing.Status == "awaiting_human" || existing.Status == "shepherding"
 			prLinked := existing.TargetType == "pull_request" || derefInt64(existing.PRNumber) > 0
 			if prLinked {
 				return loopUpsertResult{record: existing, skipEnqueue: true}, nil
@@ -3062,6 +3643,8 @@ func (r *Runner) enqueueDiscoveredIssue(ctx context.Context, project storage.Pro
 	workerMeta, _ := parseJSONObject(loop.MetadataJSON)["worker"].(map[string]any)
 	specPath := stringFromAnyDefault(workerMeta["specPath"])
 	payloadFields := map[string]any{"title": firstNonEmpty(issue.Title, buildDefaultIssueWorkerTitle(repo, issue.Number)), "repo": repo, "baseBranch": baseBranch, "issueNumber": issue.Number, "issueUrl": issue.URL, "triggerLogin": issue.Author, "autoDiscovered": true, "discoveryFingerprint": fingerprint}
+	payloadFields["labels"] = issue.Labels
+	payloadFields["strictDispatchId"] = issue.StrictDispatchID
 	targetType := "issue"
 	targetID := buildIssueTargetID(repo, issue.Number)
 	lockKey := storage.IssueLockKey(project.ID, repo, issue.Number)
@@ -3127,10 +3710,14 @@ func (r *Runner) updateLoop(ctx context.Context, loop storage.LoopRecord, mutate
 	if current != nil {
 		updated = *current
 	}
+	previousStatus := updated.Status
 	mutate(&updated)
 	updated.UpdatedAt = r.nowISO()
 	if err := r.repos.Loops.Upsert(ctx, updated); err != nil {
 		return storage.LoopRecord{}, err
+	}
+	if previousStatus != updated.Status {
+		r.track(ctx, "task.state_changed", updated.ID+":"+updated.UpdatedAt+":"+updated.Status, updated.ProjectID, updated.ID, "", map[string]any{"from": previousStatus, "to": updated.Status})
 	}
 	return updated, nil
 }
@@ -3142,7 +3729,14 @@ func (r *Runner) buildSuccessSummary(loop storage.LoopRecord, checkpoint workerC
 	if checkpoint.PullRequest != nil && checkpoint.PullRequest.URL != "" {
 		return fmt.Sprintf("Opened pull request for worker %s: %s", loop.ID, checkpoint.PullRequest.URL)
 	}
-	return fmt.Sprintf("Completed worker %s", loop.ID)
+	summary := fmt.Sprintf("Completed worker %s", loop.ID)
+	if r.openPRStrategy == config.OpenPRStrategyManual {
+		if checkpoint.Execution != nil && strings.TrimSpace(checkpoint.Execution.Summary) != "" {
+			summary = strings.TrimSpace(checkpoint.Execution.Summary)
+		}
+		summary += "\n\n按配置，本轮不自动创建 PR。"
+	}
+	return summary
 }
 
 const (
@@ -3340,7 +3934,7 @@ func shouldNotifyCompletedRun(kind QueueFailureKind, failedQueue *storage.QueueI
 }
 
 func shouldRetryQueueFailure(kind QueueFailureKind, nextAttempts, maxAttempts int64) bool {
-	if kind != FailureRetryableTransient && kind != FailureRetryableAfterResume && kind != FailureNonRetryable {
+	if kind != FailureRetryableTransient && kind != FailureRetryableAfterResume && kind != FailureRecoverableInfra && kind != FailureNonRetryable {
 		return false
 	}
 	if maxAttempts < 0 {
@@ -3434,6 +4028,8 @@ func workerFailureKind(kind failureclass.Kind) QueueFailureKind {
 		return FailureRetryableTransient
 	case failureclass.RetryableAfterResume:
 		return FailureRetryableAfterResume
+	case failureclass.RecoverableInfra:
+		return FailureRecoverableInfra
 	case failureclass.ManualIntervention:
 		return FailureManualIntervention
 	default:
@@ -3444,6 +4040,10 @@ func workerFailureKind(kind failureclass.Kind) QueueFailureKind {
 func (r *Runner) nowISO() string { return eventlog.FormatJavaScriptISOString(r.now()) }
 
 func stepsFrom(start WorkerStep) []WorkerStep {
+	// stepShepherd is off the linear sequence: one standalone pass per enqueue.
+	if start == stepShepherd {
+		return []WorkerStep{stepShepherd}
+	}
 	startIndex := 0
 	for i, step := range workerStepSequence {
 		if step == start {
@@ -3482,6 +4082,13 @@ func validateWorkerResumeCheckpoint(startStep WorkerStep, checkpoint workerCheck
 }
 
 func asWorkerStep(value string) WorkerStep {
+	// stepShepherd is a valid worker step but deliberately off workerStepSequence
+	// (so the normal impl flow stays inert); recognize it explicitly, else a
+	// resumed shepherd run whose prior pass completed "shepherd" fails
+	// createRunContext with "unknown worker last completed step".
+	if value == string(stepShepherd) {
+		return stepShepherd
+	}
 	for _, candidate := range workerStepSequence {
 		if string(candidate) == value {
 			return candidate
@@ -3782,6 +4389,10 @@ func providerKindForProject(cfg config.Config, projectID string) config.Provider
 	return config.ProviderKindGitHub
 }
 
+const taskAssessmentInstruction = `Before editing, inspect the repository guidance and relevant code, establish the cause or intended behavior, and assess the impact even for a small fix. Check callers, shared modules and repositories, compatibility, data and security implications, and how to verify the change and regressions. Briefly explain the scope, risks and validation approach using evidence from that inspection; do not classify a task as small from its title alone.
+Scale planning to what you find: for a narrow, understood change, proceed after that assessment without requiring a separate design document; for coordinated changes, make a plan and split into independently verifiable steps where useful; for architectural changes, migrations, compatibility changes or consequential tradeoffs, prepare a technical design before implementation. Reassess if the scope grows. Follow repository requirements for plans, design documents and approvals.
+Continue autonomously when the decision is within the task's authority. When a human decision is needed, explain the issue, evidence and numbered alternatives to the appropriate product, design, engineering or QA owner in the existing task conversation. Writing a plan or design is not by itself a reason to stop for approval. Do not invent extra agent roles or require a fixed multi-role pipeline.`
+
 func buildWorkerPromptWithInstructions(repoRootPath string, projectID string, instructionConfig config.Config, work workerInput, plan *checkpointPlan, allowAgentPRCreation bool, disclosureCfg config.DisclosureConfig, agentRuntime string, agentModel string, hostingKinds ...config.HostingIdentityKind) (string, config.CustomInstructionBlock, error) {
 	hostingKind := config.HostingIdentityKind("")
 	if len(hostingKinds) > 0 {
@@ -3797,7 +4408,13 @@ func buildWorkerPromptWithInstructions(repoRootPath string, projectID string, in
 	if work.Prompt != "" {
 		parts = append(parts, "User prompt:\n"+work.Prompt)
 	}
+	// Flowchart node C: a bug is worked reproduce → locate root cause → fix, not
+	// spec-driven. Steer the agent to that method when the issue is triaged kind/bug.
+	if hasLabel(work.Labels, "kind/bug") {
+		parts = append(parts, "This is a BUG. Work it in this order: (1) REPRODUCE it — write or run a failing test / concrete steps that show the wrong behaviour; (2) locate the ROOT CAUSE, not just the symptom; (3) fix the root cause and prove the reproduction now passes. Do not patch symptoms or skip the reproduction step.")
+	}
 	parts = append(parts, fmt.Sprintf("Repository: %s", work.Repo), fmt.Sprintf("Base branch: %s", work.BaseBranch))
+	parts = append(parts, taskAssessmentInstruction, agent.DeliveryInstruction)
 	if work.ExecutionMode == "push-existing" && work.SpecPath != "" {
 		parts = append(parts, fmt.Sprintf("Do not modify the spec file at %s.", work.SpecPath))
 	}
@@ -3853,13 +4470,26 @@ func buildAgentPullRequestInstruction(work workerInput, providerKind config.Prov
 		"When the implementation is ready and validation passes, create the pull request yourself using the configured provider tooling.",
 		"Before creating a PR, check whether one already exists for the current branch and avoid duplicates.",
 		"Write a concise, accurate PR title and a structured body that explains the actual changes and why they were made.",
+		"Open the pull request READY FOR REVIEW, not as a draft: the spec was already reviewed and human-approved before you were dispatched, so reviewers must be able to pick this PR up immediately. A draft PR is skipped by review automation and stalls the flow.",
 		fmt.Sprintf("Target base branch: %s.", work.BaseBranch),
 	}
 	if providerKind == config.ProviderKindGitHub {
 		parts[0] = "When the implementation is ready and validation passes, use the GitHub CLI (`gh`) to create the pull request yourself."
+		parts[3] = "Open the pull request READY FOR REVIEW, not as a draft: the spec was already reviewed and human-approved before you were dispatched, so reviewers must be able to pick this PR up immediately. Do NOT pass `--draft` to `gh pr create`; if a draft already exists for this branch, mark it ready with `gh pr ready`."
 	}
 	if work.IssueNumber > 0 {
-		parts = append(parts, fmt.Sprintf("Include `Closes %s` in the PR body.", formatIssueClosingReference(work.Repo, work.IssueRepo, work.IssueNumber)))
+		if issueIsNonGitHub(work.IssueURL) {
+			// The task comes from an external tracker (e.g. a Plane work item) whose id is
+			// NOT a GitHub issue number — a "Closes #<n>" would auto-close an unrelated
+			// GitHub issue on merge. Steer the agent away from it and give the real ref.
+			ref := strings.TrimSpace(work.IssueURL)
+			if ref == "" {
+				ref = strings.TrimSpace(work.Title)
+			}
+			parts = append(parts, fmt.Sprintf("This task comes from an external tracker, not a GitHub issue: %s. Do NOT add a `Closes #<n>` / `Fixes #<n>` line — that number is not a GitHub issue. Reference the source by its URL instead.", ref))
+		} else {
+			parts = append(parts, fmt.Sprintf("Include `Closes %s` in the PR body.", formatIssueClosingReference(work.Repo, work.IssueRepo, work.IssueNumber)))
+		}
 	}
 	if work.ExecutionMode == "push-existing" {
 		parts = append(parts, "If the existing PR title still has the planner/spec-generated `Spec: ...` format after implementation is pushed, rename it to an implementation-oriented title; preserve human-edited titles.")
@@ -3940,7 +4570,14 @@ func buildPullRequestBody(work workerInput, plan *checkpointPlan, execution *che
 	if execution != nil && execution.Summary != "" {
 		lines = append(lines, "", "## Agent Summary", execution.Summary)
 	}
-	if work.IssueNumber > 0 {
+	// A GitHub "Issue: #N" / "Closes #N" reference is only valid when the source issue
+	// actually lives on GitHub. Plane (and other external-tracker) work items carry
+	// their tracker's sequence id in IssueNumber — emitting "Closes #<planeSeq>" points
+	// at a non-existent GitHub issue (and would try to auto-close a stranger's #N on
+	// merge). Detect via the issue URL host; the "Issue URL:" line below is the correct,
+	// tracker-agnostic reference for those.
+	githubIssue := work.IssueNumber > 0 && !issueIsNonGitHub(work.IssueURL)
+	if githubIssue {
 		lines = append(lines, "", "Issue: "+formatIssueReference(firstNonEmpty(work.IssueRepo, work.Repo), work.IssueNumber))
 	}
 	if work.IssueURL != "" {
@@ -3952,10 +4589,23 @@ func buildPullRequestBody(work workerInput, plan *checkpointPlan, execution *che
 	if work.Prompt != "" {
 		lines = append(lines, "", fmt.Sprintf("Prompt: %s", work.Prompt))
 	}
-	if work.IssueNumber > 0 {
+	if githubIssue {
 		lines = append(lines, "", "Closes "+formatIssueClosingReference(work.Repo, work.IssueRepo, work.IssueNumber))
 	}
 	return strings.Join(lines, "\n")
+}
+
+// issueIsNonGitHub reports whether a source issue lives outside GitHub (e.g. a Plane
+// work item), inferred from its URL. An empty URL is treated as GitHub (the same-repo
+// discovery flow that carries no explicit URL), preserving existing behavior. A present
+// URL is GitHub only when it has the canonical /<owner>/<repo>/issues/<number> shape —
+// which holds for github.com and GitHub Enterprise, but not for Plane's
+// /projects/<uuid>/issues/<uuid> (or /browse/OPEND-N) URLs — so a Plane-sourced item
+// suppresses GitHub-only "#N" / "Closes #N" references that would otherwise point at a
+// non-existent GitHub issue.
+func issueIsNonGitHub(issueURL string) bool {
+	u := strings.TrimSpace(issueURL)
+	return u != "" && issueRepoFromURL(u) == ""
 }
 
 func hydrateWorkerInputFromIssue(work workerInput, issue IssueDetail) workerInput {
@@ -4352,7 +5002,7 @@ func backoffDelay(base time.Duration, attempts int64) time.Duration {
 }
 
 func isRetryableFailure(kind QueueFailureKind) bool {
-	return kind == FailureRetryableTransient || kind == FailureRetryableAfterResume
+	return kind == FailureRetryableTransient || kind == FailureRetryableAfterResume || kind == FailureRecoverableInfra
 }
 
 func cappedRetryDelayAttempt(attempts, maxAttempts int64) int64 {

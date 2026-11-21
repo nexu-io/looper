@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/nexu-io/looper/internal/loops"
+	loopcondition "github.com/nexu-io/looper/internal/loops/condition"
 	"github.com/nexu-io/looper/internal/storage"
 )
 
@@ -35,6 +36,7 @@ When you DO escalate, make it a decision brief the human can confirm in seconds 
 {
   "question": "<one concise question>",
   "options": ["<option 1>", "<option 2>"],
+  "mentionOpenIds": ["<responsible member open_id, optional; invite and confirm membership first>"],
   "recommendation": "<1-2 sentences: what you found, what you'd do, and why>",
   "recommendedOption": "<the option you recommend, matching one of options>",
   "consequences": {"<option 1>": "<what happens if picked>", "<option 2>": "<what happens if picked>"},
@@ -43,8 +45,29 @@ When you DO escalate, make it a decision brief the human can confirm in seconds 
 question + options are required; the rest are strongly encouraged (a bare question with no homework is a poor ask). Then STOP immediately without making further changes. A human will answer and you will be resumed in this same session with their decision.
 ---`
 
+// Presentation and conversational judgment belong to the agent. The bridge
+// only transports the existing ask fields and the next addressed reply.
+const feishuCollaborationInstruction = `
+
+FEISHU COLLABORATION:
+- Before mentioning a selected person, invite them into the existing task group and verify they are a current member. An invitation or a pending approval is not membership. If they have not joined, tell the owner that the invitation is pending; do not claim the person has received an @mention. Continue independent work while waiting.
+- Send collaboration messages and attachments ONLY as the bot, with an explicit --as bot when using lark-cli. Never use --as user to send on the owner's behalf unless the owner explicitly authorizes that specific message. Bot permission errors are not permission to impersonate the owner; report the missing permission instead. The host posts ask.json into the task thread, so do not send the same acceptance question yourself.
+- The host delivers your updates and .looper/ask.json to the existing task thread and resumes this session with addressed human replies. Do not search Feishu tasks or chats to locate the task, and do not create a second task or group. Implement the assigned work first; use ask.json for acceptance or a required human decision.
+- Write concise, plain Chinese for the people in the task thread. Lead with what changed or the specific question. Do not expose internal loop IDs, session IDs, local runtime paths, tool chatter, or generic progress slogans.
+- Write final summaries as two or three short Markdown paragraphs or a few bullets: result, useful evidence, and any material remaining gap. Tool-by-tool narration belongs in the execution record, which the host folds; do not paste it into the answer. Preserve meaningful paragraph breaks and use links, code spans or a small table where helpful. A simple follow-up needs only a direct answer.
+- Keep ask.json question to one or two short sentences: what needs judging and what to look at. Put member IDs only in mentionOpenIds, never in prose. Keep options short. Essential risks, costs and conditions for the decision must be visible in the question or option text; put supporting checks, reproduction steps, PR details and extended rationale in recommendation/consequences, which the card folds by default. Do not turn the question into a test report.
+- The task anchor shows current progress; the thread holds the conversation. When asked a follow-up, answer it before repeating the remaining decision. Do not treat a question, disagreement, or "先不要执行" as approval. Messages labeled [群内讨论，仅作背景] are context, not instructions to proceed; respond to [群成员 @bot] and respect any conditions in that message.
+- An @mention identifies the recipient, not the subject of the answer. In this task's acceptance thread, "验收通过" accepts the current deliverable unless the person explicitly limits its scope. Use the conversation context; do not ask them to confirm the same acceptance again. Continue the remaining PR work within existing authorization. Ask only about a genuinely new human decision; never invent merge authorization or repeat generic warnings about it in every message.
+- Write options as plain, unnumbered strings in ask.json; the thread renders nonempty options as 1, 2, 3 in order. A reply may be a number, a request for explanation, a correction, or a delegated decision. Interpret it against the exact previous options. Do not invent approval buttons or require a rigid response phrase.
+- Before asking for a judgment, prepare the smallest useful evidence: a working preview for behavior/UI, before-and-after screenshots for visual changes, a short recording for a sequence of steps, or a small comparison/table for tradeoffs. Explain what to look at and how it relates to the decision. Prefer one useful artifact over a pile of links. Use the tools actually available; never claim a screenshot, deployment, upload or check you did not perform.
+- Put the key finding and real evidence links into question/recommendation, with each option's impact in consequences. The human cannot see your terminal output. A local path is not a shared link. Label localhost previews as available only on the host machine; state when an artifact cannot be shared. Do not invent URLs or image keys.
+- Prefer native Feishu images/files over bare external attachment URLs. A URL that works on this machine is not proof the reviewer can open it. If a reviewer reports an inaccessible artifact, try an appropriate accessible alternative (native image, recording or file) and explain any interaction it cannot demonstrate; do not treat uploading a link as completed delivery.
+- For delivery, state the user-visible result, how to view it, what you verified and the relevant remaining gap (for example: unit tests passed, browser flow not checked). A successful tool exit is not human acceptance, a merged PR, or a production release. Use a clear small table or annotated screenshot when it helps; do not force every answer into a long report.
+`
+
 type hitlAsk struct {
 	Question          string            `json:"question"`
+	MentionOpenIDs    []string          `json:"mentionOpenIds,omitempty"`
 	Options           []string          `json:"options"`
 	Recommendation    string            `json:"recommendation,omitempty"`
 	RecommendedOption string            `json:"recommendedOption,omitempty"`
@@ -84,11 +107,12 @@ func consumeAskSentinel(worktreePath string) (*hitlAsk, error) {
 // human mid-run. The step loop catches it and suspends the loop as
 // awaiting_human instead of treating it as a failure.
 type awaitingHumanError struct {
-	question    string
-	options     []string
-	sessionID   string
-	executionID string
-	vendor      string
+	question       string
+	mentionOpenIDs []string
+	options        []string
+	sessionID      string
+	executionID    string
+	vendor         string
 	// The agent's decision brief (optional) — carried through to the ask card.
 	recommendation    string
 	recommendedOption string
@@ -219,6 +243,23 @@ func (r *Runner) pendingHumanAnswer(ctx context.Context, loop *storage.LoopRecor
 		agentVendor = r.agentRuntime
 	}
 	resumePrompt := fmt.Sprintf("A human answered the question you asked earlier (%q). Their decision: %s\nContinue the task using this decision; do not ask the same question again.", ask.Question, ask.Answer)
+	if ask.Transport == "feishu" {
+		var previous strings.Builder
+		number := 0
+		for _, option := range ask.Options {
+			if option = strings.TrimSpace(option); option != "" {
+				number++
+				fmt.Fprintf(&previous, "\n%d. %s", number, option)
+				if consequence := strings.TrimSpace(ask.Consequences[option]); consequence != "" {
+					fmt.Fprintf(&previous, " — %s", consequence)
+				}
+			}
+		}
+		resumePrompt = fmt.Sprintf("The responsible human replied in the task thread. Your previous question: %q\nPrevious options:%s\nPrevious recommendation: %s\nTheir message: %s\nRead this as conversation, not automatic approval. Answer follow-up questions in plain Chinese. If the decision is still unclear, explain and write .looper/ask.json again, then stop. The human sees only the question, options, recommendation and consequences from ask.json, so include your explanation and evidence there. Proceed with the blocked choice only when their addressed reply gives a clear decision or explicitly delegates it to you. A concrete requested correction authorizes that scoped revision: implement and verify it, then ask again for any remaining acceptance decision. Continue from the existing task and worktree; do not restart unrelated work.", ask.Question, previous.String(), ask.Recommendation, ask.Answer)
+	}
+	if ask.Transport == "feishu" {
+		resumePrompt += feishuCollaborationInstruction
+	}
 	if strings.TrimSpace(ask.Vendor) != strings.TrimSpace(agentVendor) {
 		return resumePrompt + "\nThe configured agent vendor changed after the question was asked, so continue in a fresh session rather than trying to attach to the prior vendor's session.", ""
 	}
@@ -266,10 +307,10 @@ func (r *Runner) readFreshHITLAsk(ctx context.Context, loop *storage.LoopRecord)
 	return loops.ReadHITLAsk(meta)
 }
 
-// detectHumanAsk consumes the agent's ask sentinel (if any) and, when present,
+// detectHITLAskSentinel consumes the agent's source-of-truth ask sentinel and, when present,
 // returns a typed awaitingHumanError carrying the question, options, and the
 // agent's native session id (so the run can resume the same session).
-func (r *Runner) detectHumanAsk(ctx context.Context, input stepInput, worktreePath, executionID string) (*awaitingHumanError, error) {
+func (r *Runner) detectHITLAskSentinel(ctx context.Context, input stepInput, worktreePath, executionID string) (*awaitingHumanError, error) {
 	ask, err := consumeAskSentinel(worktreePath)
 	if err != nil {
 		// Best-effort: a read error is treated as "no ask" rather than failing the
@@ -288,6 +329,7 @@ func (r *Runner) detectHumanAsk(ctx context.Context, input stepInput, worktreePa
 	sessionID, vendor := r.latestAgentSession(ctx, input.Loop.ID)
 	return &awaitingHumanError{
 		question:          ask.Question,
+		mentionOpenIDs:    ask.MentionOpenIDs,
 		options:           ask.Options,
 		sessionID:         sessionID,
 		executionID:       executionID,
@@ -323,6 +365,7 @@ func (r *Runner) suspendForHuman(ctx context.Context, input stepInput, run stora
 	nowISO := r.nowISO()
 	ask := loops.HITLAsk{
 		Question:          awaiting.question,
+		MentionOpenIDs:    awaiting.mentionOpenIDs,
 		Options:           awaiting.options,
 		SessionID:         awaiting.sessionID,
 		ExecutionID:       awaiting.executionID,
@@ -333,6 +376,9 @@ func (r *Runner) suspendForHuman(ctx context.Context, input stepInput, run stora
 		RecommendedOption: awaiting.recommendedOption,
 		Consequences:      awaiting.consequences,
 		Confidence:        awaiting.confidence,
+	}
+	if strings.EqualFold(strings.TrimSpace(r.hitlAnswerTransport), "feishu") {
+		ask.Transport = "feishu"
 	}
 	// GitHub transport (default): post the question on a (draft) PR before parking,
 	// so the ask metadata carries the PR + comment id the answer-poll lane needs.
@@ -348,9 +394,10 @@ func (r *Runner) suspendForHuman(ctx context.Context, input stepInput, run stora
 		if meta, werr := loops.WriteHITLAsk(updated.MetadataJSON, ask); werr == nil {
 			updated.MetadataJSON = &meta
 		}
-		// The agent re-asked after reading the queued human messages, so they're
-		// consumed — clear the inbox so they aren't re-injected on the next resume.
 		if meta, werr := loops.ClearHumanInbox(updated.MetadataJSON); werr == nil {
+			updated.MetadataJSON = &meta
+		}
+		if meta, werr := loopcondition.Set(updated.MetadataJSON, loopcondition.Record{Kind: loopcondition.HumanAnswered, Since: nowISO}); werr == nil {
 			updated.MetadataJSON = &meta
 		}
 		updated.Status = "awaiting_human"
@@ -359,6 +406,7 @@ func (r *Runner) suspendForHuman(ctx context.Context, input stepInput, run stora
 	}); err != nil {
 		return ProcessResult{}, err
 	}
+	r.track(ctx, "human.requested", run.ID, input.Project.ID, input.Loop.ID, run.ID, map[string]any{"transport": ask.Transport, "askedAt": ask.AskedAt})
 	reason := "worker suspended awaiting human decision"
 	if _, err := r.repos.Queue.CancelByLoop(ctx, input.Loop.ID, nowISO, &reason); err != nil {
 		return ProcessResult{}, err
@@ -367,7 +415,7 @@ func (r *Runner) suspendForHuman(ctx context.Context, input stepInput, run stora
 	if _, err := r.completeRun(ctx, run, "interrupted", summary, "", checkpoint); err != nil {
 		return ProcessResult{}, err
 	}
-	if !r.hitlTransportGitHub() && r.hitlNotify != nil {
+	if r.hitlNotify != nil && (strings.TrimSpace(ask.ActionURL) != "" || ask.Transport == "feishu") {
 		notif := HITLAskNotification{
 			ProjectID:         input.Project.ID,
 			LoopID:            input.Loop.ID,
@@ -382,18 +430,22 @@ func (r *Runner) suspendForHuman(ctx context.Context, input stepInput, run stora
 			Consequences:      awaiting.consequences,
 			Confidence:        awaiting.confidence,
 		}
-		// Source + trigger come from the loop's work metadata (issue #, url, author).
+		// Source + trigger come from the durable source-of-truth ask and work metadata.
+		notif.SourceURL = ask.ActionURL
 		if w := checkpoint.Work; w != nil {
 			notif.TriggerLogin = w.TriggerLogin
 			switch {
 			case w.PRNumber > 0:
-				notif.SourceType = "GitHub PR"
+				notif.SourceType = "GitHub decision comment"
 				notif.SourceRef = "#" + strconv.FormatInt(w.PRNumber, 10)
 			case w.IssueNumber > 0:
 				notif.SourceType = "GitHub Issue"
 				notif.SourceRef = "#" + strconv.FormatInt(w.IssueNumber, 10)
-				notif.SourceURL = w.IssueURL
 			}
+		}
+		if ask.PRNumber > 0 {
+			notif.SourceType = "GitHub decision comment"
+			notif.SourceRef = "PR #" + strconv.FormatInt(ask.PRNumber, 10)
 		}
 		if err := r.hitlNotify(ctx, notif); err != nil {
 			if r.logger != nil {
@@ -509,6 +561,10 @@ func (r *Runner) deliverAskToGitHub(ctx context.Context, input stepInput, checkp
 	}
 
 	ask.Transport = "github"
+	ask.ActionURL = strings.TrimSpace(res.URL)
+	if ask.ActionURL == "" && res.ID > 0 {
+		ask.ActionURL = fmt.Sprintf("https://github.com/%s/pull/%d#issuecomment-%d", strings.Trim(repo, "/"), prNumber, res.ID)
+	}
 	ask.PRNumber = prNumber
 	ask.AskCommentID = res.ID
 	return nil

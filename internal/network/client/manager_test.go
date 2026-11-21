@@ -41,6 +41,29 @@ func TestManagerUpdateConfigPublishesProjectCatalog(t *testing.T) {
 	}
 }
 
+func TestHasStrictDispatchProviderOnlyReportsEnabledPlaneProvider(t *testing.T) {
+	t.Parallel()
+
+	if hasStrictDispatchProvider(config.Config{Providers: []config.ProviderConfig{{
+		Kind:           config.ProviderKindPlane,
+		StrictDispatch: &config.PlaneStrictDispatchConfig{Enabled: false},
+	}}}) {
+		t.Fatal("disabled Plane strict dispatch reported as available")
+	}
+	if hasStrictDispatchProvider(config.Config{Providers: []config.ProviderConfig{{
+		Kind:           config.ProviderKindGitHub,
+		StrictDispatch: &config.PlaneStrictDispatchConfig{Enabled: true},
+	}}}) {
+		t.Fatal("non-Plane strict dispatch reported as available")
+	}
+	if !hasStrictDispatchProvider(config.Config{Providers: []config.ProviderConfig{{
+		Kind:           config.ProviderKindPlane,
+		StrictDispatch: &config.PlaneStrictDispatchConfig{Enabled: true},
+	}}}) {
+		t.Fatal("enabled Plane strict dispatch was not reported")
+	}
+}
+
 func TestManagerStartWithoutRoutedProjectsPreservesProjectCounts(t *testing.T) {
 	statePath := filepath.Join(t.TempDir(), "network.json")
 	if err := SaveState(statePath, LocalState{NetworkID: "net-1", NodeID: "node-1", NodeName: "worker-1", GitHub: protocol.GitHubIdentity{NumericID: 101, Login: "stored-user"}}); err != nil {
@@ -57,6 +80,55 @@ func TestManagerStartWithoutRoutedProjectsPreservesProjectCounts(t *testing.T) {
 		t.Fatalf("Status().RoutedProjects = %d, want %d", got, want)
 	}
 	if got, want := status.LocalProjects, 2; got != want {
+		t.Fatalf("Status().LocalProjects = %d, want %d", got, want)
+	}
+}
+
+func TestManagerStartWithStrictDispatchHeartbeatsWithoutRoutedProjects(t *testing.T) {
+	ctx := context.Background()
+	service, err := cloud.Open(ctx, cloud.Config{DBPath: filepath.Join(t.TempDir(), "net.sqlite"), AdminToken: "admin-token", ProtocolVersion: protocol.CurrentVersion, MinimumDaemonVersion: "0.0.0"})
+	if err != nil {
+		t.Fatalf("cloud.Open() error = %v", err)
+	}
+	defer service.Close()
+	server := cloud.NewServer(cloud.Config{AdminToken: "admin-token"}, service)
+	httpServer := httptest.NewServer(server.Handler())
+	defer httpServer.Close()
+
+	joinKey, err := service.CreateJoinKey(ctx)
+	if err != nil {
+		t.Fatalf("CreateJoinKey() error = %v", err)
+	}
+	joinResp, err := New(httpServer.URL, "", httpServer.Client()).Join(ctx, protocol.JoinRequest{ProtocolVersion: protocol.CurrentVersion, DaemonVersion: "0.0.0", JoinKey: joinKey, NodeName: "strict-worker", GitHub: protocol.GitHubIdentity{NumericID: 101, Login: "stored-user"}})
+	if err != nil {
+		t.Fatalf("Join() error = %v", err)
+	}
+	statePath := filepath.Join(t.TempDir(), "network.json")
+	if err := SaveState(statePath, LocalState{URL: httpServer.URL, NetworkID: joinResp.NetworkID, NodeID: joinResp.NodeID, NodeName: "strict-worker", NodeToken: joinResp.NodeToken, GitHub: protocol.GitHubIdentity{NumericID: 101, Login: "stored-user"}}); err != nil {
+		t.Fatalf("SaveState() error = %v", err)
+	}
+	cfg := config.Config{
+		Projects:  []config.ProjectRefConfig{{ID: "local-project"}},
+		Providers: []config.ProviderConfig{{Kind: config.ProviderKindPlane, StrictDispatch: &config.PlaneStrictDispatchConfig{Enabled: true}}},
+	}
+	manager := NewManager(statePath, cfg, nil, nil)
+	if err := manager.Start(ctx); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	defer manager.Stop()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for !manager.Status().CloudReachable && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	status := manager.Status()
+	if !status.CloudReachable {
+		t.Fatal("Status().CloudReachable = false, want true")
+	}
+	if got, want := status.RoutedProjects, 0; got != want {
+		t.Fatalf("Status().RoutedProjects = %d, want %d", got, want)
+	}
+	if got, want := status.LocalProjects, 1; got != want {
 		t.Fatalf("Status().LocalProjects = %d, want %d", got, want)
 	}
 }

@@ -232,7 +232,7 @@ Looper's frozen canonical top-level config roots are:
 | `logging` | logs, verbosity, sinks, and diagnostic controls |
 | `notifications` | user notifications such as osascript or future notifier integrations |
 | `disclosure` | disclosure/stamping policy for outward-facing automation output |
-| `tools` | external tool paths and tool-specific execution settings such as `git`, `gh`, and `osascript` |
+| `tools` | external tool paths and tool-specific execution settings such as `git`, `gh`, `plane`, and the optional renderer `browserPath` |
 | `package` | packaging, upgrade, and distribution policy |
 | `defaults` | user-facing default policy that does not belong to a narrower domain |
 | `instructions` | global instruction-system settings that are not role-specific instruction content |
@@ -420,6 +420,8 @@ For fresh unattended runs, Looper supplies `--always-approve` and `--sandbox off
 Grok Build support is fresh-run only. Daemon native resume and interactive takeover through `looper resume` are unsupported. A retry uses a fresh checkpoint prompt, and Looper never uses Grok Build's ambient `--continue`.
 
 ## Pi
+
+These runtime settings apply to the Go executor. The standalone `collab start` currently uses the pinned feishu-codex-bridge and local Codex app-server; its backend is not selected by `agent.vendor` or Worker argv overrides.
 
 Use `pi` as the `agent.vendor` identifier. Looper invokes the [Pi](https://pi.dev) coding agent executable as `pi`:
 
@@ -764,9 +766,19 @@ Set `roles.reviewer.autoMerge.enabled = true` explicitly to opt into Forgejo aut
 `plane` splits the task source from the code forge: Planner/Worker read work-items from Plane (filtered by a trigger label), while pull requests are opened and reviewed on the project's GitHub `repo`. Plane rules:
 
 - `providers[].kind = "plane"` requires a non-empty `tokenEnv` (the env var holding the Plane API key), `workspace` (the Plane workspace slug), and `projectId` (the Plane project UUID). `baseUrl` is optional and defaults to the public Plane API base.
+- A Plane project that has activated strict owner-only dispatch also sets
+  `providers[].strictDispatch`: `enabled: true`, the Plane app origin in
+  `baseUrl` (for example `https://plane.example.com`), stable `nodeId`, approved
+  `bindingId`, positive `keyRevision`, and `privateKeyFile`. The key file must be
+  a PKCS#8 Ed25519 PEM readable only by its owner (`chmod 600`). Strict mode
+  discovers work only from the Node's signed inbox; trigger labels and assignees
+  are no longer execution authority.
 - The project bound to a plane provider requires explicit `provider` and `repo`, where `repo` is the **GitHub code repo** (`owner/name`) where PRs are opened, and `repoPath` is its local checkout.
 - Discovery keys on the trigger label only; because Plane assignees are UUIDs (not GitHub logins), set `roles.*.triggers.requireAssigneeCurrentUser = false`.
 - One command scaffolds all of this: `looper bootstrap --provider plane …` (see [Plane provider + Feishu HITL setup](plane-provider.md)).
+- `roles.planner.preSpecDecisionGrill` is an opt-in, new-loop-only V2 pipeline. It routes product/design/engineering questions through Plane before the Chinese technical Spec. Configure each project's `productOwner`, `designOwner`, and local `owner` with both `feishuOpenId` (notification) and `planeId` (answer/approval authority). Missing identities fail closed only when that role is actually asked.
+- V2 requirement answers and technical-Spec approval are Plane-only inbound. Feishu remains a one-way notification/screenshot/link surface for this pipeline; generic coding HITL keeps its separately configured transport.
+- In a shared Feishu notification group, task anchors, live-progress cards, and HITL cards end with `来自 @owner 的 Looper`. The identity comes from that local installation's project `owner.feishuOpenId`, so teammates can distinguish cards emitted by different machines. The owner does not need to be a member of the chat; a grey @ is valid and never blocks delivery. An unset owner is shown explicitly as `未配置 owner` instead of silently producing an anonymous card.
 
 ### Forgejo live sandbox e2e
 
@@ -1269,6 +1281,8 @@ inlineCommentVisible = true
 gitPath = "/usr/bin/git"
 ghPath = "/opt/homebrew/bin/gh"
 osascriptPath = "/usr/bin/osascript"
+# Optional when Chrome/Chromium is not discoverable automatically:
+# browserPath = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
 
 [[providers]]
 id = "forgejo-main"
@@ -1674,6 +1688,10 @@ Either:
 [notifications.osascript]
 enabled = false
 ```
+
+### Design-option screenshots report that Chrome/Chromium was not found
+
+Install Chrome/Chromium locally or set `tools.browserPath` to its absolute executable path. Looper never downloads a browser or accepts an arbitrary render command.
 
 ### A runtime path is not writable
 

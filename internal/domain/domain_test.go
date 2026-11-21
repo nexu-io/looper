@@ -14,6 +14,12 @@ func TestAssertLoopTypeMatchesTarget(t *testing.T) {
 	if err := AssertLoopTypeMatchesTarget(LoopTypeReviewer, LoopTarget{TargetType: LoopTargetTypeProject, ProjectID: "project_1"}); err == nil {
 		t.Fatal("AssertLoopTypeMatchesTarget(reviewer, project) error = nil, want failure")
 	}
+	if err := AssertLoopTypeMatchesTarget(LoopTypeCoordinator, LoopTarget{TargetType: LoopTargetTypeIssue, Repo: "acme/looper", IssueNumber: 42}); err != nil {
+		t.Fatalf("AssertLoopTypeMatchesTarget(coordinator, issue) error = %v", err)
+	}
+	if err := AssertLoopTypeMatchesTarget(LoopTypeCoordinator, LoopTarget{TargetType: LoopTargetTypePullRequest, Repo: "acme/looper", PRNumber: 7}); err == nil {
+		t.Fatal("AssertLoopTypeMatchesTarget(coordinator, pull_request) error = nil, want failure")
+	}
 }
 
 func TestAssertUniqueActiveLoopAllowsConcurrentProjectWorkers(t *testing.T) {

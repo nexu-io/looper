@@ -14,6 +14,7 @@ import (
 )
 
 var networkNodeNamePattern = regexp.MustCompile(`^[A-Za-z0-9_.-]+$`)
+var planeMemberIDPattern = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
 var environmentNamePattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 var agentProfileIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
 
@@ -99,12 +100,53 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 		issues = append(issues, ValidationIssue{Path: "scheduler.retryBaseDelayMs", Message: "must be a positive integer"})
 	}
 
+	if config.Scheduler.InfraRetryBudgetSeconds < 0 {
+		issues = append(issues, ValidationIssue{Path: "scheduler.infraRetryBudgetSeconds", Message: "must be an integer >= 0"})
+	}
+
 	if config.Scheduler.SlowLaneWarnThresholdMS < 1 {
 		issues = append(issues, ValidationIssue{Path: "scheduler.slowLaneWarnThresholdMs", Message: "must be a positive integer"})
 	}
 
 	if config.Scheduler.DiscoveryCacheTTLSeconds < 0 {
 		issues = append(issues, ValidationIssue{Path: "scheduler.discoveryCacheTtlSeconds", Message: "must be an integer >= 0"})
+	}
+
+	answerTransport := strings.ToLower(strings.TrimSpace(config.HITL.AnswerTransport))
+	if answerTransport != "" && answerTransport != "github" && answerTransport != "respond" && answerTransport != "feishu" {
+		issues = append(issues, ValidationIssue{Path: "hitl.answerTransport", Message: "must be github, respond, or feishu"})
+	}
+	if answerTransport == "feishu" {
+		fs := config.HITL.Feishu
+		if fs == nil {
+			issues = append(issues, ValidationIssue{Path: "hitl.answerTransport", Message: "feishu requires hitl.feishu"})
+		} else {
+			if strings.TrimSpace(fs.ChatID) != "" && !strings.HasPrefix(fs.ChatID, "oc_") {
+				issues = append(issues, ValidationIssue{Path: "hitl.feishu.chatId", Message: "must be a Feishu chat id (oc_...) when set"})
+			}
+			if strings.TrimSpace(fs.OwnerOpenID) != "" && !strings.HasPrefix(fs.OwnerOpenID, "ou_") {
+				issues = append(issues, ValidationIssue{Path: "hitl.feishu.ownerOpenId", Message: "must be a Feishu open_id (ou_...) when set"})
+			}
+			if strings.TrimSpace(fs.ChatID) == "" && !fs.AutoCreateTaskChats && strings.TrimSpace(fs.Inbound) == "" {
+				issues = append(issues, ValidationIssue{Path: "hitl.feishu", Message: "set chatId or enable autoCreateTaskChats"})
+			}
+			if inbound := strings.TrimSpace(fs.Inbound); inbound != "" {
+				if !strings.EqualFold(inbound, "cf-inbox") {
+					issues = append(issues, ValidationIssue{Path: "hitl.feishu.inbound", Message: "must be cf-inbox when set"})
+				}
+				if strings.TrimSpace(fs.EventInboxURLEnv) == "" {
+					issues = append(issues, ValidationIssue{Path: "hitl.feishu.eventInboxUrlEnv", Message: "is required for cf-inbox"})
+				}
+				if strings.TrimSpace(fs.EventInboxTokenEnv) == "" {
+					issues = append(issues, ValidationIssue{Path: "hitl.feishu.eventInboxTokenEnv", Message: "is required for cf-inbox"})
+				}
+			}
+			for i, id := range fs.InviteOpenIDs {
+				if strings.TrimSpace(id) != "" && !strings.HasPrefix(id, "ou_") {
+					issues = append(issues, ValidationIssue{Path: fmt.Sprintf("hitl.feishu.inviteOpenIds[%d]", i), Message: "must be a Feishu open_id (ou_...)"})
+				}
+			}
+		}
 	}
 
 	if config.Webhook.FallbackPollIntervalSeconds < 60 {
@@ -165,27 +207,6 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 		issues = append(issues, ValidationIssue{Path: "notifications.webhook.mode", Message: "must be one of: webhook, app"})
 	}
 
-	transport := strings.ToLower(strings.TrimSpace(config.HITL.AnswerTransport))
-	switch transport {
-	case "", "github", "respond":
-	case "feishu":
-		if config.HITL.Feishu == nil {
-			issues = append(issues, ValidationIssue{Path: "hitl.feishu", Message: "is required when hitl.answerTransport is feishu"})
-		} else {
-			if !strings.EqualFold(strings.TrimSpace(config.HITL.Feishu.Inbound), "cf-inbox") {
-				issues = append(issues, ValidationIssue{Path: "hitl.feishu.inbound", Message: "must be cf-inbox when hitl.answerTransport is feishu"})
-			}
-			if strings.TrimSpace(config.HITL.Feishu.EventInboxURLEnv) == "" {
-				issues = append(issues, ValidationIssue{Path: "hitl.feishu.eventInboxUrlEnv", Message: "is required when hitl.answerTransport is feishu"})
-			}
-			if strings.TrimSpace(config.HITL.Feishu.EventInboxTokenEnv) == "" {
-				issues = append(issues, ValidationIssue{Path: "hitl.feishu.eventInboxTokenEnv", Message: "is required when hitl.answerTransport is feishu"})
-			}
-		}
-	default:
-		issues = append(issues, ValidationIssue{Path: "hitl.answerTransport", Message: "must be one of: github, feishu, respond"})
-	}
-
 	if !isValidDaemonMode(config.Daemon.Mode) {
 		issues = append(issues, ValidationIssue{Path: "daemon.mode", Message: fmt.Sprintf("must be one of: %s, %s", DaemonModeForeground, DaemonModeLaunchd)})
 	}
@@ -211,6 +232,7 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 		issues = append(issues, ValidationIssue{Path: "daemon.workingDirectory", Message: "must be a non-empty path"})
 	}
 	validateWorktreeCleanupConfig(config.Daemon.WorktreeCleanup, "daemon.worktreeCleanup", &issues)
+	validateDiskBackpressureConfig(config.Daemon.DiskBackpressure, "daemon.diskBackpressure", &issues)
 
 	if strings.TrimSpace(config.Package.Distribution) == "" {
 		issues = append(issues, ValidationIssue{Path: "package.distribution", Message: "must be a non-empty string"})
@@ -292,6 +314,7 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 	validateCoordinatorRoleConfig(config.Roles.Coordinator, "roles.coordinator", &issues)
 	validateIssueRoleTriggers(config.Roles.Planner.Triggers, "roles.planner.triggers", &issues)
 	validateIssueRoleTriggers(config.Roles.Worker.Triggers, "roles.worker.triggers", &issues)
+	validateNoIssueRoleTriggerLabelOverlap(config.Roles.Planner, config.Roles.Worker, "", &issues)
 	validateReviewerRoleTriggers(config.Roles.Reviewer.Discovery.Triggers, "roles.reviewer.discovery.triggers", &issues)
 	validateFixerRoleTriggers(config.Roles.Fixer.Triggers, "roles.fixer.triggers", &issues)
 	if config.Roles.Reviewer.Discovery.SpecReview.IncludeReviewingLabel && strings.TrimSpace(config.Roles.Reviewer.Discovery.SpecReview.ReviewingLabel) == "" {
@@ -321,6 +344,9 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 			validateForgejoProviderAuth(config, provider, prefix, &issues)
 		}
 		if provider.Kind == ProviderKindPlane {
+			if !isNilOrEmptyString(provider.WebBaseURL) && !IsHTTPOrigin(*provider.WebBaseURL) {
+				issues = append(issues, ValidationIssue{Path: prefix + ".webBaseUrl", Message: "must be an http(s) origin without credentials, path, query or fragment"})
+			}
 			// baseUrl is optional (a default Plane host is used when omitted); if
 			// provided it must be an absolute http(s) URL.
 			if strings.TrimSpace(provider.BaseURL) != "" && !isAbsoluteHTTPURL(provider.BaseURL) {
@@ -334,6 +360,23 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 			}
 			if isNilOrEmptyString(provider.ProjectID) {
 				issues = append(issues, ValidationIssue{Path: prefix + ".projectId", Message: "is required for plane providers (Plane project UUID)"})
+			}
+			if strict := provider.StrictDispatch; strict != nil && strict.Enabled {
+				if !isAbsoluteHTTPURL(strict.BaseURL) {
+					issues = append(issues, ValidationIssue{Path: prefix + ".strictDispatch.baseUrl", Message: "must be the absolute Plane app API origin"})
+				}
+				if strict.NodeID == "" {
+					issues = append(issues, ValidationIssue{Path: prefix + ".strictDispatch.nodeId", Message: "is required"})
+				}
+				if strict.BindingID == "" {
+					issues = append(issues, ValidationIssue{Path: prefix + ".strictDispatch.bindingId", Message: "is required"})
+				}
+				if strict.KeyRevision == 0 {
+					issues = append(issues, ValidationIssue{Path: prefix + ".strictDispatch.keyRevision", Message: "must be positive"})
+				}
+				if strict.PrivateKeyFile == "" {
+					issues = append(issues, ValidationIssue{Path: prefix + ".strictDispatch.privateKeyFile", Message: "is required"})
+				}
 			}
 		}
 	}
@@ -419,6 +462,14 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 		validateProjectRoleOverrides(project.Roles, prefix+".roles", config.Instructions.MaxBytes, &issues)
 		validateProjectRoleAgentBindings(project.Roles, prefix+".roles", &issues)
 		effectiveProjectRoles := ProjectRoleConfigs(config, project.ID)
+		// A project override can put the worker back on the planner label with
+		// requireAssigneeCurrentUser, recreating the double-dispatch the global guard
+		// prevents. Re-run the overlap check on the effective roles when this project
+		// actually overrides planner/worker (a plain project inherits the global roles
+		// already checked above, so skip it to avoid re-reporting a global overlap).
+		if project.Roles != nil && (project.Roles.Planner != nil || project.Roles.Worker != nil) {
+			validateNoIssueRoleTriggerLabelOverlap(effectiveProjectRoles.Planner, effectiveProjectRoles.Worker, prefix+".", &issues)
+		}
 		for _, roleInstruction := range roleInstructions(effectiveProjectRoles) {
 			if !projectRoleInstructionsConfigured(project.Roles, roleInstruction.role) {
 				continue
@@ -429,6 +480,10 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 		if effectiveProjectRoles.Reviewer.Discovery.SpecReview.IncludeReviewingLabel && strings.TrimSpace(effectiveProjectRoles.Reviewer.Discovery.SpecReview.ReviewingLabel) == "" {
 			issues = append(issues, ValidationIssue{Path: prefix + ".roles.reviewer.discovery.specReview.reviewingLabel", Message: "must be a non-empty string when includeReviewingLabel is true"})
 		}
+		validateProductOwner(project.ProductOwner, prefix+".productOwner", &issues)
+		validateFeishuActor(project.DesignOwner, prefix+".designOwner", &issues)
+		validateFeishuActor(project.QA, prefix+".qa", &issues)
+		validateFeishuActor(project.Owner, prefix+".owner", &issues)
 		validateReviewerFollowUpInterval(effectiveProjectRoles.Reviewer.Discovery.FollowUpInterval, prefix+".roles.reviewer.discovery.followUpInterval", &issues)
 		if project.Roles != nil && project.Roles.Reviewer != nil && project.Roles.Reviewer.Skills != nil {
 			validateReviewerSkillsConfig(effectiveProjectRoles.Reviewer.Skills, prefix+".roles.reviewer.skills", &issues)
@@ -545,6 +600,12 @@ func isAbsoluteHTTPURL(value string) bool {
 	return (parsed.Scheme == "http" || parsed.Scheme == "https") && parsed.Host != ""
 }
 
+// IsHTTPOrigin validates a human-facing web origin without embedded credentials.
+func IsHTTPOrigin(value string) bool {
+	parsed, err := url.Parse(strings.TrimSpace(value))
+	return err == nil && (parsed.Scheme == "http" || parsed.Scheme == "https") && parsed.Host != "" && parsed.User == nil && (parsed.Path == "" || parsed.Path == "/") && parsed.RawQuery == "" && parsed.Fragment == ""
+}
+
 func validateForgejoRoleCapabilities(roles RoleConfigs, prefix string, issues *[]ValidationIssue) {
 	if roles.Reviewer.Behavior.ThreadResolution.Enabled {
 		*issues = append(*issues, ValidationIssue{Path: prefix + ".roles.reviewer.behavior.threadResolution.enabled", Message: "must be false for forgejo projects"})
@@ -621,6 +682,21 @@ func validateWorktreeCleanupConfig(config WorktreeCleanupConfig, path string, is
 	}
 	if config.MaxPerTick < 1 {
 		*issues = append(*issues, ValidationIssue{Path: path + ".maxPerTick", Message: "must be a positive integer"})
+	}
+}
+
+func validateDiskBackpressureConfig(config DiskBackpressureConfig, path string, issues *[]ValidationIssue) {
+	if !config.Enabled {
+		return
+	}
+	if config.HighWatermarkPercent <= 0 || config.HighWatermarkPercent > 100 {
+		*issues = append(*issues, ValidationIssue{Path: path + ".highWatermarkPercent", Message: "must be a percentage in (0, 100]"})
+	}
+	if config.HardStopPercent <= 0 || config.HardStopPercent > 100 {
+		*issues = append(*issues, ValidationIssue{Path: path + ".hardStopPercent", Message: "must be a percentage in (0, 100]"})
+	}
+	if config.HardStopPercent > 0 && config.HighWatermarkPercent > 0 && config.HardStopPercent < config.HighWatermarkPercent {
+		*issues = append(*issues, ValidationIssue{Path: path + ".hardStopPercent", Message: "must be >= highWatermarkPercent"})
 	}
 }
 
@@ -1316,6 +1392,89 @@ func validateDistinctLabels(labels []labelPathValue, issues *[]ValidationIssue) 
 			continue
 		}
 		seen[trimmed] = label.Path
+	}
+}
+
+// validateNoIssueRoleTriggerLabelOverlap flags the P4 misconfiguration where the
+// worker shares a trigger label with the planner, so a single issue fires BOTH
+// roles at once (one need → two PRs). It deliberately exempts the Plane
+// single-label lifecycle, where the planner and worker share one label on purpose
+// and route by assignee UUID rather than the current GitHub user — signalled by
+// RequireAssigneeCurrentUser being false on both roles (see applyPlaneBootstrapPlan).
+// validateNoIssueRoleTriggerLabelOverlap flags a planner/worker trigger-label
+// overlap that would let one issue fire both roles. pathPrefix is "" for the global
+// roles and "projects[i]." for a project's effective (merged) roles, so a project
+// override that recreates the overlap is reported at a project-scoped path.
+func validateNoIssueRoleTriggerLabelOverlap(planner PlannerRoleConfig, worker WorkerRoleConfig, pathPrefix string, issues *[]ValidationIssue) {
+	// Plane lifecycle: both roles keyed off one label, routed by assignee UUID, not
+	// the GitHub current-user filter. That shared label is intended, not a bug.
+	if !planner.Triggers.RequireAssigneeCurrentUser && !worker.Triggers.RequireAssigneeCurrentUser {
+		return
+	}
+	plannerLabels := map[string]struct{}{}
+	for _, label := range planner.Triggers.Labels {
+		if trimmed := strings.TrimSpace(label); trimmed != "" {
+			plannerLabels[trimmed] = struct{}{}
+		}
+	}
+	for index, label := range worker.Triggers.Labels {
+		trimmed := strings.TrimSpace(label)
+		if trimmed == "" {
+			continue
+		}
+		if _, ok := plannerLabels[trimmed]; ok {
+			*issues = append(*issues, ValidationIssue{
+				Path:    fmt.Sprintf("%sroles.worker.triggers.labels[%d]", pathPrefix, index),
+				Message: fmt.Sprintf("overlaps %sroles.planner.triggers.labels: %q would trigger both the planner and the worker for one issue", pathPrefix, trimmed),
+			})
+		}
+	}
+}
+
+// validateProductOwner checks the optional per-project product owner (plan §8.3):
+// when set, the Feishu open_id must be trimmed and shaped like an open_id (ou_…),
+// so an @-mention doesn't silently resolve to nobody.
+func validateProductOwner(owner *ProductOwnerConfig, path string, issues *[]ValidationIssue) {
+	if owner == nil {
+		return
+	}
+	validateFeishuOpenID(owner.FeishuOpenID, path+".feishuOpenId", issues)
+	validatePlaneMemberID(owner.PlaneID, path+".planeId", issues)
+}
+
+// validateFeishuActor checks an optional per-project @-mention actor (QA / owner):
+// when set, the Feishu open_id must be trimmed and shaped like an open_id (ou_…).
+func validateFeishuActor(actor *FeishuActorConfig, path string, issues *[]ValidationIssue) {
+	if actor == nil {
+		return
+	}
+	validateFeishuOpenID(actor.FeishuOpenID, path+".feishuOpenId", issues)
+	validatePlaneMemberID(actor.PlaneID, path+".planeId", issues)
+}
+
+func validateFeishuOpenID(openID, path string, issues *[]ValidationIssue) {
+	if openID == "" {
+		return
+	}
+	if strings.TrimSpace(openID) != openID {
+		*issues = append(*issues, ValidationIssue{Path: path, Message: "must not contain leading or trailing whitespace"})
+		return
+	}
+	if !strings.HasPrefix(openID, "ou_") {
+		*issues = append(*issues, ValidationIssue{Path: path, Message: "must be a Feishu open_id (starts with ou_)"})
+	}
+}
+
+func validatePlaneMemberID(value, path string, issues *[]ValidationIssue) {
+	if value == "" {
+		return
+	}
+	if strings.TrimSpace(value) != value {
+		*issues = append(*issues, ValidationIssue{Path: path, Message: "must not contain leading or trailing whitespace"})
+		return
+	}
+	if !planeMemberIDPattern.MatchString(value) {
+		*issues = append(*issues, ValidationIssue{Path: path, Message: "must be a Plane member UUID"})
 	}
 }
 

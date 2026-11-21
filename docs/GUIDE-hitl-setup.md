@@ -1,5 +1,7 @@
 # GUIDE — configuring looper's human-in-the-loop (HITL) capabilities
 
+For the independent `looper collab start` bridge, use [the collab guide](collab-local-e2e.zh-CN.md). The setup below documents the existing daemon HITL transports.
+
 A copy-paste setup guide for the HITL features: decision cards, multi-round
 conversation, the anytime message queue, the live Feishu thread (progress +
 milestones), and one-command local takeover. For the design rationale see

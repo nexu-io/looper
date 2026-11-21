@@ -53,7 +53,8 @@
         },
         "defaults": {
           "allowAutoCommit": false,
-          "baseBranch": "develop"
+          "baseBranch": "develop",
+          "workerShepherd": false
         },
         "agent": {
           "vendor": "opencode",
@@ -94,6 +95,7 @@
         "maxConcurrentRuns": 3,
         "retryMaxAttempts": -1,
         "retryBaseDelayMs": 5000,
+        "infraRetryBudgetSeconds": 3600,
         "slowLaneWarnThresholdMs": 5000,
         "discoveryCacheTtlSeconds": 30
       },
@@ -188,11 +190,16 @@
         },
         "worktreeCleanup": {
           "enabled": true,
-          "interval": "24h",
-          "retentionDays": 7,
-          "maxPerTick": 10,
-          "includeOrphans": false,
+          "interval": "1h",
+          "retentionDays": 1,
+          "maxPerTick": 50,
+          "includeOrphans": true,
           "dryRun": false
+        },
+        "diskBackpressure": {
+          "enabled": true,
+          "highWatermarkPercent": 85,
+          "hardStopPercent": 93
         }
       },
       "package": {
@@ -213,7 +220,8 @@
         "addSnapshotMode": "async",
         "loop": {
           "quietPeriodSeconds": 60
-        }
+        },
+        "workerShepherd": false
       },
       "roles": {
         "coordinator": {
@@ -330,7 +338,8 @@
             },
             "specReview": {
               "includeReviewingLabel": true,
-              "reviewingLabel": "looper:spec-reviewing"
+              "reviewingLabel": "looper:spec-reviewing",
+              "requireHumanApproval": false
             }
           },
           "skills": {
@@ -391,7 +400,8 @@
         "gitPath": "configured",
         "ghPath": "configured",
         "looperPath": "detected",
-        "osascriptPath": "configured"
+        "osascriptPath": "configured",
+        "planePath": "missing"
       }
     }
   }

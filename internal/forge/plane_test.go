@@ -2,11 +2,37 @@ package forge
 
 import (
 	"context"
+	"github.com/nexu-io/looper/internal/config"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 )
+
+func TestPlaneSeparateWebOriginKeepsAPITransport(t *testing.T) {
+	server, _ := planeTestServer(t)
+	workspace, project, tokenEnv := "acme", "proj-123", "LOOPER_TEST_PLANE_WEB_TOKEN"
+	t.Setenv(tokenEnv, "test-token")
+	web := "http://localhost:3000/"
+	provider := config.ProviderConfig{ID: "plane-local", Kind: config.ProviderKindPlane, BaseURL: server.URL + "/api/v1", WebBaseURL: &web, Workspace: &workspace, ProjectID: &project, TokenEnv: &tokenEnv}
+	client, err := NewPlaneClientFromConfig(provider, "acme/looper", WithPlaneHTTPClient(server.Client()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	issues, err := client.ListOpenIssues(context.Background(), ListIssuesInput{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if issues[0].HTMLURL != "http://localhost:3000/acme/projects/proj-123/issues/wi-1" {
+		t.Fatalf("wrong web URL: %s", issues[0].HTMLURL)
+	}
+	for _, invalid := range []string{"javascript:alert(1)", "https://user:secret@example.test", "https://example.test/path", "https://example.test?q=secret", "https://example.test#fragment"} {
+		provider.WebBaseURL = &invalid
+		if _, err := NewPlaneClientFromConfig(provider, "acme/looper"); err == nil {
+			t.Errorf("accepted invalid web origin %q", invalid)
+		}
+	}
+}
 
 // planeTestServer serves a canned Plane project (labels + work-items + user) and
 // records the auth / user-agent headers of every request so the mapping and the
@@ -98,6 +124,41 @@ func TestPlaneListOpenIssuesMapsAndFiltersByLabel(t *testing.T) {
 	}
 }
 
+func TestPlaneListOpenIssuesFiltersByAssignee(t *testing.T) {
+	t.Parallel()
+	server, _ := planeTestServer(t)
+	client := newPlaneTestClient(t, server)
+
+	// Filtering by an assignee returns only work items assigned to that user — the
+	// partition key auto-intake uses so each person's looper classifies only its own.
+	mine, err := client.ListOpenIssues(context.Background(), ListIssuesInput{Assignee: "user-uuid-1"})
+	if err != nil {
+		t.Fatalf("ListOpenIssues(assignee) error = %v", err)
+	}
+	if len(mine) == 0 {
+		t.Fatal("ListOpenIssues(assignee=user-uuid-1) returned 0, want the assigned item(s)")
+	}
+	for _, is := range mine {
+		found := false
+		for _, a := range is.Assignees {
+			if a.Login == "user-uuid-1" {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("issue #%d assignees = %+v, want to include user-uuid-1", is.Number, is.Assignees)
+		}
+	}
+	// An assignee nobody is assigned to yields nothing.
+	none, err := client.ListOpenIssues(context.Background(), ListIssuesInput{Assignee: "nobody-uuid"})
+	if err != nil {
+		t.Fatalf("ListOpenIssues(assignee=nobody) error = %v", err)
+	}
+	if len(none) != 0 {
+		t.Fatalf("ListOpenIssues(assignee=nobody-uuid) returned %d, want 0", len(none))
+	}
+}
+
 func TestPlaneViewIssueResolvesBySequenceID(t *testing.T) {
 	t.Parallel()
 	server, _ := planeTestServer(t)
@@ -127,8 +188,57 @@ func TestPlaneCurrentUserIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CurrentUser() error = %v", err)
 	}
-	if identity.Login != "Ralph" {
-		t.Fatalf("identity.Login = %q, want %q", identity.Login, "Ralph")
+	if identity.Login != "me-uuid" {
+		t.Fatalf("identity.Login = %q, want Plane assignee UUID %q", identity.Login, "me-uuid")
+	}
+}
+
+func TestStripHTMLTagsPreservesImages(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{
+			name: "img with src and alt becomes markdown",
+			in:   `<p>See <img src="https://plane.test/a.png" alt="the bug"> here</p>`,
+			want: "See\n![the bug](https://plane.test/a.png)\n here",
+		},
+		{
+			name: "img without alt keeps the url",
+			in:   `<img src="https://plane.test/b.jpg">`,
+			want: "![](https://plane.test/b.jpg)",
+		},
+		{
+			name: "single-quoted attrs and reversed order",
+			in:   `<img alt='shot' src='https://plane.test/c.png'/>`,
+			want: "![shot](https://plane.test/c.png)",
+		},
+		{
+			name: "escaped ampersands in url are unescaped",
+			in:   `<img src="https://plane.test/d.png?a=1&amp;b=2">`,
+			want: "![](https://plane.test/d.png?a=1&b=2)",
+		},
+		{
+			name: "img with no src is dropped",
+			in:   `before<img alt="broken">after`,
+			want: "beforeafter",
+		},
+		{
+			name: "plain text still strips other tags",
+			in:   `<p>Hello <b>world</b></p>`,
+			want: "Hello world",
+		},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := stripHTMLTags(tc.in); got != tc.want {
+				t.Fatalf("stripHTMLTags(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
 	}
 }
 
@@ -166,5 +276,18 @@ func TestPlaneCreateIssueCommentRejectsUnsafeContentBeforeRequest(t *testing.T) 
 	}
 	if requests != 0 {
 		t.Fatalf("CreateIssueComment() made %d HTTP requests after content safety failure", requests)
+	}
+}
+
+func TestPlaneConfiguredWebOriginAndPublicTaskKey(t *testing.T) {
+	t.Setenv("PLANE_TEST_TOKEN", "fixture-token")
+	server, _ := planeTestServer(t)
+	tokenEnv, workspace, projectID, web := "PLANE_TEST_TOKEN", "acme", "proj-123", "https://plane-web.example"
+	client, err := NewPlaneClientFromConfig(config.ProviderConfig{ID: "plane", Kind: config.ProviderKindPlane, BaseURL: server.URL + "/api/v1", WebBaseURL: &web, TokenEnv: &tokenEnv, Workspace: &workspace, ProjectID: &projectID}, "acme/code")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := client.workItemWebURL("wi-1"); got != "https://plane-web.example/acme/projects/proj-123/issues/wi-1" {
+		t.Fatalf("web link uses API origin: %s", got)
 	}
 }

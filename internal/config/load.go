@@ -378,6 +378,9 @@ func decodeTopLevelConfigSections(decoder *json.Decoder, partialConfig *PartialC
 	}
 
 	sections := []topLevelConfigSection{
+		{key: "collab", decode: func(raw json.RawMessage) error {
+			return decodeTopLevelConfigSection(raw, "collab", &partialConfig.Collab)
+		}},
 		{key: "server", decode: func(raw json.RawMessage) error {
 			return decodeTopLevelConfigSection(raw, "server", &partialConfig.Server)
 		}},

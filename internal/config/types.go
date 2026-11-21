@@ -158,6 +158,7 @@ type SchedulerConfig struct {
 	MaxConcurrentRuns        int `json:"maxConcurrentRuns"`
 	RetryMaxAttempts         int `json:"retryMaxAttempts"`
 	RetryBaseDelayMS         int `json:"retryBaseDelayMs"`
+	InfraRetryBudgetSeconds  int `json:"infraRetryBudgetSeconds"`
 	SlowLaneWarnThresholdMS  int `json:"slowLaneWarnThresholdMs"`
 	DiscoveryCacheTTLSeconds int `json:"discoveryCacheTtlSeconds"`
 }
@@ -200,12 +201,13 @@ const (
 )
 
 type ProviderConfig struct {
-	ID       string           `json:"id"`
-	Kind     ProviderKind     `json:"kind"`
-	BaseURL  string           `json:"baseUrl,omitempty"`
-	GHPath   *string          `json:"ghPath,omitempty"`
-	Auth     ProviderAuthMode `json:"auth,omitempty"`
-	TokenEnv *string          `json:"tokenEnv,omitempty"`
+	ID         string           `json:"id"`
+	Kind       ProviderKind     `json:"kind"`
+	BaseURL    string           `json:"baseUrl,omitempty"`
+	WebBaseURL *string          `json:"webBaseUrl,omitempty"`
+	GHPath     *string          `json:"ghPath,omitempty"`
+	Auth       ProviderAuthMode `json:"auth,omitempty"`
+	TokenEnv   *string          `json:"tokenEnv,omitempty"`
 	// TeaLogin is the explicit tea CLI login name used when Auth is "tea".
 	// Required for tea-backed Forgejo providers; never inferred from tea's default.
 	TeaLogin *string `json:"teaLogin,omitempty"`
@@ -215,6 +217,20 @@ type ProviderConfig struct {
 	// its work-items from. Ignored for github/forgejo providers.
 	Workspace *string `json:"workspace,omitempty"`
 	ProjectID *string `json:"projectId,omitempty"`
+	// StrictDispatch enables Plane-authoritative owner-only dispatch for this
+	// provider. The private key stays in a separate 0600 file, never inline.
+	StrictDispatch *PlaneStrictDispatchConfig `json:"strictDispatch,omitempty"`
+}
+
+type PlaneStrictDispatchConfig struct {
+	MemoryEnabled    bool   `json:"memoryEnabled,omitempty"`
+	TelemetryEnabled bool   `json:"telemetryEnabled,omitempty"`
+	Enabled          bool   `json:"enabled"`
+	BaseURL          string `json:"baseUrl"`
+	NodeID           string `json:"nodeId"`
+	BindingID        string `json:"bindingId"`
+	KeyRevision      uint64 `json:"keyRevision"`
+	PrivateKeyFile   string `json:"privateKeyFile"`
 }
 
 // AgentBindingConfig is vendor+model only (profiles).
@@ -297,6 +313,7 @@ type OsascriptNotificationConfig struct {
 }
 
 type WebhookNotificationConfig struct {
+	VerificationTokenEnv  string                   `json:"verificationTokenEnv,omitempty"`
 	Enabled               bool                     `json:"enabled"`
 	URLEnv                string                   `json:"urlEnv"`
 	Format                string                   `json:"format"`
@@ -310,11 +327,6 @@ type WebhookNotificationConfig struct {
 	AppIDEnv     string `json:"appIdEnv,omitempty"`
 	AppSecretEnv string `json:"appSecretEnv,omitempty"`
 	ChatID       string `json:"chatId,omitempty"`
-	// VerificationTokenEnv names the env var holding the Feishu app Verification
-	// Token. It gates the inbound HITL card-action callback (/hitl/feishu): the
-	// callback's envelope token must match, proving the request came from Feishu.
-	// A NAME, never the secret value — looper is open source.
-	VerificationTokenEnv string `json:"verificationTokenEnv,omitempty"`
 	// MentionOpenIds are Feishu open_ids to @-mention on messages that need a human
 	// (the mid-run ask, and failures), so follow-up items aren't missed in a busy
 	// group. Plain user ids, not secrets.
@@ -332,6 +344,12 @@ type ToolPathsConfig struct {
 	GHPath        *string `json:"ghPath,omitempty"`
 	LooperPath    *string `json:"looperPath,omitempty"`
 	OsascriptPath *string `json:"osascriptPath,omitempty"`
+	// PlanePath is the `plane` CLI used to read/write Plane spec documents (§8.2).
+	// Optional; auto-detected on PATH when unset.
+	PlanePath *string `json:"planePath,omitempty"`
+	// BrowserPath optionally pins Chrome/Chromium for restricted design-prototype
+	// screenshots. When unset the renderer probes supported local installations.
+	BrowserPath *string `json:"browserPath,omitempty"`
 }
 
 type ToolDetectionStatus string
@@ -343,15 +361,16 @@ const (
 )
 
 type DaemonConfig struct {
-	Mode                   DaemonMode            `json:"mode"`
-	RestartPolicy          DaemonRestartPolicy   `json:"restartPolicy"`
-	RestartThrottleSeconds int                   `json:"restartThrottleSeconds"`
-	PlistPath              *string               `json:"plistPath,omitempty"`
-	LogDir                 string                `json:"logDir"`
-	ShutdownTimeoutMS      int                   `json:"shutdownTimeoutMs"`
-	WorkingDirectory       string                `json:"workingDirectory"`
-	Environment            map[string]string     `json:"environment"`
-	WorktreeCleanup        WorktreeCleanupConfig `json:"worktreeCleanup"`
+	Mode                   DaemonMode             `json:"mode"`
+	RestartPolicy          DaemonRestartPolicy    `json:"restartPolicy"`
+	RestartThrottleSeconds int                    `json:"restartThrottleSeconds"`
+	PlistPath              *string                `json:"plistPath,omitempty"`
+	LogDir                 string                 `json:"logDir"`
+	ShutdownTimeoutMS      int                    `json:"shutdownTimeoutMs"`
+	WorkingDirectory       string                 `json:"workingDirectory"`
+	Environment            map[string]string      `json:"environment"`
+	WorktreeCleanup        WorktreeCleanupConfig  `json:"worktreeCleanup"`
+	DiskBackpressure       DiskBackpressureConfig `json:"diskBackpressure"`
 }
 
 type WorktreeCleanupConfig struct {
@@ -361,6 +380,24 @@ type WorktreeCleanupConfig struct {
 	MaxPerTick     int    `json:"maxPerTick"`
 	IncludeOrphans bool   `json:"includeOrphans"`
 	DryRun         bool   `json:"dryRun"`
+}
+
+// DiskBackpressureConfig throttles the scheduler off the disk backing the
+// worktrees. WorktreeCleanup reclaims space after the fact; this is the other
+// half — it refuses to START new runs once the volume is near full, so the
+// daemon never spends an agent turn (and a multi-GB worktree) on work destined
+// to fail with ENOSPC. Both thresholds clamp new claims to zero; HardStop only
+// differs in that it logs at error severity (a disk emergency, not a warning).
+type DiskBackpressureConfig struct {
+	Enabled bool `json:"enabled"`
+	// Path is the directory whose volume is watched. Empty = the default
+	// worktree root. Any path on the same volume yields identical numbers.
+	Path string `json:"path,omitempty"`
+	// HighWatermarkPercent is the df capacity at/above which new claims pause.
+	HighWatermarkPercent float64 `json:"highWatermarkPercent"`
+	// HardStopPercent is the capacity at/above which the pause is treated as an
+	// emergency (error-level signal). Must be >= HighWatermarkPercent.
+	HardStopPercent float64 `json:"hardStopPercent"`
 }
 
 type PackageConfig struct {
@@ -416,6 +453,7 @@ type DefaultsConfig struct {
 	OpenPRStrategy     OpenPRStrategy     `json:"openPrStrategy"`
 	AddSnapshotMode    AddSnapshotMode    `json:"addSnapshotMode"`
 	Loop               DefaultsLoopConfig `json:"loop"`
+	WorkerShepherd     bool               `json:"workerShepherd"`
 }
 
 type ReviewerLoopConfig struct {
@@ -536,6 +574,11 @@ type ReviewerRoleTriggersConfig struct {
 type ReviewerSpecReviewConfig struct {
 	IncludeReviewingLabel bool   `json:"includeReviewingLabel"`
 	ReviewingLabel        string `json:"reviewingLabel"`
+	// RequireHumanApproval gates the spec-ready transition on a human APPROVE review
+	// (plan §8.6): when true, a clean automated spec review does NOT self-approve to
+	// spec-ready — the reviewer adds looper:needs-human and holds until a person
+	// approves the spec PR. Default false keeps today's auto-approve behaviour.
+	RequireHumanApproval bool `json:"requireHumanApproval"`
 }
 
 type ReviewerRoleDiscoveryConfig struct {
@@ -555,11 +598,12 @@ type FixerRoleTriggersConfig struct {
 }
 
 type PlannerRoleConfig struct {
-	Identity      string                  `json:"identity,omitempty"`
-	AutoDiscovery bool                    `json:"autoDiscovery"`
-	Triggers      IssueRoleTriggersConfig `json:"triggers"`
-	Instructions  string                  `json:"instructions,omitempty"`
-	Agent         *RoleAgentConfig        `json:"agent,omitempty"`
+	Identity             string                  `json:"identity,omitempty"`
+	AutoDiscovery        bool                    `json:"autoDiscovery"`
+	Triggers             IssueRoleTriggersConfig `json:"triggers"`
+	Instructions         string                  `json:"instructions,omitempty"`
+	Agent                *RoleAgentConfig        `json:"agent,omitempty"`
+	PreSpecDecisionGrill bool                    `json:"preSpecDecisionGrill,omitempty"`
 }
 
 type WorkerRoleConfig struct {
@@ -680,6 +724,40 @@ type ProjectRefConfig struct {
 	Network      ProjectNetworkConfig `json:"network,omitempty"`
 	Webhook      ProjectWebhookConfig `json:"webhook,omitempty"`
 	Roles        *PartialRoleConfigs  `json:"roles,omitempty"`
+	ProductOwner *ProductOwnerConfig  `json:"productOwner,omitempty"`
+	// DesignOwner owns user-interface and interaction decisions surfaced before the
+	// technical spec. PlaneID is the answer authority; FeishuOpenID is notification-only.
+	DesignOwner *FeishuActorConfig `json:"designOwner,omitempty"`
+	// QA is the project's QA validator — @-mentioned in the task thread when a PR the
+	// shepherd is driving carries `needs-validation` and hasn't been `validated` yet.
+	// Project-level (unified across every deploy of this project).
+	QA *FeishuActorConfig `json:"qa,omitempty"`
+	// Owner is this looper deploy's owner — @-mentioned to merge once a PR is approved,
+	// green, conflict-free and (if it needed validation) validated. Per-deploy: each
+	// teammate running looper on their own machine configures their own open_id here.
+	Owner *FeishuActorConfig `json:"owner,omitempty"`
+}
+
+// ProductOwnerConfig names the person who owns the product spec for a project — who
+// looper @-mentions in the task thread when a feature arrives without one (plan §8.3).
+type ProductOwnerConfig struct {
+	// FeishuOpenID is the product owner's Feishu open_id (ou_...), @-mentioned in the
+	// thread to ask for a product spec.
+	FeishuOpenID string `json:"feishuOpenId,omitempty"`
+	// PlaneID is the product owner's Plane member UUID, for operations that act on
+	// their behalf in Plane. Optional.
+	PlaneID string `json:"planeId,omitempty"`
+}
+
+// FeishuActorConfig names a person by their Feishu open_id for @-mentions in a
+// project's task threads. Used for the QA validator and the deploy's looper owner —
+// resolved per-project from config so no open_id is ever hardcoded in the source.
+type FeishuActorConfig struct {
+	// FeishuOpenID is the actor's Feishu open_id (ou_...).
+	FeishuOpenID string `json:"feishuOpenId,omitempty"`
+	// PlaneID is the actor's Plane member UUID. It is the authority for role answers
+	// and, for owner, technical-spec approval.
+	PlaneID string `json:"planeId,omitempty"`
 }
 
 type ProjectWebhookConfig struct {
@@ -700,6 +778,10 @@ type PartialProjectRefConfig struct {
 	Webhook      *PartialProjectWebhookConfig `json:"webhook,omitempty"`
 	Instructions map[string]string            `json:"instructions,omitempty"`
 	Roles        *PartialRoleConfigs          `json:"roles,omitempty"`
+	ProductOwner *ProductOwnerConfig          `json:"productOwner,omitempty"`
+	DesignOwner  *FeishuActorConfig           `json:"designOwner,omitempty"`
+	QA           *FeishuActorConfig           `json:"qa,omitempty"`
+	Owner        *FeishuActorConfig           `json:"owner,omitempty"`
 }
 
 type PartialProjectNetworkConfig struct {
@@ -711,19 +793,27 @@ type PartialProjectWebhookConfig struct {
 }
 
 type PartialProviderConfig struct {
-	ID        string            `json:"id"`
-	Kind      *ProviderKind     `json:"kind,omitempty"`
-	BaseURL   *string           `json:"baseUrl,omitempty"`
-	GHPath    *string           `json:"ghPath,omitempty"`
-	Auth      *ProviderAuthMode `json:"auth,omitempty"`
-	TokenEnv  *string           `json:"tokenEnv,omitempty"`
-	TeaLogin  *string           `json:"teaLogin,omitempty"`
-	TeaPath   *string           `json:"teaPath,omitempty"`
-	Workspace *string           `json:"workspace,omitempty"`
-	ProjectID *string           `json:"projectId,omitempty"`
+	ID             string                     `json:"id"`
+	Kind           *ProviderKind              `json:"kind,omitempty"`
+	BaseURL        *string                    `json:"baseUrl,omitempty"`
+	WebBaseURL     *string                    `json:"webBaseUrl,omitempty"`
+	GHPath         *string                    `json:"ghPath,omitempty"`
+	Auth           *ProviderAuthMode          `json:"auth,omitempty"`
+	TokenEnv       *string                    `json:"tokenEnv,omitempty"`
+	TeaLogin       *string                    `json:"teaLogin,omitempty"`
+	TeaPath        *string                    `json:"teaPath,omitempty"`
+	Workspace      *string                    `json:"workspace,omitempty"`
+	ProjectID      *string                    `json:"projectId,omitempty"`
+	StrictDispatch *PlaneStrictDispatchConfig `json:"strictDispatch,omitempty"`
+}
+
+type CollabConfig struct {
+	MemoryEnabled bool `json:"memoryEnabled"`
 }
 
 type Config struct {
+	Collab *CollabConfig `json:"collab,omitempty"`
+
 	Identities map[string]HostingIdentityConfig `json:"identities,omitempty"`
 
 	Server        ServerConfig       `json:"server"`
@@ -748,33 +838,43 @@ type Config struct {
 
 // HITLConfig gates the mid-run human-in-the-loop feature: when Enabled, agents
 // may pause mid-run to ask a human (by writing .looper/ask.json), the loop
-// suspends as awaiting_human, an ask-card is sent via the app-bot notifier, and
-// POST /api/v1/loops/{seq}/respond resumes the same agent session with the
-// answer. When Disabled (the default) every HITL code path is skipped and
-// runners behave exactly as before. It reuses the app-bot credentials in
-// notifications.webhook (appIdEnv/appSecretEnv/chatId) for send + listen.
+// suspends as awaiting_human, and the question is posted to the configured source
+// of truth, or to an explicitly scoped private Feishu test chat.
 type HITLConfig struct {
 	Enabled bool `json:"enabled"`
 	// AnswerTransport selects how a mid-run question is delivered and how the
-	// human's answer comes back: "github" (PR comment, the zero-infra default),
-	// "feishu" (a team that lives in Feishu; needs the feishu transport), or
-	// "respond" (only the /respond API). Empty defaults to "github".
+	// human's answer comes back: "github" (PR comment, the default), "respond"
+	// (authenticated /respond API), or "feishu" (private test-chat dialogue).
+	// Empty defaults to "github".
 	AnswerTransport string            `json:"answerTransport,omitempty"`
 	GitHub          *HITLGitHubConfig `json:"github,omitempty"`
 	Feishu          *HITLFeishuConfig `json:"feishu,omitempty"`
 }
 
-// HITLFeishuConfig tunes the Feishu HITL transport (answers come back via the
-// shared-app Cloudflare event inbox that the looper polls).
+// HITLFeishuConfig uses an already authenticated lark-cli. Chat membership is
+// open to the collaborators invited into the task group; ownerOpenId is only
+// attribution and the default reminder target.
 type HITLFeishuConfig struct {
-	// Inbound selects how the answer reaches this looper: "cf-inbox" (poll the
-	// shared Cloudflare inbox) is the supported mode.
+	// Inbound retains the legacy daemon cf-inbox transport. Empty selects the
+	// collab/private bridge configuration below.
 	Inbound string `json:"inbound,omitempty"`
-	// EventInboxURLEnv names the env var holding the inbox poll URL
-	// (https://…/events). EventInboxTokenEnv names the env var holding the shared
-	// bearer token. Env var NAMES, never the values.
+	// Optional shared-app event inbox. When configured, collab polls this URL
+	// instead of opening a competing Feishu WebSocket on every local instance.
 	EventInboxURLEnv   string `json:"eventInboxUrlEnv,omitempty"`
 	EventInboxTokenEnv string `json:"eventInboxTokenEnv,omitempty"`
+	// ChatID is the default/fallback collaboration group. It may be empty when
+	// autoCreateTaskChats is enabled; the collab host will create a default group
+	// on first use and keep its id in the host state directory.
+	ChatID string `json:"chatId,omitempty"`
+	// OwnerOpenID is attribution only. It is optional and never limits who may
+	// participate in a task thread.
+	OwnerOpenID string `json:"ownerOpenId,omitempty"`
+	// AutoCreateTaskChats creates one private group for each issue/module key.
+	// Unscoped runs still use ChatID (or the persisted default group).
+	AutoCreateTaskChats bool     `json:"autoCreateTaskChats,omitempty"`
+	InviteOpenIDs       []string `json:"inviteOpenIds,omitempty"`
+	ChatNamePrefix      string   `json:"chatNamePrefix,omitempty"`
+	CLIPath             string   `json:"cliPath,omitempty"`
 }
 
 // HITLGitHubConfig tunes the GitHub PR-comment HITL transport.
@@ -808,6 +908,7 @@ type PartialSchedulerConfig struct {
 	MaxConcurrentRuns        *int `json:"maxConcurrentRuns,omitempty"`
 	RetryMaxAttempts         *int `json:"retryMaxAttempts,omitempty"`
 	RetryBaseDelayMS         *int `json:"retryBaseDelayMs,omitempty"`
+	InfraRetryBudgetSeconds  *int `json:"infraRetryBudgetSeconds,omitempty"`
 	SlowLaneWarnThresholdMS  *int `json:"slowLaneWarnThresholdMs,omitempty"`
 	DiscoveryCacheTTLSeconds *int `json:"discoveryCacheTtlSeconds,omitempty"`
 }
@@ -878,6 +979,7 @@ type PartialOsascriptNotificationConfig struct {
 }
 
 type PartialWebhookNotificationConfig struct {
+	VerificationTokenEnv  *string                   `json:"verificationTokenEnv,omitempty"`
 	Enabled               *bool                     `json:"enabled,omitempty"`
 	URLEnv                *string                   `json:"urlEnv,omitempty"`
 	Format                *string                   `json:"format,omitempty"`
@@ -887,7 +989,6 @@ type PartialWebhookNotificationConfig struct {
 	AppIDEnv              *string                   `json:"appIdEnv,omitempty"`
 	AppSecretEnv          *string                   `json:"appSecretEnv,omitempty"`
 	ChatID                *string                   `json:"chatId,omitempty"`
-	VerificationTokenEnv  *string                   `json:"verificationTokenEnv,omitempty"`
 	MentionOpenIds        *[]string                 `json:"mentionOpenIds,omitempty"`
 }
 
@@ -902,18 +1003,21 @@ type PartialToolPathsConfig struct {
 	GHPath        *string `json:"ghPath,omitempty"`
 	LooperPath    *string `json:"looperPath,omitempty"`
 	OsascriptPath *string `json:"osascriptPath,omitempty"`
+	PlanePath     *string `json:"planePath,omitempty"`
+	BrowserPath   *string `json:"browserPath,omitempty"`
 }
 
 type PartialDaemonConfig struct {
-	Mode                   *DaemonMode                   `json:"mode,omitempty"`
-	RestartPolicy          *DaemonRestartPolicy          `json:"restartPolicy,omitempty"`
-	RestartThrottleSeconds *int                          `json:"restartThrottleSeconds,omitempty"`
-	PlistPath              *string                       `json:"plistPath,omitempty"`
-	LogDir                 *string                       `json:"logDir,omitempty"`
-	ShutdownTimeoutMS      *int                          `json:"shutdownTimeoutMs,omitempty"`
-	WorkingDirectory       *string                       `json:"workingDirectory,omitempty"`
-	Environment            map[string]string             `json:"environment,omitempty"`
-	WorktreeCleanup        *PartialWorktreeCleanupConfig `json:"worktreeCleanup,omitempty"`
+	Mode                   *DaemonMode                    `json:"mode,omitempty"`
+	RestartPolicy          *DaemonRestartPolicy           `json:"restartPolicy,omitempty"`
+	RestartThrottleSeconds *int                           `json:"restartThrottleSeconds,omitempty"`
+	PlistPath              *string                        `json:"plistPath,omitempty"`
+	LogDir                 *string                        `json:"logDir,omitempty"`
+	ShutdownTimeoutMS      *int                           `json:"shutdownTimeoutMs,omitempty"`
+	WorkingDirectory       *string                        `json:"workingDirectory,omitempty"`
+	Environment            map[string]string              `json:"environment,omitempty"`
+	WorktreeCleanup        *PartialWorktreeCleanupConfig  `json:"worktreeCleanup,omitempty"`
+	DiskBackpressure       *PartialDiskBackpressureConfig `json:"diskBackpressure,omitempty"`
 }
 
 type PartialWorktreeCleanupConfig struct {
@@ -923,6 +1027,13 @@ type PartialWorktreeCleanupConfig struct {
 	MaxPerTick     *int    `json:"maxPerTick,omitempty"`
 	IncludeOrphans *bool   `json:"includeOrphans,omitempty"`
 	DryRun         *bool   `json:"dryRun,omitempty"`
+}
+
+type PartialDiskBackpressureConfig struct {
+	Enabled              *bool    `json:"enabled,omitempty"`
+	Path                 *string  `json:"path,omitempty"`
+	HighWatermarkPercent *float64 `json:"highWatermarkPercent,omitempty"`
+	HardStopPercent      *float64 `json:"hardStopPercent,omitempty"`
 }
 
 type PartialPackageConfig struct {
@@ -955,6 +1066,7 @@ type PartialDefaultsConfig struct {
 	OpenPRStrategy     *OpenPRStrategy            `json:"openPrStrategy,omitempty"`
 	AddSnapshotMode    *AddSnapshotMode           `json:"addSnapshotMode,omitempty"`
 	Loop               *PartialDefaultsLoopConfig `json:"loop,omitempty"`
+	WorkerShepherd     *bool                      `json:"workerShepherd,omitempty"`
 }
 
 type PartialReviewerLoopConfig struct {
@@ -1036,19 +1148,13 @@ type PartialHITLConfig struct {
 	Enabled         *bool                    `json:"enabled,omitempty"`
 	AnswerTransport *string                  `json:"answerTransport,omitempty"`
 	GitHub          *PartialHITLGitHubConfig `json:"github,omitempty"`
-	Feishu          *PartialHITLFeishuConfig `json:"feishu,omitempty"`
+	Feishu          *HITLFeishuConfig        `json:"feishu,omitempty"`
 }
 
 type PartialHITLGitHubConfig struct {
 	AwaitingLabel *string   `json:"awaitingLabel,omitempty"`
 	MentionLogins *[]string `json:"mentionLogins,omitempty"`
 	AnswerAuthors *[]string `json:"answerAuthors,omitempty"`
-}
-
-type PartialHITLFeishuConfig struct {
-	Inbound            *string `json:"inbound,omitempty"`
-	EventInboxURLEnv   *string `json:"eventInboxUrlEnv,omitempty"`
-	EventInboxTokenEnv *string `json:"eventInboxTokenEnv,omitempty"`
 }
 
 type PartialIssueRoleTriggersConfig struct {
@@ -1074,6 +1180,7 @@ type PartialReviewerRoleTriggersConfig struct {
 type PartialReviewerSpecReviewConfig struct {
 	IncludeReviewingLabel *bool   `json:"includeReviewingLabel,omitempty"`
 	ReviewingLabel        *string `json:"reviewingLabel,omitempty"`
+	RequireHumanApproval  *bool   `json:"requireHumanApproval,omitempty"`
 }
 
 type PartialReviewerRoleDiscoveryConfig struct {
@@ -1091,11 +1198,12 @@ type PartialFixerRoleTriggersConfig struct {
 }
 
 type PartialPlannerRoleConfig struct {
-	Identity      *string                         `json:"identity,omitempty"`
-	AutoDiscovery *bool                           `json:"autoDiscovery,omitempty"`
-	Triggers      *PartialIssueRoleTriggersConfig `json:"triggers,omitempty"`
-	Instructions  *string                         `json:"instructions,omitempty"`
-	Agent         *RoleAgentConfig                `json:"agent,omitempty"`
+	Identity             *string                         `json:"identity,omitempty"`
+	AutoDiscovery        *bool                           `json:"autoDiscovery,omitempty"`
+	Triggers             *PartialIssueRoleTriggersConfig `json:"triggers,omitempty"`
+	Instructions         *string                         `json:"instructions,omitempty"`
+	Agent                *RoleAgentConfig                `json:"agent,omitempty"`
+	PreSpecDecisionGrill *bool                           `json:"preSpecDecisionGrill,omitempty"`
 }
 
 type PartialWorkerRoleConfig struct {
@@ -1201,6 +1309,8 @@ type PartialRoleConfigs struct {
 }
 
 type PartialConfig struct {
+	Collab *CollabConfig `json:"collab,omitempty"`
+
 	Identities *map[string]HostingIdentityConfig `json:"identities,omitempty"`
 
 	Server         *PartialServerConfig       `json:"server,omitempty"`

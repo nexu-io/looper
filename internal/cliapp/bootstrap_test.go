@@ -553,16 +553,20 @@ func TestEnsureBootstrapConfigGeneratesLoadablePlaneConfig(t *testing.T) {
 		t.Fatalf("resolved project provider kind = %q, want plane", config.ResolvedProjectProviderKind(loaded.Config, project))
 	}
 
-	if got := loaded.Config.Roles.Planner.Triggers.Labels; len(got) != 1 || got[0] != "afk:candidate" {
+	effectiveRoles := config.ProjectRoleConfigs(loaded.Config, project.ID)
+	if !effectiveRoles.Planner.PreSpecDecisionGrill {
+		t.Fatal("planner preSpecDecisionGrill = false, want true for Plane collaboration")
+	}
+	if got := effectiveRoles.Planner.Triggers.Labels; len(got) != 1 || got[0] != "afk:candidate" {
 		t.Fatalf("planner trigger labels = %#v, want [afk:candidate]", got)
 	}
-	if loaded.Config.Roles.Planner.Triggers.RequireAssigneeCurrentUser {
+	if effectiveRoles.Planner.Triggers.RequireAssigneeCurrentUser {
 		t.Fatal("planner requireAssigneeCurrentUser = true, want false for plane")
 	}
-	if got := loaded.Config.Roles.Worker.Triggers.Labels; len(got) != 1 || got[0] != "afk:candidate" {
+	if got := effectiveRoles.Worker.Triggers.Labels; len(got) != 1 || got[0] != "afk:candidate" {
 		t.Fatalf("worker trigger labels = %#v, want [afk:candidate]", got)
 	}
-	if loaded.Config.Roles.Worker.Triggers.RequireAssigneeCurrentUser {
+	if effectiveRoles.Worker.Triggers.RequireAssigneeCurrentUser {
 		t.Fatal("worker requireAssigneeCurrentUser = true, want false for plane")
 	}
 
@@ -572,6 +576,58 @@ func TestEnsureBootstrapConfigGeneratesLoadablePlaneConfig(t *testing.T) {
 	}
 	if len(webhook.Levels) != 2 {
 		t.Fatalf("notifications.webhook.levels = %#v, want action_required + failure", webhook.Levels)
+	}
+}
+
+func TestEnsureBootstrapConfigAddsPlaneToExistingConfigIdempotently(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	configPath := filepath.Join(root, "looper.yaml")
+	projectPath := filepath.Join(root, "open-design")
+	if err := os.MkdirAll(projectPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	base, err := config.DefaultConfig(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writeBootstrapConfig(configPath, base); err != nil {
+		t.Fatal(err)
+	}
+	plan := bootstrapConfigPlan{
+		Provider: bootstrapProviderPlane, ProjectPath: projectPath, CodeRepo: "acme/open-design",
+		TriggerLabel: "looper:plan", PlaneBaseURL: "https://plane.example.test/api/v1",
+		PlaneWorkspace: "acme", PlaneProject: "49832a02-3158-4faf-bf2f-d0e39c40c7e6", PlaneTokenEnv: "PLANE_API_KEY",
+	}
+	runtime := newCommandRuntime(New(Deps{}), nil)
+	created, added, err := runtime.ensureBootstrapConfig(configPath, root, plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created || !added {
+		t.Fatalf("created=%v added=%v, want false/true", created, added)
+	}
+	created, added, err = runtime.ensureBootstrapConfig(configPath, root, plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created || added {
+		t.Fatalf("second call created=%v added=%v, want false/false", created, added)
+	}
+	loaded, err := config.LoadFile(config.LoadFileOptions{Args: []string{"--config", configPath}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(loaded.Config.Providers) != 1 || len(loaded.Config.Projects) != 1 {
+		t.Fatalf("providers=%#v projects=%#v", loaded.Config.Providers, loaded.Config.Projects)
+	}
+	roles := config.ProjectRoleConfigs(loaded.Config, loaded.Config.Projects[0].ID)
+	if !roles.Planner.PreSpecDecisionGrill {
+		t.Fatal("effective planner preSpecDecisionGrill = false")
+	}
+	if got := roles.Planner.Triggers.Labels; len(got) != 1 || got[0] != "looper:plan" {
+		t.Fatalf("effective planner labels=%#v", got)
 	}
 }
 

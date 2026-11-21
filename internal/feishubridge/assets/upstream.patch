@@ -1,0 +1,380 @@
+--- a/src/bot/bridge.ts
++++ b/src/bot/bridge.ts
+@@ -1,3 +1,5 @@
++import type { ExternalTask, ExternalHooks } from './external';
++import { getSession } from './session-store';
+ import { createLarkChannel, Domain, type LarkChannel } from '@larksuiteoapi/node-sdk';
+ import type { AdminWriteOp } from '../admin/ops';
+ import type { AppConfig } from '../config/schema';
+@@ -28,10 +30,15 @@
+   appSecret: string;
+   /** fallback cwd for groups that aren't registered projects. */
+   fallbackCwd: string;
++  externalHooks?: ExternalHooks;
++  transport?: 'websocket' | 'webhook';
+ }
+ 
+ export interface BridgeHandle {
+   channel: LarkChannel;
++  dispatchEvent: (raw: unknown) => Promise<void>;
++  submitTask: (task: ExternalTask) => Promise<void>;
++  stopTask: (threadId: string) => boolean;
+   /** 管理面写操作（Web 控制台 / supervisor IPC）：进程内执行，与 DM 卡片回调
+    * 同一套共享逻辑（admin/ops.ts）；校验拒绝抛 AdminWriteError。 */
+   adminExecute: (op: AdminWriteOp) => Promise<void>;
+@@ -54,6 +61,7 @@
+     appSecret: opts.appSecret,
+     domain: app.tenant === 'lark' ? Domain.Lark : Domain.Feishu,
+     source: 'feishu-codex-bridge',
++    transport: opts.transport,
+     // surface raw events so card-action handlers can read form submissions
+     // (action.form_value) — used by the new-project form.
+     includeRawEvent: true,
+@@ -82,7 +90,7 @@
+     socketPath: paths.cliBridgeSocket,
+     isBoundProject: cwdIsBoundProject,
+   });
+-  const orchestrator = createOrchestrator(channel, opts.cfg, opts.fallbackCwd, cliBridge);
++  const orchestrator = createOrchestrator(channel, opts.cfg, opts.fallbackCwd, cliBridge, opts.externalHooks);
+   channel.on('message', orchestrator.onMessage);
+   channel.on('cardAction', orchestrator.dispatcher.handle);
+   // Cloud-doc comments: @bot in a doc comment (drive.notice.comment_add_v1) →
+@@ -158,5 +166,26 @@
+     await cliBridge.shutdown().catch((err) => log.fail('cli-bridge', err, { phase: 'shutdown' }));
+     await channel.disconnect().catch((err) => log.fail('ws', err, { phase: 'disconnect' }));
+   };
+-  return { channel, adminExecute: orchestrator.adminExecute, shutdown };
++  // Same SDK normalizer, dedup, mention policy and upstream conversation handler
++  // as WebSocket intake. Only reachable through Looper's private Unix socket;
++  // the shared inbox verifies Feishu's callback before an event gets here.
++  async function dispatchEvent(raw: unknown): Promise<void> {
++    const dispatcher = (channel as unknown as {
++      dispatcher: { invoke: (raw: unknown, options: { needCheck: boolean }) => Promise<unknown> };
++    }).dispatcher;
++    const envelope = raw as { header?: { event_type?: string }; event?: {
++      message_id?: string; context?: { open_message_id?: string };
++    } };
++    if (envelope.header?.event_type !== 'im.message.receive_v1') {
++      // Buttons and reactions point to a card, not its topic root. Resolve the
++      // real topic through Feishu and use the existing local session store.
++      const messageId = envelope.event?.message_id ?? envelope.event?.context?.open_message_id;
++      if (!messageId) return;
++      const response = await channel.rawClient.im.v1.message.get({ path: { message_id: messageId } });
++      const threadId = response.data?.items?.[0]?.thread_id;
++      if (!threadId || !(await getSession(threadId))) return;
++    }
++    await dispatcher.invoke(raw, { needCheck: false });
++  }
++  return { channel, dispatchEvent, submitTask: orchestrator.submitTask, stopTask: orchestrator.stopTask, adminExecute: orchestrator.adminExecute, shutdown };
+ }
+--- a/src/bot/handle-message.ts
++++ b/src/bot/handle-message.ts
+@@ -1,3 +1,4 @@
++import type { ExternalTask, ExternalHooks } from './external';
+ import { registerVoiceConsole } from './voice-console';
+ import { createVoiceService } from '../voice/service';
+ import { ingestVoice, createIntakeQueue, type IngestedContext } from '../voice/inbound';
+@@ -471,6 +472,8 @@
+ }
+ 
+ interface ActiveState {
++  /** Receipts for supplements accepted by this running turn. */
++  steerReactions?: RunReaction[];
+   steerReply?: { run: AgentRun; accept: (messageId: string, voice?: VoiceReply) => boolean };
+   /** Captured with the steer target so a late ACK cannot decorate another turn. */
+   voiceReply?: { run: AgentRun; add: (voice: VoiceReply) => void };
+@@ -514,6 +517,8 @@
+ }
+ 
+ export interface Orchestrator {
++  submitTask: (task: ExternalTask) => Promise<void>;
++  stopTask: (threadId: string) => boolean;
+   onMessage: (msg: NormalizedMessage) => Promise<void>;
+   /** `comment` event handler: @bot in a cloud-doc comment → reply in-thread. */
+   onComment: (evt: CommentEvent) => Promise<void>;
+@@ -671,6 +676,7 @@
+   cfg: AppConfig,
+   fallbackCwd: string,
+   cliBridge?: CliBridgeRuntimeHooks,
++  externalHooks?: ExternalHooks,
+ ): Orchestrator {
+   /** Lazily-constructed backends by id — one instance per backend for the whole
+    * bridge (mirrors the old single-instance shape; codex stays the default). */
+@@ -960,6 +966,14 @@
+       return;
+     }
+ 
++    const sender = msg.raw as { sender?: { sender_type?: string } } | undefined;
++    if (sender?.sender?.sender_type === 'user') {
++      // Observation failures must not replay a human command or block execution.
++      void externalHooks?.onHuman?.({ chatId: msg.chatId, rootId: msg.rootId,
++        threadId: msg.threadId, messageId: msg.messageId, participantId: msg.senderId,
++        at: msg.createTime }).catch((err) => log.fail('looper-human-observation', err));
++    }
++
+     // 多维表格「发送消息卡片」等 card 2.0 交互卡片：推送事件 / 旧版 content 只给降级
+     // 占位（SDK 归一化成 "[interactive card]"，或「请升级至最新版本客户端…」），真正的
+     // 卡片正文（含 Base 记录链接）要带 card_msg_content_type=raw_card_content 回查才拿得
+@@ -1334,6 +1348,8 @@
+       if (tid) {
+         const voiceReply = cur.voiceReply?.run === cur.run ? cur.voiceReply : undefined;
+         const steerReply = cur.steerReply?.run === cur.run ? cur.steerReply : undefined;
++        const receipt = runReaction(msg.messageId, false);
++        (cur.steerReactions ??= []).push(receipt);
+         try {
+           await steerWithDeadline(cur.thread, { text: woven.text, images }, tid);
+           const split = steerReply?.accept(msg.messageId, woven.voice);
+@@ -1341,6 +1357,7 @@
+           log.info('intake', 'steer', { tid, images: images?.length ?? 0 });
+           return;
+         } catch (err) {
++          receipt.done();
+           log.warn('intake', 'steer-failed', { err: String(err) });
+           if (!isRejectedSteer(err)) {
+             void channel.send(msg.chatId,
+@@ -4134,7 +4151,13 @@
+ 
+     // M-3: 池满先排队（占位卡可见可取消）；null = 等待期被 ⏹ 取消，预订已释放。
+     const slot = await acquireRunSlot(opts, state, activeKey, reaction);
+-    if (!slot) return;
++    if (!slot) {
++      await opts.thread.close();
++      await externalHooks?.onTurn?.({ phase: 'failed', rootMessageId: opts.replyTo, chatId: opts.chatId,
++        threadId: topicThreadId, sessionId: opts.thread.sessionId, cwd: runCwd,
++        terminal: 'interrupted', text: 'Queued task cancelled' });
++      return;
++    }
+     if (shuttingDown) {
+       slot.release();
+       active.delete(activeKey);
+@@ -4270,6 +4293,9 @@
+         const turnModel = rec?.model ?? opts.model;
+         const turnEffort = rec?.effort ?? opts.effort;
+         const modelDisp = getModelDisplay(cfg);
++        const memoryContext = await externalHooks?.onTurn?.({ phase: 'started', rootMessageId: opts.replyTo, chatId: opts.chatId,
++          threadId: topicThreadId, sessionId: opts.thread.sessionId, cwd: runCwd });
++        if (memoryContext) turnInput.text += '\n\n' + memoryContext;
+         const run = opts.thread.runStreamed(turnInput, { model: turnModel, effort: turnEffort });
+         titleTurnAttempted = true;
+         const turnStartAt = Date.now(); // turn/start 已在 runStreamed() 内发出（与下面的建卡并行）
+@@ -4310,6 +4335,8 @@
+               topicThreadId = key;
+               rc.threadId = key;
+               await persist(key);
++              await externalHooks?.onTurn?.({ phase: 'bound', rootMessageId: opts.replyTo, chatId: opts.chatId,
++                threadId: key, sessionId: opts.thread.sessionId, cwd: runCwd });
+             }
+           } else {
+             topicThreadId = activeKey;
+@@ -4540,6 +4567,8 @@
+         }
+         clearInterval(cardClock);
+         cardClock = undefined;
++        for (const receipt of state.steerReactions ?? []) receipt.done();
++        state.steerReactions = undefined;
+         state.steerReply = undefined;
+         state.run = undefined; // completion-card I/O must queue, never steer into a finished turn
+         const doneAt = Date.now(); // codex stopped emitting / loop ended
+@@ -4678,6 +4707,9 @@
+         replyTo = finalMsgId;
+         replyInThread = !opts.flat; // stay in the topic for queued turns (single: stay flat)
+         log.info('card', 'final', { terminal: render.terminal() });
++        await externalHooks?.onTurn?.({ phase: 'finished', rootMessageId: opts.replyTo, chatId: opts.chatId,
++          threadId: topicThreadId, sessionId: opts.thread.sessionId, cwd: runCwd,
++          terminal: render.terminal(), text: finalMessageText(render.snapshot()) });
+ 
+         // A stop (⏹ graceful or forced / watchdog) or a dead process ends the
+         // whole run — drop any queued follow-ups, but tell the user instead of
+@@ -4715,6 +4747,9 @@
+       // client before the next message resumes the persisted session.
+       if (topicThreadId && sessions.get(topicThreadId) === opts.thread) sessions.delete(topicThreadId);
+       await opts.thread.close().catch(() => undefined);
++      await externalHooks?.onTurn?.({ phase: 'failed', rootMessageId: opts.replyTo, chatId: opts.chatId,
++        threadId: topicThreadId, sessionId: opts.thread.sessionId, cwd: runCwd,
++        terminal: 'error', text: err instanceof Error ? err.message : String(err) });
+       log.fail('intake', err);
+       await channel
+         .send(opts.chatId, { markdown: runFailureMessage(err, dropped) }, { replyTo: opts.replyTo, replyInThread: !opts.flat })
+@@ -4724,6 +4759,8 @@
+       // was in flight. Never delete another run's reservation.
+       if (active.get(activeKey) === state) active.delete(activeKey);
+       clearInterval(cardClock);
++      for (const receipt of state.steerReactions ?? []) receipt.done();
++      state.steerReactions = undefined;
+       state.steerReply = undefined;
+       state.voiceReply = undefined;
+       if (curCardKey) {
+@@ -5669,7 +5706,55 @@
+     if (op.kind === 'setCompletionReminder') refreshCompletionReminderCards();
+   };
+ 
+-  return { onMessage, onComment, onBotAddedToChat, onBotRemovedFromChat, onReaction, onBotMenu, dispatcher, adminExecute, shutdown };
++  async function submitTask(task: ExternalTask): Promise<void> {
++    if (shuttingDown) throw new Error('bridge is stopping');
++    const queued: QueuedTurn = { input: { text: task.prompt },
++      titleSource: { text: task.title, rawContentType: 'text' },
++      summary: task.title, requesterOpenId: task.requesterOpenId, requestedAt: Date.now() };
++    const key = task.threadId ?? `pending:${task.rootMessageId}`;
++    const prior = active.get(key);
++    if (prior) { prior.queue.push(queued); return; }
++    const reserved: ActiveState = { queue: [], requesterOpenId: task.requesterOpenId };
++    active.set(key, reserved);
++    try {
++      const be = backendFor(task.backendId);
++      const rec = task.threadId ? await getSession(task.threadId) : undefined;
++      const { model, effort } = pickDefault(await listModels(be), { model: rec?.model ?? task.model, effort: rec?.effort });
++      const resolved = task.threadId ? await resolveThread(task.threadId, task.chatId, { mode: 'full', network: true }) : { thread: undefined };
++      const thread = resolved.thread ?? await be.startThread({ cwd: task.cwd, model, effort, mode: 'full', network: true });
++      if (reserved.intakeCancelled || shuttingDown) {
++        await thread.close();
++        await externalHooks?.onTurn?.({ phase: 'failed', rootMessageId: task.rootMessageId, chatId: task.chatId,
++          threadId: task.threadId, sessionId: thread.sessionId, cwd: task.cwd,
++          terminal: 'interrupted', text: 'Task cancelled before starting' });
++        return;
++      }
++      if (task.threadId) await upsertSession({ threadId: task.threadId, chatId: task.chatId, cwd: task.cwd,
++        sessionId: thread.sessionId, backend: be.id, model, effort,
++        summary: task.title, createdAt: rec?.createdAt ?? Date.now(), updatedAt: Date.now() });
++      await trackRun(launchRun({ chatId: task.chatId, replyTo: task.rootMessageId,
++        knownThreadId: task.threadId, replyInThread: true, thread,
++        firstText: task.prompt, cwd: task.cwd, mode: 'full', model, effort,
++        backendId: be.id, summary: task.title, requesterOpenId: task.requesterOpenId,
++        titleSource: queued.titleSource }));
++    } catch (err) {
++      await externalHooks?.onTurn?.({ phase: 'failed', rootMessageId: task.rootMessageId, chatId: task.chatId,
++        threadId: task.threadId, cwd: task.cwd, terminal: 'error',
++        text: err instanceof Error ? err.message : String(err) });
++      throw err;
++    } finally {
++      if (active.get(key) === reserved) active.delete(key);
++    }
++  }
++  function stopTask(threadId: string): boolean {
++    const state = active.get(threadId);
++    if (!state) return false;
++    state.queue.splice(0);
++    state.intakeCancelled = true;
++    state.interrupt?.();
++    return true;
++  }
++  return { submitTask, stopTask, onMessage, onComment, onBotAddedToChat, onBotRemovedFromChat, onReaction, onBotMenu, dispatcher, adminExecute, shutdown };
+ }
+ 
+ /** Resolve a message's thread_id via raw API (reply response omits it). The
+--- a/src/config/paths.ts
++++ b/src/config/paths.ts
+@@ -2,7 +2,7 @@
+ import { homedir } from 'node:os';
+ import { join } from 'node:path';
+ 
+-const appDir = join(homedir(), '.feishu-codex-bridge');
++const appDir = process.env.LOOPER_BRIDGE_HOME ?? join(homedir(), '.feishu-codex-bridge');
+ const larkCliDir = join(appDir, 'lark-cli');
+ const codexCliDir = join(appDir, 'codex-cli');
+ 
+--- a/src/bot/context-weave.ts
++++ b/src/bot/context-weave.ts
+@@ -442,10 +442,14 @@
+  * uploader-influenced, so oneLine=true collapses it so a crafted name can't
+  * forge a fenced block (mirrors weaveQuote / weaveThreadHistory).
+  */
+-export function weaveSender(text: string, sender: { senderId?: string; senderName?: string }): string {
++export function weaveSender(text: string, sender: { senderId?: string; senderName?: string; messageId?: string; createTime?: number }): string {
+   const id = (sender.senderId ?? '').trim();
+   if (!id) return text;
+   const who = sanitizeContext(sender.senderName ?? '', SENDER_NAME_MAX, true) || '某用户';
+-  const block = `[本条消息的发信人：${who}（open_id：${id}）]`;
++  const messageId = sanitizeContext(sender.messageId ?? '', 100, true);
++  const sentAt = sender.createTime && Number.isFinite(sender.createTime)
++    ? new Date(sender.createTime).toISOString() : '';
++  const source = messageId ? `\n[来源消息：message_id=${messageId}；发送时间=${sentAt || '未知'}]` : '';
++  const block = `[本条消息的发信人：${who}（open_id：${id}）]${source}`;
+   return prependBlock(block, text);
+ }
+--- a/src/agent/bridge-instructions.ts
++++ b/src/agent/bridge-instructions.ts
+@@ -14,9 +14,10 @@
+   '',
+   '本地文件交付：正常回复即可，用 [文件名](绝对路径) 引用真实存在的本地文件；路径含空格时用 [文件名](<绝对路径>)。',
+   '飞书桥会在文件引用的原位置提供蓝色可点击入口，用户点击后由桥直接发送原文件附件，不需要你调用工具上传。',
+-  '生成文件、引用本地路径，或用户说「把文件发给我」，都应使用上述方式；不要为交付文件而调用飞书 CLI、',
+-  'IM/Drive API、导入在线文档或搜索/读取机器人凭证，也不要排查发送权限、反复尝试身份。',
+-  '只有用户明确要求「上传到云盘 / 创建飞书在线文档 / 发到另一个指定会话」等外部操作时，才使用对应工具或 skill。',
++  '普通文件分享默认使用上述入口；任务需要主动归档、回读附件或把持久链接写回 Plane 时，',
++  '可在任务已授权的范围内使用对应工具或 skill，以 bot 上传到原话题或文档，核对实际附件内容后记录入口。',
++  '不要把本地文件按钮当作已上传或已归档；尚未上传时如实说明，必要时提供截图、录屏或正文说明。',
++  '不要搜索/读取机器人凭证、切换用户身份或反复尝试身份；权限不足时说明具体缺口。',
+   '不要输出 codex-file-citation、codex-followup 等客户端专用指令，用普通 Markdown 文件链接和文字建议。',
+   '',
+   '1) 图片：要配图时，用标准 Markdown 图片语法 ![说明](路径) 引用一个【真实存在】的图片，',
+--- a/src/card/inline-files.ts
++++ b/src/card/inline-files.ts
+@@ -60,7 +60,7 @@
+         if ((content.match(/(?<!\\)\*\*/g)?.length ?? 0) % 2) bold = !bold;
+         const balanced = (prefix + content + (bold ? '**' : ''))
+           .replace(/^(\*\*)(\s+)/, '$2$1').replace(/(\s+)(\*\*)$/, '$2$1');
+-        if (balanced.replace(/\*\*/g, '').trim() || (content.length > 0 && /^\s+$/.test(content))) {
++        if (balanced.replace(/\*\*/g, '').trim() && !/^[\s•、，,；;。]+$/.test(balanced)) {
+           const spaced = balanced.replace(/^ +| +$/g, (spaces) => '&nbsp;'.repeat(spaces.length));
+           pieces.push({ ...element, content: spaced, ...(textSize ? { text_size: textSize } : {}) });
+         }
+@@ -70,10 +70,10 @@
+         if (link) pieces.push(link);
+         else pushText(part);
+       }
+-      result.push(pieces.length === 1 ? pieces[0]! : columns(
+-        pieces.map((el) => ({ elements: [el], verticalAlign: 'center' })),
+-        { flexMode: 'flow', spacing: '0px' },
+-      ));
++      // Callback links cannot participate in Markdown's inline layout.
++      // Keep each piece full-width so prose cannot squeeze CJK labels into
++      // narrow columns (for example 验收 / 指南 next to a long sentence).
++      result.push(...pieces);
+     }
+     flush();
+     return result;
+--- a/src/agent/codex-appserver/backend.ts
++++ b/src/agent/codex-appserver/backend.ts
+@@ -689,6 +689,20 @@
+       developerInstructions: BRIDGE_DEVELOPER_INSTRUCTIONS,
+       ...(opts.model ? { model: opts.model } : {}),
+     });
++    try {
++      // Resume retains the original developer message in persisted history.
++      // Refresh guidance without replacing the user's native session.
++      await client.request('thread/inject_items', {
++        threadId: res.thread.id,
++        items: [{ type: 'message', role: 'developer', content: [{
++          type: 'input_text',
++          text: '以下是当前飞书桥交互约定，取代历史版本的同类约定：\n\n' + BRIDGE_DEVELOPER_INSTRUCTIONS,
++        }] }],
++      });
++    } catch (error) {
++      await client.close();
++      throw error;
++    }
+     return new CodexThread(client, res.thread.id, opts.model, opts.effort);
+   }
+ 
+--- a/src/agent/codex-appserver/app-server-client.ts
++++ b/src/agent/codex-appserver/app-server-client.ts
+@@ -110,7 +110,18 @@
+     // Launch via cross-spawn (platform/spawn) so a Windows `.cmd` codex shim
+     // runs instead of throwing EINVAL (CVE-2024-27980). With stdio all-piped the
+     // streams are non-null, so the cast to *WithoutNullStreams is sound.
+-    const child = spawnProcess(this.opts.bin, ['app-server', '--listen', 'stdio://'], {
++    const args = ['app-server', '--listen', 'stdio://'];
++    const memoryScript = process.env.LOOPER_MEMORY_MCP_SCRIPT;
++    const memorySocket = process.env.LOOPER_MEMORY_MCP_SOCKET;
++    if (memoryScript && memorySocket) {
++      args.push('-c', 'mcp_servers.looper_memory.command="python3"',
++        '-c', 'mcp_servers.looper_memory.args=' + JSON.stringify([memoryScript, '--socket', memorySocket, '--mcp']));
++      // Only these task-scoped tools are preauthorized; publishing and business mutations are absent.
++      for (const name of ['list_for_item', 'get', 'feedback', 'propose']) {
++        args.push('-c', `mcp_servers.looper_memory.tools.${name}.approval_mode="approve"`);
++      }
++    }
++    const child = spawnProcess(this.opts.bin, args, {
+       cwd: this.opts.cwd,
+       env: mergeProcessEnv(process.env, { ...this.opts.env, FEISHU_CODEX_BRIDGE: '1' }),
+       stdio: ['pipe', 'pipe', 'pipe'],

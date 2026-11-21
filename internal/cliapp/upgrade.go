@@ -270,6 +270,11 @@ func (r *commandRuntime) maybeRunAutoUpgrade(cmd *cobra.Command, args []string) 
 }
 
 func shouldSkipAutoUpgrade(cmd *cobra.Command) bool {
+	for parent := cmd; parent != nil; parent = parent.Parent() {
+		if parent.Name() == "collab" {
+			return true
+		}
+	}
 	if cmd == nil {
 		return true
 	}
@@ -282,7 +287,7 @@ func shouldSkipAutoUpgrade(cmd *cobra.Command) bool {
 		}
 	}
 	path := strings.TrimSpace(cmd.CommandPath())
-	return path == "looper" || path == "looper upgrade"
+	return path == "looper" || path == "looper upgrade" || path == "looper collab export"
 }
 
 func newAutoUpgradeCommand(parent *cobra.Command) *cobra.Command {

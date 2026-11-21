@@ -85,8 +85,8 @@ func TestHandlerMutationAdmissionGate(t *testing.T) {
 	}
 }
 
-// Contract: Feishu url_verification must echo the challenge while admission is
-// closed; real card actions still require admission (#583).
+// Contract: URL verification must work while admission is closed; real
+// callbacks still require admission and a matching verification token.
 func TestHandlerFeishuURLVerificationBypassesAdmission(t *testing.T) {
 	t.Parallel()
 

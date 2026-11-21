@@ -37,15 +37,26 @@ func TestClassifyFailureRetriesBoundaryExternalTransport(t *testing.T) {
 func TestClassifyFailureRetriesInvalidProjectRepoPath(t *testing.T) {
 	runner := &Runner{}
 	got := runner.classifyFailureWithBoundary(errors.New("git worktree list --porcelain: fatal: not a git repository (or any of the parent directories): .git"), failureclass.BoundaryGitRemote)
-	if got.kind != FailureRetryableTransient {
-		t.Fatalf("classifyFailure() kind = %s, want %s", got.kind, FailureRetryableTransient)
+	if got.kind != FailureRecoverableInfra {
+		t.Fatalf("classifyFailure() kind = %s, want %s", got.kind, FailureRecoverableInfra)
 	}
 }
 
 func TestClassifyFailureRetriesMissingProjectRepoDirectory(t *testing.T) {
 	runner := &Runner{}
 	got := runner.classifyFailureWithBoundary(errors.New("start command: chdir /tmp/missing-repo: no such file or directory"), failureclass.BoundaryGitRemote)
-	if got.kind != FailureRetryableTransient {
-		t.Fatalf("classifyFailure() kind = %s, want %s", got.kind, FailureRetryableTransient)
+	if got.kind != FailureRecoverableInfra {
+		t.Fatalf("classifyFailure() kind = %s, want %s", got.kind, FailureRecoverableInfra)
+	}
+}
+
+func TestClassifyFailureMapsRecoverableInfra(t *testing.T) {
+	runner := &Runner{}
+	got := runner.classifyFailureWithBoundary(errors.New("write object: no space left on device"), failureclass.BoundaryGitLocal)
+	if got.kind != FailureRecoverableInfra {
+		t.Fatalf("classifyFailure() kind = %s, want %s", got.kind, FailureRecoverableInfra)
+	}
+	if !shouldRetryQueueFailure(got.kind, 1, -1) {
+		t.Fatal("recoverable infrastructure failure must remain queued while its condition can self-clear")
 	}
 }
