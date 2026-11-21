@@ -63,6 +63,7 @@ type GHPullRequest struct {
 	UpdatedAt         string           `json:"updatedAt,omitempty"`
 	ClosedAt          string           `json:"closedAt,omitempty"`
 	IsDraft           bool             `json:"isDraft,omitempty"`
+	IsCrossRepository bool             `json:"isCrossRepository,omitempty"`
 	ReviewDecision    string           `json:"reviewDecision,omitempty"`
 	Labels            []string         `json:"labels,omitempty"`
 	HeadRefName       string           `json:"headRefName,omitempty"`

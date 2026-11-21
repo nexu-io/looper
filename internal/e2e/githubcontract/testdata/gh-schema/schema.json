@@ -30,6 +30,7 @@
       "mergeStateStatus"
     ],
     "pr view": [
+      "isCrossRepository",
       "number",
       "title",
       "body",

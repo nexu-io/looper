@@ -101,7 +101,7 @@ func Classify(err error, ctx Context) Kind {
 	if isOneRunningRunPerLoopViolation(message) {
 		return RetryableTransient
 	}
-	if isManualWorktreeMessage(message) || ctx.Boundary == BoundaryLocalWorktree {
+	if isManualWorktreeMessage(message) || ctx.Boundary == BoundaryLocalWorktree || strings.Contains(message, "native github api writes blocked") {
 		return ManualIntervention
 	}
 	if ctx.Boundary == BoundaryGitHubAPI && isRetryableGitHubGraphQLUnauthorized(message) {

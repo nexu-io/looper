@@ -383,6 +383,10 @@ Fixer will:
 
 Third-party review comments (a human or Codex, not Looper) stay Fixer-eligible. If Fixer declines one of those, it still replies with evidence and leaves the thread open; Reviewer adjudicates the decline. Trusted `/looper` directives apply only on Looper-authored threads.
 
+GitHub Fixer currently publishes only to branches in the registered repository. Automatic discovery skips fork PRs; already queued or explicitly started fork repairs stop for manual intervention before preparing a worktree.
+
+Review-thread mutations rejected by a local write policy require manual intervention; transient mutation failures retain their normal retry behavior.
+
 For Forgejo projects, automatic and manual Fixer runs consume native findings without requiring a review-comment resolve mutation:
 
 - native findings from other reviewers and the current account's Looper Reviewer can trigger repairs; ordinary self-comments and Fixer chatter are ignored
