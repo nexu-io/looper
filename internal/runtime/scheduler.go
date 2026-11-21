@@ -930,13 +930,13 @@ func (a plannerGitHubAdapter) ListOpenIssues(ctx context.Context, input planner.
 		if err != nil {
 			return nil, err
 		}
-		issues, err := client.ListOpenIssues(ctx, forge.ListIssuesInput{Labels: input.Labels, Assignee: input.Assignee, Limit: input.Limit})
+		issues, err := client.ListPlannerIssues(ctx, forge.ListIssuesInput{Labels: input.Labels, Assignee: input.Assignee, Limit: input.Limit}, input.IssueNumber)
 		if err != nil {
 			return nil, err
 		}
 		result := make([]planner.IssueSummary, 0, len(issues))
 		for _, issue := range issues {
-			result = append(result, planner.IssueSummary{Number: issue.Number, Title: issue.Title, Body: issue.Body, URL: issue.HTMLURL, Assignees: forgeIdentityLogins(issue.Assignees), Labels: forgeLabelNames(issue.Labels)})
+			result = append(result, planner.IssueSummary{Number: issue.Number, Title: issue.Title, Body: issue.Body, URL: issue.HTMLURL, Assignees: forgeIdentityLogins(issue.Assignees), Labels: forgeLabelNames(issue.Labels), StrictDispatchID: issue.StrictDispatchID, StrictAttemptID: issue.StrictAttemptID})
 		}
 		return result, nil
 	}
@@ -966,6 +966,17 @@ func (a plannerGitHubAdapter) ListOpenIssues(ctx context.Context, input planner.
 		result = append(result, planner.IssueSummary{Number: issue.Number, Title: issue.Title, Body: issue.Body, URL: issue.URL, Assignees: issue.Assignees, Labels: issue.Labels})
 	}
 	return result, nil
+}
+
+func (a plannerGitHubAdapter) StartStrictDispatch(ctx context.Context, input planner.StrictDispatchStartInput) error {
+	client, ok, err := a.plane(ctx, input.Repo, input.CWD)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("strict dispatch %s is not backed by a Plane provider", input.DispatchID)
+	}
+	return client.StartStrictDispatch(ctx, input.DispatchID, input.AttemptID)
 }
 
 func (a plannerGitHubAdapter) ViewIssue(ctx context.Context, input planner.ViewIssueInput) (planner.IssueDetail, error) {

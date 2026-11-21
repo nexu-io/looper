@@ -335,6 +335,23 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 			if isNilOrEmptyString(provider.ProjectID) {
 				issues = append(issues, ValidationIssue{Path: prefix + ".projectId", Message: "is required for plane providers (Plane project UUID)"})
 			}
+			if strict := provider.StrictDispatch; strict != nil && strict.Enabled {
+				if !isAbsoluteHTTPURL(strict.BaseURL) {
+					issues = append(issues, ValidationIssue{Path: prefix + ".strictDispatch.baseUrl", Message: "must be the absolute Plane app API origin"})
+				}
+				if strict.NodeID == "" {
+					issues = append(issues, ValidationIssue{Path: prefix + ".strictDispatch.nodeId", Message: "is required"})
+				}
+				if strict.BindingID == "" {
+					issues = append(issues, ValidationIssue{Path: prefix + ".strictDispatch.bindingId", Message: "is required"})
+				}
+				if strict.KeyRevision == 0 {
+					issues = append(issues, ValidationIssue{Path: prefix + ".strictDispatch.keyRevision", Message: "must be positive"})
+				}
+				if strict.PrivateKeyFile == "" {
+					issues = append(issues, ValidationIssue{Path: prefix + ".strictDispatch.privateKeyFile", Message: "is required"})
+				}
+			}
 		}
 	}
 
