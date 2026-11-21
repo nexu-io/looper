@@ -308,7 +308,7 @@ jobs:
       matrix:
         include:
           - target: darwin-arm64
-            runner: macos-14
+            runner: macos-15
             goos: darwin
             goarch: arm64
             artifact-name: looper-darwin-arm64
@@ -393,7 +393,7 @@ jobs:
       matrix:
         include:
           - target: darwin-arm64
-            runner: macos-14
+            runner: macos-15
             goos: darwin
             goarch: arm64
             artifact-name: looperd-darwin-arm64
