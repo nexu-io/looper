@@ -411,39 +411,119 @@ func (r *commandRuntime) tryAcquireAutoUpgradeLock(path string, mode string) (fu
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return nil, false, autoUpgradeLockState{}, err
 	}
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
-	if err != nil {
-		return nil, false, autoUpgradeLockState{}, err
-	}
-	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
-		if errors.Is(err, syscall.EWOULDBLOCK) || errors.Is(err, syscall.EAGAIN) {
-			holder := readAutoUpgradeLockState(file)
+	for attempt := 0; attempt < 3; attempt++ {
+		file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+		if err != nil {
+			return nil, false, autoUpgradeLockState{}, err
+		}
+		if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+			if errors.Is(err, syscall.EWOULDBLOCK) || errors.Is(err, syscall.EAGAIN) {
+				holder := readAutoUpgradeLockState(file)
+				_ = file.Close()
+				return nil, false, holder, nil
+			}
+			_ = file.Close()
+			return nil, false, autoUpgradeLockState{}, err
+		}
+
+		existing := readAutoUpgradeLockState(file)
+		if holder, active := r.activeLegacyAutoUpgradeLock(path, file, existing); active {
+			_ = syscall.Flock(int(file.Fd()), syscall.LOCK_UN)
 			_ = file.Close()
 			return nil, false, holder, nil
 		}
-		_ = file.Close()
-		return nil, false, autoUpgradeLockState{}, err
-	}
-
-	state := autoUpgradeLockState{
-		PID:        os.Getpid(),
-		Mode:       mode,
-		ObservedAt: time.Now().UTC().Format(time.RFC3339Nano),
-	}
-	if err := writeAutoUpgradeLockState(file, state); err != nil {
-		_ = syscall.Flock(int(file.Fd()), syscall.LOCK_UN)
-		_ = file.Close()
-		return nil, false, autoUpgradeLockState{}, err
-	}
-
-	var once sync.Once
-	unlock := func() {
-		once.Do(func() {
+		if !sameLockFile(path, file) {
 			_ = syscall.Flock(int(file.Fd()), syscall.LOCK_UN)
 			_ = file.Close()
-		})
+			continue
+		}
+
+		state := autoUpgradeLockState{
+			PID:        os.Getpid(),
+			Mode:       mode,
+			ObservedAt: time.Now().UTC().Format(time.RFC3339Nano),
+		}
+		if err := writeAutoUpgradeLockState(file, state); err != nil {
+			_ = syscall.Flock(int(file.Fd()), syscall.LOCK_UN)
+			_ = file.Close()
+			return nil, false, autoUpgradeLockState{}, err
+		}
+
+		var once sync.Once
+		unlock := func() {
+			once.Do(func() {
+				_ = syscall.Flock(int(file.Fd()), syscall.LOCK_UN)
+				_ = file.Close()
+			})
+		}
+		return unlock, true, autoUpgradeLockState{}, nil
 	}
-	return unlock, true, autoUpgradeLockState{}, nil
+	return nil, false, autoUpgradeLockState{}, nil
+}
+
+func sameLockFile(path string, file *os.File) bool {
+	if file == nil {
+		return false
+	}
+	fdInfo, err := file.Stat()
+	if err != nil {
+		return false
+	}
+	pathInfo, err := os.Stat(path)
+	if err != nil {
+		return false
+	}
+	return os.SameFile(fdInfo, pathInfo)
+}
+
+func (r *commandRuntime) activeLegacyAutoUpgradeLock(path string, file *os.File, existing autoUpgradeLockState) (autoUpgradeLockState, bool) {
+	if existing.Mode != "" || existing.PID <= 0 || existing.PID == os.Getpid() {
+		return autoUpgradeLockState{}, false
+	}
+	if !r.isProcessAlive(existing.PID) {
+		return autoUpgradeLockState{}, false
+	}
+	command, err := r.readProcessCommand(context.Background(), existing.PID)
+	if err != nil {
+		if info, statErr := file.Stat(); statErr == nil && time.Since(info.ModTime()) < autoUpgradeBusyRetryDelay {
+			return existing, true
+		}
+		return autoUpgradeLockState{}, false
+	}
+	if command == "" {
+		return autoUpgradeLockState{}, false
+	}
+	if !r.isExpectedLegacyAutoUpgradeLockCommand(path, command, existing.Command) {
+		return autoUpgradeLockState{}, false
+	}
+	holder := existing
+	if holder.Command == "" {
+		holder.Command = command
+	}
+	return holder, true
+}
+
+func (r *commandRuntime) isExpectedLegacyAutoUpgradeLockCommand(path string, command string, recordedCommand string) bool {
+	tokens := splitProcessCommand(command)
+	if len(tokens) == 0 || filepath.Base(tokens[0]) != r.autoUpgradeLockExecutable() {
+		return false
+	}
+	if recordedCommand != "" && command != recordedCommand {
+		return false
+	}
+	switch filepath.Base(path) {
+	case "auto-upgrade.run.lock":
+		for _, token := range tokens[1:] {
+			if token == "upgrade" {
+				return true
+			}
+		}
+		return false
+	case "auto-upgrade.state.lock":
+		return true
+	default:
+		return r.isBackgroundAutoUpgradeProcess(command)
+	}
 }
 
 func readAutoUpgradeLockState(file *os.File) autoUpgradeLockState {
@@ -779,6 +859,9 @@ func (r *commandRuntime) upgrade(cmd *cobra.Command, args []string) error {
 			return writeJSON(cmd.OutOrStdout(), summary)
 		}
 		return writeHumanUpgradeSummary(cmd.OutOrStdout(), summary)
+	}
+	if !daemonOnly {
+		r.captureExecutablePath()
 	}
 	runLockPath, err := r.resolveAutoUpgradeRunLockPath()
 	if err != nil {
@@ -1494,7 +1577,16 @@ func isInstallerSelectedUserBinPath(execPath string) bool {
 	return false
 }
 
+func (r *commandRuntime) captureExecutablePath() {
+	if path, err := r.executablePath(); err == nil && path != "" {
+		r.capturedExecPath = path
+	}
+}
+
 func (r *commandRuntime) executablePath() (string, error) {
+	if r.capturedExecPath != "" {
+		return r.capturedExecPath, nil
+	}
 	resolve := func(path string) string {
 		resolvedPath, err := filepath.EvalSymlinks(path)
 		if err != nil {
@@ -1510,7 +1602,15 @@ func (r *commandRuntime) executablePath() (string, error) {
 	if value := strings.TrimSpace(r.app.deps.ExecutablePath); value != "" {
 		return resolve(value), nil
 	}
-	path, err := os.Executable()
+	var (
+		path string
+		err  error
+	)
+	if r.app.deps.ResolveExecutable != nil {
+		path, err = r.app.deps.ResolveExecutable()
+	} else {
+		path, err = os.Executable()
+	}
 	if err != nil {
 		return "", err
 	}

@@ -34,6 +34,9 @@ type Deps struct {
 	Sleep          sleepFunc
 	Getwd          getwdFunc
 	ExecutablePath string
+	// ResolveExecutable overrides os.Executable when set (primarily for tests
+	// simulating executable path changes across a lock wait).
+	ResolveExecutable func() (string, error)
 
 	// DaemonStartTimeout overrides how long daemon start/restart waits for the
 	// spawned looperd process to become API-ready. It is primarily intended for

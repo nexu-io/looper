@@ -28,6 +28,7 @@ type commandRuntime struct {
 	argv               []string
 	startupOutputPath  string
 	skipAPIStartProbe  bool
+	capturedExecPath   string
 	emittedConfigNotes map[string]struct{}
 }
 

@@ -674,6 +674,298 @@ func TestBackgroundAutoUpgradeSetsRetryAfterWhenRunLockHeld(t *testing.T) {
 	}
 }
 
+func TestUpgradePreservesExecutablePathAcrossLockWait(t *testing.T) {
+	t.Parallel()
+
+	homeDir := t.TempDir()
+	configPath := writeCLIConfig(t, "http://127.0.0.1:4321", "")
+	execPath := filepath.Join(homeDir, ".looper", "bin", "looper")
+	prevPath := execPath + ".prev"
+	if err := os.MkdirAll(filepath.Dir(execPath), 0o755); err != nil {
+		t.Fatalf("MkdirAll(exec dir) error = %v", err)
+	}
+	if err := os.WriteFile(execPath, []byte("looper"), 0o755); err != nil {
+		t.Fatalf("WriteFile(execPath) error = %v", err)
+	}
+	if err := os.WriteFile(prevPath, []byte("looper-prev"), 0o755); err != nil {
+		t.Fatalf("WriteFile(prevPath) error = %v", err)
+	}
+	resolvedExecPath, err := filepath.EvalSymlinks(execPath)
+	if err != nil {
+		resolvedExecPath = execPath
+	}
+
+	holderRuntime := newCommandRuntime(New(Deps{HomeDir: homeDir}), nil)
+	runLockPath, err := holderRuntime.resolveAutoUpgradeRunLockPath()
+	if err != nil {
+		t.Fatalf("resolveAutoUpgradeRunLockPath() error = %v", err)
+	}
+	unlock, acquired, _, err := holderRuntime.tryAcquireAutoUpgradeLock(runLockPath, autoUpgradeLockModeBackgroundAuto)
+	if err != nil {
+		t.Fatalf("tryAcquireAutoUpgradeLock() error = %v", err)
+	}
+	if !acquired {
+		t.Fatal("tryAcquireAutoUpgradeLock() acquired = false, want true")
+	}
+
+	var upgraded atomic.Bool
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		time.Sleep(40 * time.Millisecond)
+		upgraded.Store(true)
+		unlock()
+	}()
+	defer func() {
+		<-done
+	}()
+
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	app := New(Deps{
+		Stdout:     stdout,
+		Stderr:     stderr,
+		HomeDir:    homeDir,
+		Platform:   "darwin",
+		Arch:       "arm64",
+		CLIChannel: cliInstallChannelStable,
+		ResolveExecutable: func() (string, error) {
+			if upgraded.Load() {
+				return prevPath, nil
+			}
+			return execPath, nil
+		},
+		HTTPClient: newTestHTTPClient(func(req *http.Request) (*http.Response, error) {
+			switch req.URL.String() {
+			case "https://api.github.com/repos/nexu-io/looper/releases/latest":
+				return jsonResponse(t, http.StatusOK, `{"tag_name":"v0.3.0","assets":[{"name":"looper-darwin-arm64","browser_download_url":"https://example.invalid/looper-darwin-arm64"},{"name":"looper-darwin-arm64.sha256","browser_download_url":"https://example.invalid/looper-darwin-arm64.sha256"}]}`), nil
+			default:
+				t.Errorf("unexpected request URL %q", req.URL.String())
+				return nil, fmt.Errorf("unexpected request URL %q", req.URL.String())
+			}
+		}),
+		RunCommand: func(ctx context.Context, command string, args []string, timeout time.Duration) (commandExecutionResult, error) {
+			_ = ctx
+			_ = timeout
+			if strings.Join(args, " ") == "--version" && (command == execPath || command == resolvedExecPath) {
+				if upgraded.Load() {
+					return commandExecutionResult{Stdout: "0.3.0\n", ExitCode: 0}, nil
+				}
+				return commandExecutionResult{Stdout: "0.2.1\n", ExitCode: 0}, nil
+			}
+			return commandExecutionResult{ExitCode: 1, Stderr: "not found"}, nil
+		},
+	})
+
+	exitCode := app.Run(context.Background(), []string{"upgrade", "--cli", "--config", configPath})
+	if exitCode != 0 {
+		t.Fatalf("Run([upgrade --cli]) exit code = %d, want 0; stderr=%q", exitCode, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "Waiting for background auto-upgrade (pid ") {
+		t.Fatalf("stderr = %q, want waiting notice", stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "looper is already up to date (0.3.0)") {
+		t.Fatalf("stdout = %q, want up-to-date message using preserved executable path", stdout.String())
+	}
+}
+
+func TestUpgradeWaitsForActiveLegacyRunLockAndAcquiresAfterRemoval(t *testing.T) {
+	t.Parallel()
+
+	homeDir := t.TempDir()
+	configPath := writeCLIConfig(t, "http://127.0.0.1:4321", "")
+	execPath := filepath.Join(homeDir, ".looper", "bin", "looper")
+	managedPath := filepath.Join(homeDir, ".looper", "bin", "looperd")
+	if err := os.MkdirAll(filepath.Dir(execPath), 0o755); err != nil {
+		t.Fatalf("MkdirAll(exec dir) error = %v", err)
+	}
+	if err := os.WriteFile(execPath, []byte("looper"), 0o755); err != nil {
+		t.Fatalf("WriteFile(execPath) error = %v", err)
+	}
+	if err := os.WriteFile(managedPath, []byte("looperd"), 0o755); err != nil {
+		t.Fatalf("WriteFile(managedPath) error = %v", err)
+	}
+	resolvedExecPath, err := filepath.EvalSymlinks(execPath)
+	if err != nil {
+		resolvedExecPath = execPath
+	}
+
+	runLockPath := filepath.Join(homeDir, ".looper", "auto-upgrade.run.lock")
+	legacyPID := os.Getpid() + 100000
+	legacyCommand := "/usr/local/bin/looper upgrade --background-auto"
+	legacyRaw, err := json.Marshal(autoUpgradeLockState{
+		PID:        legacyPID,
+		Executable: "looper",
+		Command:    legacyCommand,
+		ObservedAt: time.Now().UTC().Format(time.RFC3339Nano),
+	})
+	if err != nil {
+		t.Fatalf("Marshal(legacy lock) error = %v", err)
+	}
+	if err := os.WriteFile(runLockPath, append(legacyRaw, '\n'), 0o600); err != nil {
+		t.Fatalf("WriteFile(runLockPath) error = %v", err)
+	}
+
+	var legacyDone atomic.Bool
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		time.Sleep(40 * time.Millisecond)
+		_ = os.Remove(runLockPath)
+		legacyDone.Store(true)
+	}()
+	defer func() {
+		<-done
+	}()
+
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	app := New(Deps{
+		Stdout:         stdout,
+		Stderr:         stderr,
+		HomeDir:        homeDir,
+		Platform:       "darwin",
+		Arch:           "arm64",
+		ExecutablePath: execPath,
+		CLIChannel:     cliInstallChannelStable,
+		KillProcess: func(pid int, signal int) error {
+			if pid == legacyPID && signal == 0 {
+				if legacyDone.Load() {
+					return os.ErrProcessDone
+				}
+				return nil
+			}
+			return os.ErrProcessDone
+		},
+		HTTPClient: newTestHTTPClient(func(req *http.Request) (*http.Response, error) {
+			switch req.URL.String() {
+			case "http://127.0.0.1:4321/api/v1/status":
+				return jsonResponse(t, http.StatusOK, fmt.Sprintf(`{"ok":true,"requestId":"req_status","data":{"service":{"version":"0.2.1","binary":{"name":"looperd","path":%q}}}}`, managedPath)), nil
+			case "https://api.github.com/repos/nexu-io/looper/releases/latest":
+				return jsonResponse(t, http.StatusOK, `{"tag_name":"v0.3.0","assets":[{"name":"looper-darwin-arm64","browser_download_url":"https://example.invalid/looper-darwin-arm64"},{"name":"looper-darwin-arm64.sha256","browser_download_url":"https://example.invalid/looper-darwin-arm64.sha256"},{"name":"looperd-darwin-arm64","browser_download_url":"https://example.invalid/looperd-darwin-arm64"},{"name":"looperd-darwin-arm64.sha256","browser_download_url":"https://example.invalid/looperd-darwin-arm64.sha256"}]}`), nil
+			default:
+				t.Errorf("unexpected request URL %q", req.URL.String())
+				return nil, fmt.Errorf("unexpected request URL %q", req.URL.String())
+			}
+		}),
+		RunCommand: func(ctx context.Context, command string, args []string, timeout time.Duration) (commandExecutionResult, error) {
+			_ = ctx
+			_ = timeout
+			if command == "ps" && strings.Join(args, " ") == fmt.Sprintf("-p %d -o command=", legacyPID) {
+				if legacyDone.Load() {
+					return commandExecutionResult{ExitCode: 1}, nil
+				}
+				return commandExecutionResult{Stdout: legacyCommand + "\n", ExitCode: 0}, nil
+			}
+			if strings.Join(args, " ") == "--version" && (command == execPath || command == resolvedExecPath || command == managedPath) {
+				if legacyDone.Load() {
+					return commandExecutionResult{Stdout: "0.3.0\n", ExitCode: 0}, nil
+				}
+				return commandExecutionResult{Stdout: "0.2.1\n", ExitCode: 0}, nil
+			}
+			return commandExecutionResult{ExitCode: 1, Stderr: "not found"}, nil
+		},
+	})
+
+	exitCode := app.Run(context.Background(), []string{"upgrade", "--config", configPath})
+	if exitCode != 0 {
+		t.Fatalf("Run([upgrade]) exit code = %d, want 0; stderr=%q", exitCode, stderr.String())
+	}
+	wantNotice := fmt.Sprintf("Waiting for background auto-upgrade (pid %d) to finish", legacyPID)
+	if !strings.Contains(stderr.String(), wantNotice) {
+		t.Fatalf("stderr = %q, want %q", stderr.String(), wantNotice)
+	}
+	for _, want := range []string{
+		"looper is already up to date (0.3.0)",
+		"looperd is already up to date (0.3.0)",
+		"Running daemon is still 0.2.1",
+		"looper daemon restart",
+	} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Fatalf("stdout = %q, want to contain %q", stdout.String(), want)
+		}
+	}
+	raw, err := os.ReadFile(runLockPath)
+	if err != nil {
+		t.Fatalf("ReadFile(runLockPath) error = %v", err)
+	}
+	lock, ok := parseAutoUpgradeLockState(raw)
+	if !ok {
+		t.Fatalf("parseAutoUpgradeLockState(runLockPath) = false, want true; raw=%q", string(raw))
+	}
+	if lock.Mode != autoUpgradeLockModeUpgrade {
+		t.Fatalf("lock.Mode = %q, want %q", lock.Mode, autoUpgradeLockModeUpgrade)
+	}
+	if lock.PID != os.Getpid() {
+		t.Fatalf("lock.PID = %d, want %d", lock.PID, os.Getpid())
+	}
+}
+
+func TestTryAcquireAutoUpgradeLockTakesOverLegacyLockWhenPIDIsDifferentProcess(t *testing.T) {
+	t.Parallel()
+
+	homeDir := t.TempDir()
+	runLockPath := filepath.Join(homeDir, ".looper", "auto-upgrade.run.lock")
+	if err := os.MkdirAll(filepath.Dir(runLockPath), 0o755); err != nil {
+		t.Fatalf("MkdirAll(lock dir) error = %v", err)
+	}
+	legacyPID := os.Getpid() + 100001
+	legacyRaw, err := json.Marshal(autoUpgradeLockState{
+		PID:        legacyPID,
+		Executable: "looper",
+		Command:    "/usr/local/bin/looper upgrade --background-auto",
+		ObservedAt: time.Now().UTC().Format(time.RFC3339Nano),
+	})
+	if err != nil {
+		t.Fatalf("Marshal(legacy lock) error = %v", err)
+	}
+	if err := os.WriteFile(runLockPath, append(legacyRaw, '\n'), 0o600); err != nil {
+		t.Fatalf("WriteFile(runLockPath) error = %v", err)
+	}
+
+	runtime := newCommandRuntime(New(Deps{
+		HomeDir: homeDir,
+		KillProcess: func(pid int, signal int) error {
+			if pid == legacyPID && signal == 0 {
+				return nil
+			}
+			return os.ErrProcessDone
+		},
+		RunCommand: func(ctx context.Context, command string, args []string, timeout time.Duration) (commandExecutionResult, error) {
+			_ = ctx
+			_ = timeout
+			if command == "ps" && strings.Join(args, " ") == fmt.Sprintf("-p %d -o command=", legacyPID) {
+				return commandExecutionResult{Stdout: "/usr/bin/vim /tmp/note.txt\n", ExitCode: 0}, nil
+			}
+			return commandExecutionResult{ExitCode: 1}, nil
+		},
+	}), nil)
+
+	unlock, acquired, _, err := runtime.tryAcquireAutoUpgradeLock(runLockPath, autoUpgradeLockModeUpgrade)
+	if err != nil {
+		t.Fatalf("tryAcquireAutoUpgradeLock() error = %v", err)
+	}
+	if !acquired {
+		t.Fatal("tryAcquireAutoUpgradeLock() acquired = false, want true")
+	}
+	defer unlock()
+
+	raw, err := os.ReadFile(runLockPath)
+	if err != nil {
+		t.Fatalf("ReadFile(runLockPath) error = %v", err)
+	}
+	lock, ok := parseAutoUpgradeLockState(raw)
+	if !ok {
+		t.Fatalf("parseAutoUpgradeLockState(runLockPath) = false, want true; raw=%q", string(raw))
+	}
+	if lock.PID != os.Getpid() {
+		t.Fatalf("lock.PID = %d, want %d", lock.PID, os.Getpid())
+	}
+	if lock.Mode != autoUpgradeLockModeUpgrade {
+		t.Fatalf("lock.Mode = %q, want %q", lock.Mode, autoUpgradeLockModeUpgrade)
+	}
+}
+
 func TestBackgroundAutoUpgradeCommandPersistsReadyRestartState(t *testing.T) {
 	t.Parallel()
 
