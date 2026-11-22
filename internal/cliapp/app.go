@@ -34,11 +34,19 @@ type Deps struct {
 	Sleep          sleepFunc
 	Getwd          getwdFunc
 	ExecutablePath string
+	// ResolveExecutable overrides os.Executable when set (primarily for tests
+	// simulating executable path changes across a lock wait).
+	ResolveExecutable func() (string, error)
 
 	// DaemonStartTimeout overrides how long daemon start/restart waits for the
 	// spawned looperd process to become API-ready. It is primarily intended for
 	// tests; production uses the CLI default.
 	DaemonStartTimeout time.Duration
+
+	// UpgradeLockWaitTimeout overrides how long `looper upgrade` waits for an
+	// active upgrade lock to be released before timing out. Production uses the
+	// CLI default.
+	UpgradeLockWaitTimeout time.Duration
 
 	// CLIChannel overrides the install-source channel used to decide whether
 	// auto-upgrade may run. Defaults to version.Channel when empty. Tests that
