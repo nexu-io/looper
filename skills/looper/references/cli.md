@@ -188,7 +188,9 @@ looper daemon restart
 
 ## Add an existing project/repo
 
-If Looper is already installed and the user wants to watch another repository, use `looper project add` as the default **zero-restart** workflow instead of re-running first-time bootstrap or editing `~/.looper/config.toml`. The binding is saved to the runtime Project Catalog in SQLite, inherits the active global `roles.*` and `defaults.*` policy, and begins polling immediately without restarting `looperd`.
+If Looper is already installed and the user wants to watch another repository on GitHub or on an **already-configured** Forgejo provider, use `looper project add` as the default **zero-restart** workflow instead of re-running first-time bootstrap or editing `~/.looper/config.toml`. The binding is saved to the runtime Project Catalog in SQLite, inherits the active global `roles.*` and `defaults.*` policy, and begins polling immediately without restarting `looperd`.
+
+> **Exception — creating a new Forgejo provider:** Passing `--forgejo-url` to create a brand-new Forgejo provider is **not** zero-restart. `looper project add` writes `[[providers]]` to the config file and restarts `looperd` automatically so the daemon can load the new provider. Always confirm the daemon restart with the user before running `--forgejo-url` against a running daemon.
 
 ### 1. Preflight before adding
 
@@ -221,7 +223,9 @@ looper project add /absolute/path/to/repo \
 
 The repository slug is detected from an origin matching the selected provider when possible; otherwise pass `--repo owner/name`. The binding is saved and activated immediately through the runtime Project Catalog, so background automation may begin as soon as the command succeeds.
 
-**Forgejo (creating the provider and binding the project in the same flow):**
+**Forgejo (creating the provider and binding the project in the same flow — restarts `looperd`):**
+
+> **Warning:** Because `[[providers]]` is restart-bound, running `looper project add` with `--forgejo-url` (when that provider ID does not already exist with matching settings) writes the provider to config and invokes a daemon restart automatically. Confirm with the user before running this against an active daemon.
 
 ```bash
 export FORGEJO_TOKEN=<forgejo-token>
@@ -237,7 +241,7 @@ looper project add /absolute/path/to/repo \
 #   --auth tea --tea-login powerformer-code
 ```
 
-### 3. Validate after adding (no daemon restart)
+### 3. Validate after adding (no daemon restart for GitHub or an existing Forgejo provider)
 
 ```bash
 looper project list

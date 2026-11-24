@@ -225,7 +225,7 @@ For daemon log layout and supervised vs detached mode, see [`references/daemon.m
 
 ### Step 6 — Add additional projects (optional)
 
-Use `looper project add` as the default **zero-restart** path when registering a new repository against an already-running daemon. It persists the binding to the runtime Project Catalog in SQLite and starts polling immediately, inheriting effective global `roles.*` and `defaults.*` without touching `~/.looper/config.toml` or restarting `looperd`.
+For GitHub repositories or Forgejo repositories reusing an already-configured provider, `looper project add` is the default **zero-restart** path when registering a new repository against an already-running daemon. It persists the binding to the runtime Project Catalog in SQLite and starts polling immediately, inheriting effective global `roles.*` and `defaults.*` without touching `~/.looper/config.toml` or restarting `looperd`. (Creating a new Forgejo provider with `--forgejo-url` writes `[[providers]]` to config and restarts `looperd` automatically — confirm with the user before using `--forgejo-url` against a running daemon.)
 
 1. **Preflight (read-only)**:
    - Run `looper status`, `looper project list`, and `looper config show` to verify global role defaults, existing projects, and configured Forgejo providers.
