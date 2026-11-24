@@ -225,11 +225,34 @@ For daemon log layout and supervised vs detached mode, see [`references/daemon.m
 
 ### Step 6 — Add additional projects (optional)
 
-```bash
-looper project add /absolute/path/to/repo --id <stable-id> --repo <owner>/<repo>
-```
+For GitHub repositories or Forgejo repositories reusing an already-configured provider, `looper project add` is the default **zero-restart** path when registering a new repository against an already-running daemon. It persists the binding to the runtime Project Catalog in SQLite and starts polling immediately, inheriting effective global `roles.*` and `defaults.*` without touching `~/.looper/config.toml` or restarting `looperd`. (Creating a new Forgejo provider with `--forgejo-url` writes `[[providers]]` to config and restarts `looperd` automatically — confirm with the user before using `--forgejo-url` against a running daemon.)
 
-Always prefer absolute paths and confirm the GitHub slug (`owner/repo`) before running.
+1. **Preflight (read-only)**:
+   - Run `looper status`, `looper project list`, and `looper config show` to verify global role defaults, existing projects, and configured Forgejo providers.
+   - Confirm the target local checkout exists at an absolute path (clone it first if needed) and confirm `--id`, `--repo` (`<owner>/<repo>`), and `--base-branch`.
+   - Verify remote access: `gh auth status` for GitHub; for Forgejo, verify the provider's `teaLogin` or `tokenEnv` and test `git ls-remote <clone-url> HEAD`.
+2. **Register with `looper project add`**:
+
+   ```bash
+   # GitHub
+   looper project add /absolute/path/to/repo --id <stable-id> --repo <owner>/<repo>
+
+   # Forgejo (existing provider)
+   looper project add /absolute/path/to/repo \
+     --id <stable-id> \
+     --name <owner>/<repo> \
+     --provider <provider-id> \
+     --repo <owner>/<repo> \
+     --base-branch main
+   ```
+
+3. **Verify without restarting `looperd`**:
+   - Run `looper project list` and `looper status` to confirm the new project is registered and active.
+4. **Do not mirror into `~/.looper/config.toml` by default**:
+   - Do **not** append a `[[projects]]` block to `~/.looper/config.toml` merely to register a project or match existing entries. `projects` in `config.toml` is restart-bound, so adding `[[projects]]` causes `looperd`'s file watcher to reject config reloads (`rejectedPaths: ["projects"]`) until reverted or restarted.
+   - Only add `[[projects]]` to `config.toml` when the user explicitly requests per-project overrides that `looper project add` cannot express (such as project-specific `instructions`, `skills`, or custom triggers), and confirm the restart trade-off before writing.
+
+See [`references/cli.md`](references/cli.md) for Forgejo provider creation flags and full `looper project add` details.
 
 ### Step 7 — First loop (smoke test)
 
@@ -301,6 +324,7 @@ looper webhook cleanup owner/repo --confirm
 ## Common mistakes
 
 - `cat ~/.looper/config.*` as a first move: use `looper config show` instead and redact secrets.
+- Editing `[[projects]]` in `~/.looper/config.toml` just to add a repository (or after `looper project add`): use `looper project add` alone for zero-restart registration; editing `projects` in `config.toml` is restart-bound and causes `looperd`'s watcher to reject reloads (`rejectedPaths: ["projects"]`) until reverted or restarted.
 - Restarting after every config edit: hot-safe policy reloads automatically for claims made after publication. Check the Configuration page or logs first; restart can re-trigger automation.
 - Assuming every valid edit was applied: a restart-bound field in the same candidate rejects the entire reload, and the last-known-good snapshot remains active until the file is corrected or the daemon is restarted with that config.
 - Submitting a stale Configuration page repeatedly: the patch revision intentionally conflicts after another editor changes the file; wait for a safe edit to publish and refresh, or resolve the displayed reload diagnostics in the file before retrying.

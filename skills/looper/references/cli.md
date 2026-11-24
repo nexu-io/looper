@@ -188,40 +188,44 @@ looper daemon restart
 
 ## Add an existing project/repo
 
-If Looper is already installed and the user has an existing local GitHub repository, register it explicitly instead of re-running first-time bootstrap:
+If Looper is already installed and the user wants to watch another repository on GitHub or on an **already-configured** Forgejo provider, use `looper project add` as the default **zero-restart** workflow instead of re-running first-time bootstrap or editing `~/.looper/config.toml`. The binding is saved to the runtime Project Catalog in SQLite, inherits the active global `roles.*` and `defaults.*` policy, and begins polling immediately without restarting `looperd`.
+
+> **Exception — creating a new Forgejo provider:** Passing `--forgejo-url` to create a brand-new Forgejo provider is **not** zero-restart. `looper project add` writes `[[providers]]` to the config file and restarts `looperd` automatically so the daemon can load the new provider. Always confirm the daemon restart with the user before running `--forgejo-url` against a running daemon.
+
+### 1. Preflight before adding
+
+- Inspect current runtime state (`looper status`, `looper project list`, `looper config show`) to see existing projects, configured Forgejo providers, and whether global `roles.*` defaults already match what the new project needs.
+- Confirm `/absolute/path/to/repo` is the intended local Git repository (prefer an absolute path; clone the repo first if it is not yet on disk, and avoid registering guessed or relative paths without confirmation).
+- Confirm the repository slug (`owner/repo`), `--id` (omit to let Looper infer one, or pass `--id` when a stable, memorable id is needed), and optional `--name`, `--base-branch`, or `--worktree-root`.
+- Verify provider access:
+  - **GitHub**: run `gh auth status` and ensure the authenticated account can access `owner/repo`.
+  - **Forgejo**: confirm the provider in `looper status` (or its `teaLogin` / `tokenEnv` credentials) and verify remote access with `git ls-remote <clone-url> HEAD`.
+- Use `--snapshot-mode async`, `full`, or `off` only when the user asks to control initial PR snapshot behavior; default behavior is configured by `defaults.addSnapshotMode`.
+
+### 2. Register the project (`looper project add`)
+
+**GitHub:**
 
 ```bash
 looper project add /absolute/path/to/repo --id myproj --repo owner/repo
 ```
 
-Preflight before adding:
-
-- Confirm `/absolute/path/to/repo` is the user's intended local Git repository.
-- Prefer an absolute path; avoid registering a guessed or relative path without confirmation.
-- Confirm the GitHub repository slug (`owner/repo`) or let the user provide it.
-- Check `gh auth status` and ensure the authenticated account can access the repository.
-- If `--id` is omitted, Looper generates or infers a project id; use `--id` when the user needs a stable, memorable project id.
-- Use `--name`, `--base-branch`, and `--worktree-root` only when the user wants non-default values.
-- Use `--snapshot-mode async`, `full`, or `off` only when the user asks to control initial PR snapshot behavior; default behavior is configured by `defaults.addSnapshotMode`.
-
-Validate after adding:
+**Forgejo (reusing an existing provider):**
 
 ```bash
-looper project list
-looper status
-```
-
-After a project is registered, Looper can often infer it from commands run inside that repo. If no project matches the current directory, or multiple projects match, pass `--project <id>` explicitly.
-
-For Forgejo, select an existing provider explicitly:
-
-```bash
-looper project add /absolute/path/to/repo --provider forgejo-main
+looper project add /absolute/path/to/repo \
+  --id myproj \
+  --name owner/name \
+  --provider forgejo-main \
+  --repo owner/name \
+  --base-branch main
 ```
 
 The repository slug is detected from an origin matching the selected provider when possible; otherwise pass `--repo owner/name`. The binding is saved and activated immediately through the runtime Project Catalog, so background automation may begin as soon as the command succeeds.
 
-To create the provider and bind the project non-interactively in the same flow:
+**Forgejo (creating the provider and binding the project in the same flow — restarts `looperd`):**
+
+> **Warning:** Because `[[providers]]` is restart-bound, running `looper project add` with `--forgejo-url` (when that provider ID does not already exist with matching settings) writes the provider to config and invokes a daemon restart automatically. Confirm with the user before running this against an active daemon.
 
 ```bash
 export FORGEJO_TOKEN=<forgejo-token>
@@ -236,6 +240,21 @@ looper project add /absolute/path/to/repo \
 #   --forgejo-url https://code.example.com \
 #   --auth tea --tea-login powerformer-code
 ```
+
+### 3. Validate after adding (no daemon restart for GitHub or an existing Forgejo provider)
+
+```bash
+looper project list
+looper status
+```
+
+Confirm the project appears in both outputs and `looperd` remains healthy without restarting the daemon. After a project is registered, Looper can often infer it from commands run inside that repo. If no project matches the current directory, or multiple projects match, pass `--project <id>` explicitly.
+
+### 4. When (and only when) to edit `~/.looper/config.toml`
+
+- Do **not** append a `[[projects]]` block to `~/.looper/config.toml` just to register a project or mirror existing project blocks when global defaults already suffice.
+- `projects` in `config.toml` is a **restart-bound** setting (`configuration changes require a daemon restart: projects`). Adding or modifying `[[projects]]` in `config.toml` causes `looperd`'s file watcher to reject config reloads (`rejectedPaths: ["projects"]`) until the edit is reverted or `looperd` is restarted.
+- Only add a `[[projects]]` block in `config.toml` when the user explicitly wants per-project overrides that `looper project add` cannot express (such as project-specific `roles.<role>.instructions`, `roles.reviewer.skills`, or custom discovery/trigger overrides), and confirm with the user beforehand that applying those overrides requires a daemon restart (or waiting for the next restart).
 
 Daemon lifecycle commands:
 

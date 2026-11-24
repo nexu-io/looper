@@ -237,6 +237,8 @@ blocking = "REQUEST_CHANGES"
 
 ## Project override rules
 
+To add a new GitHub repository or a Forgejo repository on an already-configured provider using the active global `roles.*` and `defaults.*` policy without restarting `looperd`, use `looper project add` (persisted in the runtime Project Catalog) instead of editing `[[projects]]` in `~/.looper/config.toml`. (By contrast, creating a new Forgejo provider via `looper project add --forgejo-url` writes `[[providers]]` and restarts `looperd`.) Because `projects` in the config file is restart-bound, editing `[[projects]]` causes `looperd`'s file watcher to reject hot reloads (`rejectedPaths: ["projects"]`) until reverted or restarted. Reserve `[[projects]]` entries in `config.toml` for confirmed per-project overrides (such as project-specific `instructions`, `skills`, or custom triggers).
+
 Project entries stay in `projects[]`, but any override-bearing config must mirror the same local shape it uses globally.
 
 Project entries are split into:
