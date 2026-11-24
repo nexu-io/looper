@@ -14,6 +14,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/nexu-io/looper/internal/config"
@@ -64,10 +65,11 @@ type HostBrokerOptions struct {
 }
 
 type hostBroker struct {
-	options  HostBrokerOptions
-	session  *hostingidentity.Session
-	client   *http.Client
-	snapshot []byte
+	options        HostBrokerOptions
+	session        *hostingidentity.Session
+	client         *http.Client
+	snapshot       []byte
+	rereviewSubmit sync.Mutex
 }
 
 // StartHostBroker binds every operation to the already-selected run identity.
@@ -145,6 +147,13 @@ func (b *hostBroker) handle(ctx context.Context, conn net.Conn) {
 				return
 			}
 			authority := b.options.Review
+			if authority.Policy.ForgejoRereviewMarker != "" {
+				if !b.rereviewSubmit.TryLock() {
+					writeHostingError(conn, "Forgejo re-review submission is already in progress")
+					return
+				}
+				defer b.rereviewSubmit.Unlock()
+			}
 			runTrustedReviewProxyRequest(ctx, conn, req, b.options.RealLooper, env, authority.PRRef, b.options.CWD, b.snapshot, authority.Policy, b.options.Tracker)
 			return
 		}

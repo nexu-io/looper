@@ -77,11 +77,12 @@ func FormatTrustedReviewPRRef(repo string, prNumber int64) string {
 // expected-head, and manual-run identity flags are stripped and replaced with
 // these values before the child runs.
 type TrustedReviewProxyPolicy struct {
-	Clean            string // COMMENT or APPROVE
-	Blocking         string // COMMENT or REQUEST_CHANGES
-	ExpectedCommitID string
-	ReviewerManual   bool
-	ReviewerRunID    string
+	Clean                 string // COMMENT or APPROVE
+	Blocking              string // COMMENT or REQUEST_CHANGES
+	ExpectedCommitID      string
+	ReviewerManual        bool
+	ReviewerRunID         string
+	ForgejoRereviewMarker string
 }
 
 // StartTrustedReviewProxy listens on a private Unix socket and runs
@@ -140,7 +141,16 @@ func StartTrustedReviewProxy(realLooper string, trustedEnv map[string]string, al
 	if err != nil {
 		return "", nil, err
 	}
+	var rereviewSubmit sync.Mutex
 	return startHostingSocket(context.Background(), func(ctx context.Context, conn net.Conn) {
+		if boundPolicy.ForgejoRereviewMarker != "" {
+			if !rereviewSubmit.TryLock() {
+				defer conn.Close()
+				writeHostingError(conn, "Forgejo re-review submission is already in progress")
+				return
+			}
+			defer rereviewSubmit.Unlock()
+		}
 		handleTrustedReviewProxyConn(ctx, conn, realLooper, trustedEnv, normalizedAllowed, boundCwd, boundConfig, boundPolicy, tracker)
 	})
 }
@@ -792,9 +802,13 @@ func normalizeTrustedReviewProxyPolicy(policy TrustedReviewProxyPolicy) (Trusted
 	if policy.ReviewerManual && reviewerRunID == "" {
 		return TrustedReviewProxyPolicy{}, fmt.Errorf("manual reviewer run id is required")
 	}
+	if policy.ForgejoRereviewMarker != "" && RereviewRequestID(policy.ForgejoRereviewMarker) == 0 {
+		return TrustedReviewProxyPolicy{}, fmt.Errorf("invalid Forgejo re-review marker")
+	}
 	return TrustedReviewProxyPolicy{
 		Clean: clean, Blocking: blocking, ExpectedCommitID: expectedCommitID,
-		ReviewerManual: policy.ReviewerManual, ReviewerRunID: reviewerRunID,
+		ForgejoRereviewMarker: policy.ForgejoRereviewMarker,
+		ReviewerManual:        policy.ReviewerManual, ReviewerRunID: reviewerRunID,
 	}, nil
 }
 
@@ -814,6 +828,9 @@ func applyTrustedReviewProxyPolicy(argv []string, policy TrustedReviewProxyPolic
 	if policy.ReviewerRunID != "" {
 		bound = append(bound, "--reviewer-run-id", policy.ReviewerRunID)
 	}
+	if policy.ForgejoRereviewMarker != "" {
+		bound = append(bound, "--forgejo-rereview-marker", policy.ForgejoRereviewMarker)
+	}
 	return bound
 }
 
@@ -828,7 +845,7 @@ func stripTrustedReviewProxyPolicyFlags(argv []string) []string {
 		switch name {
 		case "reviewer-manual":
 			continue
-		case "clean-review-event", "blocking-review-event", "commit-id", "reviewer-run-id":
+		case "clean-review-event", "blocking-review-event", "commit-id", "reviewer-run-id", "forgejo-rereview-marker":
 			if !strings.Contains(arg, "=") && i+1 < len(argv) && !strings.HasPrefix(argv[i+1], "-") {
 				i++
 			}

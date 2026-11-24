@@ -2086,12 +2086,14 @@ func reviewerAllowedReviewPolicy(metadata map[string]any) forge.TrustedReviewPro
 	expectedCommitID, _ := metadata["expectedCommitID"].(string)
 	reviewerManual, _ := metadata["reviewerManual"].(bool)
 	reviewerRunID, _ := metadata["reviewerRunID"].(string)
+	forgejoRereviewMarker, _ := metadata["forgejoRereviewMarker"].(string)
 	return forge.TrustedReviewProxyPolicy{
-		Clean:            strings.TrimSpace(clean),
-		Blocking:         strings.TrimSpace(blocking),
-		ExpectedCommitID: strings.TrimSpace(expectedCommitID),
-		ReviewerManual:   reviewerManual,
-		ReviewerRunID:    strings.TrimSpace(reviewerRunID),
+		Clean:                 strings.TrimSpace(clean),
+		Blocking:              strings.TrimSpace(blocking),
+		ExpectedCommitID:      strings.TrimSpace(expectedCommitID),
+		ReviewerManual:        reviewerManual,
+		ReviewerRunID:         strings.TrimSpace(reviewerRunID),
+		ForgejoRereviewMarker: forgejoRereviewMarker,
 	}
 }
 

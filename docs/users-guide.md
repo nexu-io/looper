@@ -391,7 +391,7 @@ For Forgejo projects, automatic and manual Fixer runs consume native findings wi
 - deferred and declined findings remain open; existing manual holds and role budgets apply, and explicit `needs_human` results suspend for intervention
 - legacy reviewer-summary items remain supported, with protocol metadata hidden from the visible message
 
-After a repair changes the head, Reviewer can review the new code. GitHub's same-head decline adjudication is not available on Forgejo. See [Forgejo configuration](configuration.md#provider-support) for opt-in auto-merge and the remaining provider limits.
+After a repair changes the head, Reviewer can review the new code. On Forgejo projects using native review publication with auto-merge disabled, explicitly requesting the same reviewer after its latest review can also trigger a fresh review of the unchanged head. The normal automatic discovery rules and publish budget still apply. A removed request or changed head invalidates the queued re-review. GitHub's same-head decline adjudication is not available on Forgejo. See [Forgejo configuration](configuration.md#provider-support) for opt-in auto-merge and the remaining provider limits.
 
 If the PR is still in the spec review phase and the review becomes clean, fixer can also move the labels from:
 
