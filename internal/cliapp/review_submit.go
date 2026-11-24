@@ -98,6 +98,7 @@ type forgejoReviewSubmitGateway struct {
 	requireReviewRequest bool
 	labels               []string
 	labelMode            config.LabelMode
+	rereviewMarker       string
 }
 
 func (gateway forgejoReviewSubmitGateway) validateReviewRequest(ctx context.Context, prNumber int64, labels []string, bypass bool) error {
@@ -105,7 +106,7 @@ func (gateway forgejoReviewSubmitGateway) validateReviewRequest(ctx context.Cont
 	// (manual reviewer loop, or enabled follow-up on a new head). The argv
 	// --reviewer-manual flag alone is never sufficient to skip the
 	// requested-reviewer / label publish gate.
-	if bypass || !gateway.requireReviewRequest || forgeReviewSubmitLabelsMatch(labels, gateway.labels, gateway.labelMode) {
+	if gateway.rereviewMarker != "" || bypass || !gateway.requireReviewRequest || forgeReviewSubmitLabelsMatch(labels, gateway.labels, gateway.labelMode) {
 		return nil
 	}
 	identity, err := gateway.client.CurrentUser(ctx)
@@ -162,9 +163,13 @@ func (gateway forgejoReviewSubmitGateway) BuildReviewAnchorIndex(ctx context.Con
 }
 
 func (gateway forgejoReviewSubmitGateway) SubmitReview(ctx context.Context, input githubinfra.SubmitReviewInput) error {
-	if matches := reviewSubmitMarkerRE.FindStringSubmatch(input.Body); len(matches) == 2 {
+	matches := reviewSubmitMarkerRE.FindStringSubmatch(input.Body)
+	if gateway.rereviewMarker != "" && (len(matches) != 2 || parseReviewSubmitMarkerFields(matches[1])["id"] != gateway.rereviewMarker) {
+		return errors.New("review marker does not match the trusted Forgejo re-review")
+	}
+	if len(matches) == 2 {
 		expected := parseReviewSubmitMarkerFields(matches[1])
-		reviews, err := gateway.client.ListPullRequestReviews(ctx, input.PRNumber)
+		reviews, err := gateway.client.ListPullRequestReviewSummaries(ctx, input.PRNumber)
 		if err != nil {
 			return err
 		}
@@ -172,18 +177,26 @@ func (gateway forgejoReviewSubmitGateway) SubmitReview(ctx context.Context, inpu
 		if err != nil {
 			return err
 		}
+		requestID := forge.RereviewRequestID(gateway.rereviewMarker)
+		var liveRequest bool
 		for _, review := range reviews {
+			if !sameGitHubLogin(review.User.Login, identity.Login) {
+				continue
+			}
+			if requestID != 0 && review.ID == requestID && review.State == "REQUEST_REVIEW" {
+				liveRequest = true
+			}
 			candidateMatch := reviewSubmitMarkerRE.FindStringSubmatch(review.Body)
 			if len(candidateMatch) != 2 {
 				continue
 			}
 			candidate := parseReviewSubmitMarkerFields(candidateMatch[1])
-			// Only reuse a marker published by the current authenticated account.
-			// Another identity may share id/head/outcome after token rotation or
-			// multi-instance reuse; later marker verification filters by login.
-			if candidate["id"] == expected["id"] && candidate["head"] == expected["head"] && candidate["outcome"] == expected["outcome"] && forgeReviewSubmitStateMatchesEvent(review.State, input.Event) && sameGitHubLogin(review.User.Login, identity.Login) {
+			if candidate["id"] == expected["id"] && candidate["head"] == expected["head"] && candidate["outcome"] == expected["outcome"] && forgeReviewSubmitStateMatchesEvent(review.State, input.Event) {
 				return nil
 			}
+		}
+		if requestID != 0 && !liveRequest {
+			return errors.New("review request removed before publish")
 		}
 	}
 	// Match the GitHub gateway contract: retarget/downgrade invalid anchors using the
@@ -499,6 +512,14 @@ func (r *commandRuntime) reviewSubmit(cmd *cobra.Command, args []string) error {
 	gateway, err := reviewSubmitGatewayForContext(cmd.Context(), loaded.Config, repo, cwd, diagnosticWriter)
 	if err != nil {
 		return err
+	}
+	if marker := getStringFlag(cmd, "forgejo-rereview-marker"); marker != "" {
+		native, ok := gateway.(forgejoReviewSubmitGateway)
+		if !ok || !forge.TrustedReviewProxyChildConfigured() || forge.RereviewRequestID(marker) == 0 {
+			return errors.New("Forgejo re-review marker requires the trusted review proxy")
+		}
+		native.rereviewMarker = marker
+		gateway = native
 	}
 	detail, err := gateway.ViewPullRequest(cmd.Context(), githubinfra.ViewPullRequestInput{Repo: repo, PRNumber: prNumber, CWD: cwd})
 	if err != nil {

@@ -627,6 +627,7 @@ type reviewerCheckpoint struct {
 	// disposition cleared Looper blockers. It must not reuse head-only
 	// publication identity or the lastPublishedHeadSha already-published skip.
 	ConvergencePass         bool                     `json:"convergencePass,omitempty"`
+	ForgejoRereviewID       int64                    `json:"forgejoRereviewId,omitempty"`
 	ReviewSignalFingerprint string                   `json:"reviewSignalFingerprint,omitempty"`
 	PendingReview           *pendingReviewCheckpoint `json:"pendingReview,omitempty"`
 	SkipReason              string                   `json:"skipReason,omitempty"`
@@ -1213,10 +1214,21 @@ func (r *Runner) enqueueReviewerDiscoveryCandidate(ctx context.Context, project 
 	}
 	dispositionOnly := false
 	reviewSignal := ""
+	var rereviewID int64
+	if r.supportsForgejoRereview(project.ID, loopResult.record) && len(pr.ReviewRequests) != 0 {
+		if *currentLogin == "" {
+			login, err := r.requireCurrentUserLogin(ctx, project.RepoPath)
+			if err != nil {
+				return err
+			}
+			*currentLogin = login
+		}
+		rereviewID = forgejoPendingRereview(pr.ReviewRequests, pr.Reviews, *currentLogin, pr.HeadSHA)
+	}
 	// For continuous native-thread loops, evaluate same-head signal before
 	// head-based lastFilterSkip suppression so a changed disposition is not
 	// blocked forever by already_published_head / not_requested history.
-	if samePublishedHead {
+	if samePublishedHead && rereviewID == 0 {
 		// lastPublishedHeadSha is publication metadata only; discovery identity is
 		// the review signal (head + Looper-authored thread feedback).
 		decision, err := r.sameHeadDiscoveryDecision(ctx, project, repo, pr, loopResult.record, meta)
@@ -1237,7 +1249,7 @@ func (r *Runner) enqueueReviewerDiscoveryCandidate(ctx context.Context, project 
 			reviewSignal = decision.signal
 		}
 	}
-	if !dispositionOnly && reviewerDiscoverySuppressedByLastSkip(loopResult.record, pr, *currentLogin, policy) && !allowThreadResolutionFollowUp {
+	if rereviewID == 0 && !dispositionOnly && reviewerDiscoverySuppressedByLastSkip(loopResult.record, pr, *currentLogin, policy) && !allowThreadResolutionFollowUp {
 		allowFollowUp, followErr := r.allowThreadResolutionFollowUpAfterNotRequestedSkip(ctx, project.RepoPath, repo, pr, *currentLogin, meta, policy)
 		if followErr != nil {
 			return followErr
@@ -1329,6 +1341,7 @@ func (r *Runner) enqueueReviewerDiscoveryCandidate(ctx context.Context, project 
 		HeadSHA:                 pr.HeadSHA,
 		ReviewSignalFingerprint: reviewSignal,
 		DispositionOnly:         dispositionOnly,
+		ForgejoRereviewID:       rereviewID,
 		AvailableAt:             availableAt,
 	})
 	if queueErr != nil {
@@ -2919,7 +2932,28 @@ func (r *Runner) runFilterStep(ctx context.Context, input stepInput) (reviewerCh
 			alreadyReviewedHead = true
 		}
 	}
-	if samePublishedHead || alreadyReviewedHead {
+	if requestID := forgejoRereviewIDFromQueue(input.QueueItem.PayloadJSON); requestID > 0 {
+		if err := ensureCurrentLogin(); err != nil {
+			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableTransient}
+		}
+		head := checkpoint.Detail.HeadSHA
+		if !r.supportsForgejoRereview(input.Project.ID, input.Loop) ||
+			headSHAFromQueuePayload(input.QueueItem.PayloadJSON) != head {
+			return skipInvalidForgejoRereview(checkpoint), nil
+		}
+		if forgejoPendingRereview(checkpoint.Detail.ReviewRequests, checkpoint.Detail.Reviews, currentLogin, head) != requestID {
+			id := forgejoRereviewPublicationID(input.Loop.ID, head, requestID)
+			marker, err := r.verifyAgentNativeReviewMarker(ctx, input, head, id, checkpoint.Detail.Author)
+			if err != nil {
+				return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+			}
+			if !marker.Found {
+				return skipInvalidForgejoRereview(checkpoint), nil
+			}
+		}
+		checkpoint.ForgejoRereviewID = requestID
+	}
+	if checkpoint.ForgejoRereviewID == 0 && (samePublishedHead || alreadyReviewedHead) {
 		// Explicit same-head full-review continuation after disposition cleared
 		// blockers. Do not force disposition-only or head-only skip.
 		if queuedSameHeadConvergencePass(input.QueueItem.PayloadJSON) {
@@ -4974,6 +5008,13 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 	if checkpoint.Snapshot == nil {
 		return checkpoint, &loopError{message: "Missing PR snapshot checkpoint for review step", kind: FailureRetryableTransient}
 	}
+	if checkpoint.ForgejoRereviewID != 0 {
+		next, done, err := r.recoverOrValidateForgejoRereview(ctx, input, checkpoint)
+		if done || err != nil {
+			return next, err
+		}
+		checkpoint = next
+	}
 	if reviewerWorktreePrepared(checkpoint) {
 		worktreeRoot, rootErr := reviewerWorktreeRoot(input.Project)
 		if rootErr != nil {
@@ -5005,7 +5046,9 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 	policy := r.discoveryPolicyForProject(input.Project.ID)
 	requireReviewRequest := requireReviewRequestForLoop(input.Loop, reviewRequestRequiredForCandidate(policy, checkpoint.Detail.Labels), checkpoint.Snapshot.HeadSHA)
 	reviewRequestBypassReason := ""
-	if !requireReviewRequest && policy.RequireReviewRequest && reviewerFollowUpHasNewHead(input.Loop, checkpoint.Snapshot.HeadSHA) {
+	if checkpoint.ForgejoRereviewID > 0 {
+		requireReviewRequest = true
+	} else if !requireReviewRequest && policy.RequireReviewRequest && reviewerFollowUpHasNewHead(input.Loop, checkpoint.Snapshot.HeadSHA) {
 		reviewRequestBypassReason = "follow_up_new_head"
 	}
 	reviewEvents := r.effectiveReviewEvents(input.Project.ID, input.Loop.MetadataJSON)
@@ -5106,6 +5149,9 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 		"reviewSkillsOptional":    reviewSkillMetadata(optionalReviewSkills(resolvedSkills.Entries)),
 		"reviewSkillsUnavailable": append([]string(nil), resolvedSkills.Unavailable...),
 	}
+	if checkpoint.ForgejoRereviewID != 0 {
+		metadata["forgejoRereviewMarker"] = idempotencyKey
+	}
 	for key, value := range config.CustomInstructionMetadata(instructionBlock, prompt) {
 		metadata[key] = value
 	}
@@ -5148,6 +5194,12 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 	if err != nil {
 		r.appendReviewerAgentEvent(ctx, input, "reviewer.agent.failed", "review", executionID, reviewerAgentWaitErrorPayload(err, r.now().Sub(agentStartedAt)))
 		r.logWarn("reviewer agent wait failed", map[string]any{"projectId": input.Project.ID, "loopId": input.Loop.ID, "runId": input.Run.ID, "repo": input.Repo, "prNumber": input.PRNumber, "phase": "review", "executionId": executionID, "elapsedSeconds": durationSeconds(r.now().Sub(agentStartedAt)), "error": err.Error()})
+		if checkpoint.ForgejoRereviewID != 0 {
+			next, done, recoveryErr := r.recoverOrValidateForgejoRereview(ctx, input, checkpoint)
+			if done || recoveryErr != nil {
+				return next, recoveryErr
+			}
+		}
 		r.markAgentExecutionNativeResumePendingForTransientProvider(ctx, executionID, err.Error())
 		return checkpoint, err
 	}
@@ -5264,7 +5316,7 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 		nativeFindingsJSON = string(payload)
 	}
 
-	if cleanReviewNoopSummary(result.Summary) {
+	if checkpoint.ForgejoRereviewID == 0 && cleanReviewNoopSummary(result.Summary) {
 		if reviewEvents.Clean == config.ReviewerReviewEventApprove && r.reviewerAutoMergeConfigForProject(input.Project.ID).Enabled && resolvePullRequestPhase(detailLabels(checkpoint.Detail)) != "spec" {
 			checkpoint.PendingReview = &pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, IdempotencyKey: idempotencyKey, Event: reviewEventAgentNative, Summary: result.Summary, Outcome: "clean", ReviewerSummaryJSON: nativeFindingsJSON, CleanNoop: true}
 			checkpoint.ResumePolicy = "advance_from_checkpoint"
@@ -5319,7 +5371,7 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 	}
 	pending := *checkpoint.PendingReview
 	meta := parseJSONObject(input.Loop.MetadataJSON)
-	if last, ok := stringFromAny(meta["lastPublishedHeadSha"]); ok && last == pending.HeadSHA && !isConvergencePublication(checkpoint, pending) {
+	if last, ok := stringFromAny(meta["lastPublishedHeadSha"]); ok && last == pending.HeadSHA && checkpoint.ForgejoRereviewID == 0 && !isConvergencePublication(checkpoint, pending) {
 		// Crash/retry gap: recordPublishedReviewProgress may have written
 		// lastPublishedHeadSha (and budget park) before
 		// afterCommentOnlyPublishMaybeParkScope ran. Recover park/defer
@@ -5508,8 +5560,17 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 	}
 	policy := r.discoveryPolicyForProject(input.Project.ID)
 	requireReviewRequest := requireReviewRequestForLoop(input.Loop, reviewRequestRequiredForCandidate(policy, detail.Labels), pending.HeadSHA)
+	if checkpoint.ForgejoRereviewID != 0 && !markerResult.Found {
+		login, err := r.requireCurrentUserLogin(ctx, input.Project.RepoPath)
+		if err != nil {
+			return checkpoint, err
+		}
+		if forgejoPendingRereview(detail.ReviewRequests, detail.Reviews, login, pending.HeadSHA) != checkpoint.ForgejoRereviewID {
+			return skipInvalidForgejoRereview(checkpoint), nil
+		}
+	}
 	if requireReviewRequest && !markerResult.Found {
-		staleReason, reviewedReason, login := r.detectMarkerMissingRecovery(ctx, input, checkpoint, pending.HeadSHA, !isManualReviewerLoop(input.Loop))
+		staleReason, reviewedReason, login := r.detectMarkerMissingRecovery(ctx, input, checkpoint, pending.HeadSHA, checkpoint.ForgejoRereviewID == 0 && !isManualReviewerLoop(input.Loop))
 		if staleReason != "" {
 			return markReviewerRunStale(checkpoint, staleReason), nil
 		}
@@ -5531,7 +5592,7 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 		}
 	}
 	if !markerResult.Found {
-		staleReason, reviewedReason, login := r.detectMarkerMissingRecovery(ctx, input, checkpoint, pending.HeadSHA, !isManualReviewerLoop(input.Loop))
+		staleReason, reviewedReason, login := r.detectMarkerMissingRecovery(ctx, input, checkpoint, pending.HeadSHA, checkpoint.ForgejoRereviewID == 0 && !isManualReviewerLoop(input.Loop))
 		if staleReason != "" {
 			return markReviewerRunStale(checkpoint, staleReason), nil
 		}
@@ -5690,8 +5751,8 @@ func (r *Runner) verifyAgentNativeReviewMarker(ctx context.Context, input stepIn
 	if err != nil || found.Found {
 		return found, err
 	}
-	if isConvergenceReviewID(idempotencyKey) {
-		// Same-head convergence must not reuse a prior head-only marker.
+	if isConvergenceReviewID(idempotencyKey) || forge.RereviewRequestID(idempotencyKey) != 0 {
+		// A fresh same-head publication requires its own exact marker.
 		return found, nil
 	}
 	bareLoopMarker := agentNativeBareLoopReviewMarker(input.Loop.ID, headSHA)
@@ -7970,6 +8031,7 @@ type enqueueInput struct {
 	ReviewSignalFingerprint string
 	DispositionOnly         bool
 	ConvergencePass         bool
+	ForgejoRereviewID       int64
 	AvailableAt             time.Time
 }
 
@@ -7984,9 +8046,14 @@ func (r *Runner) enqueue(ctx context.Context, input enqueueInput) (storage.Queue
 		availableAt = eventlog.FormatJavaScriptISOString(input.AvailableAt.UTC())
 	}
 	payloadJSON := reviewerQueuePayloadJSON(input.HeadSHA, input.ReviewSignalFingerprint, input.DispositionOnly)
-	if input.ConvergencePass {
+	if input.ConvergencePass || input.ForgejoRereviewID != 0 {
 		merged := parseJSONObject(&payloadJSON)
-		merged["convergencePass"] = true
+		if input.ConvergencePass {
+			merged["convergencePass"] = true
+		}
+		if input.ForgejoRereviewID != 0 {
+			merged["forgejoRereviewId"] = input.ForgejoRereviewID
+		}
 		if encoded, err := json.Marshal(merged); err == nil {
 			payloadJSON = string(encoded)
 		}
@@ -10108,6 +10175,9 @@ func buildReviewPromptWithInstructions(projectID string, instructionConfig confi
 	if strings.TrimSpace(skillIndex) != "" {
 		parts = append(parts, skillIndex)
 	}
+	if checkpoint.ForgejoRereviewID != 0 {
+		parts = append(parts, "This review was explicitly requested again on the same commit. Read the reviewer’s preceding submission and the PR discussion added since then. Re-evaluate the earlier findings against the new evidence and the current code before deciding the new review outcome.")
+	}
 	parts = append(parts, "Finding presentation contract: prefix every finding title with [P0], [P1], [P2], or [P3] (critical, high, normal, or low urgency). Use a short imperative title and one concise paragraph describing the trigger, consequence, and fix direction; aim for 2–4 sentences. In structured findings, keep the prefixed title in `title` and the explanation in `body`. In native inline comments, start `body` with the same bold priority-prefixed title, a blank line, then the explanation. Priority is a presentation label, not a new JSON field or a substitute for severity blocking|non_blocking|nit or disposition. Do not omit supported findings to shorten the review, and do not repeat each finding in the top-level overview.")
 	cleanReviewAuthorMention := cleanReviewAuthorTarget(checkpoint)
 	cleanNoopInstruction := "For no-actionable-finding results when the clean review policy is COMMENT, do not submit a clean COMMENT or APPROVE review; finish successfully with the `No actionable findings` summary only. After Looper validates that no clean review marker was required for this run, the runner will reconcile the clean-signal +1 reaction."
@@ -10139,6 +10209,9 @@ func buildReviewPromptWithInstructions(projectID string, instructionConfig confi
 		cleanInstruction = fmt.Sprintf("For no-actionable-finding results when the clean review policy is APPROVE, submit exactly one APPROVE review through the trusted Looper CLI wrapper with `outcome=clean`, no inline `comments`, and no extra PR conversation comment: `%s review submit %s#%d --event APPROVE --commit-id %s%s %s`. The APPROVE review body must not be empty or disclosure-only: the visible body must start with `%s`, briefly summarize what changed or what you verified, and include a warm, friendly, encouraging acknowledgement of the author's work. Then include exactly one clean review marker and any required Looper disclosure. Do not use a bare LGTM or marker/disclosure-only body; the wrapper rejects clean APPROVE reviews that do not start with an @mention or lack enough human-written summary text. If the authenticated GitHub user authored the pull request, the wrapper will downgrade the submission to a COMMENT because GitHub rejects self-approval. After Looper validates the matching APPROVED clean review marker, or the self-authored clean COMMENT fallback, the runner will reconcile the clean-signal +1 reaction and any eligible spec label transition.", looperCLICommand, repo, prNumber, snapshotHeadSHA(checkpoint), reviewerModeFlag, policyFlags, cleanReviewAuthorMention)
 		specLabelInstruction = "Do not transition spec-review labels yourself. Looper may transition spec-review labels only after a new matching APPROVED clean review is validated for this head, or when idempotency finds an existing matching APPROVED clean review for this head."
 	}
+	if checkpoint.ForgejoRereviewID != 0 && reviewEvents.Clean == config.ReviewerReviewEventComment && looperCLIPath != "" {
+		cleanInstruction = fmt.Sprintf("For a clean result on this explicitly requested Forgejo re-review, submit one native COMMENT with outcome=clean and no inline comments through %s, then finish with a summary beginning `No actionable findings`. The native review completes the outstanding request.", actionableReviewSubmitCommand)
+	}
 	if reviewEvents.Blocking == config.ReviewerReviewEventRequestChanges {
 		blockingInstruction = "If the review has blocking findings, submit REQUEST_CHANGES with outcome=blocking. If findings are non-blocking, submit COMMENT with outcome=non_blocking. Never submit REQUEST_CHANGES for non-blocking findings."
 		if forgejoNative {
@@ -10157,7 +10230,7 @@ func buildReviewPromptWithInstructions(projectID string, instructionConfig confi
 		reviewRequestInstruction = "This is a manual reviewer run, so a current-user review request is not required before posting."
 	} else if !requireReviewRequest && reviewRequestBypassReason == "follow_up_new_head" {
 		reviewRequestInstruction = "This is an enabled reviewer follow-up loop for a PR head that differs from the last published review head, so a fresh current-user review request is not required before posting for this follow-up pass."
-	} else if !requireReviewRequest {
+	} else if !requireReviewRequest && checkpoint.ForgejoRereviewID == 0 {
 		reviewRequestInstruction = "This reviewer configuration does not require a current-user review request before posting."
 	}
 	if commentOnlyPublish {
@@ -10377,6 +10450,9 @@ func reviewPublicationID(loopID string, checkpoint reviewerCheckpoint) string {
 	if checkpoint.Snapshot != nil {
 		headSHA = checkpoint.Snapshot.HeadSHA
 	}
+	if checkpoint.ForgejoRereviewID != 0 {
+		return forgejoRereviewPublicationID(loopID, headSHA, checkpoint.ForgejoRereviewID)
+	}
 	if checkpoint.ConvergencePass || (checkpoint.ThreadResolution != nil && checkpoint.ThreadResolution.ScheduleConvergencePass) {
 		return agentNativeConvergenceReviewID(loopID, headSHA, checkpoint.ReviewSignalFingerprint)
 	}
@@ -10392,7 +10468,7 @@ func isConvergencePublication(checkpoint reviewerCheckpoint, pending pendingRevi
 // same-head convergence uses the distinct publication identity instead.
 func shouldCountPublishedReview(previousHead, previousReviewID, headSHA, reviewID string) bool {
 	reviewID = strings.TrimSpace(reviewID)
-	if isConvergenceReviewID(reviewID) {
+	if isConvergenceReviewID(reviewID) || forge.RereviewRequestID(reviewID) != 0 {
 		return reviewID != strings.TrimSpace(previousReviewID)
 	}
 	return strings.TrimSpace(previousHead) != strings.TrimSpace(headSHA)

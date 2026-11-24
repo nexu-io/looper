@@ -1773,3 +1773,61 @@ func TestForgejoReviewSubmitUsesLocalDiffWithoutRemotePatch(t *testing.T) {
 		t.Fatalf("body-only anchor lookup = %v, %v", anchors, err)
 	}
 }
+
+func TestForgejoRereviewSubmissionUsesExactRequestAndRecoversLostResponse(t *testing.T) {
+	const id = "reviewer:loop:head:rereview:11256"
+	const reviewsURL = "/api/v1/repos/acme/looper/pulls/42/reviews"
+	const marker = "<!-- looper:review id=" + id + " head=head outcome=clean -->"
+	publishCalls := 0
+	reviews := []map[string]any{
+		{"id": 11220, "state": "COMMENT", "commit_id": "head", "user": map[string]any{"login": "reviewer"}},
+		{"id": 11257, "state": "REQUEST_REVIEW", "user": map[string]any{"login": "reviewer"}},
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/swagger.v1.json":
+			_, _ = w.Write([]byte(`{"paths":{"/repos/{owner}/{repo}/pulls/{index}/reviews":{"get":{},"post":{}},"/repos/{owner}/{repo}/pulls/{index}/reviews/{id}/comments":{"get":{}}}}`))
+		case r.URL.Path == "/api/v1/user":
+			_, _ = w.Write([]byte(`{"id":33,"login":"reviewer"}`))
+		case r.Method == http.MethodGet && r.URL.Path == reviewsURL:
+			_ = json.NewEncoder(w).Encode(reviews)
+		case r.Method == http.MethodPost && r.URL.Path == reviewsURL:
+			publishCalls++
+			var payload map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+				t.Error(err)
+			}
+			// Forgejo committed the review and consumed the request, but the
+			// application did not receive a success response.
+			reviews[1] = map[string]any{"id": 11258, "state": "COMMENT", "commit_id": "head", "body": payload["body"], "user": map[string]any{"login": "reviewer"}}
+			http.Error(w, "upstream connection reset", http.StatusBadGateway)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	client, err := forge.NewForgejoClient(forge.RepositoryRef{ProviderID: "forgejo", Kind: forge.ProviderKindForgejo, BaseURL: server.URL, Repo: "acme/looper"}, "token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	gateway := forgejoReviewSubmitGateway{client: client, rereviewMarker: id}
+	submit := func(body string) error {
+		return gateway.SubmitReview(context.Background(), githubinfra.SubmitReviewInput{PRNumber: 42, Event: "COMMENT", CommitID: "head", Body: body})
+	}
+	if err := submit(marker); err == nil || !strings.Contains(err.Error(), "request removed") {
+		t.Fatalf("replaced request must not publish: %v", err)
+	}
+	reviews[1]["id"] = 11256
+	if err := submit(strings.Replace(marker, ":11256", ":11257", 1)); err == nil || !strings.Contains(err.Error(), "trusted Forgejo re-review") {
+		t.Fatalf("agent-supplied marker must not replace its bound marker: %v", err)
+	}
+	if err := submit(marker); err == nil {
+		t.Fatal("expected lost response")
+	}
+	if err := submit(marker); err != nil {
+		t.Fatalf("retry must find the committed review after the request disappears: %v", err)
+	}
+	if publishCalls != 1 {
+		t.Fatalf("publish calls = %d, want 1", publishCalls)
+	}
+}
