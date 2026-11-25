@@ -30,7 +30,12 @@ type Bundle struct {
 // ("looper-review-skills-*"). Paths in Entries are absolute. The caller must
 // Close() to RemoveAll. Never write into a managed worktree.
 func MaterializeBuiltin() (*Bundle, error) {
-	dir, err := os.MkdirTemp("", "looper-review-skills-*")
+	return MaterializeBuiltinIn("")
+}
+
+// MaterializeBuiltinIn places embedded skills under the run-owned sandbox input directory.
+func MaterializeBuiltinIn(parent string) (*Bundle, error) {
+	dir, err := os.MkdirTemp(parent, "looper-review-skills-*")
 	if err != nil {
 		return nil, err
 	}

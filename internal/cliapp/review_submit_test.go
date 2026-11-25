@@ -1831,3 +1831,26 @@ func TestForgejoRereviewSubmissionUsesExactRequestAndRecoversLostResponse(t *tes
 		t.Fatalf("publish calls = %d, want 1", publishCalls)
 	}
 }
+
+func TestValidateSandboxReviewTarget(t *testing.T) {
+	const checkpoint = `{"snapshot":{"headSha":"head","baseSha":"base"},"detail":{"baseRefName":"main","isDraft":false}}`
+	live := githubinfra.PullRequestDetail{HeadSHA: "head", BaseSHA: "base", BaseRefName: "main", State: "OPEN"}
+	if err := validateSandboxReviewTarget(checkpoint, live); err != nil {
+		t.Fatal(err)
+	}
+	for name, change := range map[string]func(*githubinfra.PullRequestDetail){
+		"retarget": func(pr *githubinfra.PullRequestDetail) { pr.BaseRefName = "release" },
+		"base":     func(pr *githubinfra.PullRequestDetail) { pr.BaseSHA = "new-base" },
+		"head":     func(pr *githubinfra.PullRequestDetail) { pr.HeadSHA = "new-head" },
+		"draft":    func(pr *githubinfra.PullRequestDetail) { pr.IsDraft = true },
+		"closed":   func(pr *githubinfra.PullRequestDetail) { pr.State = "CLOSED" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			drift := live
+			change(&drift)
+			if validateSandboxReviewTarget(checkpoint, drift) == nil {
+				t.Fatal("accepted changed PR")
+			}
+		})
+	}
+}

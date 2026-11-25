@@ -24,9 +24,11 @@ The daemon operator owns the profile, binary, runtime homes and permitted endpoi
 
 Looper adds only:
 
-- Read access to the current Reviewer working directory.
+- Read access to the current Reviewer working directory and its per-run, daemon-created input directory. The latter holds embedded review skills, grouped findings when enabled, and the PR context for personal-account GitHub reviews. Looper removes it when the attempt ends. Operator-installed skills outside the worktree still require individual read grants.
 - Read access to per-run hosting shims and the trusted Looper CLI, when bot hosting is active.
 - Exact per-run hosting/review Unix socket connection grants. It never grants the socket parent directory.
+
+For a GitHub review using the daemon's personal login, the daemon reads the PR, discussion and inline threads. The agent reads this data inside the sandbox and uses the existing run-bound review-submit socket for publication. Direct GitHub network access and personal credentials are unnecessary inside the sandbox.
 
 The operator supplies system/runtime dependencies, shared Git common-directory reads, model credentials, session/cache writes and model network endpoints. A Git worktree's `.git` file points outside the worktree: grant its shared Git common directory **read-only**, not the whole Looper data root. Reviewers that need temporary build output must use a dedicated writable scratch directory or an explicitly reviewed writable-worktree policy.
 

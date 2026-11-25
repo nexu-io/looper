@@ -988,10 +988,53 @@ func (r *commandRuntime) validateLatestReviewerReviewSubmitPublication(cmd *cobr
 	if err := validateExpectedBaseCommit(expectedBaseSHA, detail.BaseSHA); err != nil {
 		return nil, err
 	}
+	_, bot := hostingidentity.FromContext(cmd.Context())
+	_, forgejo := gh.(forgejoReviewSubmitGateway)
+	if cfg.Roles.Reviewer.Nono != nil && !bot && !forgejo && runID != "" {
+		db, err := storage.OpenSQLiteDB(cmd.Context(), cfg.Storage.DBPath)
+		if err != nil {
+			return nil, err
+		}
+		defer db.Close()
+		run, err := storage.NewRepositories(db).Runs.GetByID(cmd.Context(), runID)
+		if err != nil {
+			return nil, err
+		}
+		if run == nil || run.CheckpointJSON == nil {
+			return nil, fmt.Errorf("sandbox review %s has no saved PR context", runID)
+		}
+		if err := validateSandboxReviewTarget(*run.CheckpointJSON, detail); err != nil {
+			return nil, err
+		}
+	}
 	if err := r.validateReviewerReviewSubmitHold(cmd, cfg, repo, prNumber, manual, runID, detail.Labels); err != nil {
 		return nil, err
 	}
 	return detail.Labels, nil
+}
+
+// The personal-account sandbox cannot query GitHub to repeat this check itself.
+func validateSandboxReviewTarget(checkpoint string, live githubinfra.PullRequestDetail) error {
+	var seed struct {
+		Detail *struct {
+			BaseRefName string
+			IsDraft     bool
+		}
+		Snapshot *struct{ HeadSHA, BaseSHA string }
+	}
+	if err := json.Unmarshal([]byte(checkpoint), &seed); err != nil {
+		return err
+	}
+	if seed.Snapshot == nil || seed.Detail == nil || seed.Snapshot.BaseSHA == "" || seed.Detail.BaseRefName == "" {
+		return fmt.Errorf("sandbox review PR context is incomplete")
+	}
+	if err := validateExpectedHeadCommit(seed.Snapshot.HeadSHA, live.HeadSHA); err != nil {
+		return err
+	}
+	if !strings.EqualFold(live.State, "OPEN") || live.IsDraft != seed.Detail.IsDraft || live.BaseRefName != seed.Detail.BaseRefName || live.BaseSHA != seed.Snapshot.BaseSHA {
+		return fmt.Errorf("PR state, draft status or base changed since the sandbox review started")
+	}
+	return nil
 }
 
 func validateExpectedBaseCommit(expected string, actual string) error {
