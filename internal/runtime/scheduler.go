@@ -2200,6 +2200,7 @@ func (a reviewerAgentExecutorAdapter) Start(ctx context.Context, input reviewer.
 		HeartbeatTimeout:    input.HeartbeatTimeout,
 		Metadata:            input.Metadata,
 		IdempotencyKey:      input.IdempotencyKey,
+		SandboxInputDir:     input.SandboxInputDir,
 		Env:                 reviewerTrustedReviewEnv(sock),
 		TrustedReview:       trustedReview,
 		UseSnapshot:         input.UseSnapshot,

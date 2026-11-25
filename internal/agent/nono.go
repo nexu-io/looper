@@ -29,6 +29,9 @@ func (e *ConfiguredExecutor) agentCommand(command string, args []string, input R
 			"--silent", "--no-rollback", "--no-rollback-prompt", "--no-diagnostics", "--startup-timeout", "0"}
 		// These grants are per-run capabilities created by Looper, not paths supplied
 		// in repository instructions. Never grant a whole socket parent or /tmp.
+		if input.SandboxInputDir != "" {
+			wrapped = append(wrapped, "--read", input.SandboxInputDir)
+		}
 		if hosting != nil {
 			wrapped = append(wrapped, "--read", hosting.dir, "--read-file", hosting.env[forge.HostCLIEnv], "--allow-unix-socket", hosting.env[forge.HostSockEnv])
 		}

@@ -106,14 +106,14 @@ func TestNonoGrantsOnlyRunCapabilities(t *testing.T) {
 		t.Fatal(err)
 	}
 	e := New(ExecutorOptions{Nono: &config.ReviewerNonoConfig{Command: "/bin/echo", Profile: profile}})
-	input := RunInput{WorkingDirectory: dir, Env: map[string]string{forge.TrustedReviewSockEnv: "/run/review.sock"}}
+	input := RunInput{WorkingDirectory: dir, SandboxInputDir: "/run/reviewer-inputs-42", Env: map[string]string{forge.TrustedReviewSockEnv: "/run/review.sock"}}
 	hosting := &hostingExecution{dir: "/run/shims", env: map[string]string{forge.HostCLIEnv: "/opt/looper", forge.HostSockEnv: "/run/hosting.sock"}}
 	cmd, err := e.agentCommand("codex", []string{"exec", "prompt with spaces"}, input, "review", ExecutorConfig{}, hosting)
 	if err != nil {
 		t.Fatal(err)
 	}
 	args := strings.Join(cmd.Args, "\n")
-	for _, grant := range []string{"--allow-unix-socket\n/run/review.sock", "--allow-unix-socket\n/run/hosting.sock", "--read\n/run/shims", "--read-file\n/opt/looper", "--\ncodex\nexec\nprompt with spaces"} {
+	for _, grant := range []string{"--read\n/run/reviewer-inputs-42", "--allow-unix-socket\n/run/review.sock", "--allow-unix-socket\n/run/hosting.sock", "--read\n/run/shims", "--read-file\n/opt/looper", "--\ncodex\nexec\nprompt with spaces"} {
 		if !strings.Contains(args, grant) {
 			t.Fatalf("missing %s in %s", grant, args)
 		}

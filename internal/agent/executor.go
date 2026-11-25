@@ -150,6 +150,7 @@ type ProgressUpdate struct {
 }
 
 type RunInput struct {
+	SandboxInputDir    string
 	ExecutionID        string
 	ProjectID          string
 	LoopID             string

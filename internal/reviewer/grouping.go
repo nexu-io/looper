@@ -206,7 +206,7 @@ func (r *Runner) applyRelatedFileGroups(ctx context.Context, input stepInput, ch
 		}
 	}
 	groups := groupChangedFiles(files)
-	contextDir, err := os.MkdirTemp("", "looper-review-groups-*")
+	contextDir, err := os.MkdirTemp(input.sandboxDir, "looper-review-groups-*")
 	if err != nil {
 		return "", nil, fmt.Errorf("related-file groups: create context directory: %w", err)
 	}
@@ -254,6 +254,8 @@ func (r *Runner) runGroupedFindingAgents(ctx context.Context, input stepInput, w
 		provider := forge.ForgejoAgentContext(r.customInstructions, input.Project.ID, input.Repo, input.PRNumber)
 		if kind := hostingKindForContext(ctx); kind != "" {
 			provider = forge.HostingAgentContext(kind, "reviewer", input.Repo, input.PRNumber)
+		} else if usesSandboxGitHubContext(r.customInstructions, input.Project.ID, "") {
+			provider = sandboxGitHubFetchContract
 		} else if provider == "" {
 			provider = reviewerAgentSideGitHubFetchContract()
 		}
@@ -278,7 +280,7 @@ func (r *Runner) runGroupedFindingAgents(ctx context.Context, input stepInput, w
 		agentCtx, cancelAgent := reviewerAgentContext(ctx, r.agentTimeout)
 		execution, err := r.agentExecutor.Start(agentCtx, AgentRunInput{
 			ExecutionID: eventlog.NewEventID("agent"), ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID,
-			Prompt: prompt, WorkingDirectory: worktreePath, Timeout: r.agentTimeout, HeartbeatTimeout: r.agentIdleTimeout,
+			Prompt: prompt, WorkingDirectory: worktreePath, SandboxInputDir: input.sandboxDir, Timeout: r.agentTimeout, HeartbeatTimeout: r.agentIdleTimeout,
 			Metadata:            map[string]any{"loopType": "reviewer", "phase": "review-group", "groupId": group.ID, "repo": input.Repo, "prNumber": input.PRNumber},
 			UseSnapshot:         useSnap,
 			SnapshotVendor:      snapVendor,
