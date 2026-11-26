@@ -150,7 +150,19 @@ func (gateway forgejoReviewSubmitGateway) ViewPullRequest(ctx context.Context, i
 	if err != nil {
 		return githubinfra.PullRequestDetail{}, err
 	}
-	return githubinfra.PullRequestDetail{Number: pr.Number, Title: pr.Title, Body: pr.Body, URL: pr.HTMLURL, State: pr.State, IsDraft: pr.IsDraft, Labels: forgeReviewSubmitLabelNames(pr.Labels), HeadRefName: pr.Head.Name, BaseRefName: pr.Base.Name, HeadSHA: pr.Head.SHA, BaseSHA: pr.Base.SHA, Author: pr.User.Login}, nil
+	hasConflicts := false
+	if pr.Mergeable != nil && !*pr.Mergeable && strings.EqualFold(strings.TrimSpace(pr.State), "open") {
+		// Forgejo's mergeable=false also represents asynchronous CHECKING state
+		// right after base advances; verify actual conflicts via git merge-tree.
+		if gateway.localGit == nil {
+			hasConflicts = true
+		} else if conflicted, mergeErr := gateway.localGit.HasLocalMergeConflicts(ctx, input.CWD, pr.Base.SHA, pr.Base.Name, pr.Head.SHA, pr.Head.Name); mergeErr != nil {
+			hasConflicts = true
+		} else {
+			hasConflicts = conflicted
+		}
+	}
+	return githubinfra.PullRequestDetail{Number: pr.Number, Title: pr.Title, Body: pr.Body, URL: pr.HTMLURL, State: pr.State, IsDraft: pr.IsDraft, Labels: forgeReviewSubmitLabelNames(pr.Labels), HeadRefName: pr.Head.Name, BaseRefName: pr.Base.Name, HeadSHA: pr.Head.SHA, BaseSHA: pr.Base.SHA, HasConflicts: hasConflicts, Author: pr.User.Login}, nil
 }
 
 func (gateway forgejoReviewSubmitGateway) GetCurrentUserLogin(ctx context.Context, _ string) (string, error) {
@@ -580,7 +592,7 @@ func (r *commandRuntime) reviewSubmit(cmd *cobra.Command, args []string) error {
 	}
 
 	// Fail closed on base/head drift between anchor resolution and mutation.
-	freshLabels, err := r.validateLatestReviewerReviewSubmitPublication(cmd, gateway, loaded.Config, repo, prNumber, commitID, detail.BaseSHA, getBoolFlag(cmd, "reviewer-manual"), getStringFlag(cmd, "reviewer-run-id"), cwd)
+	freshLabels, err := r.validateLatestReviewerReviewSubmitPublicationWithBaseRef(cmd, gateway, loaded.Config, repo, prNumber, commitID, detail.BaseSHA, detail.BaseRefName, getBoolFlag(cmd, "reviewer-manual"), getStringFlag(cmd, "reviewer-run-id"), cwd)
 	if err != nil {
 		return err
 	}
@@ -671,7 +683,7 @@ func resolveReviewSubmitAnchors(ctx context.Context, gateway reviewSubmitGateway
 	for _, comment := range comments {
 		paths = append(paths, comment.Path)
 	}
-	anchors, _, err := gateway.BuildReviewAnchorIndex(ctx, githubinfra.BuildReviewAnchorIndexInput{CWD: cwd, BaseSHA: detail.BaseSHA, HeadSHA: detail.HeadSHA, Paths: paths})
+	anchors, _, err := gateway.BuildReviewAnchorIndex(ctx, githubinfra.BuildReviewAnchorIndexInput{CWD: cwd, BaseSHA: detail.BaseSHA, BaseRefName: detail.BaseRefName, HeadSHA: detail.HeadSHA, Paths: paths})
 	return anchors, err
 }
 
@@ -1057,10 +1069,21 @@ func (r *commandRuntime) validateLatestReviewerReviewSubmitHold(cmd *cobra.Comma
 	return detail.Labels, nil
 }
 
+func reviewSubmitGitPath(cfg config.Config) string {
+	if cfg.Tools.GitPath != nil && strings.TrimSpace(*cfg.Tools.GitPath) != "" {
+		return strings.TrimSpace(*cfg.Tools.GitPath)
+	}
+	return "git"
+}
+
 // validateLatestReviewerReviewSubmitPublication re-reads the PR before mutation
 // and fails closed on head/base drift plus hold labels. Refreshed labels are
 // returned so Forgejo publish authority uses the latest snapshot.
 func (r *commandRuntime) validateLatestReviewerReviewSubmitPublication(cmd *cobra.Command, gh reviewSubmitPullRequestViewer, cfg config.Config, repo string, prNumber int64, commitID string, expectedBaseSHA string, manual bool, runID string, cwd string) ([]string, error) {
+	return r.validateLatestReviewerReviewSubmitPublicationWithBaseRef(cmd, gh, cfg, repo, prNumber, commitID, expectedBaseSHA, "", manual, runID, cwd)
+}
+
+func (r *commandRuntime) validateLatestReviewerReviewSubmitPublicationWithBaseRef(cmd *cobra.Command, gh reviewSubmitPullRequestViewer, cfg config.Config, repo string, prNumber int64, commitID string, expectedBaseSHA string, expectedBaseRefName string, manual bool, runID string, cwd string) ([]string, error) {
 	detail, err := gh.ViewPullRequest(cmd.Context(), githubinfra.ViewPullRequestInput{Repo: repo, PRNumber: prNumber, CWD: cwd})
 	if err != nil {
 		return nil, fmt.Errorf("refresh pull request before review publish: %w", err)
@@ -1068,8 +1091,20 @@ func (r *commandRuntime) validateLatestReviewerReviewSubmitPublication(cmd *cobr
 	if err := validateExpectedHeadCommit(commitID, detail.HeadSHA); err != nil {
 		return nil, err
 	}
+	expectedBaseRefName = strings.TrimSpace(expectedBaseRefName)
+	liveBaseRefName := strings.TrimSpace(detail.BaseRefName)
+	if expectedBaseRefName != "" && liveBaseRefName != "" && expectedBaseRefName != liveBaseRefName {
+		return nil, fmt.Errorf("PR base branch changed before publish: expected %s, got %s", expectedBaseRefName, liveBaseRefName)
+	}
+	gitPath := reviewSubmitGitPath(cfg)
 	if err := validateExpectedBaseCommit(expectedBaseSHA, detail.BaseSHA); err != nil {
-		return nil, err
+		if detail.HasConflicts || (expectedBaseRefName != "" && liveBaseRefName == "") {
+			return nil, err
+		}
+		preserved, mbErr := githubinfra.BaseAdvancePreservesMergeBase(cmd.Context(), gitPath, cwd, expectedBaseSHA, detail.BaseSHA, commitID, liveBaseRefName)
+		if mbErr != nil || !preserved {
+			return nil, err
+		}
 	}
 	_, bot := hostingidentity.FromContext(cmd.Context())
 	_, forgejo := gh.(forgejoReviewSubmitGateway)
@@ -1086,7 +1121,7 @@ func (r *commandRuntime) validateLatestReviewerReviewSubmitPublication(cmd *cobr
 		if run == nil || run.CheckpointJSON == nil {
 			return nil, fmt.Errorf("sandbox review %s has no saved PR context", runID)
 		}
-		if err := validateSandboxReviewTarget(*run.CheckpointJSON, detail); err != nil {
+		if err := validateSandboxReviewTargetWithGit(cmd.Context(), gitPath, cwd, *run.CheckpointJSON, detail); err != nil {
 			return nil, err
 		}
 	}
@@ -1098,6 +1133,10 @@ func (r *commandRuntime) validateLatestReviewerReviewSubmitPublication(cmd *cobr
 
 // The personal-account sandbox cannot query GitHub to repeat this check itself.
 func validateSandboxReviewTarget(checkpoint string, live githubinfra.PullRequestDetail) error {
+	return validateSandboxReviewTargetWithGit(context.Background(), "", "", checkpoint, live)
+}
+
+func validateSandboxReviewTargetWithGit(ctx context.Context, gitPath, cwd, checkpoint string, live githubinfra.PullRequestDetail) error {
 	var seed struct {
 		Detail *struct {
 			BaseRefName string
@@ -1114,8 +1153,17 @@ func validateSandboxReviewTarget(checkpoint string, live githubinfra.PullRequest
 	if err := validateExpectedHeadCommit(seed.Snapshot.HeadSHA, live.HeadSHA); err != nil {
 		return err
 	}
-	if !strings.EqualFold(live.State, "OPEN") || live.IsDraft != seed.Detail.IsDraft || live.BaseRefName != seed.Detail.BaseRefName || live.BaseSHA != seed.Snapshot.BaseSHA {
+	if !strings.EqualFold(live.State, "OPEN") || live.IsDraft != seed.Detail.IsDraft || live.BaseRefName != seed.Detail.BaseRefName {
 		return fmt.Errorf("PR state, draft status or base changed since the sandbox review started")
+	}
+	if live.BaseSHA != seed.Snapshot.BaseSHA {
+		if live.HasConflicts {
+			return fmt.Errorf("PR state, draft status or base changed since the sandbox review started")
+		}
+		preserved, err := githubinfra.BaseAdvancePreservesMergeBase(ctx, gitPath, cwd, seed.Snapshot.BaseSHA, live.BaseSHA, live.HeadSHA, live.BaseRefName)
+		if err != nil || !preserved {
+			return fmt.Errorf("PR state, draft status or base changed since the sandbox review started")
+		}
 	}
 	return nil
 }
