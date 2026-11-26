@@ -5409,12 +5409,14 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 	// Summary-only markers without findings stay valid; remote marker is publish authority.
 	nativeCompletion, err := parseReviewerNativeCompletionWithOptions(result, !pairActive)
 	if err != nil {
-		if found, markerErr := r.verifyAgentNativeReviewMarker(ctx, input, checkpoint.Snapshot.HeadSHA, idempotencyKey, cleanReviewAuthorLogin(checkpoint, PullRequestDetail{})); markerErr != nil {
-			return checkpoint, &loopError{message: markerErr.Error(), kind: FailureRetryableAfterResume}
-		} else if found.Found {
-			checkpoint.PendingReview = &pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, IdempotencyKey: idempotencyKey, Event: reviewEventAgentNative, Summary: result.Summary, Outcome: normalizeCommentOnlyOutcome(found.Outcome), ContentFingerprint: reviewMarkerFingerprint(found), ReviewerSummaryJSON: recoveredReviewerSummaryJSON(result)}
-			checkpoint.ResumePolicy = "advance_from_checkpoint"
-			return checkpoint, nil
+		if !pairActive || nativeCompletionAllowsPairMarkerRecovery(result) {
+			if found, markerErr := r.verifyAgentNativeReviewMarker(ctx, input, checkpoint.Snapshot.HeadSHA, idempotencyKey, cleanReviewAuthorLogin(checkpoint, PullRequestDetail{})); markerErr != nil {
+				return checkpoint, &loopError{message: markerErr.Error(), kind: FailureRetryableAfterResume}
+			} else if found.Found {
+				checkpoint.PendingReview = &pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, IdempotencyKey: idempotencyKey, Event: reviewEventAgentNative, Summary: result.Summary, Outcome: normalizeCommentOnlyOutcome(found.Outcome), ContentFingerprint: reviewMarkerFingerprint(found), ReviewerSummaryJSON: recoveredReviewerSummaryJSON(result)}
+				checkpoint.ResumePolicy = "advance_from_checkpoint"
+				return checkpoint, nil
+			}
 		}
 		return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 	}
@@ -6956,6 +6958,21 @@ func parseReviewerNativeCompletionWithOptions(result AgentResult, includeNeedsHu
 		}
 	}
 	return validateReviewerCommentOnlyCompletionWithOptions(completion, includeNeedsHuman)
+}
+
+func nativeCompletionAllowsPairMarkerRecovery(result AgentResult) bool {
+	completion, err := unmarshalReviewerCompletionMarker(result)
+	if err != nil {
+		return false
+	}
+	for _, finding := range completion.Findings {
+		switch strings.TrimSpace(finding.Disposition) {
+		case reviewFindingDispositionMustFix, reviewFindingDispositionFollowUp:
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // Recovery accepts the already-published marker independently of optional

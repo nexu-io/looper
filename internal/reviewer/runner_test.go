@@ -6633,9 +6633,11 @@ func TestRunReviewStepRecoversPublishedMarkerWhenCompletionSchemaFails(t *testin
 		Summary:     "Published review",
 		Stdout:      `__LOOPER_RESULT__={"summary":"Published review","outcome":"non_blocking","findings":[{"title":"Bug","body":"Fix nil check"}]}`,
 	}}}
+	standaloneCfg, _ := config.DefaultConfig(t.TempDir())
+	standaloneCfg.Roles.Fixer.AutoDiscovery = false
 	runner := New(Options{
 		DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{},
-		AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now,
+		AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, CustomInstructions: &standaloneCfg,
 	})
 	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
 	if err != nil || project == nil {
@@ -6658,6 +6660,109 @@ func TestRunReviewStepRecoversPublishedMarkerWhenCompletionSchemaFails(t *testin
 	}
 	if checkpoint.PendingReview == nil || checkpoint.PendingReview.Outcome != "non_blocking" || checkpoint.ResumePolicy != "advance_from_checkpoint" {
 		t.Fatalf("checkpoint = %#v, want recovered PendingReview with non_blocking outcome", checkpoint)
+	}
+}
+
+func TestRunReviewStepPairMarkerRecoveryPreservesNeedsHumanSafety(t *testing.T) {
+	t.Parallel()
+
+	pairConfig := func(t *testing.T) *config.Config {
+		t.Helper()
+		cfg, _ := config.DefaultConfig(t.TempDir())
+		cfg.Roles.Fixer.AutoDiscovery = true
+		return &cfg
+	}
+
+	t.Run("recovers when all findings have explicit must_fix or follow_up disposition", func(t *testing.T) {
+		t.Parallel()
+		fixture := newRunnerFixture(t)
+		github := &fakeGitHubGateway{reviewRequests: []string{"octocat"}, reviewMarkerOutcome: "non_blocking"}
+		agent := &fakeAgentExecutor{results: []AgentResult{{
+			Status:      "completed",
+			ParseStatus: "parsed",
+			Summary:     "Published review",
+			Stdout:      `__LOOPER_RESULT__={"summary":"Published review","outcome":"non_blocking","findings":[{"title":"Bug","body":"Fix nil check","disposition":"must_fix"},{"title":"Later","body":"Rename helper","disposition":"follow_up"}]}`,
+		}}}
+		runner := New(Options{
+			DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{},
+			AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, CustomInstructions: pairConfig(t),
+		})
+		project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+		if err != nil || project == nil {
+			t.Fatalf("Projects.GetByID() = (%#v, %v), want project", project, err)
+		}
+		checkpoint, err := runner.runReviewStep(context.Background(), stepInput{
+			Project:  *project,
+			Loop:     storage.LoopRecord{ID: "loop_pair_recover_ok", ProjectID: project.ID, Type: "reviewer"},
+			Run:      storage.RunRecord{ID: "run_pair_recover_ok", LoopID: "loop_pair_recover_ok"},
+			Repo:     "acme/looper",
+			PRNumber: 42,
+			Checkpoint: reviewerCheckpoint{
+				Detail:   &checkpointDetail{HeadRefName: "feature/review-me", BaseRefName: "main", Author: "alice"},
+				Snapshot: &checkpointSnapshot{HeadSHA: "abc123"},
+				Worktree: &checkpointWorktree{Path: t.TempDir(), Branch: "pr-42-head", PreparedAt: fixture.nowISO()},
+			},
+		})
+		if err != nil {
+			t.Fatalf("runReviewStep() error = %v, want pair recovery without needs_human", err)
+		}
+		if checkpoint.PendingReview == nil || checkpoint.PendingReview.Outcome != "non_blocking" {
+			t.Fatalf("checkpoint = %#v, want recovered PendingReview", checkpoint)
+		}
+	})
+
+	for _, tc := range []struct {
+		name   string
+		stdout string
+	}{
+		{
+			name:   "refuses recovery when needs_human accompanies schema error",
+			stdout: `__LOOPER_RESULT__={"summary":"Mixed","outcome":"blocking","findings":[{"title":"Bug","body":"Fix nil check","disposition":"must_fix"},{"title":"Ambiguous","body":"Need human","disposition":"needs_human","severity":"blocking"}]}`,
+		},
+		{
+			name:   "refuses recovery when finding disposition is missing",
+			stdout: `__LOOPER_RESULT__={"summary":"Unlabeled","outcome":"non_blocking","findings":[{"title":"Bug","body":"Fix nil check"}]}`,
+		},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			fixture := newRunnerFixture(t)
+			github := &fakeGitHubGateway{reviewRequests: []string{"octocat"}, reviewMarkerOutcome: "non_blocking"}
+			agent := &fakeAgentExecutor{results: []AgentResult{{
+				Status:      "completed",
+				ParseStatus: "parsed",
+				Summary:     "Published review",
+				Stdout:      tc.stdout,
+			}}}
+			runner := New(Options{
+				DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{},
+				AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, CustomInstructions: pairConfig(t),
+			})
+			project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+			if err != nil || project == nil {
+				t.Fatalf("Projects.GetByID() = (%#v, %v), want project", project, err)
+			}
+			_, err = runner.runReviewStep(context.Background(), stepInput{
+				Project:  *project,
+				Loop:     storage.LoopRecord{ID: "loop_pair_no_recover", ProjectID: project.ID, Type: "reviewer"},
+				Run:      storage.RunRecord{ID: "run_pair_no_recover", LoopID: "loop_pair_no_recover"},
+				Repo:     "acme/looper",
+				PRNumber: 42,
+				Checkpoint: reviewerCheckpoint{
+					Detail:   &checkpointDetail{HeadRefName: "feature/review-me", BaseRefName: "main", Author: "alice"},
+					Snapshot: &checkpointSnapshot{HeadSHA: "abc123"},
+					Worktree: &checkpointWorktree{Path: t.TempDir(), Branch: "pr-42-head", PreparedAt: fixture.nowISO()},
+				},
+			})
+			var loopErr *loopError
+			if !errors.As(err, &loopErr) || loopErr.kind != FailureRetryableAfterResume {
+				t.Fatalf("runReviewStep() err = %v, want FailureRetryableAfterResume", err)
+			}
+			if github.reviewMarkerCalls != 0 {
+				t.Fatalf("reviewMarkerCalls = %d, want 0 (must not recover marker when needs_human safety is unverified)", github.reviewMarkerCalls)
+			}
+		})
 	}
 }
 
