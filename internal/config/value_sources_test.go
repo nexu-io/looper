@@ -39,10 +39,10 @@ func TestLoadFileMetadataReportsCanonicalFieldSources(t *testing.T) {
 	}
 
 	want := map[string]ValueSource{
-		"agent.model":                   ValueSourceConfigFile,
-		"agent.env":                     ValueSourceConfigFile,
-		"agent.env.TOKEN":               ValueSourceConfigFile,
-		"agent.timeouts.plannerSeconds": ValueSourceCLI,
+		"agent.model":                             ValueSourceConfigFile,
+		"agent.env":                               ValueSourceConfigFile,
+		"agent.env.TOKEN":                         ValueSourceConfigFile,
+		"agent.timeouts.plannerSeconds":           ValueSourceCLI,
 		"agent.timeouts.plannerMaxRuntimeSeconds": ValueSourceCLI,
 		"defaults.allowAutoPush":                  ValueSourceEnv,
 		"notifications.webhook.mentionOpenIds":    ValueSourceConfigFile,
