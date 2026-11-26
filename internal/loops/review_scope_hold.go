@@ -54,13 +54,15 @@ var ErrReviewScopeHumanInvalidAnswer = fmt.Errorf("review scope answer must be %
 // hold (no status/ask change). After budget Continue releases the pair, pending
 // is promoted to a real scope park.
 type ReviewScopeHumanState struct {
-	HeldBy         string `json:"heldBy,omitempty"`
-	PauseReason    string `json:"pauseReason,omitempty"`
-	HandoffEventAt string `json:"handoffEventAt,omitempty"`
-	Question       string `json:"question,omitempty"`
-	Evidence       string `json:"evidence,omitempty"`
-	Pending        bool   `json:"pending,omitempty"`
-	PendingHITL    bool   `json:"pendingHitl,omitempty"`
+	HeldBy            string `json:"heldBy,omitempty"`
+	PauseReason       string `json:"pauseReason,omitempty"`
+	HandoffEventAt    string `json:"handoffEventAt,omitempty"`
+	HeadSHA           string `json:"headSha,omitempty"`
+	ForgejoRereviewID int64  `json:"forgejoRereviewId,omitempty"`
+	Question          string `json:"question,omitempty"`
+	Evidence          string `json:"evidence,omitempty"`
+	Pending           bool   `json:"pending,omitempty"`
+	PendingHITL       bool   `json:"pendingHitl,omitempty"`
 }
 
 func NewReviewScopeHumanAsk(role, repo string, prNumber int64, question, nowISO string) HITLAsk {
@@ -177,6 +179,13 @@ func HasPendingReviewScopeHuman(loop storage.LoopRecord) bool {
 // without changing status or writing a HITL ask. Used when budget is already the
 // primary hold so the pair never stacks two asks/reasons.
 func PersistPendingReviewScopeHumanEvidence(metadataJSON *string, question, evidence string, hitlEnabled bool) (string, error) {
+	return PersistPendingReviewScopeHumanEvidenceWithContext(metadataJSON, question, evidence, "", 0, hitlEnabled)
+}
+
+// PersistPendingReviewScopeHumanEvidenceWithContext stores needs_human evidence
+// along with the PR head SHA and optional Forgejo re-review request ID observed
+// when the scope ambiguity occurred.
+func PersistPendingReviewScopeHumanEvidenceWithContext(metadataJSON *string, question, evidence, headSHA string, forgejoRereviewID int64, hitlEnabled bool) (string, error) {
 	state := ReadReviewScopeHumanState(metadataJSON)
 	if strings.TrimSpace(state.HeldBy) != "" {
 		// Active scope hold already owns the pair; keep existing hold fields.
@@ -185,6 +194,12 @@ func PersistPendingReviewScopeHumanEvidence(metadataJSON *string, question, evid
 		}
 		if e := strings.TrimSpace(evidence); e != "" {
 			state.Evidence = e
+		}
+		if h := strings.TrimSpace(headSHA); h != "" {
+			state.HeadSHA = h
+		}
+		if forgejoRereviewID > state.ForgejoRereviewID {
+			state.ForgejoRereviewID = forgejoRereviewID
 		}
 		return WriteReviewScopeHumanState(metadataJSON, state)
 	}
@@ -196,11 +211,44 @@ func PersistPendingReviewScopeHumanEvidence(metadataJSON *string, question, evid
 	if e := strings.TrimSpace(evidence); e != "" {
 		state.Evidence = e
 	}
+	if h := strings.TrimSpace(headSHA); h != "" {
+		state.HeadSHA = h
+	}
+	if forgejoRereviewID > state.ForgejoRereviewID {
+		state.ForgejoRereviewID = forgejoRereviewID
+	}
 	// Pending must not look like an active sibling/required pause.
 	if state.PauseReason == ReviewScopeHumanSiblingPauseReason || state.PauseReason == ReviewScopeHumanRequiredReason {
 		state.PauseReason = ""
 	}
 	return WriteReviewScopeHumanState(metadataJSON, state)
+}
+
+// HasActiveFixerLoopForPR reports whether any non-terminal fixer loop exists
+// for the same project/repo/PR. When projectID is empty, any matching repo/PR
+// fixer loop counts as active.
+func HasActiveFixerLoopForPR(all []storage.LoopRecord, projectID, repo string, prNumber int64) bool {
+	projectID = strings.TrimSpace(projectID)
+	repo = strings.TrimSpace(repo)
+	if repo == "" || prNumber == 0 {
+		return false
+	}
+	for _, candidate := range all {
+		if strings.TrimSpace(candidate.Type) != "fixer" {
+			continue
+		}
+		if !isReviewScopeSiblingHoldApplicable(candidate.Status) {
+			continue
+		}
+		if projectID != "" && strings.TrimSpace(candidate.ProjectID) != projectID {
+			continue
+		}
+		if !strings.EqualFold(derefLoopString(candidate.Repo), repo) || derefLoopInt64(candidate.PRNumber) != prNumber {
+			continue
+		}
+		return true
+	}
+	return false
 }
 
 // IsReviewFixPairHold is true for budget holds or scope-human holds.
@@ -223,7 +271,14 @@ type ParkReviewScopeHumanInput struct {
 	// wins over lastReviewedSignalFingerprint already stored on Held, so a
 	// needs_human park can record the current identity before persist.
 	Signal string
-	DB     *sql.DB
+	// HeadSHA is the PR head SHA observed when the scope hold was recorded.
+	// Used to distinguish unchanged-head polling from a fresh human push.
+	HeadSHA string
+	// ForgejoRereviewID is the Forgejo REQUEST_REVIEW ID being processed when
+	// the scope hold was recorded. Only a strictly newer request may wake the
+	// hold on an unchanged head so an unconsumed request cannot re-trigger.
+	ForgejoRereviewID int64
+	DB                *sql.DB
 }
 
 // ParkReviewScopeHuman parks the held role and pauses same-lane siblings for a
@@ -255,6 +310,27 @@ func parkReviewScopeHumanBody(ctx context.Context, repos *storage.Repositories, 
 		if err := finishReviewScopeHumanPark(ctx, repos, held, input.Role, input.NowISO); err != nil {
 			return held, err
 		}
+		needsUpsert := false
+		if head := strings.TrimSpace(input.HeadSHA); head != "" || input.ForgejoRereviewID > 0 {
+			state := ReadReviewScopeHumanState(held.MetadataJSON)
+			stateChanged := false
+			if head != "" && strings.TrimSpace(state.HeadSHA) == "" {
+				state.HeadSHA = head
+				stateChanged = true
+			}
+			if input.ForgejoRereviewID > state.ForgejoRereviewID {
+				state.ForgejoRereviewID = input.ForgejoRereviewID
+				stateChanged = true
+			}
+			if stateChanged {
+				encoded, encErr := WriteReviewScopeHumanState(held.MetadataJSON, state)
+				if encErr != nil {
+					return held, encErr
+				}
+				held.MetadataJSON = &encoded
+				needsUpsert = true
+			}
+		}
 		if sig := strings.TrimSpace(input.Signal); sig != "" && held.MetadataJSON != nil {
 			meta := parseMetadataObject(held.MetadataJSON)
 			meta["lastReviewedSignalFingerprint"] = sig
@@ -264,6 +340,9 @@ func parkReviewScopeHumanBody(ctx context.Context, repos *storage.Repositories, 
 			}
 			text := string(encoded)
 			held.MetadataJSON = &text
+			needsUpsert = true
+		}
+		if needsUpsert {
 			held.UpdatedAt = input.NowISO
 			if err := repos.Loops.Upsert(ctx, held); err != nil {
 				return held, err
@@ -288,6 +367,16 @@ func parkReviewScopeHumanBody(ctx context.Context, repos *storage.Repositories, 
 	state.Question = strings.TrimSpace(input.Question)
 	if e := strings.TrimSpace(input.Evidence); e != "" {
 		state.Evidence = e
+	}
+	if head := strings.TrimSpace(input.HeadSHA); head != "" {
+		state.HeadSHA = head
+	} else if strings.TrimSpace(state.HeadSHA) == "" {
+		if fallback := reviewFixBudgetHandoffHead(held); fallback != "" {
+			state.HeadSHA = fallback
+		}
+	}
+	if input.ForgejoRereviewID > state.ForgejoRereviewID {
+		state.ForgejoRereviewID = input.ForgejoRereviewID
 	}
 	// Promoting from deferred budget path: clear pending markers.
 	state.Pending = false
@@ -555,7 +644,7 @@ func appendReviewScopeHumanHandoffEvent(ctx context.Context, repos *storage.Repo
 	if evidence := strings.TrimSpace(input.Evidence); evidence != "" {
 		payload["evidence"] = evidence
 	}
-	if head := reviewFixBudgetHandoffHead(held); head != "" {
+	if head := reviewScopeHandoffHead(held, input.HeadSHA); head != "" {
 		payload["head"] = head
 	}
 	if signal := reviewScopeHandoffSignal(held, input.Signal); signal != "" {
@@ -571,6 +660,16 @@ func appendReviewScopeHumanHandoffEvent(ctx context.Context, repos *storage.Repo
 		ActorID:    optionalBudgetString("review-scope-human"),
 		Payload:    payload,
 	})
+}
+
+func reviewScopeHandoffHead(held storage.LoopRecord, pending string) string {
+	if head := strings.TrimSpace(pending); head != "" {
+		return head
+	}
+	if head := strings.TrimSpace(ReadReviewScopeHumanState(held.MetadataJSON).HeadSHA); head != "" {
+		return head
+	}
+	return reviewFixBudgetHandoffHead(held)
 }
 
 func reviewScopeHandoffSignal(held storage.LoopRecord, pending string) string {
@@ -612,7 +711,35 @@ func ApplyReviewScopeHumanAnswer(ctx context.Context, repos *storage.Repositorie
 	return ReviewScopeHumanAnswerResult{Applied: true, Action: "continue", Loop: updated}, nil
 }
 
+// ReleaseReviewScopeHumanHoldWithoutRequeue clears a scope hold on loop and its
+// same-lane siblings without touching budget meters or reviving stale queue
+// items. Released loops transition to "waiting" so discovery can enqueue fresh
+// work for the live PR head or explicit re-review request. Independent blockers
+// (budget holds, manual pauses, mid-run asks, failed/interrupted) stay intact.
+func ReleaseReviewScopeHumanHoldWithoutRequeue(ctx context.Context, repos *storage.Repositories, loop storage.LoopRecord, nowISO string, db *sql.DB) (storage.LoopRecord, error) {
+	if !IsReviewScopeHumanHold(loop) {
+		return loop, nil
+	}
+	if repos == nil || repos.Loops == nil {
+		return loop, fmt.Errorf("review scope release requires loop storage")
+	}
+	if db != nil {
+		var released storage.LoopRecord
+		err := storage.WithTransaction(ctx, db, nil, func(tx *sql.Tx) error {
+			var relErr error
+			released, relErr = releaseReviewScopeHuman(ctx, storage.NewRepositories(tx), loop, nowISO, false)
+			return relErr
+		})
+		return released, err
+	}
+	return releaseReviewScopeHuman(ctx, repos, loop, nowISO, false)
+}
+
 func continueReviewScopeHuman(ctx context.Context, repos *storage.Repositories, loop storage.LoopRecord, nowISO string) (storage.LoopRecord, error) {
+	return releaseReviewScopeHuman(ctx, repos, loop, nowISO, true)
+}
+
+func releaseReviewScopeHuman(ctx context.Context, repos *storage.Repositories, loop storage.LoopRecord, nowISO string, requeue bool) (storage.LoopRecord, error) {
 	all, err := repos.Loops.List(ctx)
 	if err != nil {
 		return loop, err
@@ -620,14 +747,14 @@ func continueReviewScopeHuman(ctx context.Context, repos *storage.Repositories, 
 	members := reviewFixBudgetPairMembers(all, loop)
 
 	// Release answered side first; do not touch role meters.
-	if err := releaseOneReviewScopeHumanHold(ctx, repos, loop.ID, nowISO); err != nil {
+	if err := releaseOneReviewScopeHumanHold(ctx, repos, loop.ID, nowISO, requeue); err != nil {
 		return loop, err
 	}
 	for _, member := range members {
 		if member.ID == loop.ID {
 			continue
 		}
-		if err := releaseOneReviewScopeHumanHold(ctx, repos, member.ID, nowISO); err != nil {
+		if err := releaseOneReviewScopeHumanHold(ctx, repos, member.ID, nowISO, requeue); err != nil {
 			return loop, err
 		}
 	}
@@ -641,7 +768,7 @@ func continueReviewScopeHuman(ctx context.Context, repos *storage.Repositories, 
 	return *fresh, nil
 }
 
-func releaseOneReviewScopeHumanHold(ctx context.Context, repos *storage.Repositories, loopID, nowISO string) error {
+func releaseOneReviewScopeHumanHold(ctx context.Context, repos *storage.Repositories, loopID, nowISO string, requeue bool) error {
 	fresh, err := repos.Loops.GetByID(ctx, loopID)
 	if err != nil {
 		return err
@@ -663,6 +790,8 @@ func releaseOneReviewScopeHumanHold(ctx context.Context, repos *storage.Reposito
 	}
 	state := ReadReviewScopeHumanState(metadata)
 	state.HeldBy = ""
+	state.HeadSHA = ""
+	state.ForgejoRereviewID = 0
 	state.Question = ""
 	state.Evidence = ""
 	state.Pending = false
@@ -732,14 +861,19 @@ func releaseOneReviewScopeHumanHold(ctx context.Context, repos *storage.Reposito
 		updated.NextRunAt = nil
 		return repos.Loops.Upsert(ctx, updated)
 	}
-	updated.Status = "queued"
-	updated.NextRunAt = &nowISO
 	meta = parseMetadataObject(updated.MetadataJSON)
 	delete(meta, "lastReviewedSignalFingerprint")
 	if encoded, encErr := json.Marshal(meta); encErr == nil {
 		text := string(encoded)
 		updated.MetadataJSON = &text
 	}
+	if !requeue {
+		updated.Status = "waiting"
+		updated.NextRunAt = nil
+		return repos.Loops.Upsert(ctx, updated)
+	}
+	updated.Status = "queued"
+	updated.NextRunAt = &nowISO
 	if err := repos.Loops.Upsert(ctx, updated); err != nil {
 		return err
 	}

@@ -153,7 +153,7 @@ func (gateway forgejoReviewSubmitGateway) ViewPullRequest(ctx context.Context, i
 	hasConflicts := false
 	if pr.Mergeable != nil && !*pr.Mergeable && strings.EqualFold(strings.TrimSpace(pr.State), "open") {
 		// Forgejo's mergeable=false also represents asynchronous CHECKING state
-		// right after pushes; verify actual conflicts via git merge-tree.
+		// right after pushes or base advances; verify actual conflicts via git merge-tree.
 		if gateway.localGit == nil {
 			hasConflicts = true
 		} else if conflicted, mergeErr := gateway.localGit.HasLocalMergeConflicts(ctx, input.CWD, pr.Base.SHA, pr.Base.Name, pr.Head.SHA, pr.Head.Name); mergeErr != nil {
@@ -550,7 +550,12 @@ func (r *commandRuntime) reviewSubmit(cmd *cobra.Command, args []string) error {
 	if err := r.validateReviewerReviewSubmitHold(cmd, loaded.Config, repo, prNumber, getBoolFlag(cmd, "reviewer-manual"), getStringFlag(cmd, "reviewer-run-id"), detail.Labels); err != nil {
 		return err
 	}
-	if err := validateReviewSubmitBody(payload.Body, payload.Comments, commitID, event, policy, detail.Author); err != nil {
+	pairActive, err := reviewSubmitIsReviewFixPairActive(cmd.Context(), loaded.Config, repo, prNumber, cwd)
+	if err != nil {
+		return err
+	}
+	allowNeedsHuman := !pairActive
+	if err := validateReviewSubmitBodyWithOptions(payload.Body, payload.Comments, commitID, event, policy, detail.Author, allowNeedsHuman); err != nil {
 		// Always redact paths on pre-gate validation diagnostics: a malformed
 		// marker or APPROVE-with-comments path never reaches SubmitReview's
 		// content guard, and path may itself be secret-shaped.
@@ -559,7 +564,7 @@ func (r *commandRuntime) reviewSubmit(cmd *cobra.Command, args []string) error {
 		})
 		return err
 	}
-	if err := validateReviewSubmitCommentDispositions(payload.Comments); err != nil {
+	if err := validateReviewSubmitCommentDispositionsWithOptions(payload.Comments, allowNeedsHuman); err != nil {
 		writeReviewSubmitDiagnostic(cmd.ErrOrStderr(), "github_review_submit_validation_failed", reviewSubmitDiagnosticFields{
 			Repo: repo, PRNumber: prNumber, Event: event, CommitID: commitID, Payload: payload, Error: err.Error(), RedactPaths: true,
 		})
@@ -587,7 +592,7 @@ func (r *commandRuntime) reviewSubmit(cmd *cobra.Command, args []string) error {
 	}
 
 	// Fail closed on base/head drift between anchor resolution and mutation.
-	freshLabels, err := r.validateLatestReviewerReviewSubmitPublicationWithComments(cmd, gateway, loaded.Config, repo, prNumber, commitID, detail.BaseSHA, event, payload.Comments, getBoolFlag(cmd, "reviewer-manual"), getStringFlag(cmd, "reviewer-run-id"), cwd)
+	freshLabels, err := r.validateLatestReviewerReviewSubmitPublicationWithOptions(cmd, gateway, loaded.Config, repo, prNumber, commitID, detail.BaseSHA, detail.BaseRefName, event, payload.Comments, getBoolFlag(cmd, "reviewer-manual"), getStringFlag(cmd, "reviewer-run-id"), cwd)
 	if err != nil {
 		return err
 	}
@@ -682,7 +687,7 @@ func resolveReviewSubmitAnchors(ctx context.Context, gateway reviewSubmitGateway
 	for _, comment := range comments {
 		paths = append(paths, comment.Path)
 	}
-	anchors, _, err := gateway.BuildReviewAnchorIndex(ctx, githubinfra.BuildReviewAnchorIndexInput{CWD: cwd, BaseSHA: detail.BaseSHA, HeadSHA: detail.HeadSHA, Paths: paths})
+	anchors, _, err := gateway.BuildReviewAnchorIndex(ctx, githubinfra.BuildReviewAnchorIndexInput{CWD: cwd, BaseSHA: detail.BaseSHA, BaseRefName: detail.BaseRefName, HeadSHA: detail.HeadSHA, Paths: paths})
 	return anchors, err
 }
 
@@ -789,8 +794,56 @@ var reviewSubmitMarkerRE = regexp.MustCompile(`<!--\s*looper:review\s+([^>]*)-->
 var markdownHTMLCommentRE = regexp.MustCompile(`(?s)<!--.*?-->`)
 var markdownReferenceDefinitionRE = regexp.MustCompile(`(?m)^\s{0,3}\[[^\]\n]+\]:[^\n]*(?:\n[ \t]+[^\n]*)*`)
 var reviewSubmitSuppressedFindingRE = regexp.MustCompile(`(?i)\b(?:follow_up|needs_human)\b`)
+var reviewSubmitFollowUpOnlyRE = regexp.MustCompile(`(?i)\bfollow_up\b`)
+
+// reviewSubmitIsReviewFixPairActive reports whether the target PR operates as a
+// review-fix pair (Fixer auto-discovery enabled for the matched project, or an
+// active non-terminal Fixer loop exists for this PR in storage). When false
+// (standalone reviewer mode), needs_human findings may be surfaced directly on
+// the PR so human authors see them without stalling the loop.
+func reviewSubmitIsReviewFixPairActive(ctx context.Context, cfg config.Config, repo string, prNumber int64, cwd string) (bool, error) {
+	projectID := ""
+	if resolved, ok := hostingidentity.FromContext(ctx); ok {
+		projectID = strings.TrimSpace(resolved.ProjectID())
+	}
+	matched, err := reviewSubmitProjectForRepo(cfg, repo, cwd)
+	if err != nil {
+		return true, err
+	}
+	if matched != nil && projectID == "" {
+		projectID = strings.TrimSpace(matched.ID)
+	}
+	roleCfg := reviewSubmitConfigWithMatchedProject(cfg, matched)
+	if config.ProjectRoleAutoDiscoveryEnabled(roleCfg, projectID, "fixer") {
+		return true, nil
+	}
+	dbPath := strings.TrimSpace(cfg.Storage.DBPath)
+	if dbPath == "" {
+		return false, nil
+	}
+	if _, err := os.Stat(dbPath); err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return true, fmt.Errorf("check review-fix pair state: %w", err)
+	}
+	db, err := storage.OpenSQLiteDB(ctx, dbPath)
+	if err != nil {
+		return true, fmt.Errorf("check review-fix pair state: %w", err)
+	}
+	defer func() { _ = db.Close() }()
+	all, err := storage.NewRepositories(db).Loops.List(ctx)
+	if err != nil {
+		return true, fmt.Errorf("check review-fix pair state: %w", err)
+	}
+	return loops.HasActiveFixerLoopForPR(all, projectID, repo, prNumber), nil
+}
 
 func validateReviewSubmitBody(body string, comments []reviewSubmitComment, commitID string, event string, policy config.ReviewerReviewEventsConfig, authorLogin string) error {
+	return validateReviewSubmitBodyWithOptions(body, comments, commitID, event, policy, authorLogin, false)
+}
+
+func validateReviewSubmitBodyWithOptions(body string, comments []reviewSubmitComment, commitID string, event string, policy config.ReviewerReviewEventsConfig, authorLogin string, allowNeedsHuman bool) error {
 	matches := reviewSubmitMarkerRE.FindAllStringSubmatch(body, -1)
 	if len(matches) != 1 {
 		return fmt.Errorf("review body must contain exactly one well-formed looper review marker")
@@ -829,7 +882,7 @@ func validateReviewSubmitBody(body string, comments []reviewSubmitComment, commi
 		if outcome == "blocking" && policy.Blocking == config.ReviewerReviewEventRequestChanges {
 			return fmt.Errorf("review marker outcome=blocking requires REQUEST_CHANGES under effective policy")
 		}
-		// Clean COMMENT is body-only (same as APPROVE); inline comments imply must_fix.
+		// Clean COMMENT is body-only (same as APPROVE); inline comments imply actionable feedback.
 		if outcome == "clean" && len(comments) > 0 {
 			return fmt.Errorf("COMMENT reviews require clean outcome without inline comments")
 		}
@@ -838,14 +891,27 @@ func validateReviewSubmitBody(body string, comments []reviewSubmitComment, commi
 			return fmt.Errorf("actionable COMMENT reviews require at least one inline comment; body-only reviews may only be clean COMMENT/APPROVE")
 		}
 	}
-	return validateReviewSubmitBodyHasNoSuppressedFindings(body)
+	return validateReviewSubmitBodyHasNoSuppressedFindingsWithOptions(body, allowNeedsHuman)
 }
 
 // validateReviewSubmitBodyHasNoSuppressedFindings fail-closes when visible
-// review prose smuggles follow_up/needs_human findings. Spec 7.3 allows a
-// must_fix summary in the body; it does not allow suppressed dispositions.
+// review prose smuggles suppressed findings. In review-fix pair mode, both
+// follow_up and needs_human are suppressed; in standalone reviewer mode (no
+// active Fixer), only follow_up is suppressed so human judgment items can be
+// surfaced directly on the PR.
 func validateReviewSubmitBodyHasNoSuppressedFindings(body string) error {
-	if reviewSubmitSuppressedFindingRE.FindString(cleanReviewHumanBody(body)) == "" {
+	return validateReviewSubmitBodyHasNoSuppressedFindingsWithOptions(body, false)
+}
+
+func validateReviewSubmitBodyHasNoSuppressedFindingsWithOptions(body string, allowNeedsHuman bool) error {
+	visible := cleanReviewHumanBody(body)
+	if allowNeedsHuman {
+		if reviewSubmitFollowUpOnlyRE.FindString(visible) == "" {
+			return nil
+		}
+		return fmt.Errorf("review body must not include follow_up findings; only must_fix and needs_human may be published remotely in standalone reviewer mode")
+	}
+	if reviewSubmitSuppressedFindingRE.FindString(visible) == "" {
 		return nil
 	}
 	return fmt.Errorf("review body must not include follow_up or needs_human findings; only must_fix may be published remotely")
@@ -857,9 +923,13 @@ func validateReviewSubmitBodyHasNoSuppressedFindings(body string) error {
 // Authority for publishing a finding as remote review feedback is repository
 // instructions, PR intent, and spec 7.3 — not this gate. The gate fail-closes on
 // the agent's own structured disposition/scope fields so a prompt-only subset
-// cannot publish follow_up/needs_human or omit the declaration; it does not infer
-// disposition from GitHub or other infra state.
+// cannot publish suppressed dispositions or omit the declaration; it does not
+// infer disposition from GitHub or other infra state.
 func validateReviewSubmitCommentDispositions(comments []reviewSubmitComment) error {
+	return validateReviewSubmitCommentDispositionsWithOptions(comments, false)
+}
+
+func validateReviewSubmitCommentDispositionsWithOptions(comments []reviewSubmitComment, allowNeedsHuman bool) error {
 	if len(comments) == 0 {
 		return nil
 	}
@@ -868,14 +938,27 @@ func validateReviewSubmitCommentDispositions(comments []reviewSubmitComment) err
 		scopeBasis := strings.TrimSpace(comment.ScopeBasis)
 		scopeEvidence := strings.TrimSpace(comment.ScopeEvidence)
 		if disposition == "" || scopeBasis == "" || scopeEvidence == "" {
+			if allowNeedsHuman {
+				return fmt.Errorf("actionable review comment %d requires disposition=must_fix|needs_human, non-empty scopeBasis, and non-empty scopeEvidence", i)
+			}
 			return fmt.Errorf("actionable review comment %d requires disposition=must_fix, non-empty scopeBasis, and non-empty scopeEvidence", i)
 		}
 		switch disposition {
 		case reviewFindingDispositionMustFix:
 			// ok
-		case reviewFindingDispositionFollowUp, reviewFindingDispositionNeedsHuman:
+		case reviewFindingDispositionNeedsHuman:
+			if !allowNeedsHuman {
+				return fmt.Errorf("actionable review comment %d rejects disposition=%s; only must_fix may be submitted as remote feedback", i, disposition)
+			}
+		case reviewFindingDispositionFollowUp:
+			if allowNeedsHuman {
+				return fmt.Errorf("actionable review comment %d rejects disposition=%s; only must_fix or needs_human may be submitted as remote feedback", i, disposition)
+			}
 			return fmt.Errorf("actionable review comment %d rejects disposition=%s; only must_fix may be submitted as remote feedback", i, disposition)
 		default:
+			if allowNeedsHuman {
+				return fmt.Errorf("actionable review comment %d has invalid disposition %q (want must_fix or needs_human)", i, disposition)
+			}
 			return fmt.Errorf("actionable review comment %d has invalid disposition %q (want must_fix)", i, disposition)
 		}
 		switch scopeBasis {
@@ -1035,10 +1118,18 @@ func validateReviewSubmitHeadCommit(ctx context.Context, gitPath, cwd, expected 
 // and fails closed on head/base drift plus hold labels. Refreshed labels are
 // returned so Forgejo publish authority uses the latest snapshot.
 func (r *commandRuntime) validateLatestReviewerReviewSubmitPublication(cmd *cobra.Command, gh reviewSubmitPullRequestViewer, cfg config.Config, repo string, prNumber int64, commitID string, expectedBaseSHA string, manual bool, runID string, cwd string) ([]string, error) {
-	return r.validateLatestReviewerReviewSubmitPublicationWithComments(cmd, gh, cfg, repo, prNumber, commitID, expectedBaseSHA, "", nil, manual, runID, cwd)
+	return r.validateLatestReviewerReviewSubmitPublicationWithOptions(cmd, gh, cfg, repo, prNumber, commitID, expectedBaseSHA, "", "", nil, manual, runID, cwd)
+}
+
+func (r *commandRuntime) validateLatestReviewerReviewSubmitPublicationWithBaseRef(cmd *cobra.Command, gh reviewSubmitPullRequestViewer, cfg config.Config, repo string, prNumber int64, commitID string, expectedBaseSHA string, expectedBaseRefName string, manual bool, runID string, cwd string) ([]string, error) {
+	return r.validateLatestReviewerReviewSubmitPublicationWithOptions(cmd, gh, cfg, repo, prNumber, commitID, expectedBaseSHA, expectedBaseRefName, "", nil, manual, runID, cwd)
 }
 
 func (r *commandRuntime) validateLatestReviewerReviewSubmitPublicationWithComments(cmd *cobra.Command, gh reviewSubmitPullRequestViewer, cfg config.Config, repo string, prNumber int64, commitID string, expectedBaseSHA string, event string, comments []reviewSubmitComment, manual bool, runID string, cwd string) ([]string, error) {
+	return r.validateLatestReviewerReviewSubmitPublicationWithOptions(cmd, gh, cfg, repo, prNumber, commitID, expectedBaseSHA, "", event, comments, manual, runID, cwd)
+}
+
+func (r *commandRuntime) validateLatestReviewerReviewSubmitPublicationWithOptions(cmd *cobra.Command, gh reviewSubmitPullRequestViewer, cfg config.Config, repo string, prNumber int64, commitID string, expectedBaseSHA string, expectedBaseRefName string, event string, comments []reviewSubmitComment, manual bool, runID string, cwd string) ([]string, error) {
 	detail, err := gh.ViewPullRequest(cmd.Context(), githubinfra.ViewPullRequestInput{Repo: repo, PRNumber: prNumber, CWD: cwd})
 	if err != nil {
 		return nil, fmt.Errorf("refresh pull request before review publish: %w", err)
@@ -1047,8 +1138,19 @@ func (r *commandRuntime) validateLatestReviewerReviewSubmitPublicationWithCommen
 	if err := validateReviewSubmitHeadCommit(cmd.Context(), gitPath, cwd, commitID, detail, event, comments); err != nil {
 		return nil, err
 	}
+	expectedBaseRefName = strings.TrimSpace(expectedBaseRefName)
+	liveBaseRefName := strings.TrimSpace(detail.BaseRefName)
+	if expectedBaseRefName != "" && liveBaseRefName != "" && expectedBaseRefName != liveBaseRefName {
+		return nil, fmt.Errorf("PR base branch changed before publish: expected %s, got %s", expectedBaseRefName, liveBaseRefName)
+	}
 	if err := validateExpectedBaseCommit(expectedBaseSHA, detail.BaseSHA); err != nil {
-		return nil, err
+		if detail.HasConflicts || (expectedBaseRefName != "" && liveBaseRefName == "") {
+			return nil, err
+		}
+		preserved, mbErr := githubinfra.BaseAdvancePreservesMergeBase(cmd.Context(), gitPath, cwd, expectedBaseSHA, detail.BaseSHA, detail.HeadSHA, liveBaseRefName)
+		if mbErr != nil || !preserved {
+			return nil, err
+		}
 	}
 	_, bot := hostingidentity.FromContext(cmd.Context())
 	_, forgejo := gh.(forgejoReviewSubmitGateway)
@@ -1080,6 +1182,10 @@ func validateSandboxReviewTarget(checkpoint string, live githubinfra.PullRequest
 	return validateSandboxReviewTargetWithComments(context.Background(), "", "", checkpoint, live, "", nil)
 }
 
+func validateSandboxReviewTargetWithGit(ctx context.Context, gitPath, cwd, checkpoint string, live githubinfra.PullRequestDetail) error {
+	return validateSandboxReviewTargetWithComments(ctx, gitPath, cwd, checkpoint, live, "", nil)
+}
+
 func validateSandboxReviewTargetWithComments(ctx context.Context, gitPath, cwd, checkpoint string, live githubinfra.PullRequestDetail, event string, comments []reviewSubmitComment) error {
 	var seed struct {
 		Detail *struct {
@@ -1097,8 +1203,17 @@ func validateSandboxReviewTargetWithComments(ctx context.Context, gitPath, cwd, 
 	if err := validateReviewSubmitHeadCommit(ctx, gitPath, cwd, seed.Snapshot.HeadSHA, live, event, comments); err != nil {
 		return err
 	}
-	if !strings.EqualFold(live.State, "OPEN") || live.IsDraft != seed.Detail.IsDraft || live.BaseRefName != seed.Detail.BaseRefName || live.BaseSHA != seed.Snapshot.BaseSHA {
+	if !strings.EqualFold(live.State, "OPEN") || live.IsDraft != seed.Detail.IsDraft || live.BaseRefName != seed.Detail.BaseRefName {
 		return fmt.Errorf("PR state, draft status or base changed since the sandbox review started")
+	}
+	if live.BaseSHA != seed.Snapshot.BaseSHA {
+		if live.HasConflicts {
+			return fmt.Errorf("PR state, draft status or base changed since the sandbox review started")
+		}
+		preserved, err := githubinfra.BaseAdvancePreservesMergeBase(ctx, gitPath, cwd, seed.Snapshot.BaseSHA, live.BaseSHA, live.HeadSHA, live.BaseRefName)
+		if err != nil || !preserved {
+			return fmt.Errorf("PR state, draft status or base changed since the sandbox review started")
+		}
 	}
 	return nil
 }

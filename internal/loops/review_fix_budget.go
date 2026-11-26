@@ -963,15 +963,17 @@ func promotePendingReviewScopeHumanAfterBudgetRelease(ctx context.Context, repos
 			role = "reviewer"
 		}
 		if _, err := ParkReviewScopeHuman(ctx, repos, ParkReviewScopeHumanInput{
-			Held:        *fresh,
-			Role:        role,
-			Repo:        strings.TrimSpace(derefLoopString(fresh.Repo)),
-			PRNumber:    derefLoopInt64(fresh.PRNumber),
-			NowISO:      nowISO,
-			HITLEnabled: state.PendingHITL,
-			Question:    state.Question,
-			Evidence:    state.Evidence,
-			Signal:      reviewFixHandoffSignal(*fresh),
+			Held:              *fresh,
+			Role:              role,
+			Repo:              strings.TrimSpace(derefLoopString(fresh.Repo)),
+			PRNumber:          derefLoopInt64(fresh.PRNumber),
+			NowISO:            nowISO,
+			HITLEnabled:       state.PendingHITL,
+			Question:          state.Question,
+			Evidence:          state.Evidence,
+			Signal:            reviewFixHandoffSignal(*fresh),
+			HeadSHA:           state.HeadSHA,
+			ForgejoRereviewID: state.ForgejoRereviewID,
 		}); err != nil {
 			return err
 		}

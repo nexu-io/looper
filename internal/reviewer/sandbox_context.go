@@ -27,7 +27,7 @@ func (r *Runner) writeSandboxGitHubContext(ctx context.Context, input stepInput,
 	if detail.HeadSHA != checkpoint.Snapshot.HeadSHA {
 		return "", &loopError{message: "PR head changed while loading sandbox review context", kind: FailureRetryableAfterResume, interrupted: true, headChangeInterrupt: true}
 	}
-	if reason := reviewerPublishDriftReason(input, checkpoint, detail); reason != "" {
+	if reason := r.reviewerPublishDriftReason(ctx, input, checkpoint, detail); reason != "" {
 		return "", &loopError{message: reason, kind: FailureRetryableAfterResume, interrupted: true}
 	}
 	comments, err := r.github.ListIssueComments(ctx, query)

@@ -604,3 +604,96 @@ func TestParkReviewScopeHumanFailsClosedWhenRefreshErrors(t *testing.T) {
 		t.Fatalf("fixer after failed park = (%#v, %v), want still queued and unparked", freshFixer, err)
 	}
 }
+
+func TestHasActiveFixerLoopForPR(t *testing.T) {
+	t.Parallel()
+	repo := "Acme/Looper"
+	pr := int64(42)
+	otherPR := int64(43)
+	records := []storage.LoopRecord{
+		{ID: "r1", ProjectID: "p1", Type: "reviewer", Repo: &repo, PRNumber: &pr, Status: "waiting"},
+		{ID: "f_done", ProjectID: "p1", Type: "fixer", Repo: &repo, PRNumber: &pr, Status: "terminated"},
+		{ID: "f_stopped", ProjectID: "p1", Type: "fixer", Repo: &repo, PRNumber: &pr, Status: "stopped"},
+		{ID: "f_completed", ProjectID: "p1", Type: "fixer", Repo: &repo, PRNumber: &pr, Status: "completed"},
+		{ID: "f_other_pr", ProjectID: "p1", Type: "fixer", Repo: &repo, PRNumber: &otherPR, Status: "waiting"},
+	}
+	if HasActiveFixerLoopForPR(records, "p1", "acme/looper", 42) {
+		t.Fatal("HasActiveFixerLoopForPR = true with only terminal/other-PR fixer loops, want false")
+	}
+	records = append(records, storage.LoopRecord{ID: "f_active", ProjectID: "p1", Type: "fixer", Repo: &repo, PRNumber: &pr, Status: "waiting"})
+	if !HasActiveFixerLoopForPR(records, "p1", "acme/looper", 42) {
+		t.Fatal("HasActiveFixerLoopForPR = false with active fixer loop on same PR, want true")
+	}
+	if HasActiveFixerLoopForPR(records, "p2", "acme/looper", 42) {
+		t.Fatal("HasActiveFixerLoopForPR = true for different projectID, want false")
+	}
+	if !HasActiveFixerLoopForPR(records, "", "acme/looper", 42) {
+		t.Fatal("HasActiveFixerLoopForPR = false when projectID is empty and repo/PR match, want true")
+	}
+}
+
+func TestParkAndReleaseReviewScopeHumanWithoutRequeuePreservesHeadMetersAndBlockers(t *testing.T) {
+	t.Parallel()
+	repos, nowISO := newBudgetFixture(t)
+	reviewer := seedBudgetLoop(t, repos, nowISO, "loop_scope_wake_reviewer", "reviewer", "running")
+	revMeta := `{"loop":{"iterationCount":2}}`
+	reviewer.MetadataJSON = &revMeta
+	if err := repos.Loops.Upsert(context.Background(), reviewer); err != nil {
+		t.Fatalf("upsert reviewer: %v", err)
+	}
+	fixer := seedBudgetLoop(t, repos, nowISO, "loop_scope_wake_fixer", "fixer", "waiting")
+	fixMeta := `{"reviewFixBudget":{"pushCount":1}}`
+	fixer.MetadataJSON = &fixMeta
+	if err := repos.Loops.Upsert(context.Background(), fixer); err != nil {
+		t.Fatalf("upsert fixer: %v", err)
+	}
+	// Seed a cancelled stale queue item on reviewer to ensure release-without-requeue does not revive it.
+	cancelReason := ReviewScopeHumanRequiredReason
+	staleItem := storage.QueueItemRecord{
+		ID: "queue_stale_scope_1", Type: "reviewer", ProjectID: ptrString("project_1"), LoopID: ptrString(reviewer.ID),
+		Repo: ptrString("acme/looper"), PRNumber: ptrInt64(42), DedupeKey: "reviewer:stale:1",
+		Status: "cancelled", Priority: 100, MaxAttempts: 5, AvailableAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO, LastError: &cancelReason,
+	}
+	if err := repos.Queue.Upsert(context.Background(), staleItem); err != nil {
+		t.Fatalf("upsert stale queue: %v", err)
+	}
+
+	parked, err := ParkReviewScopeHuman(context.Background(), repos, ParkReviewScopeHumanInput{
+		Held: reviewer, Role: "reviewer", Repo: "acme/looper", PRNumber: 42,
+		NowISO: nowISO, HITLEnabled: false, Question: "Clarify scope", HeadSHA: "head_v1",
+	})
+	if err != nil {
+		t.Fatalf("ParkReviewScopeHuman: %v", err)
+	}
+	if got := ReadReviewScopeHumanState(parked.MetadataJSON).HeadSHA; got != "head_v1" {
+		t.Fatalf("ReviewScopeHumanState.HeadSHA = %q, want head_v1", got)
+	}
+
+	released, err := ReleaseReviewScopeHumanHoldWithoutRequeue(context.Background(), repos, parked, nowISO, nil)
+	if err != nil {
+		t.Fatalf("ReleaseReviewScopeHumanHoldWithoutRequeue: %v", err)
+	}
+	if released.Status != "waiting" || IsReviewScopeHumanHold(released) {
+		t.Fatalf("released reviewer = %#v, want waiting with no scope hold", released)
+	}
+	if got := ReadReviewScopeHumanState(released.MetadataJSON).HeadSHA; got != "" {
+		t.Fatalf("released reviewer HeadSHA = %q, want cleared", got)
+	}
+	if got := ReviewerPublishCount(released.MetadataJSON); got != 2 {
+		t.Fatalf("ReviewerPublishCount = %d, want 2 preserved", got)
+	}
+	activeQueue, err := repos.Queue.FindActiveByLoopID(context.Background(), reviewer.ID)
+	if err != nil || activeQueue != nil {
+		t.Fatalf("active queue after release-without-requeue = (%#v, %v), want nil (stale item not revived)", activeQueue, err)
+	}
+	freshFixer, err := repos.Loops.GetByID(context.Background(), fixer.ID)
+	if err != nil || freshFixer == nil || freshFixer.Status != "waiting" || IsReviewScopeHumanHold(*freshFixer) {
+		t.Fatalf("sibling fixer after release-without-requeue = (%#v, %v), want waiting with no scope hold", freshFixer, err)
+	}
+	if got := FixerPushCount(freshFixer.MetadataJSON); got != 1 {
+		t.Fatalf("FixerPushCount = %d, want 1 preserved", got)
+	}
+}
+
+func ptrString(s string) *string { return &s }
+func ptrInt64(v int64) *int64    { return &v }

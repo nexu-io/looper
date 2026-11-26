@@ -28,10 +28,11 @@ const (
 // BuildReviewAnchorIndexInput selects the complete base/head authority used to
 // validate inline review comment anchors.
 type BuildReviewAnchorIndexInput struct {
-	CWD     string
-	BaseSHA string
-	HeadSHA string
-	Paths   []string
+	CWD         string
+	BaseSHA     string
+	BaseRefName string
+	HeadSHA     string
+	Paths       []string
 }
 
 // BuildReviewAnchorIndex validates only the comment paths using local PR commits.
@@ -53,7 +54,7 @@ func (g *Gateway) BuildReviewAnchorIndex(ctx context.Context, input BuildReviewA
 		return nil, "", fmt.Errorf("%w: missing base or head SHA", ErrAnchorValidationUnavailable)
 	}
 
-	index, err := g.buildLocalPathAnchorIndex(ctx, input.CWD, baseSHA, headSHA, paths)
+	index, err := g.buildLocalPathAnchorIndexWithBaseRef(ctx, input.CWD, baseSHA, strings.TrimSpace(input.BaseRefName), headSHA, paths)
 	if err != nil {
 		return nil, "", fmt.Errorf("%w: %s", ErrAnchorValidationUnavailable, sanitizeReviewAnchorLocalError(err))
 	}
@@ -77,8 +78,12 @@ func sanitizeReviewAnchorLocalError(err error) string {
 }
 
 func (g *Gateway) buildLocalPathAnchorIndex(ctx context.Context, cwd, baseSHA, headSHA string, paths []string) (*diffanchor.Index, error) {
+	return g.buildLocalPathAnchorIndexWithBaseRef(ctx, cwd, baseSHA, "", headSHA, paths)
+}
+
+func (g *Gateway) buildLocalPathAnchorIndexWithBaseRef(ctx context.Context, cwd, baseSHA, baseRefName, headSHA string, paths []string) (*diffanchor.Index, error) {
 	var parsed diffanchor.Index
-	err := g.ReadLocalPullRequestDiff(ctx, cwd, baseSHA, headSHA, paths, func(reader io.Reader) error {
+	err := g.readLocalPullRequestDiff(ctx, cwd, baseSHA, baseRefName, headSHA, paths, func(reader io.Reader) error {
 		var parseErr error
 		parsed, parseErr = diffanchor.ParseReader(reader)
 		return parseErr
@@ -93,7 +98,11 @@ func (g *Gateway) buildLocalPathAnchorIndex(ctx context.Context, cwd, baseSHA, h
 // Git writes to a disposable file, bypassing shell output capture limits. The
 // file is removed on every return; snapshots never persist the patch.
 func (g *Gateway) ReadLocalPullRequestDiff(ctx context.Context, cwd, baseSHA, headSHA string, paths []string, read func(io.Reader) error) error {
-	if err := g.verifyLocalCommitObject(ctx, cwd, baseSHA); err != nil {
+	return g.readLocalPullRequestDiff(ctx, cwd, baseSHA, "", headSHA, paths, read)
+}
+
+func (g *Gateway) readLocalPullRequestDiff(ctx context.Context, cwd, baseSHA, baseRefName, headSHA string, paths []string, read func(io.Reader) error) error {
+	if err := g.ensureLocalBaseCommit(ctx, cwd, baseSHA, baseRefName); err != nil {
 		return err
 	}
 	if err := g.verifyLocalCommitObject(ctx, cwd, headSHA); err != nil {
@@ -110,6 +119,135 @@ func (g *Gateway) ReadLocalPullRequestDiff(ctx context.Context, cwd, baseSHA, he
 	args := []string{"--literal-pathspecs", "diff", "--no-ext-diff", "--no-textconv", "--no-color", "-M", "--unified=3", baseSHA + "..." + headSHA, "--"}
 	args = append(args, paths...)
 	return g.readGitDiffOutput(ctx, cwd, args, read)
+}
+
+func (g *Gateway) ensureLocalBaseCommit(ctx context.Context, cwd, baseSHA, baseRefName string) error {
+	return g.ensureLocalCommit(ctx, cwd, baseSHA, baseRefName)
+}
+
+func (g *Gateway) ensureLocalCommit(ctx context.Context, cwd, sha, fallbackRef string) error {
+	err := g.verifyLocalCommitObject(ctx, cwd, sha)
+	if err == nil {
+		return nil
+	}
+	sha = strings.TrimSpace(sha)
+	fallbackRef = strings.TrimSpace(fallbackRef)
+	if !isSafeGitRev(sha) {
+		return err
+	}
+	// Empty refmap and --no-write-fetch-head keep the caller's FETCH_HEAD,
+	// remote tracking refs, HEAD, and working tree untouched.
+	if _, fetchErr := g.runGitForReviewAnchors(ctx, cwd, "fetch", "--no-write-fetch-head", "--no-tags", "--refmap=", "origin", sha); fetchErr != nil && isSafeGitRev(fallbackRef) {
+		_, _ = g.runGitForReviewAnchors(ctx, cwd, "fetch", "--no-write-fetch-head", "--no-tags", "--refmap=", "origin", fallbackRef)
+	}
+	return g.verifyLocalCommitObject(ctx, cwd, sha)
+}
+
+// HasLocalMergeConflicts checks whether merging baseSHA and headSHA produces a
+// merge conflict using git merge-tree --write-tree without touching HEAD,
+// index, working tree, FETCH_HEAD, or remote tracking refs. Used to distinguish
+// real conflicts from Forgejo's asynchronous mergeable=false CHECKING state.
+func (g *Gateway) HasLocalMergeConflicts(ctx context.Context, cwd, baseSHA, baseRefName, headSHA, headRefName string) (bool, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	baseSHA = strings.TrimSpace(baseSHA)
+	headSHA = strings.TrimSpace(headSHA)
+	if !isSafeGitRev(baseSHA) || !isSafeGitRev(headSHA) {
+		return false, fmt.Errorf("merge conflict check requires valid base and head commits")
+	}
+	if err := g.ensureLocalCommit(ctx, cwd, baseSHA, baseRefName); err != nil {
+		return false, err
+	}
+	if err := g.ensureLocalCommit(ctx, cwd, headSHA, headRefName); err != nil {
+		return false, err
+	}
+	result, err := g.runGitForReviewAnchors(ctx, cwd, "merge-tree", "--write-tree", baseSHA, headSHA)
+	if err == nil {
+		return false, nil
+	}
+	if ctx.Err() != nil {
+		return false, ctx.Err()
+	}
+	var cmdErr *shell.CommandExecutionError
+	if errors.As(err, &cmdErr) && result.ExitCode == 1 {
+		return true, nil
+	}
+	return false, err
+}
+
+// BaseAdvancePreservesMergeBase reports whether advancing the PR base commit
+// from oldBaseSHA to newBaseSHA leaves git merge-base(base, headSHA) unchanged.
+// When merge-base(oldBaseSHA, headSHA) == merge-base(newBaseSHA, headSHA), the
+// three-dot PR diff base...head is identical and previously computed findings
+// and inline diff anchors remain exact. Fails closed on missing commits, fetch
+// failures, shifted merge-bases (e.g. stacked PR merged or base rewritten), or
+// invalid git state.
+func BaseAdvancePreservesMergeBase(ctx context.Context, gitPath, cwd, oldBaseSHA, newBaseSHA, headSHA, baseRefName string) (bool, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	oldBaseSHA = strings.TrimSpace(oldBaseSHA)
+	newBaseSHA = strings.TrimSpace(newBaseSHA)
+	headSHA = strings.TrimSpace(headSHA)
+	baseRefName = strings.TrimSpace(baseRefName)
+	if oldBaseSHA == "" || newBaseSHA == "" || headSHA == "" {
+		return false, nil
+	}
+	if commitSHAsMatch(oldBaseSHA, newBaseSHA) {
+		return true, nil
+	}
+	if strings.TrimSpace(cwd) == "" || !isSafeGitRev(oldBaseSHA) || !isSafeGitRev(newBaseSHA) || !isSafeGitRev(headSHA) {
+		return false, nil
+	}
+	gateway := &Gateway{gitPath: strings.TrimSpace(gitPath), cwd: strings.TrimSpace(cwd)}
+	if err := gateway.verifyLocalCommitObject(ctx, cwd, oldBaseSHA); err != nil {
+		return false, err
+	}
+	if err := gateway.verifyLocalCommitObject(ctx, cwd, headSHA); err != nil {
+		return false, err
+	}
+	if err := gateway.ensureLocalBaseCommit(ctx, cwd, newBaseSHA, baseRefName); err != nil {
+		return false, err
+	}
+	oldMergeBases, err := gateway.sortedMergeBases(ctx, cwd, oldBaseSHA, headSHA)
+	if err != nil || len(oldMergeBases) != 1 {
+		return false, err
+	}
+	newMergeBases, err := gateway.sortedMergeBases(ctx, cwd, newBaseSHA, headSHA)
+	if err != nil || len(newMergeBases) != 1 {
+		return false, err
+	}
+	return strings.EqualFold(oldMergeBases[0], newMergeBases[0]), nil
+}
+
+func (g *Gateway) sortedMergeBases(ctx context.Context, cwd, baseSHA, headSHA string) ([]string, error) {
+	result, err := g.runGitForReviewAnchors(ctx, cwd, "merge-base", "--all", baseSHA, headSHA)
+	if err != nil {
+		return nil, err
+	}
+	lines := strings.Split(result.Stdout, "\n")
+	bases := make([]string, 0, len(lines))
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed != "" {
+			bases = append(bases, strings.ToLower(trimmed))
+		}
+	}
+	sort.Strings(bases)
+	return bases, nil
+}
+
+func isSafeGitRev(value string) bool {
+	if value == "" || strings.HasPrefix(value, "-") {
+		return false
+	}
+	for _, r := range value {
+		if r <= 0x20 || r == 0x7f {
+			return false
+		}
+	}
+	return true
 }
 
 func (g *Gateway) readGitDiffOutput(ctx context.Context, cwd string, args []string, read func(io.Reader) error) error {
@@ -477,57 +615,6 @@ func HeadAdvanceDisjointFromPullRequestDiff(ctx context.Context, gitPath, cwd, b
 	return true, nil
 }
 
-func (g *Gateway) ensureLocalCommit(ctx context.Context, cwd, sha, fallbackRef string) error {
-	err := g.verifyLocalCommitObject(ctx, cwd, sha)
-	if err == nil {
-		return nil
-	}
-	sha = strings.TrimSpace(sha)
-	fallbackRef = strings.TrimSpace(fallbackRef)
-	if !isSafeGitRev(sha) {
-		return err
-	}
-	// Empty refmap and --no-write-fetch-head keep the caller's FETCH_HEAD,
-	// remote tracking refs, HEAD, and working tree untouched.
-	if _, fetchErr := g.runGitForReviewAnchors(ctx, cwd, "fetch", "--no-write-fetch-head", "--no-tags", "--refmap=", "origin", sha); fetchErr != nil && isSafeGitRev(fallbackRef) {
-		_, _ = g.runGitForReviewAnchors(ctx, cwd, "fetch", "--no-write-fetch-head", "--no-tags", "--refmap=", "origin", fallbackRef)
-	}
-	return g.verifyLocalCommitObject(ctx, cwd, sha)
-}
-
-// HasLocalMergeConflicts checks whether merging baseSHA and headSHA produces a
-// merge conflict using git merge-tree --write-tree without touching HEAD,
-// index, working tree, FETCH_HEAD, or remote tracking refs. Used to distinguish
-// real conflicts from Forgejo's asynchronous mergeable=false CHECKING state.
-func (g *Gateway) HasLocalMergeConflicts(ctx context.Context, cwd, baseSHA, baseRefName, headSHA, headRefName string) (bool, error) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	baseSHA = strings.TrimSpace(baseSHA)
-	headSHA = strings.TrimSpace(headSHA)
-	if !isSafeGitRev(baseSHA) || !isSafeGitRev(headSHA) {
-		return false, fmt.Errorf("merge conflict check requires valid base and head commits")
-	}
-	if err := g.ensureLocalCommit(ctx, cwd, baseSHA, baseRefName); err != nil {
-		return false, err
-	}
-	if err := g.ensureLocalCommit(ctx, cwd, headSHA, headRefName); err != nil {
-		return false, err
-	}
-	result, err := g.runGitForReviewAnchors(ctx, cwd, "merge-tree", "--write-tree", baseSHA, headSHA)
-	if err == nil {
-		return false, nil
-	}
-	if ctx.Err() != nil {
-		return false, ctx.Err()
-	}
-	var cmdErr *shell.CommandExecutionError
-	if errors.As(err, &cmdErr) && result.ExitCode == 1 {
-		return true, nil
-	}
-	return false, err
-}
-
 func (g *Gateway) isCommitAncestor(ctx context.Context, cwd, ancestorSHA, descendantSHA string) (bool, error) {
 	_, err := g.runGitForReviewAnchors(ctx, cwd, "merge-base", "--is-ancestor", ancestorSHA, descendantSHA)
 	if err == nil {
@@ -585,16 +672,4 @@ func parseNameStatusZPaths(output string) map[string]struct{} {
 		}
 	}
 	return paths
-}
-
-func isSafeGitRev(value string) bool {
-	if value == "" || strings.HasPrefix(value, "-") {
-		return false
-	}
-	for _, r := range value {
-		if r <= 0x20 || r == 0x7f {
-			return false
-		}
-	}
-	return true
 }
