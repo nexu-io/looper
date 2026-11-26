@@ -5,6 +5,15 @@ import (
 	"testing"
 )
 
+func TestClassifyLocalGitHubWritePolicyDenialRequiresIntervention(t *testing.T) {
+	for _, boundary := range []Boundary{BoundaryGitHubAPI, BoundaryUnknown} {
+		err := errors.New("Command exited with code 1: Native GitHub API writes blocked: use Odcrew; unsupported operations require manual intervention.")
+		if got := Classify(err, Context{Runner: RunnerFixer, Boundary: boundary}); got != ManualIntervention {
+			t.Fatalf("Classify(%s) = %s, want manual intervention", boundary, got)
+		}
+	}
+}
+
 func TestClassifyExternalBoundaryTransportFailures(t *testing.T) {
 	tests := []struct {
 		name     string
