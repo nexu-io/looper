@@ -5146,7 +5146,7 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 			return checkpoint, &loopError{message: fmt.Sprintf("PR head changed before final grouped reviewer: expected %s, got %s", checkpoint.Snapshot.HeadSHA, freshDetail.HeadSHA), kind: FailureRetryableAfterResume, interrupted: true}
 		}
 		if sandboxGitHub || relatedFileGroupsConfig(r, input.Project.ID).Enabled {
-			if reason := reviewerPublishDriftReason(input, checkpoint, freshDetail); reason != "" {
+			if reason := r.reviewerPublishDriftReason(ctx, input, checkpoint, freshDetail); reason != "" {
 				checkpoint.PendingReview = nil
 				checkpoint.ResumePolicy = "restart_from_discover"
 				return checkpoint, &loopError{message: reason, kind: FailureRetryableAfterResume, interrupted: true}
@@ -5431,7 +5431,7 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 		if !isManualReviewerLoop(input.Loop) && domain.IsAutoLaneHeld(domain.LoopTypeReviewer, detail.Labels) {
 			return checkpoint, &holdSkipError{summary: fmt.Sprintf("Reviewer stopped because %s#%d is currently held", input.Repo, input.PRNumber)}
 		}
-		if reason := reviewerPublishDriftReason(input, checkpoint, detail); reason != "" {
+		if reason := r.reviewerPublishDriftReason(ctx, input, checkpoint, detail); reason != "" {
 			return markReviewerRunStale(checkpoint, reason), nil
 		}
 		policy := r.discoveryPolicyForProject(input.Project.ID)
@@ -5533,7 +5533,7 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 	if !isManualReviewerLoop(input.Loop) && domain.IsAutoLaneHeld(domain.LoopTypeReviewer, detail.Labels) {
 		return checkpoint, &holdSkipError{summary: fmt.Sprintf("Reviewer stopped because %s#%d is currently held", input.Repo, input.PRNumber)}
 	}
-	if reason := reviewerPublishDriftReason(input, checkpoint, detail); reason != "" {
+	if reason := r.reviewerPublishDriftReason(ctx, input, checkpoint, detail); reason != "" {
 		return markReviewerRunStale(checkpoint, reason), nil
 	}
 	checkpoint.Detail = checkpointDetailFromDetail(detail)
@@ -5913,23 +5913,13 @@ func markReviewerRunStale(checkpoint reviewerCheckpoint, reason string) reviewer
 	return checkpoint
 }
 
-func reviewerPublishDriftReason(input stepInput, checkpoint reviewerCheckpoint, detail PullRequestDetail) string {
+func (r *Runner) reviewerPublishDriftReason(ctx context.Context, input stepInput, checkpoint reviewerCheckpoint, detail PullRequestDetail) string {
 	if state := normalizePRState(detail.State); state != "" && state != "open" {
 		observed := strings.ToUpper(strings.TrimSpace(detail.State))
 		if observed == "" {
 			observed = strings.ToUpper(state)
 		}
 		return fmt.Sprintf("PR drift detected before publish: expected PR state OPEN, observed %s for %s#%d", observed, input.Repo, input.PRNumber)
-	}
-	seededBase := ""
-	if checkpoint.Snapshot != nil {
-		seededBase = checkpoint.Snapshot.BaseSHA
-	}
-	if seededBase == "" && checkpoint.Detail != nil {
-		seededBase = checkpoint.Detail.BaseSHA
-	}
-	if seededBase != "" && seededBase != detail.BaseSHA {
-		return fmt.Sprintf("PR base changed before publish: expected %s, got %s", seededBase, detail.BaseSHA)
 	}
 	if checkpoint.Detail != nil {
 		if checkpoint.Detail.IsDraft != detail.IsDraft {
@@ -5942,7 +5932,36 @@ func reviewerPublishDriftReason(input stepInput, checkpoint reviewerCheckpoint, 
 			return fmt.Sprintf("PR head branch changed before publish: expected %s, got %s", checkpoint.Detail.HeadRefName, detail.HeadRefName)
 		}
 	}
+	seededBase := ""
+	if checkpoint.Snapshot != nil {
+		seededBase = checkpoint.Snapshot.BaseSHA
+	}
+	if seededBase == "" && checkpoint.Detail != nil {
+		seededBase = checkpoint.Detail.BaseSHA
+	}
+	if seededBase != "" && seededBase != detail.BaseSHA {
+		if detail.HasConflicts {
+			return fmt.Sprintf("PR base changed before publish: expected %s, got %s (PR has merge conflicts)", seededBase, detail.BaseSHA)
+		}
+		expectedHead := firstNonEmpty(snapshotHeadSHA(checkpoint), detail.HeadSHA)
+		cwd := input.Project.RepoPath
+		if checkpoint.Worktree != nil && strings.TrimSpace(checkpoint.Worktree.Path) != "" {
+			cwd = checkpoint.Worktree.Path
+		}
+		baseRef := detail.BaseRefName
+		if baseRef == "" && checkpoint.Detail != nil {
+			baseRef = checkpoint.Detail.BaseRefName
+		}
+		if !r.baseAdvancePreservesMergeBase(ctx, cwd, seededBase, detail.BaseSHA, expectedHead, baseRef) {
+			return fmt.Sprintf("PR base changed before publish: expected %s, got %s", seededBase, detail.BaseSHA)
+		}
+	}
 	return ""
+}
+
+func (r *Runner) baseAdvancePreservesMergeBase(ctx context.Context, cwd, oldBaseSHA, newBaseSHA, headSHA, baseRefName string) bool {
+	preserved, err := githubinfra.BaseAdvancePreservesMergeBase(ctx, groupingGitPath(r), cwd, oldBaseSHA, newBaseSHA, headSHA, baseRefName)
+	return err == nil && preserved
 }
 
 func (r *Runner) appendReviewerAgentEvent(ctx context.Context, input stepInput, eventType, phase, executionID string, payload map[string]any) {
@@ -8542,7 +8561,7 @@ func (r *Runner) refreshGroupedReview(ctx context.Context, input stepInput, expe
 	if strings.TrimSpace(freshDetail.HeadSHA) != strings.TrimSpace(expectedHead) {
 		return freshDetail, &loopError{message: fmt.Sprintf("PR head changed during grouped review: expected %s, got %s", expectedHead, freshDetail.HeadSHA), kind: FailureRetryableAfterResume, interrupted: true}
 	}
-	if reason := reviewerPublishDriftReason(input, input.Checkpoint, freshDetail); reason != "" {
+	if reason := r.reviewerPublishDriftReason(ctx, input, input.Checkpoint, freshDetail); reason != "" {
 		return freshDetail, &loopError{message: reason, kind: FailureRetryableAfterResume, interrupted: true}
 	}
 	return freshDetail, nil
@@ -8852,7 +8871,7 @@ func (r *Runner) detectMarkerMissingRecovery(ctx context.Context, input stepInpu
 	if detail.HeadSHA != "" && detail.HeadSHA != expectedHeadSHA {
 		return fmt.Sprintf("PR head changed before publish: expected %s, got %s", expectedHeadSHA, detail.HeadSHA), "", ""
 	}
-	if reason := reviewerPublishDriftReason(input, checkpoint, detail); reason != "" {
+	if reason := r.reviewerPublishDriftReason(ctx, input, checkpoint, detail); reason != "" {
 		return reason, "", ""
 	}
 	if !allowAlreadyReviewed {
@@ -9641,7 +9660,7 @@ func (r *Runner) scopeParkRecoveryFreshnessBlockReason(ctx context.Context, proj
 	if detail.HeadSHA != "" && pending.HeadSHA != "" && detail.HeadSHA != pending.HeadSHA {
 		return fmt.Sprintf("PR head changed before publish: expected %s, got %s", pending.HeadSHA, detail.HeadSHA), nil
 	}
-	if reason := reviewerPublishDriftReason(stepInput{Repo: repo, PRNumber: prNumber}, checkpoint, detail); reason != "" {
+	if reason := r.reviewerPublishDriftReason(ctx, stepInput{Project: project, Repo: repo, PRNumber: prNumber}, checkpoint, detail); reason != "" {
 		return reason, nil
 	}
 	if normalizePRState(detail.State) != "open" {
@@ -10094,7 +10113,7 @@ func reviewerAgentSideGitHubFetchContract() string {
 	return strings.Join([]string{
 		"Agent-side GitHub fetch contract: use the minimal PR seed above as the stable handoff. Do not assume PR title, body, full diff, full comment dumps, reviews, or checks from this prompt are complete or fresh.",
 		"Local checkout contract: the current working directory is Looper's prepared reviewer worktree for this PR and is the canonical local checkout for verification. Reuse this worktree for git fetch, git checkout, diff inspection, and any local validation. Do not run `gh repo clone`, `git clone`, or create any additional checkout for this PR's base or head repository unless the provided worktree is missing or unusable.",
-		"Before acting and again before final conclusions or publishing, run `gh pr view <pr-url> -R <repo> --json number,title,body,state,isDraft,baseRefName,baseRefOid,headRefName,headRefOid,url,labels` using the seeded PR URL or number plus repository, and validate `headRefOid` equals the seeded `head_sha`, `baseRefOid` equals the seeded `base_sha` and `baseRefName` equals the seeded `base_ref` when present, and state/draft status match the seed. Fail fast on drift.",
+		"Before acting and again before final conclusions or publishing, run `gh pr view <pr-url> -R <repo> --json number,title,body,state,isDraft,baseRefName,baseRefOid,headRefName,headRefOid,url,labels` using the seeded PR URL or number plus repository, and validate `headRefOid` equals the seeded `head_sha`, `baseRefName` equals the seeded `base_ref` when present, and state/draft status match the seed. Fail fast on drift (a fast-forward of `baseRefOid` on the same `base_ref` while `headRefOid` is unchanged is not drift when the merge-base with `head_sha` is unchanged and the PR has no merge conflicts; the trusted review-submit wrapper and daemon enforce merge-base equivalence).",
 		"Inspect changes with local Git using the fixed `base_sha` and `head_sha` from the seed. Start with `git diff --name-status <base_sha>...<head_sha>`, then use `git diff <base_sha>...<head_sha> -- <path>` and read files as needed. Fetch missing commits/history before inspecting; never treat missing objects or truncated output as an empty diff. Page large file diffs and continue reviewing all changed files. A remote PR diff is not required. Run `gh pr checks <pr-url> -R <repo>` only when CI status matters.",
 		"When review feedback context matters, do not rely only on `gh pr view --comments`; collect all review feedback with pagination: `gh api repos/{owner}/{repo}/pulls/{number}/comments --paginate`, `gh api repos/{owner}/{repo}/pulls/{number}/reviews --paginate`, and `gh api repos/{owner}/{repo}/issues/{number}/comments --paginate`.",
 		"If `gh` fails for authentication, network, rate-limit, or PR drift reasons, stop and return a structured error with `type` set to one of `auth`, `network`, `rate_limit`, or `pr_drift`, plus a short `message` and any observed PR metadata. Do not proceed on stale PR data.",
@@ -10154,7 +10173,7 @@ func buildReviewPromptWithInstructions(projectID string, instructionConfig confi
 		fetchContract = "Provider-supplied Forgejo review context: Looper fetched PR metadata before invoking you. Use the prepared local worktree plus the supplied metadata as the review context; do not use GitHub CLI/API commands or native review/thread features."
 	}
 	if hostingKind != "" {
-		fetchContract = forge.HostingAgentContext(hostingKind, "reviewer", repo, prNumber) + "\nBefore reviewing and again before conclusions or publication, read live PR metadata; verify seeded head/base/state/draft and stop on drift or access failures. Read all PR conversation and reviews before reviewing; inspect the diff locally at the seeded base/head SHAs."
+		fetchContract = forge.HostingAgentContext(hostingKind, "reviewer", repo, prNumber) + "\nBefore reviewing and again before conclusions or publication, read live PR metadata; verify seeded head/base/state/draft and stop on drift or access failures (a base-branch advance on the same base_ref with unchanged head_sha and unchanged merge-base is not drift). Read all PR conversation and reviews before reviewing; inspect the diff locally at the seeded base/head SHAs."
 	}
 	scopeInstruction := reviewerScopeInstruction(scope)
 	if hostingKind != "" {

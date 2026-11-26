@@ -14092,7 +14092,7 @@ func (g *fakeGitHubGateway) CapturePullRequestSnapshot(_ context.Context, input 
 	if g.changeHeadOnSecondView && g.viewCalls >= 2 {
 		headSHA = "new-head"
 	}
-	return storage.PullRequestSnapshotRecord{ID: fmt.Sprintf("snapshot:%d:%s", input.PRNumber, input.CapturedAt), ProjectID: input.ProjectID, Repo: input.Repo, PRNumber: input.PRNumber, HeadSHA: headSHA, BaseSHA: stringPtr("base123"), Title: stringPtr("Review me"), Body: stringPtr("PR body"), Author: stringPtr(g.effectiveAuthor()), ChecksSummary: stringPtr("SUCCESS"), CapturedAt: input.CapturedAt, CreatedAt: input.CapturedAt}, nil
+	return storage.PullRequestSnapshotRecord{ID: fmt.Sprintf("snapshot:%d:%s", input.PRNumber, input.CapturedAt), ProjectID: input.ProjectID, Repo: input.Repo, PRNumber: input.PRNumber, HeadSHA: headSHA, BaseSHA: stringPtr(firstNonEmpty(g.viewBaseSHA, "base123")), Title: stringPtr("Review me"), Body: stringPtr("PR body"), Author: stringPtr(g.effectiveAuthor()), ChecksSummary: stringPtr("SUCCESS"), CapturedAt: input.CapturedAt, CreatedAt: input.CapturedAt}, nil
 }
 
 func (g *fakeGitHubGateway) FindReviewMarker(_ context.Context, input VerifyReviewMarkerInput) (ReviewMarkerResult, error) {
