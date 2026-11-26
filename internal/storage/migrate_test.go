@@ -461,6 +461,9 @@ func TestMigrationRunnerAppliesPendingMigrationsOnLegacyDatabasesAcrossVersions(
 	ctx := context.Background()
 	latestFixtureID := EmbeddedMigrations[len(EmbeddedMigrations)-1].ID
 	latestDB := openSQLiteDBAtPath(t, writeLegacyDBFixture(t, latestFixtureID))
+	if _, err := NewMigrationRunner(latestDB, MigrationRunnerOptions{Migrations: EmbeddedMigrations}).RunPending(ctx); err != nil {
+		t.Fatalf("migrate latest legacy fixture error = %v", err)
+	}
 	latestSchema := readSQLiteSchemaSnapshot(t, latestDB)
 
 	const legacyAppliedAt = "2026-04-17T12:00:00.000Z"
@@ -486,8 +489,8 @@ func TestMigrationRunnerAppliesPendingMigrationsOnLegacyDatabasesAcrossVersions(
 				t.Fatalf("runner.Status() before run error = %v", err)
 			}
 
-			wantAppliedIDs := migrationIDsForPrefix(version)
-			wantPendingIDs := migrationIDsForSuffix(version)
+			wantAppliedIDs := appliedMigrationIDs(status.Applied)
+			wantPendingIDs := migrationDescriptorIDs(status.Pending)
 			assertDescriptors(t, status.Available, migrationIDsForPrefix(len(EmbeddedMigrations)))
 			assertAppliedMigrations(t, status.Applied, wantAppliedIDs, legacyAppliedAt)
 			assertDescriptors(t, status.Pending, wantPendingIDs)
@@ -509,7 +512,7 @@ func TestMigrationRunnerAppliesPendingMigrationsOnLegacyDatabasesAcrossVersions(
 				t.Fatalf("runner.Status() after run error = %v", err)
 			}
 
-			assertAppliedMigrationsWithSplitTimestamps(t, status.Applied, migrationIDsForPrefix(len(EmbeddedMigrations)), version, legacyAppliedAt, goAppliedAt)
+			assertAppliedMigrationsWithInitialSet(t, status.Applied, migrationIDsForPrefix(len(EmbeddedMigrations)), wantAppliedIDs, legacyAppliedAt, goAppliedAt)
 			if len(status.Pending) != 0 {
 				t.Fatalf("runner.Status().Pending after run = %v, want empty", status.Pending)
 			}
@@ -854,6 +857,45 @@ func migrationIDsForSuffix(offset int) []string {
 	}
 
 	return ids
+}
+
+func appliedMigrationIDs(migrations []AppliedMigration) []string {
+	ids := make([]string, len(migrations))
+	for i, migration := range migrations {
+		ids[i] = migration.ID
+	}
+	return ids
+}
+
+func migrationDescriptorIDs(migrations []MigrationDescriptor) []string {
+	ids := make([]string, len(migrations))
+	for i, migration := range migrations {
+		ids[i] = migration.ID
+	}
+	return ids
+}
+
+func assertAppliedMigrationsWithInitialSet(t *testing.T, got []AppliedMigration, wantIDs, initiallyApplied []string, legacyAppliedAt, goAppliedAt string) {
+	t.Helper()
+	initial := make(map[string]struct{}, len(initiallyApplied))
+	for _, id := range initiallyApplied {
+		initial[id] = struct{}{}
+	}
+	if len(got) != len(wantIDs) {
+		t.Fatalf("applied migration count = %d, want %d", len(got), len(wantIDs))
+	}
+	for i, migration := range got {
+		if migration.ID != wantIDs[i] {
+			t.Fatalf("applied[%d].ID = %q, want %q", i, migration.ID, wantIDs[i])
+		}
+		wantAppliedAt := goAppliedAt
+		if _, ok := initial[migration.ID]; ok {
+			wantAppliedAt = legacyAppliedAt
+		}
+		if migration.AppliedAt != wantAppliedAt {
+			t.Fatalf("applied[%d].AppliedAt = %q, want %q", i, migration.AppliedAt, wantAppliedAt)
+		}
+	}
 }
 
 func assertAppliedMigrationsWithSplitTimestamps(t *testing.T, got []AppliedMigration, wantIDs []string, typeScriptCount int, typeScriptAppliedAt string, goAppliedAt string) {

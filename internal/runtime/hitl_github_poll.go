@@ -1103,3 +1103,8 @@ func runGitHubHITLPoll(ctx context.Context, input defaultSchedulerTickInput, pro
 		input.Logger.Info("hitl github: delivered human answers", map[string]any{"projectId": project.ID, "count": n})
 	}
 }
+
+func deliverHITLAnswerToLoopForQuestion(ctx context.Context, repos *storage.Repositories, nowISO, loopID, answer, expectedQuestionID string) error {
+	_, err := loops.DeliverHITLAnswerForQuestion(ctx, repos, nowISO, loopID, answer, expectedQuestionID)
+	return err
+}

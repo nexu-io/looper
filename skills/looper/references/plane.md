@@ -63,10 +63,13 @@ Redact both as `***` in any summary. An authenticated `gh` is still needed for t
     { "id": "<repo-name>", "name": "<repo-name>",
       "provider": "plane-<workspace>",
       "repo": "<owner>/<repo>",
-      "repoPath": "<project-path>" }
+      "repoPath": "<project-path>",
+      "productOwner": { "feishuOpenId": "ou_...", "planeId": "<product UUID>" },
+      "designOwner": { "feishuOpenId": "ou_...", "planeId": "<design UUID>" },
+      "owner": { "feishuOpenId": "ou_...", "planeId": "<local owner UUID>" } }
   ],
   "roles": {
-    "planner": { "autoDiscovery": true, "triggers": { "labels": ["looper:plan"], "labelMode": "all", "requireAssigneeCurrentUser": false } },
+    "planner": { "autoDiscovery": true, "preSpecDecisionGrill": true, "triggers": { "labels": ["looper:plan"], "labelMode": "all", "requireAssigneeCurrentUser": false } },
     "worker":  { "autoDiscovery": true, "triggers": { "labels": ["looper:plan"], "labelMode": "all", "requireAssigneeCurrentUser": false, "planeAssigneeId": "<your-plane-member-uuid>" } }
   },
   "notifications": { "webhook": { "enabled": true, "urlEnv": "LOOPER_FEISHU_WEBHOOK_URL", "format": "feishu", "levels": ["action_required", "failure"] } }
@@ -79,6 +82,7 @@ Key facts an agent must not get wrong:
 - To route Plane work-items **per person** (so each teammate's looper only picks up its owner's items instead of every looper racing for every labelled item), set `triggers.planeAssigneeId` to that person's Plane member UUID. Empty = label-only discovery (fine when a single central looper consumes the project). Ignored for github/forgejo providers. Get the UUID with the `plane` CLI: `plane api me` → the `id:` line (or `plane api member workspace-list` for anyone's; raw: `curl -H "X-API-Key: <key>" .../api/v1/users/me/` → `id`). Get the `projectId` with `plane api project list`.
 - `repo` is the GitHub code repo where PRs land; `workspace`/`projectId` on the provider point at Plane.
 - Coordinator and Fixer lanes are skipped for plane projects; Reviewer runs against the GitHub PRs Worker opens.
+- With `preSpecDecisionGrill`, Plane work-item comments are the only requirement-answer authority. Route `PROD-*` to `productOwner`, `DESIGN-*` to `designOwner`, and `ENG-*` plus final technical-Spec approval to the local `owner`; validate by `planeId`, never display name. Feishu is notification/screenshot/link only, and a grey @ for someone outside the notification group is allowed.
 
 ## Verify (confirm Plane discovery)
 

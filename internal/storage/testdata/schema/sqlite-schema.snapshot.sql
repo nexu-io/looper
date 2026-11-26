@@ -177,7 +177,7 @@ CREATE TABLE "queue_items" (
   CHECK (attempts >= 0),
   CHECK (max_attempts = -1 OR max_attempts > 0),
   CHECK (status IN ('queued', 'running', 'completed', 'failed', 'cancelled', 'manual_intervention')),
-  CHECK (last_error_kind IS NULL OR last_error_kind IN ('retryable_transient', 'retryable_after_resume', 'non_retryable', 'manual_intervention'))
+  CHECK (last_error_kind IS NULL OR last_error_kind IN ('retryable_transient', 'retryable_after_resume', 'recoverable_infra', 'non_retryable', 'manual_intervention'))
 );
 
 CREATE TABLE runs (

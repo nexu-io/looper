@@ -46,6 +46,7 @@ func TestResolvePiArgs(t *testing.T) {
 			original := append([]string(nil), tt.args...)
 			cfg := base
 			cfg.Params = map[string]any{"args": tt.args}
+			tt.want = append([]string{"--mode", "json"}, tt.want...)
 			command, got := ResolveSpawn(cfg, workdir, prompt)
 			if command != "pi" || !reflect.DeepEqual(got, tt.want) {
 				t.Fatalf("ResolveSpawn() = (%q, %#v), want (pi, %#v)", command, got, tt.want)
@@ -66,7 +67,7 @@ func TestPiExecutionContractAndUnsupportedResume(t *testing.T) {
 		t.Fatalf("write script: %v", err)
 	}
 	repos := storage.NewRepositories(openAgentCoordinator(t).DB())
-	executor := New(ExecutorOptions{Config: ExecutorConfig{Vendor: config.AgentVendorPi, NativeResumeEnabled: true, Params: map[string]any{"command": scriptPath}}, Repos: repos,
+	executor := New(ExecutorOptions{Config: ExecutorConfig{Vendor: config.AgentVendorPi, NativeResumeEnabled: true, Params: map[string]any{"command": scriptPath, "args": []string{"--mode", "text"}}}, Repos: repos,
 		ParamsOwnerVendor: piOwner(),
 	})
 	execution, err := executor.Start(context.Background(), RunInput{ExecutionID: "agent_pi", WorkingDirectory: workdir, Prompt: "fresh prompt", NativeResumePrompt: "resume prompt", NativeSessionID: "session-1", Timeout: 10 * time.Second, Env: map[string]string{"OBSERVED_PATH": observedPath}})
@@ -85,7 +86,7 @@ func TestPiExecutionContractAndUnsupportedResume(t *testing.T) {
 		t.Fatalf("read observed args: %v", err)
 	}
 	got := strings.Split(strings.TrimSpace(string(observed)), "\n")
-	want := []string{"-p", "fresh prompt", "--approve", "env:" + workdir, "dir:" + workdir}
+	want := []string{"--mode", "text", "-p", "fresh prompt", "--approve", "env:" + workdir, "dir:" + workdir}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("observed = %#v, want %#v", got, want)
 	}
@@ -95,5 +96,15 @@ func TestPiExecutionContractAndUnsupportedResume(t *testing.T) {
 	record, err := repos.AgentExecutions.GetByID(context.Background(), "agent_pi")
 	if err != nil || record == nil || record.NativeResumeMode == nil || *record.NativeResumeMode != "checkpoint_restart" || record.NativeResumeStatus == nil || *record.NativeResumeStatus != "unsupported" {
 		t.Fatalf("native resume record = %#v, err = %v, want checkpoint_restart/unsupported", record, err)
+	}
+}
+
+func TestPiExplicitOutputModeIsPreserved(t *testing.T) {
+	for _, args := range [][]string{{"--mode", "text"}, {"--mode=json"}} {
+		cfg := ExecutorConfig{Vendor: config.AgentVendorPi, Params: map[string]any{"args": args}}
+		_, got := ResolveSpawn(cfg, t.TempDir(), "task")
+		if !reflect.DeepEqual(got, append(append([]string{}, args...), "-p", "task", "--approve")) {
+			t.Fatalf("operator output mode changed: %v", got)
+		}
 	}
 }

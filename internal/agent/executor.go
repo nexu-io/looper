@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -57,6 +58,8 @@ var unsafeAgentEnvKeys = []string{
 	"GIT_SHALLOW_FILE",
 }
 
+var malformedProductAskPattern = regexp.MustCompile(`(?s)^\s*\{\s*"summary"\s*:\s*("(?:\\.|[^"\\])*")\s*,\s*"productAsk"\s*:\s*"(.*)"\s*\}\s*$`)
+
 var inheritedAgentEnvKeys = []string{
 	"PATH",
 	"HOME",
@@ -101,6 +104,13 @@ type ExecutorConfig struct {
 	// affects the codex vendor; the result + session are read from the JSONL. Off
 	// by default (env-gated) so it can't disturb the text-mode path until proven.
 	LiveToolEvents bool
+	// ClaudeJSONEvents runs claude-code with `--output-format stream-json --verbose`
+	// and parses its JSONL event stream so its native session id can be captured
+	// (unlocking native resume; plain `--print` never emits one) and a structured
+	// tool feed shown. Only affects the claude-code vendor; the result + session are
+	// read from the JSONL. Off by default (env-gated) so it can't disturb the
+	// text-mode path until proven.
+	ClaudeJSONEvents bool
 }
 
 type ExecutorOptions struct {
@@ -188,6 +198,7 @@ type RunInput struct {
 type Result struct {
 	Status                       string
 	Summary                      string
+	ProductAsk                   string
 	Stdout                       string
 	Stderr                       string
 	ParseStatus                  string
@@ -203,16 +214,33 @@ type Result struct {
 	ElapsedRuntimeSeconds        int64
 	LastProgressAt               string
 	PID                          int
+	// Interrupted is true when the agent was deliberately killed to hand the wheel back
+	// to a human mid-run (强操控: a thread @bot arrived while it was running), NOT a
+	// timeout or a crash. The caller resumes the SAME session to answer them rather than
+	// retrying/failing the step.
+	Interrupted bool
 }
+
+// HITLInterruptKillReason is the kill reason the HITL poll passes to
+// ActiveExecutionRegistry.Kill when a human's mid-run message should interrupt the
+// running agent. The executor stamps Result.Interrupted from it, so a deliberate human
+// interrupt is told apart from a timeout / orphan-reaper kill (which stay failures).
+const HITLInterruptKillReason = "hitl-interrupt"
 
 type completionParse struct {
 	ParseStatus      string
 	CompletionSignal string
 	Summary          string
-	Artifacts        []string
-	ChangedFiles     []string
-	Commits          []string
-	Lifecycle        *lifecycle.State
+	// ProductAsk is an optional product-language message the agent emits in its
+	// completion marker (`{"summary":…,"productAsk":…}`) when a spec has a real
+	// product decision only a human product owner can make. Empty for the common
+	// case; only the planner is instructed to ever populate it.
+	ProductAsk        string
+	Artifacts         []string
+	ChangedFiles      []string
+	Commits           []string
+	Lifecycle         *lifecycle.State
+	RepositoryReports []RepositoryReport
 }
 
 type Execution interface {
@@ -723,6 +751,11 @@ type execution struct {
 
 	killCh chan string
 	doneCh chan execOutcome
+
+	// hitlInterrupted is set when this execution was killed via HITLInterruptKillReason
+	// (a human's mid-run @bot), so the Result it produces is marked Interrupted and the
+	// caller resumes the same session to answer them instead of failing/retrying.
+	hitlInterrupted bool
 }
 
 func (x *execution) Wait(ctx context.Context) (Result, error) {
@@ -925,6 +958,9 @@ func (x *execution) run(ctx context.Context) {
 		case reason := <-x.killCh:
 			killed = true
 			killReason = reason
+			if reason == HITLInterruptKillReason {
+				x.hitlInterrupted = true
+			}
 			x.setStatus("killed")
 			terminateSignal()
 		case <-runCtx.Done():
@@ -963,6 +999,13 @@ func (x *execution) run(ctx context.Context) {
 		}
 	}
 	completion := parseCompletion(stdout, stderr)
+	// nativeFinalText holds the agent's clean final message, reconstructed from a JSONL
+	// stream (codex/opencode/claude). When the agent emits no __LOOPER_RESULT__ marker
+	// (e.g. the grill/review sub-agents just write prose), the Summary fallback below
+	// MUST use this — not summarizeLogs(stdout): in a JSONL mode the last raw stdout line
+	// is a `{"type":"result",…}` event object, so summarizeLogs would surface that raw
+	// JSON as the "summary" (a grill transcript posted as a wall of escaped JSON).
+	nativeFinalText := ""
 	if x.jsonMode() {
 		// codex --json: stdout is JSONL. The completion marker + final message live
 		// inside agent_message / command-output events, and the session is the
@@ -973,6 +1016,35 @@ func (x *execution) run(ctx context.Context) {
 		if tr.threadID != "" {
 			x.nativeSessionID = tr.threadID
 		}
+		nativeFinalText = tr.combinedText()
+	} else if x.openCodeJSONMode() {
+		// opencode --format json: stdout is JSONL. The completion marker + assistant
+		// text live inside `text` events (part.text, not a bare stdout line), and the
+		// session id is stamped on every event — read both from the parsed stream
+		// instead of raw stdout.
+		tr := newOpenCodeJSONLTranslator()
+		tr.ingestAll(stdout)
+		completion = parseCompletion(tr.combinedText(), stderr)
+		if tr.sessionID != "" {
+			x.nativeSessionID = tr.sessionID
+		}
+		nativeFinalText = tr.assistantText()
+	} else if x.claudeJSONMode() {
+		// claude --output-format stream-json: stdout is JSONL. The completion marker +
+		// final message live inside the `result` event's `result` field (not a bare
+		// stdout line), and the session id is stamped on every event — read both from
+		// the parsed stream instead of raw stdout.
+		tr := newClaudeJSONLTranslator()
+		tr.ingestAll(stdout)
+		completion = parseCompletion(tr.combinedText(), stderr)
+		if tr.sessionID != "" {
+			x.nativeSessionID = tr.sessionID
+		}
+		nativeFinalText = tr.assistantText()
+	}
+	if x.piJSONMode() {
+		nativeFinalText, _ = piJSONL(stdout)
+		completion = parseCompletion(nativeFinalText, stderr)
 	}
 	if status != "completed" {
 		completion = completionParse{ParseStatus: "missing"}
@@ -980,7 +1052,11 @@ func (x *execution) run(ctx context.Context) {
 	if completion.Summary == "" {
 		completion.Summary = errorMessage
 		if completion.Summary == "" {
-			completion.Summary = summarizeLogs(stdout, stderr)
+			if fromStream := strings.TrimSpace(nativeFinalText); fromStream != "" {
+				completion.Summary = fromStream
+			} else {
+				completion.Summary = summarizeLogs(stdout, stderr)
+			}
 		}
 	}
 	endedAtISO := eventlog.FormatJavaScriptISOString(x.executor.now().UTC())
@@ -988,6 +1064,7 @@ func (x *execution) run(ctx context.Context) {
 	result := Result{
 		Status:                       status,
 		Summary:                      completion.Summary,
+		ProductAsk:                   completion.ProductAsk,
 		Stdout:                       stdout,
 		Stderr:                       stderr,
 		ParseStatus:                  completion.ParseStatus,
@@ -1003,6 +1080,7 @@ func (x *execution) run(ctx context.Context) {
 		ElapsedRuntimeSeconds:        durationSeconds(x.executor.now().UTC().Sub(x.startedAt)),
 		LastProgressAt:               lastProgressAt,
 		PID:                          x.leaderPID(),
+		Interrupted:                  x.hitlInterrupted,
 	}
 	if x.shouldFallbackNativeResume(status, stdout, stderr) {
 		// Cancellation / stop must not spawn a second process (#576).
@@ -1067,6 +1145,12 @@ func (x *execution) run(ctx context.Context) {
 			"heartbeatCount":               result.HeartbeatCount,
 			"summary":                      result.Summary,
 		}, endedAtISO)
+		if len(completion.Artifacts) > 0 {
+			x.executor.appendLifecycleEvent("artifacts.reported", x.input, x.executionID, map[string]any{"source": "agent_report", "count": len(completion.Artifacts)}, endedAtISO)
+		}
+		for _, report := range completion.RepositoryReports {
+			x.executor.appendLifecycleEvent("repository.reported", x.input, x.executionID, map[string]any{"source": "agent_report", "repo": report.Repo, "role": report.Role, "branch": report.Branch, "baseSha": report.BaseSHA, "prUrl": report.PRURL, "validationStatus": report.ValidationStatus}, endedAtISO)
+		}
 	}
 
 	x.doneCh <- execOutcome{result: result, err: persistErr}
@@ -1299,6 +1383,9 @@ func (x *execution) runCheckpointFallback(ctx context.Context, nativeError strin
 		case reason := <-x.killCh:
 			killed = true
 			killReason = reason
+			if reason == HITLInterruptKillReason {
+				x.hitlInterrupted = true
+			}
 			terminate()
 		case <-ctx.Done():
 			killed = true
@@ -1377,6 +1464,7 @@ func (x *execution) runCheckpointFallback(ctx context.Context, nativeError strin
 		ElapsedRuntimeSeconds:        durationSeconds(x.executor.now().UTC().Sub(x.startedAt)),
 		LastProgressAt:               x.lastProgressAtISO(),
 		PID:                          x.leaderPID(),
+		Interrupted:                  x.hitlInterrupted,
 	}, errorMessage, true, nil
 }
 
@@ -1406,7 +1494,24 @@ func (x *execution) onOutput(stream string, chunk []byte) {
 	// late). Text-mode ids can stream in across chunks, so re-extract each time; the
 	// codex --json thread id arrives whole in a thread.started line, so capture it
 	// once (only when text extraction found nothing and it's not already known).
-	if nativeSessionID := extractNativeSessionID(stdout, stderr); nativeSessionID != "" {
+	if x.openCodeJSONMode() {
+		// opencode --format json stamps the session id on every event; capture the
+		// first via a precise ses_ regex (authoritative for this vendor rather than
+		// the generic substring scan below).
+		if strings.TrimSpace(x.nativeSessionID) == "" {
+			if sessionID := extractOpenCodeSessionID(stdout); sessionID != "" {
+				x.nativeSessionID = sessionID
+			}
+		}
+	} else if x.claudeJSONMode() {
+		// claude stream-json stamps the session id (a UUID) on every event; capture
+		// the first via a precise regex so a live takeover / resume has it.
+		if strings.TrimSpace(x.nativeSessionID) == "" {
+			if sessionID := extractClaudeSessionID(stdout); sessionID != "" {
+				x.nativeSessionID = sessionID
+			}
+		}
+	} else if nativeSessionID := extractNativeSessionID(stdout, stderr); nativeSessionID != "" {
 		x.nativeSessionID = nativeSessionID
 	} else if x.jsonMode() && strings.TrimSpace(x.nativeSessionID) == "" {
 		if threadID := extractCodexThreadID(stdout); threadID != "" {
@@ -1450,10 +1555,22 @@ func (x *execution) maybeEmitProgress(now time.Time, stdout, stderr string) {
 		elapsed = 0
 	}
 	var tail []string
-	if x.jsonMode() {
+	switch {
+	case x.jsonMode():
 		// Structured codex tool-call feed ("✅ <cmd>") parsed from the JSONL stream.
 		tail = codexToolTail(stdout, liveProgressTailLines)
-	} else {
+	case x.openCodeJSONMode():
+		// Structured opencode feed (tool calls + text snippets) parsed from JSONL, so
+		// the card shows human activity rather than raw JSON events.
+		tail = openCodeActivityTail(stdout, liveProgressTailLines)
+	case x.piJSONMode():
+		_, activity := piJSONL(stdout)
+		tail = lastNonEmptyLines(strings.Join(activity, "\n"), liveProgressTailLines)
+	case x.claudeJSONMode():
+		// Structured claude feed (tool_use calls + text snippets) parsed from JSONL, so
+		// the card shows human activity rather than raw JSON events.
+		tail = claudeActivityTail(stdout, liveProgressTailLines)
+	default:
 		// Combine streams; the last N lines skew toward whichever is actively writing.
 		tail = lastNonEmptyLines(stdout+"\n"+stderr, liveProgressTailLines)
 	}
@@ -1473,6 +1590,25 @@ func (x *execution) jsonMode() bool {
 	}
 	cfg := x.executor.effectiveConfig(x.input)
 	return cfg.LiveToolEvents && cfg.Vendor == config.AgentVendorCodex
+}
+
+// openCodeJSONMode reports whether this run is an opencode `run --format json` run.
+// Unlike codex's jsonMode (env-gated via LiveToolEvents), opencode ALWAYS runs with
+// --format json — it's the only output mode that exposes the session id, which
+// native resume needs — so structured-JSON handling is on for every opencode run,
+// independent of LiveToolEvents. Safe because resolveOpenCodeArgs and
+// resolveNativeResumeArgs unconditionally add --format json for this vendor.
+func (x *execution) openCodeJSONMode() bool {
+	return x.executor != nil && x.executor.config.Vendor == config.AgentVendorOpenCode
+}
+
+// claudeJSONMode reports whether this run is a claude-code `--output-format
+// stream-json` run. Env-gated (via ClaudeJSONEvents) so it stays zero-risk to the
+// existing plain-text `--print` path until proven; when on, resolveClaudeArgs and
+// resolveNativeResumeArgs add `--output-format stream-json --verbose` so stdout is
+// JSONL for both a fresh run and a resumed one.
+func (x *execution) claudeJSONMode() bool {
+	return x.executor != nil && x.executor.config.ClaudeJSONEvents && x.executor.config.Vendor == config.AgentVendorClaudeCode
 }
 
 // codexToolTail renders the last n command executions from a codex JSONL blob.
@@ -1612,7 +1748,12 @@ func (x *execution) persistFinal(status string, result Result, errorMessage, end
 	pid := int64(pidOrZero(x.process.Process))
 	parseStatus := result.ParseStatus
 	completionSignal := emptyToNil(result.CompletionSignal)
-	if extractedNativeSessionID := extractNativeSessionID(embeddedStdout, embeddedStderr); extractedNativeSessionID != "" {
+	if x.openCodeJSONMode() {
+		// opencode json mode: prefer the precise ses_ regex over the generic scan.
+		if id := extractOpenCodeSessionID(embeddedStdout); id != "" {
+			nativeSessionID = id
+		}
+	} else if extractedNativeSessionID := extractNativeSessionID(embeddedStdout, embeddedStderr); extractedNativeSessionID != "" {
 		nativeSessionID = extractedNativeSessionID
 	}
 	if nativeResumeMode == "native_resume" && status == "failed" {
@@ -2073,6 +2214,23 @@ func resolveClaudeArgs(cfg ExecutorConfig, args []string, prompt string) []strin
 	if !hasAnyFlag(resolved, []string{"--dangerously-skip-permissions"}) {
 		resolved = append(resolved, "--dangerously-skip-permissions")
 	}
+	return appendClaudeStreamJSON(cfg, resolved)
+}
+
+// appendClaudeStreamJSON adds `--output-format stream-json --verbose` when the
+// ClaudeJSONEvents flag is on (stream-json REQUIRES --verbose), so stdout is JSONL
+// and the native session id can be captured. No-op when the flag is off (plain
+// `--print` text mode, unchanged) or the flags are already present.
+func appendClaudeStreamJSON(cfg ExecutorConfig, resolved []string) []string {
+	if !cfg.ClaudeJSONEvents {
+		return resolved
+	}
+	if !hasAnyFlag(resolved, []string{"--output-format"}) {
+		resolved = append(resolved, "--output-format", "stream-json")
+	}
+	if !hasAnyFlag(resolved, []string{"--verbose"}) {
+		resolved = append(resolved, "--verbose")
+	}
 	return resolved
 }
 
@@ -2099,6 +2257,7 @@ func resolveOpenCodeArgs(cfg ExecutorConfig, args []string, workingDirectory str
 	if strings.TrimSpace(workingDirectory) != "" && !hasAnyFlag(resolved, []string{"--dir"}) {
 		resolved = appendDirFlag(resolved, workingDirectory)
 	}
+	resolved = appendOpenCodeFormatJSON(resolved)
 	withModel := prependModelFlag(resolved, cfg.Model, "--model", []string{"--model", "-m"})
 	if hasAnyFlag(withModel, []string{"-p", "--prompt", "-f", "--file"}) {
 		return withModel
@@ -2142,6 +2301,9 @@ func resolveGrokArgs(cfg ExecutorConfig, args []string, workingDirectory string,
 // Looper already sets process cmd.Dir to the worktree. Fresh-run only.
 func resolvePiArgs(cfg ExecutorConfig, args []string, prompt string) []string {
 	resolved := prependModelFlag(args, cfg.Model, "--model", []string{"--model"})
+	if !hasAnyFlag(resolved, []string{"--mode"}) {
+		resolved = append([]string{"--mode", "json"}, resolved...)
+	}
 	if !hasAnyFlag(resolved, []string{"-p", "--print"}) {
 		// Operator-owned print/prompt: when -p/--print is already configured,
 		// do not append Looper's generated prompt (matches claude-code).
@@ -2196,7 +2358,10 @@ func resolveNativeResumeArgs(cfg ExecutorConfig, workingDirectory string, args [
 		if !hasAnyFlag(resolved, []string{"--dangerously-skip-permissions"}) {
 			resolved = append(resolved, "--dangerously-skip-permissions")
 		}
-		return resolved
+		// Keep the resumed run on the same JSONL contract as a fresh one so its stdout
+		// parses (and its session id re-captures); otherwise claudeJSONMode would try to
+		// parse plain text and lose the completion marker.
+		return appendClaudeStreamJSON(cfg, resolved)
 	case config.AgentVendorCodex:
 		resolved := removeFirstArg(args, "exec")
 		resolved = removeFirstArg(resolved, "resume")
@@ -2215,6 +2380,7 @@ func resolveNativeResumeArgs(cfg ExecutorConfig, workingDirectory string, args [
 		if strings.TrimSpace(workingDirectory) != "" && !hasAnyFlag(resolved, []string{"--dir"}) {
 			resolved = appendDirFlag(resolved, workingDirectory)
 		}
+		resolved = appendOpenCodeFormatJSON(resolved)
 		if !hasAnyFlag(resolved, []string{"--session", "--continue"}) {
 			resolved = append(resolved, "--session", sessionID)
 		}
@@ -2296,6 +2462,18 @@ func envMapToSlice(env map[string]string) []string {
 		resolved = append(resolved, key+"="+env[key])
 	}
 	return resolved
+}
+
+// appendOpenCodeFormatJSON forces `--format json` onto an opencode invocation
+// (idempotent). It's the ONLY output mode that emits the session id — stamped on
+// every JSONL event — which native resume needs to reuse the same session across
+// passes; the default text output hides it. Honours a caller-supplied --format so
+// an explicit override in agent.params.args isn't duplicated.
+func appendOpenCodeFormatJSON(args []string) []string {
+	if hasAnyFlag(args, []string{"--format"}) {
+		return args
+	}
+	return append(args, "--format", "json")
 }
 
 func appendDirFlag(args []string, workingDirectory string) []string {
@@ -2588,34 +2766,147 @@ func tickerChan(ticker *time.Ticker) <-chan time.Time {
 func parseCompletion(stdout, stderr string) completionParse {
 	raw := stdout + "\n" + stderr
 	lines := strings.Split(raw, "\n")
+	// The latest (bottom-up first) real marker owns the summary + parse status.
+	// Some agents emit a rich marker via a tool echo AND a summary-only marker as
+	// their final text (e.g. opencode/grok: the echo carries git_pr_lifecycle, the
+	// final message drops it). The summary-only one lands here first, so when it is
+	// missing structured evidence keep scanning earlier markers and backfill only
+	// the fields it dropped — never overwriting the latest summary. For an agent
+	// that emits one complete marker (codex), the first match already carries
+	// lifecycle and returns immediately: behaviour is unchanged.
+	var primary *completionParse
 	for i := len(lines) - 1; i >= 0; i-- {
 		line := strings.TrimSpace(lines[i])
-		if strings.HasPrefix(line, CompletionMarkerPrefix) {
-			payload := strings.TrimPrefix(line, CompletionMarkerPrefix)
-			var parsed map[string]any
-			if err := json.Unmarshal([]byte(payload), &parsed); err != nil {
-				return completionParse{ParseStatus: "invalid_json", CompletionSignal: CompletionMarkerPrefix}
-			}
-			result := completionParse{
-				ParseStatus:      "parsed",
-				CompletionSignal: CompletionMarkerPrefix,
-				Artifacts:        asStringSlice(parsed["artifacts"]),
-				ChangedFiles:     asStringSlice(parsed["changedFiles"]),
-				Commits:          asStringSlice(parsed["commits"]),
-			}
-			if state, err := lifecycle.FromMap(parsed["git_pr_lifecycle"]); err == nil {
-				result.Lifecycle = state
-			}
-			if summary, ok := parsed["summary"].(string); ok {
-				result.Summary = summary
-			}
-			if isTemplateCompletion(result, parsed) {
+		if !strings.HasPrefix(line, CompletionMarkerPrefix) {
+			continue
+		}
+		payload := strings.TrimPrefix(line, CompletionMarkerPrefix)
+		var parsed map[string]any
+		if err := json.Unmarshal([]byte(payload), &parsed); err != nil {
+			if recovered, ok := recoverMalformedProductAsk(payload); ok {
+				if primary == nil {
+					captured := recovered
+					primary = &captured
+				}
 				continue
 			}
-			return result
+			if primary != nil {
+				// A later marker already stood in; a malformed earlier echo is just
+				// noise — don't fail the whole parse over it.
+				continue
+			}
+			return completionParse{ParseStatus: "invalid_json", CompletionSignal: CompletionMarkerPrefix}
+		}
+		result := completionParse{
+			ParseStatus:       "parsed",
+			CompletionSignal:  CompletionMarkerPrefix,
+			Artifacts:         asStringSlice(parsed["artifacts"]),
+			RepositoryReports: parseRepositoryReports(parsed["repositories"]),
+			ChangedFiles:      asStringSlice(parsed["changedFiles"]),
+			Commits:           asStringSlice(parsed["commits"]),
+		}
+		if state, err := lifecycle.FromMap(parsed["git_pr_lifecycle"]); err == nil {
+			result.Lifecycle = state
+		}
+		if summary, ok := parsed["summary"].(string); ok {
+			result.Summary = summary
+		}
+		if productAsk, ok := parsed["productAsk"].(string); ok {
+			result.ProductAsk = productAsk
+		}
+		if isTemplateCompletion(result, parsed) {
+			continue
+		}
+		if primary == nil {
+			captured := result
+			primary = &captured
+			if completionLifecyclePopulated(primary.Lifecycle) {
+				return *primary
+			}
+			continue
+		}
+		if !completionLifecyclePopulated(primary.Lifecycle) && completionLifecyclePopulated(result.Lifecycle) {
+			primary.Lifecycle = result.Lifecycle
+		}
+		if len(primary.Commits) == 0 {
+			primary.Commits = result.Commits
+		}
+		if len(primary.ChangedFiles) == 0 {
+			primary.ChangedFiles = result.ChangedFiles
+		}
+		if len(primary.Artifacts) == 0 {
+			primary.Artifacts = result.Artifacts
+		}
+		if len(primary.RepositoryReports) == 0 {
+			primary.RepositoryReports = result.RepositoryReports
+		}
+		if strings.TrimSpace(primary.ProductAsk) == "" && strings.TrimSpace(result.ProductAsk) != "" {
+			primary.ProductAsk = result.ProductAsk
+		}
+		if completionLifecyclePopulated(primary.Lifecycle) {
+			return *primary
 		}
 	}
+	if primary != nil {
+		return *primary
+	}
 	return completionParse{ParseStatus: "missing"}
+}
+
+// recoverMalformedProductAsk preserves planner node-H asks when an agent follows
+// the completion schema but forgets to JSON-escape quotation marks inside the final
+// productAsk string. The planner marker has productAsk as its last field, which lets
+// us recover that field without treating arbitrary malformed markers as success.
+func recoverMalformedProductAsk(payload string) (completionParse, bool) {
+	fields := malformedProductAskPattern.FindStringSubmatch(payload)
+	if len(fields) != 3 {
+		return completionParse{}, false
+	}
+	var summary string
+	if err := json.Unmarshal([]byte(fields[1]), &summary); err != nil {
+		return completionParse{}, false
+	}
+	productAsk, err := strconv.Unquote(`"` + escapeLooseJSONString(fields[2]) + `"`)
+	if err != nil || strings.TrimSpace(productAsk) == "" {
+		return completionParse{}, false
+	}
+	return completionParse{
+		ParseStatus:      "parsed",
+		CompletionSignal: CompletionMarkerPrefix,
+		Summary:          summary,
+		ProductAsk:       productAsk,
+	}, true
+}
+
+func escapeLooseJSONString(value string) string {
+	var escaped strings.Builder
+	for i := 0; i < len(value); i++ {
+		switch value[i] {
+		case '\\':
+			escaped.WriteByte(value[i])
+			if i+1 < len(value) {
+				i++
+				escaped.WriteByte(value[i])
+			}
+		case '"':
+			escaped.WriteString(`\"`)
+		default:
+			escaped.WriteByte(value[i])
+		}
+	}
+	return escaped.String()
+}
+
+// completionLifecyclePopulated reports whether a parsed marker's git_pr_lifecycle
+// carries real evidence (a PR, commits, or a branch) rather than being absent or
+// an empty object. It gates the backfill in parseCompletion so a summary-only
+// final marker adopts the structured lifecycle an earlier echo marker reported.
+func completionLifecyclePopulated(s *lifecycle.State) bool {
+	if s == nil {
+		return false
+	}
+	return s.PRNumber > 0 || strings.TrimSpace(s.PRURL) != "" || len(s.CommitSHAs) > 0 ||
+		strings.TrimSpace(s.AgentBranch) != "" || strings.TrimSpace(s.Branch) != ""
 }
 
 func isTemplateCompletion(result completionParse, parsed map[string]any) bool {
@@ -2718,6 +3009,7 @@ func (e *ConfiguredExecutor) appendLifecycleEvent(eventType string, input RunInp
 		ProjectID:        emptyToNil(input.ProjectID),
 		LoopID:           emptyToNil(input.LoopID),
 		RunID:            emptyToNil(input.RunID),
+		CorrelationID:    emptyToNil(input.LoopID),
 		EntityType:       stringPtr("agent_execution"),
 		EntityID:         &executionID,
 		ActorType:        stringPtr("agent"),

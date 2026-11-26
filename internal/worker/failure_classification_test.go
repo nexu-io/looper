@@ -31,3 +31,14 @@ func TestClassifyFailurePreservesContextTransient(t *testing.T) {
 		t.Fatalf("classifyFailure() kind = %s, want %s", got.kind, FailureRetryableTransient)
 	}
 }
+
+func TestClassifyFailureMapsRecoverableInfra(t *testing.T) {
+	runner := &Runner{}
+	got := runner.classifyFailureWithBoundary(errors.New("fork/exec git: resource temporarily unavailable"), failureclass.BoundaryAgentProcess)
+	if got.kind != FailureRecoverableInfra {
+		t.Fatalf("classifyFailure() kind = %s, want %s", got.kind, FailureRecoverableInfra)
+	}
+	if !shouldRetryQueueFailure(got.kind, 1, -1) {
+		t.Fatal("recoverable infrastructure failure must remain queued while its condition can self-clear")
+	}
+}

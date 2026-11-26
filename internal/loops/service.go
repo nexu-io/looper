@@ -9,6 +9,7 @@ import (
 
 	"github.com/nexu-io/looper/internal/domain"
 	"github.com/nexu-io/looper/internal/eventlog"
+	loopengine "github.com/nexu-io/looper/internal/loops/engine"
 	"github.com/nexu-io/looper/internal/storage"
 )
 
@@ -19,6 +20,11 @@ type Service struct {
 }
 
 type CreateInput struct {
+	// ID optionally reuses an external dispatch identity for atomic, idempotent
+	// ingestion. Replays return the original task even after it changes targets.
+	ID string
+	// QueueItem, when supplied, is inserted atomically with the new loop.
+	QueueItem    *storage.QueueItemRecord
 	ProjectID    string
 	Type         domain.LoopType
 	Target       domain.LoopTarget
@@ -63,6 +69,18 @@ func (s *Service) Create(ctx context.Context, input CreateInput) (storage.LoopRe
 		if project == nil {
 			return storage.LoopRecord{}, fmt.Errorf("project not found: %s", input.ProjectID)
 		}
+		if input.ID != "" {
+			existing, err := repos.Loops.GetByID(ctx, input.ID)
+			if err != nil {
+				return storage.LoopRecord{}, err
+			}
+			if existing != nil {
+				if existing.ProjectID != input.ProjectID || existing.Type != string(input.Type) {
+					return storage.LoopRecord{}, fmt.Errorf("task identity %s already belongs to another project or executor", input.ID)
+				}
+				return *existing, nil
+			}
+		}
 
 		existingLoops, err := repos.Loops.List(ctx)
 		if err != nil {
@@ -70,6 +88,14 @@ func (s *Service) Create(ctx context.Context, input CreateInput) (storage.LoopRe
 		}
 		summaries := make([]domain.LoopSummary, 0, len(existingLoops))
 		for _, loop := range existingLoops {
+			// Uniqueness only considers statuses that can conflict with a new
+			// loop. Historical deployments sometimes retired terminal issue
+			// loops by suffixing target_id (for example, ":retired-rerun"),
+			// which is intentionally no longer a parseable issue target. Do not
+			// let such non-conflicting audit records block every future Create.
+			if !domain.IsConflictingActiveLoopStatus(domain.LoopStatus(loop.Status)) {
+				continue
+			}
 			summary, convErr := loopSummaryFromRecord(loop)
 			if convErr != nil {
 				return storage.LoopRecord{}, convErr
@@ -77,7 +103,10 @@ func (s *Service) Create(ctx context.Context, input CreateInput) (storage.LoopRe
 			summaries = append(summaries, summary)
 		}
 
-		id := eventlog.NewEventID("loop")
+		id := input.ID
+		if id == "" {
+			id = eventlog.NewEventID("loop")
+		}
 		candidate := domain.LoopSummary{ID: id, ProjectID: input.ProjectID, Type: input.Type, Target: input.Target, Status: input.Status}
 		if err := domain.AssertUniqueActiveLoop(summaries, candidate); err != nil {
 			return storage.LoopRecord{}, err
@@ -103,13 +132,32 @@ func (s *Service) Create(ctx context.Context, input CreateInput) (storage.LoopRe
 			CreatedAt:    nowISO,
 			UpdatedAt:    nowISO,
 		}
+		if metadata, stateErr := loopengine.Write(record.MetadataJSON, loopengine.FromLegacy(record.Status, "", nowISO)); stateErr == nil {
+			record.MetadataJSON = &metadata
+		}
 		if input.Status == domain.LoopStatusRunning {
 			record.NextRunAt = &nowISO
 		}
 		if err := repos.Loops.Upsert(ctx, record); err != nil {
 			return storage.LoopRecord{}, err
 		}
-
+		if input.QueueItem != nil {
+			item := *input.QueueItem
+			item.LoopID = &record.ID
+			item.ProjectID = &record.ProjectID
+			item.TargetType = record.TargetType
+			item.TargetID = domain.LoopTargetKey(input.Target)
+			if item.DedupeKey == "" {
+				item.DedupeKey = record.Type + ":" + record.ID
+			}
+			if item.LockKey == nil {
+				key := record.Type + ":" + record.ID
+				item.LockKey = &key
+			}
+			if err := repos.Queue.Upsert(ctx, item); err != nil {
+				return storage.LoopRecord{}, err
+			}
+		}
 		return record, nil
 	})
 	if err != nil {
@@ -162,6 +210,9 @@ func (s *Service) TransitionStatus(ctx context.Context, loopID string, input Tra
 		updated := *loop
 		updated.Status = string(input.Status)
 		updated.UpdatedAt = eventlog.FormatJavaScriptISOString(now)
+		if metadata, stateErr := loopengine.Write(updated.MetadataJSON, loopengine.FromLegacy(updated.Status, "", updated.UpdatedAt)); stateErr == nil {
+			updated.MetadataJSON = &metadata
+		}
 		if input.NextRunAt != nil {
 			nextRunAt := eventlog.FormatJavaScriptISOString(*input.NextRunAt)
 			updated.NextRunAt = &nextRunAt
@@ -210,6 +261,9 @@ func (s *Service) Pause(ctx context.Context, loopID string, reason *string) (Pau
 		updated.Status = string(domain.LoopStatusPaused)
 		updated.NextRunAt = nil
 		updated.UpdatedAt = eventlog.FormatJavaScriptISOString(now)
+		if metadata, stateErr := loopengine.Write(updated.MetadataJSON, loopengine.FromLegacy(updated.Status, "manual_pause", updated.UpdatedAt)); stateErr == nil {
+			updated.MetadataJSON = &metadata
+		}
 		if err := repos.Loops.Upsert(ctx, updated); err != nil {
 			return PauseResult{}, err
 		}
@@ -249,6 +303,9 @@ func (s *Service) Terminate(ctx context.Context, loopID string, reason *string) 
 		updated.Status = string(domain.LoopStatusTerminated)
 		updated.NextRunAt = nil
 		updated.UpdatedAt = eventlog.FormatJavaScriptISOString(now)
+		if metadata, stateErr := loopengine.Write(updated.MetadataJSON, loopengine.FromLegacy(updated.Status, "", updated.UpdatedAt)); stateErr == nil {
+			updated.MetadataJSON = &metadata
+		}
 		if err := repos.Loops.Upsert(ctx, updated); err != nil {
 			return TerminateResult{}, err
 		}

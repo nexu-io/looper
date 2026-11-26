@@ -34,10 +34,14 @@
             "dbPath": "<tmp-root>/state/looper.sqlite",
             "lastUpdatedAt": "<generated-timestamp>",
             "migration": {
-              "latestAvailableId": "0019_run_agent_snapshot",
-              "latestAppliedId": "0019_run_agent_snapshot",
+              "latestAvailableId": "0024_memory_operations",
+              "latestAppliedId": "0024_memory_operations",
               "pendingCount": 0
             }
+          },
+          "scheduler": {
+            "healthy": true,
+            "blockedInfra": 0
           }
         },
         "requestId": "fixture-request-id"
@@ -83,12 +87,13 @@
           "storage": {
             "mode": "sqlite",
             "dbPath": "<tmp-root>/state/looper.sqlite",
-            "schemaVersion": "0019_run_agent_snapshot",
+            "schemaVersion": "0024_memory_operations",
             "pendingMigrations": [],
             "healthy": true
           },
           "scheduler": {
             "healthy": true,
+            "blockedInfra": 0,
             "queuedItems": 1,
             "runningItems": 0,
             "completedItems": 0,
@@ -235,6 +240,7 @@
             "maxConcurrentRuns": 3,
             "retryMaxAttempts": -1,
             "retryBaseDelayMs": 5000,
+            "infraRetryBudgetSeconds": 3600,
             "slowLaneWarnThresholdMs": 5000,
             "discoveryCacheTtlSeconds": 30
           },
@@ -323,10 +329,10 @@
             "environment": {},
             "worktreeCleanup": {
               "enabled": true,
-              "interval": "24h",
-              "retentionDays": 7,
-              "maxPerTick": 10,
-              "includeOrphans": false,
+              "interval": "1h",
+              "retentionDays": 1,
+              "maxPerTick": 50,
+              "includeOrphans": true,
               "dryRun": false
             }
           },
@@ -348,7 +354,8 @@
             "addSnapshotMode": "async",
             "loop": {
               "quietPeriodSeconds": 60
-            }
+            },
+            "workerShepherd": false
           },
           "instructions": {
             "enabled": true,
@@ -472,7 +479,8 @@
                 },
                 "specReview": {
                   "includeReviewingLabel": true,
-                  "reviewingLabel": "looper:spec-reviewing"
+                  "reviewingLabel": "looper:spec-reviewing",
+                  "requireHumanApproval": false
                 }
               },
               "skills": {

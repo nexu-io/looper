@@ -11,27 +11,29 @@ const hitlMetadataKey = "hitl"
 
 // HITLAsk is the persisted state of a mid-run human-in-the-loop question. It is
 // written by the runner when the agent asks (Question/Options/SessionID), and
-// the answer is filled in by POST /loops/{seq}/respond. On resume the runner
+// the answer is filled in by /respond or the configured answer transport. On resume the runner
 // reads Answer + SessionID to continue the same agent session.
 type HITLAsk struct {
-	// Kind distinguishes mid-run agent asks (empty) from control-plane asks
-	// such as review-fix budget exhaustion.
-	Kind        string   `json:"kind,omitempty"`
-	Question    string   `json:"question,omitempty"`
-	Options     []string `json:"options,omitempty"`
-	SessionID   string   `json:"sessionId,omitempty"`
-	ExecutionID string   `json:"executionId,omitempty"`
-	Vendor      string   `json:"vendor,omitempty"`
-	Answer      string   `json:"answer,omitempty"`
-	Status      string   `json:"status,omitempty"` // "awaiting" | "answered" | "consumed"
-	AskedAt     string   `json:"askedAt,omitempty"`
-	AnsweredAt  string   `json:"answeredAt,omitempty"`
-	// Transport records how the ask was delivered ("github" | "feishu"). GitHub
-	// asks carry the PR + ask-comment id so the answer-poll lane can find the human
-	// reply that came after the ask and resolve/re-request on that PR.
+	Kind           string   `json:"kind,omitempty"`
+	MentionOpenIDs []string `json:"mentionOpenIds,omitempty"`
+	Question       string   `json:"question,omitempty"`
+	Options        []string `json:"options,omitempty"`
+	SessionID      string   `json:"sessionId,omitempty"`
+	ExecutionID    string   `json:"executionId,omitempty"`
+	Vendor         string   `json:"vendor,omitempty"`
+	Answer         string   `json:"answer,omitempty"`
+	Status         string   `json:"status,omitempty"` // "awaiting" | "answered" | "consumed"
+	AskedAt        string   `json:"askedAt,omitempty"`
+	AnsweredAt     string   `json:"answeredAt,omitempty"`
+	// Transport records which source owns the answer ("github" | "plane" | "feishu").
+	// ActionURL points to the exact comment where the human must respond.
 	Transport    string `json:"transport,omitempty"`
+	ActionURL    string `json:"actionUrl,omitempty"`
 	PRNumber     int64  `json:"prNumber,omitempty"`
 	AskCommentID int64  `json:"askCommentId,omitempty"`
+	// QuestionMessageID identifies the exact Feishu question, so replies to an
+	// earlier question in the same thread cannot answer a later hold.
+	QuestionMessageID string `json:"questionMessageId,omitempty"`
 
 	// The agent's decision brief — research + recommendation surfaced on the ask
 	// card so a human can confirm in seconds instead of researching from scratch.

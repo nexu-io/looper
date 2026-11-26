@@ -147,6 +147,7 @@ func isTransientGitHubMessage(message string) bool {
 		"secondary rate limit",
 		"rate limit exceeded",
 		"api rate limit exceeded",
+		"resource limits for this query exceeded",
 		"graphql: something went wrong",
 	} {
 		if strings.Contains(message, fragment) {

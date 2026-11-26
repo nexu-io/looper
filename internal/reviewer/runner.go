@@ -87,13 +87,14 @@ const (
 	reviewEventAgentNative    ReviewEvent = "AGENT_NATIVE"
 )
 
-type QueueFailureKind string
+type QueueFailureKind = failureclass.Kind
 
 const (
-	FailureRetryableTransient   QueueFailureKind = "retryable_transient"
-	FailureRetryableAfterResume QueueFailureKind = "retryable_after_resume"
-	FailureNonRetryable         QueueFailureKind = "non_retryable"
-	FailureManualIntervention   QueueFailureKind = "manual_intervention"
+	FailureRetryableTransient   = failureclass.RetryableTransient
+	FailureRetryableAfterResume = failureclass.RetryableAfterResume
+	FailureRecoverableInfra     = failureclass.RecoverableInfra
+	FailureNonRetryable         = failureclass.NonRetryable
+	FailureManualIntervention   = failureclass.ManualIntervention
 )
 
 const (
@@ -521,11 +522,12 @@ type DiscoveryPolicy struct {
 	LabelMode                 config.LabelMode
 	IncludeSpecReviewingLabel bool
 	SpecReviewingLabel        string
-	MatchAnyTrigger           bool
-	RoutedClaimPolicy         networkpolicy.ProjectPolicy
-	// FollowUpInterval is the minimum time between full follow-up sweeps for one
-	// project and repo. Zero sweeps on every discovery pass.
-	FollowUpInterval time.Duration
+	// SpecReviewRequireHumanApproval gates the spec-ready transition on a human
+	// APPROVE review (plan §8.6) instead of the reviewer self-approving.
+	SpecReviewRequireHumanApproval bool
+	RoutedClaimPolicy              networkpolicy.ProjectPolicy
+	MatchAnyTrigger                bool
+	FollowUpInterval               time.Duration
 }
 
 type Runner struct {
@@ -1893,7 +1895,7 @@ func (r *Runner) discoveryPolicyForProject(projectID string) DiscoveryPolicy {
 	matchAnyTrigger := r.forgejoProject(projectID) && roles.Reviewer.Discovery.Triggers.RequireReviewRequest && len(prQueryLabels(labels)) > 0
 	// Validation rejects malformed intervals, so a parse error here means unset.
 	followUpInterval, _ := time.ParseDuration(strings.TrimSpace(roles.Reviewer.Discovery.FollowUpInterval))
-	return DiscoveryPolicy{AutoDiscovery: roles.Reviewer.Discovery.AutoDiscovery, IncludeDrafts: roles.Reviewer.Discovery.Triggers.IncludeDrafts, RequireReviewRequest: roles.Reviewer.Discovery.Triggers.RequireReviewRequest, EnableSelfReview: roles.Reviewer.Discovery.Triggers.EnableSelfReview, Labels: labels, LabelMode: roles.Reviewer.Discovery.Triggers.LabelMode, IncludeSpecReviewingLabel: roles.Reviewer.Discovery.SpecReview.IncludeReviewingLabel, SpecReviewingLabel: roles.Reviewer.Discovery.SpecReview.ReviewingLabel, MatchAnyTrigger: matchAnyTrigger, RoutedClaimPolicy: networkpolicy.ProjectPolicyForProject(*r.projectRoleConfig, projectID), FollowUpInterval: followUpInterval}
+	return DiscoveryPolicy{AutoDiscovery: roles.Reviewer.Discovery.AutoDiscovery, IncludeDrafts: roles.Reviewer.Discovery.Triggers.IncludeDrafts, RequireReviewRequest: roles.Reviewer.Discovery.Triggers.RequireReviewRequest, EnableSelfReview: roles.Reviewer.Discovery.Triggers.EnableSelfReview, Labels: labels, LabelMode: roles.Reviewer.Discovery.Triggers.LabelMode, IncludeSpecReviewingLabel: roles.Reviewer.Discovery.SpecReview.IncludeReviewingLabel, SpecReviewingLabel: roles.Reviewer.Discovery.SpecReview.ReviewingLabel, SpecReviewRequireHumanApproval: roles.Reviewer.Discovery.SpecReview.RequireHumanApproval, MatchAnyTrigger: matchAnyTrigger, RoutedClaimPolicy: networkpolicy.ProjectPolicyForProject(*r.projectRoleConfig, projectID), FollowUpInterval: followUpInterval}
 }
 
 // followUpSweepDue reports whether the follow-up sweep for project/repo should
@@ -6216,6 +6218,46 @@ func cleanSpecLabelTransitionAllowed(policy config.ReviewerReviewEventsConfig, e
 	return strings.EqualFold(strings.TrimSpace(outcome), "clean") && policy.Clean == config.ReviewerReviewEventApprove && event == ReviewEventApprove
 }
 
+// specReviewGateDecision is the next action for a CLEAN spec review under the
+// human-approval gate (plan §8.6).
+type specReviewGateDecision int
+
+const (
+	specReviewProceed      specReviewGateDecision = iota // transition to spec-ready
+	specReviewRequestHuman                               // add looper:needs-human, hold
+	specReviewHold                                       // already requested, still waiting
+)
+
+// decideSpecReviewGate decides what a clean spec review does. Without the gate it
+// proceeds (self-approve, today's behaviour). With the gate it proceeds only once a
+// human has approved the spec PR; otherwise it requests a human (first clean pass)
+// or holds (already requested, still waiting).
+func decideSpecReviewGate(requireHuman, needsHumanPresent, humanApproved bool) specReviewGateDecision {
+	if !requireHuman || humanApproved {
+		return specReviewProceed
+	}
+	if needsHumanPresent {
+		return specReviewHold
+	}
+	return specReviewRequestHuman
+}
+
+// hasHumanApproval reports whether a human APPROVED the PR. looper never holds an
+// APPROVED review of its own PR — GitHub forbids self-approval, so the reviewer
+// downgrades its own APPROVE to a COMMENT — so any APPROVED review is a person's.
+func hasHumanApproval(reviews []map[string]any) bool {
+	for _, review := range reviews {
+		state, _ := review["state"].(string)
+		if strings.TrimSpace(state) == "" {
+			state, _ = review["event"].(string)
+		}
+		if strings.EqualFold(strings.TrimSpace(state), "APPROVED") {
+			return true
+		}
+	}
+	return false
+}
+
 func cleanReviewEventForPolicy(policy config.ReviewerReviewEventsConfig) ReviewEvent {
 	if policy.Clean == config.ReviewerReviewEventApprove {
 		return ReviewEventApprove
@@ -6244,6 +6286,31 @@ func (r *Runner) applyCleanSpecLabelTransition(ctx context.Context, input stepIn
 	}
 	if !specpr.IsReviewClean(freshDetail.ReviewDecision, freshDetail.Comments) {
 		return nil
+	}
+	// §8.6: gate the spec-ready transition on a human APPROVE review when the project
+	// opts in. Default off → this whole block is skipped and behaviour is unchanged.
+	// freshDetail comes from the reviewer's ViewPullRequest, which already carries
+	// the PR's reviews + current labels.
+	if r.discoveryPolicyForProject(input.Project.ID).SpecReviewRequireHumanApproval {
+		needsHuman := specpr.HasLabel(freshDetail.Labels, specpr.NeedsHumanLabel)
+		switch decideSpecReviewGate(true, needsHuman, hasHumanApproval(freshDetail.Reviews)) {
+		case specReviewRequestHuman:
+			if !needsHuman {
+				if err := r.github.AddPullRequestLabels(ctx, PullRequestLabelsInput{Repo: input.Repo, PRNumber: input.PRNumber, Labels: []string{specpr.NeedsHumanLabel}, CWD: input.Project.RepoPath}); err != nil {
+					return &loopError{message: fmt.Sprintf("Failed to add %s label for spec human-approval gate: %v", specpr.NeedsHumanLabel, err), kind: FailureRetryableAfterResume}
+				}
+			}
+			return nil // hold: a human must approve the spec PR before it goes ready
+		case specReviewHold:
+			return nil // still waiting on a human
+		case specReviewProceed:
+			// A human approved — clear the gate label, then fall through to spec-ready.
+			if needsHuman {
+				if err := r.github.RemovePullRequestLabels(ctx, PullRequestLabelsInput{Repo: input.Repo, PRNumber: input.PRNumber, Labels: []string{specpr.NeedsHumanLabel}, CWD: input.Project.RepoPath}); err != nil {
+					return &loopError{message: fmt.Sprintf("Failed to remove %s label after spec approval: %v", specpr.NeedsHumanLabel, err), kind: FailureRetryableAfterResume}
+				}
+			}
+		}
 	}
 	if specpr.HasLabel(freshDetail.Labels, specReviewingLabel) {
 		if err := r.github.RemovePullRequestLabels(ctx, PullRequestLabelsInput{Repo: input.Repo, PRNumber: input.PRNumber, Labels: []string{specReviewingLabel}, CWD: input.Project.RepoPath}); err != nil {
@@ -8534,6 +8601,8 @@ func reviewerFailureKind(kind failureclass.Kind) QueueFailureKind {
 		return FailureRetryableTransient
 	case failureclass.RetryableAfterResume:
 		return FailureRetryableAfterResume
+	case failureclass.RecoverableInfra:
+		return FailureRecoverableInfra
 	case failureclass.ManualIntervention:
 		return FailureManualIntervention
 	default:
@@ -11178,7 +11247,7 @@ func sleepWithContext(ctx context.Context, delay time.Duration) error {
 }
 
 func isRetryableFailure(kind QueueFailureKind) bool {
-	return kind == FailureRetryableTransient || kind == FailureRetryableAfterResume || kind == FailureNonRetryable
+	return kind == FailureRetryableTransient || kind == FailureRetryableAfterResume || kind == FailureRecoverableInfra || kind == FailureNonRetryable
 }
 
 func shouldRetryQueueFailure(kind QueueFailureKind, nextAttempts, maxAttempts int64) bool {

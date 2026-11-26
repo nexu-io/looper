@@ -26,8 +26,14 @@ func TestPlanDryRunAppliesRetentionAndProtectsRuntimeReferences(t *testing.T) {
 	fixture.worktree("wt_recent", "branch-recent", recent)
 	fixture.loop("loop_recent", "completed", "wt_recent", "branch-recent", recent)
 
+	// A resting loop (failed) no longer pins its worktree: the branch is durable
+	// and the daemon recreates the worktree on resume, so once past retention it
+	// is reclaimable. Only actively-in-use statuses (shepherding below) still pin.
 	fixture.worktree("wt_failed", "branch-failed", old)
 	fixture.loop("loop_failed", "failed", "wt_failed", "branch-failed", old)
+
+	fixture.worktree("wt_shepherd", "branch-shepherd", old)
+	fixture.loop("loop_shepherd", "shepherding", "wt_shepherd", "branch-shepherd", old)
 
 	fixture.worktree("wt_running", "branch-running", old)
 	fixture.loop("loop_running", "completed", "wt_running", "branch-running", old)
@@ -43,12 +49,13 @@ func TestPlanDryRunAppliesRetentionAndProtectsRuntimeReferences(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Plan() error = %v", err)
 	}
-	if result.Summary.Scanned != 6 || result.Summary.Candidates != 1 || result.Summary.WouldClean != 1 || result.Summary.Orphans != 1 {
-		t.Fatalf("Plan().Summary = %#v, want scanned=6 candidates=1 wouldClean=1 orphans=1", result.Summary)
+	if result.Summary.Scanned != 7 || result.Summary.Candidates != 2 || result.Summary.WouldClean != 2 || result.Summary.Orphans != 1 {
+		t.Fatalf("Plan().Summary = %#v, want scanned=7 candidates=2 wouldClean=2 orphans=1", result.Summary)
 	}
 	assertDecision(t, result, "wt_old", ActionWouldClean, "eligible in dry-run plan")
 	assertDecision(t, result, "wt_recent", ActionSkipped, "within retention window")
-	assertDecision(t, result, "wt_failed", ActionSkipped, "referenced by protected loop status failed")
+	assertDecision(t, result, "wt_failed", ActionWouldClean, "eligible in dry-run plan")
+	assertDecision(t, result, "wt_shepherd", ActionSkipped, "referenced by protected loop status shepherding")
 	assertDecision(t, result, "wt_running", ActionSkipped, "referenced by running run")
 	assertDecision(t, result, "wt_queue", ActionSkipped, "referenced by active queue item")
 	assertDecision(t, result, "wt_orphan", ActionSkipped, "orphan worktree and includeOrphans=false")
@@ -102,13 +109,16 @@ func TestPlanDoesNotCrossMatchSharedBranchAcrossProjects(t *testing.T) {
 	old := fixture.now.Add(-10 * 24 * time.Hour)
 	fixture.project("project_2", "/tmp/other")
 
+	// The loops are "shepherding" (a worktree-pinning status) purely so their
+	// referenced worktree is skipped — this test is about cross-project branch
+	// isolation, not which status pins.
 	fixture.worktreeForProject("project_1", "wt_precise", "looper/shared", old)
 	fixture.worktreeForProject("project_2", "wt_same_branch", "looper/shared", old)
-	fixture.loop("loop_precise", "failed", "wt_precise", "looper/shared", old)
+	fixture.loop("loop_precise", "shepherding", "wt_precise", "looper/shared", old)
 
 	fixture.worktreeForProject("project_1", "wt_branch_only", "looper/branch-only", old)
 	fixture.worktreeForProject("project_2", "wt_branch_only_other", "looper/branch-only", old)
-	fixture.loopWithMetadata("project_1", "loop_branch_only", "failed", `{"branch":"looper/branch-only"}`, old)
+	fixture.loopWithMetadata("project_1", "loop_branch_only", "shepherding", `{"branch":"looper/branch-only"}`, old)
 
 	service := fixture.service()
 	service.Config.IncludeOrphans = true
@@ -117,9 +127,9 @@ func TestPlanDoesNotCrossMatchSharedBranchAcrossProjects(t *testing.T) {
 		t.Fatalf("Plan() error = %v", err)
 	}
 
-	assertDecision(t, result, "wt_precise", ActionSkipped, "referenced by protected loop status failed")
+	assertDecision(t, result, "wt_precise", ActionSkipped, "referenced by protected loop status shepherding")
 	assertDecision(t, result, "wt_same_branch", ActionWouldClean, "eligible in dry-run plan")
-	assertDecision(t, result, "wt_branch_only", ActionSkipped, "referenced by protected loop status failed")
+	assertDecision(t, result, "wt_branch_only", ActionSkipped, "referenced by protected loop status shepherding")
 	assertDecision(t, result, "wt_branch_only_other", ActionWouldClean, "eligible in dry-run plan")
 }
 

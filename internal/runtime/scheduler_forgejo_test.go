@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/nexu-io/looper/internal/workerhost"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -138,8 +139,8 @@ func TestPlannerAdapterRoutesSameRepoSlugByProjectPath(t *testing.T) {
 		}
 	}
 
-	if _, _, err := forgejoClientForRepo(&cfg, "acme/app"); err == nil || !strings.Contains(err.Error(), "multiple projects") {
-		t.Fatalf("forgejoClientForRepo() error = %v, want ambiguous bare-repo rejection", err)
+	if _, _, err := workerhost.ForgejoClientForRepo(&cfg, "acme/app"); err == nil || !strings.Contains(err.Error(), "multiple projects") {
+		t.Fatalf("workerhost.ForgejoClientForRepo() error = %v, want ambiguous bare-repo rejection", err)
 	}
 }
 
@@ -159,9 +160,9 @@ func TestForgeRoutingRejectsOverlappingWorktreeRoots(t *testing.T) {
 			{ID: "inner", Provider: "forgejo-two", Repo: "acme/inner", RepoPath: filepath.Join(root, "inner"), WorktreeRoot: &innerRoot},
 		},
 	}
-	_, _, ok, err := forgejoProjectProviderForCWD(&cfg, filepath.Join(innerRoot, "feature"))
+	_, _, ok, err := workerhost.ForgejoProjectProviderForCWD(&cfg, filepath.Join(innerRoot, "feature"))
 	if err == nil || !strings.Contains(err.Error(), "matches multiple projects") {
-		t.Fatalf("forgejoProjectProviderForCWD() = ok %v, error %v; want ambiguous root rejection", ok, err)
+		t.Fatalf("workerhost.ForgejoProjectProviderForCWD() = ok %v, error %v; want ambiguous root rejection", ok, err)
 	}
 }
 
@@ -207,7 +208,7 @@ func TestWorkerGitHubAdapterForgejoCreatePullRequestRequestsNativeReviewer(t *te
 		Providers: []config.ProviderConfig{{ID: "forgejo-main", Kind: config.ProviderKindForgejo, BaseURL: server.URL, TokenEnv: stringPtr("FORGEJO_TOKEN")}},
 		Projects:  []config.ProjectRefConfig{{ID: "project_1", Provider: "forgejo-main", Repo: "acme/looper", RepoPath: repoPath}},
 	}
-	adapter := workerGitHubAdapter{stamper: disclosure.FromConfig(cfg), config: &cfg}
+	adapter := workerhost.GitHub{Stamper: disclosure.FromConfig(cfg), Config: &cfg}
 
 	created, err := adapter.CreatePullRequest(context.Background(), worker.CreatePullRequestInput{Repo: "acme/looper", HeadBranch: "worker-branch", BaseBranch: "main", Title: "Implement worker", Body: "Body", CWD: repoPath})
 	if err != nil {
@@ -264,7 +265,7 @@ func TestWorkerGitHubAdapterForgejoAddReviewersFallsBackToLabelsWhenNativeUnavai
 		Providers: []config.ProviderConfig{{ID: "forgejo-main", Kind: config.ProviderKindForgejo, BaseURL: server.URL, TokenEnv: stringPtr("FORGEJO_TOKEN")}},
 		Projects:  []config.ProjectRefConfig{{ID: "project_1", Provider: "forgejo-main", Repo: "acme/looper", RepoPath: repoPath}},
 	}
-	adapter := workerGitHubAdapter{stamper: disclosure.FromConfig(cfg), config: &cfg}
+	adapter := workerhost.GitHub{Stamper: disclosure.FromConfig(cfg), Config: &cfg}
 	if err := adapter.AddPullRequestReviewers(context.Background(), worker.PullRequestReviewersInput{Repo: "acme/looper", PRNumber: 201, Reviewers: []string{"reviewer"}, CWD: repoPath}); err != nil {
 		t.Fatalf("AddPullRequestReviewers() error = %v", err)
 	}
@@ -309,7 +310,7 @@ func TestWorkerGitHubAdapterForgejoAddReviewersIgnoresLabelFailureAfterNativeSuc
 		Providers: []config.ProviderConfig{{ID: "forgejo-main", Kind: config.ProviderKindForgejo, BaseURL: server.URL, TokenEnv: stringPtr("FORGEJO_TOKEN")}},
 		Projects:  []config.ProjectRefConfig{{ID: "project_1", Provider: "forgejo-main", Repo: "acme/looper", RepoPath: repoPath}},
 	}
-	adapter := workerGitHubAdapter{stamper: disclosure.FromConfig(cfg), config: &cfg}
+	adapter := workerhost.GitHub{Stamper: disclosure.FromConfig(cfg), Config: &cfg}
 	if err := adapter.AddPullRequestReviewers(context.Background(), worker.PullRequestReviewersInput{Repo: "acme/looper", PRNumber: 201, Reviewers: []string{"reviewer"}, CWD: repoPath}); err != nil {
 		t.Fatalf("AddPullRequestReviewers() error = %v, want nil after native success despite label failure", err)
 	}
@@ -357,7 +358,7 @@ func TestWorkerGitHubAdapterForgejoAddReviewersFailsLabelTriggeredWhenLabelMissi
 		Providers: []config.ProviderConfig{{ID: "forgejo-main", Kind: config.ProviderKindForgejo, BaseURL: server.URL, TokenEnv: stringPtr("FORGEJO_TOKEN")}},
 		Projects:  []config.ProjectRefConfig{{ID: "project_1", Provider: "forgejo-main", Repo: "acme/looper", RepoPath: repoPath}},
 	}
-	adapter := workerGitHubAdapter{stamper: disclosure.FromConfig(cfg), config: &cfg}
+	adapter := workerhost.GitHub{Stamper: disclosure.FromConfig(cfg), Config: &cfg}
 	err := adapter.AddPullRequestReviewers(context.Background(), worker.PullRequestReviewersInput{Repo: "acme/looper", PRNumber: 201, Reviewers: []string{"reviewer"}, CWD: repoPath})
 	if err == nil {
 		t.Fatal("AddPullRequestReviewers() error = nil, want label failure to keep label-triggered handoff retryable")
@@ -484,7 +485,7 @@ func TestReviewerGitHubAdapterForgejoCommentOnlyFlow(t *testing.T) {
 	if err := adapter.RemovePullRequestLabels(context.Background(), reviewer.PullRequestLabelsInput{Repo: "acme/looper", PRNumber: 42, Labels: []string{"looper:review"}, CWD: repoPath}); err != nil {
 		t.Fatalf("RemovePullRequestLabels() error = %v", err)
 	}
-	workerAdapter := workerGitHubAdapter{stamper: disclosure.FromConfig(cfg), config: &cfg}
+	workerAdapter := workerhost.GitHub{Stamper: disclosure.FromConfig(cfg), Config: &cfg}
 	comparison, err := workerAdapter.CompareBranches(context.Background(), worker.CompareBranchesInput{Repo: "acme/looper", BaseBranch: "main", HeadBranch: "feature/review-me", CWD: repoPath})
 	if err != nil {
 		t.Fatalf("CompareBranches() error = %v", err)

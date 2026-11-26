@@ -100,6 +100,12 @@ func (g *Gateway) NotifyHumanAttention(ctx context.Context, input HumanAttention
 	}
 	if q := strings.TrimSpace(input.Question); q != "" {
 		body += " " + q
+	} else if reason == HumanAttentionAwaitingHuman {
+		// A loop can be parked by an explicit user stop without a structured HITL
+		// question. Do not emit a vague "needs attention" notification: tell the
+		// operator exactly how to resume it. If the stop should remain in effect,
+		// no reply is needed.
+		body += " 已按当前停止要求暂停；如需继续，请在原话题 @bot 回复「继续」，保持暂停则无需回复。"
 	}
 	if e := strings.TrimSpace(input.Evidence); e != "" {
 		body += " " + e
