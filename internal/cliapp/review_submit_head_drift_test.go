@@ -11,6 +11,8 @@ import (
 
 	"github.com/nexu-io/looper/internal/config"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
+	"github.com/nexu-io/looper/internal/infra/shell"
+	"github.com/nexu-io/looper/internal/storage"
 	"github.com/spf13/cobra"
 )
 
@@ -194,5 +196,43 @@ func TestValidateSandboxReviewTargetWithCommentsHeadDriftSemantics(t *testing.T)
 	force.HeadSHA = forcePushedHead
 	if err := validateSandboxReviewTargetWithComments(context.Background(), "git", workDir, checkpoint, force, "REQUEST_CHANGES", comments); err == nil {
 		t.Fatal("sandbox force-pushed head unexpectedly allowed")
+	}
+}
+
+func TestRecoverReviewSubmitEngagementWithCommentsAllowsDisjointAdditiveHead(t *testing.T) {
+	t.Parallel()
+	workDir, baseSHA, oldHead, disjointHead, overlappingHead, _ := seedSubmitHeadDriftRepo(t)
+	comments := []reviewSubmitComment{{Path: "app.go", Line: 3, Side: "RIGHT", Body: "fix bug"}}
+	meta := `{"followUpdates":true}`
+	loop := storage.LoopRecord{ID: "loop_engage_head_drift", ProjectID: "proj_1", MetadataJSON: &meta}
+
+	makeGateway := func(headRef, liveHead string) *githubinfra.Gateway {
+		return githubinfra.New(githubinfra.Options{
+			GHPath:  "gh",
+			GitPath: "git",
+			CWD:     workDir,
+			GHRun: func(_ context.Context, opts shell.Options) (shell.Result, error) {
+				joined := strings.Join(opts.Args, " ")
+				if strings.Contains(joined, "api user") {
+					return shell.Result{Stdout: "octocat\n"}, nil
+				}
+				if strings.Contains(joined, "pr view") {
+					return shell.Result{Stdout: fmt.Sprintf(`{"number":42,"title":"PR","body":"Body","state":"OPEN","isDraft":false,"headRefName":%q,"baseRefName":"main","headRefOid":%q,"baseRefOid":%q,"author":{"login":"author"},"labels":[],"reviews":[],"mergeStateStatus":"CLEAN"}`, headRef, liveHead, baseSHA)}, nil
+				}
+				if strings.Contains(joined, "graphql") {
+					return shell.Result{Stdout: `{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":false}}}}}}`}, nil
+				}
+				return shell.Result{Stdout: "[]"}, nil
+			},
+		})
+	}
+
+	// Disjoint additive push must succeed through recoverReviewSubmitEngagementWithComments.
+	if prev, err := recoverReviewSubmitEngagementWithComments(context.Background(), makeGateway("feature/pr", disjointHead), config.Config{}, loop, "acme/looper", 42, oldHead, workDir, "REQUEST_CHANGES", comments); err != nil || prev != "" {
+		t.Fatalf("recoverReviewSubmitEngagementWithComments(disjoint) = (%q, %v), want (\"\", nil)", prev, err)
+	}
+	// Overlapping push must still be rejected.
+	if _, err := recoverReviewSubmitEngagementWithComments(context.Background(), makeGateway("feature/overlap", overlappingHead), config.Config{}, loop, "acme/looper", 42, oldHead, workDir, "REQUEST_CHANGES", comments); err == nil {
+		t.Fatal("recoverReviewSubmitEngagementWithComments(overlap) = nil, want rejection")
 	}
 }

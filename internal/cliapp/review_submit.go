@@ -543,7 +543,7 @@ func (r *commandRuntime) reviewSubmit(cmd *cobra.Command, args []string) error {
 	// Review-request publish bypass for Forgejo is derived from trusted
 	// run/loop metadata (manual loop, or enabled follow-up on a new head),
 	// never from the agent-controlled argv --reviewer-manual flag alone.
-	requestBypass, err := r.trustedReviewRequestSubmitBypass(cmd, loaded.Config, repo, prNumber, commitID)
+	requestBypass, err := r.trustedReviewRequestSubmitBypassWithComments(cmd, loaded.Config, repo, prNumber, commitID, event, payload.Comments)
 	if err != nil {
 		return err
 	}
@@ -619,6 +619,10 @@ func validateForgejoReviewSubmitRequest(ctx context.Context, gateway reviewSubmi
 //     pass --reviewer-run-id; the no-flag path still resolves the current running
 //     reviewer loop for the PR when the flag is absent.
 func (r *commandRuntime) trustedReviewRequestSubmitBypass(cmd *cobra.Command, cfg config.Config, repo string, prNumber int64, headSHA string) (bool, error) {
+	return r.trustedReviewRequestSubmitBypassWithComments(cmd, cfg, repo, prNumber, headSHA, "", nil)
+}
+
+func (r *commandRuntime) trustedReviewRequestSubmitBypassWithComments(cmd *cobra.Command, cfg config.Config, repo string, prNumber int64, headSHA string, event string, comments []reviewSubmitComment) (bool, error) {
 	dbPath := strings.TrimSpace(cfg.Storage.DBPath)
 	if dbPath == "" {
 		return false, nil
@@ -650,7 +654,7 @@ func (r *commandRuntime) trustedReviewRequestSubmitBypass(cmd *cobra.Command, cf
 			if err != nil {
 				return "", err
 			}
-			return recoverReviewSubmitEngagement(cmd.Context(), gateway, cfg, loop, repo, prNumber, headSHA, cwd)
+			return recoverReviewSubmitEngagementWithComments(cmd.Context(), gateway, cfg, loop, repo, prNumber, headSHA, cwd, event, comments)
 		})
 		return previous != "" && previous != strings.TrimSpace(headSHA), err
 	}
@@ -1220,6 +1224,10 @@ func reviewSubmitFollowUpHasNewHead(metadataJSON *string, headSHA string) bool {
 // Recovery never trusts submitted argv or payload markers. The caller has
 // already bound this lookup to the current running reviewer loop in storage.
 func recoverReviewSubmitEngagement(ctx context.Context, gateway reviewSubmitGateway, cfg config.Config, loop storage.LoopRecord, repo string, prNumber int64, headSHA, cwd string) (string, error) {
+	return recoverReviewSubmitEngagementWithComments(ctx, gateway, cfg, loop, repo, prNumber, headSHA, cwd, "", nil)
+}
+
+func recoverReviewSubmitEngagementWithComments(ctx context.Context, gateway reviewSubmitGateway, cfg config.Config, loop storage.LoopRecord, repo string, prNumber int64, headSHA, cwd, event string, comments []reviewSubmitComment) (string, error) {
 	login, err := gateway.GetCurrentUserLogin(ctx, cwd)
 	if err != nil {
 		return "", err
@@ -1243,7 +1251,7 @@ func recoverReviewSubmitEngagement(ctx context.Context, gateway reviewSubmitGate
 	if err != nil {
 		return "", err
 	}
-	if err := validateExpectedHeadCommit(headSHA, detail.HeadSHA); err != nil {
+	if err := validateReviewSubmitHeadCommit(ctx, reviewSubmitGitPath(cfg), cwd, headSHA, detail, event, comments); err != nil {
 		return "", err
 	}
 	matched, err := reviewSubmitProjectForRepo(cfg, repo, cwd)

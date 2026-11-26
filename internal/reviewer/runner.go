@@ -5587,6 +5587,9 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 							checkpoint.PendingReview.ContentFingerprint = fp
 						}
 					}
+					if err := r.applyVerifiedReviewSideEffects(ctx, input, checkpoint, detail, found); err != nil {
+						return checkpoint, err
+					}
 					if err := r.recordPublishedReviewProgress(ctx, input, pending, found.Event); err != nil {
 						return checkpoint, err
 					}

@@ -299,6 +299,17 @@ func TestHeadChangeMonitorKeepsRunningOnDisjointAdditiveCommitAndRecordsPublishe
 	if got, _ := stringFromAny(parseJSONObject(updatedLoop.MetadataJSON)["lastPublishedHeadSha"]); got != oldHead {
 		t.Fatalf("lastPublishedHeadSha = %q, want reviewed head %q", got, oldHead)
 	}
+	// Must reconcile verified non-clean review side effects (remove stale +1 reaction).
+	removedPlusOne := false
+	for _, removed := range github.removeReactionCalls {
+		if removed.Content == "+1" {
+			removedPlusOne = true
+			break
+		}
+	}
+	if !removedPlusOne {
+		t.Fatalf("removeReactionCalls = %#v, want stale +1 clean-review reaction removed on recovered actionable review", github.removeReactionCalls)
+	}
 }
 
 func TestHeadChangeMonitorInterruptsOnOverlapOrForcePushWithoutBurningAttemptsAndDebounces(t *testing.T) {
