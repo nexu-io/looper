@@ -295,14 +295,16 @@ Reviewer then:
 
 - **accepts** (`accept_wontfix`): replies with scope evidence and resolves the thread
 - **rejects** (`reject_wontfix`): replies with concrete authority and leaves the thread open for Fixer
-- **needs human**: holds the Reviewer/Fixer pair; no remote adjudication reply
+- **needs human**: in review-fix pair mode, holds the Reviewer/Fixer pair with no remote adjudication reply; in standalone reviewer mode (no active Fixer), replies on the thread explaining the ambiguity and leaves the thread open without pausing the loop
 
 This path does **not** enable `roles.reviewer.behavior.threadResolution.enabled`. That setting still gates objective stale-thread reconciliation only and stays `false` by default. Forgejo is exempt from same-head disposition; Reviewer and Fixer budgets still apply there.
 
-When either role budget trips, or Reviewer returns `needs_human`:
+When either role budget trips, or Reviewer returns `needs_human` in review-fix pair mode (`roles.fixer.autoDiscovery=true` or an active Fixer loop on the PR):
 
 - HITL on: Continue/Stop ask on the pair
-- HITL off (default): paused with no ask. Resume with `looper unpause <seq>` (Continue: refill only exhausted meters) or `looper stop <seq>` (terminate both). Either seq in the held pair works.
+- HITL off (default): paused with no ask. Resume with `looper unpause <seq>` (Continue: refill only exhausted meters) or `looper stop <seq>` (terminate both). Either seq in the held pair works. For a `review_scope_human_required` pause, pushing a new PR commit (`head_sha`) or explicitly requesting re-review (`REQUEST_REVIEW`) also releases the scope hold cleanly without resetting budget meters.
+
+In standalone reviewer mode (`roles.fixer.autoDiscovery=false` with no active Fixer loop on the PR), Reviewer publishes `needs_human` findings visibly on the PR instead of parking the loop, and any legacy `review_scope_human_required` pause self-heals on discovery.
 
 Budget exhaustion is not approval. It never publishes a clean review, resolves a blocker, or enables auto-merge. Inspect a hold with `looper describe <seq>`.
 
