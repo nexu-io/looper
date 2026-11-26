@@ -526,7 +526,7 @@ func partialProviders(loaded config.LoadedFileConfig) []config.PartialProviderCo
 		partial := config.PartialProviderConfig{
 			ID: provider.ID, Kind: &kind, BaseURL: stringPtr(provider.BaseURL), GHPath: provider.GHPath,
 			TokenEnv: provider.TokenEnv, TeaLogin: provider.TeaLogin, TeaPath: provider.TeaPath,
-			Workspace: provider.Workspace, ProjectID: provider.ProjectID,
+			Workspace: provider.Workspace, ProjectID: provider.ProjectID, StrictDispatch: provider.StrictDispatch,
 		}
 		if provider.Auth != "" {
 			auth := provider.Auth

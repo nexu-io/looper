@@ -31,6 +31,7 @@ func NewServer(cfg Config, service *Service) *Server {
 	mux.HandleFunc("/v1/join", s.handleJoin)
 	mux.HandleFunc("/v1/status", s.nodeOnly(s.handleNodeStatus))
 	mux.HandleFunc("/v1/heartbeat", s.nodeOnly(s.handleHeartbeat))
+	mux.HandleFunc("/v1/link-challenges", s.nodeOnly(s.handleLinkChallenge))
 	mux.HandleFunc("/v1/leave", s.nodeOnly(s.handleLeave))
 	mux.HandleFunc("/v1/coordinator-lease/acquire", s.nodeOnly(s.handleAcquireLease))
 	mux.HandleFunc("/v1/coordinator-lease/renew", s.nodeOnly(s.handleRenewLease))
@@ -42,6 +43,30 @@ func NewServer(cfg Config, service *Service) *Server {
 	mux.HandleFunc("/v1/github/webhook", s.handleGitHubWebhook)
 	s.httpServer = &http.Server{Addr: cfg.ListenAddr, Handler: mux, ReadHeaderTimeout: 30 * time.Second}
 	return s
+}
+
+func (s *Server) handleLinkChallenge(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	var req protocol.LinkChallengeRequest
+	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4<<10))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	resp, err := s.service.CreateLinkChallenge(r.Context(), bearerToken(r), req)
+	if err != nil {
+		if errors.Is(err, errChallengeSigningDisabled) {
+			writeError(w, http.StatusServiceUnavailable, err.Error())
+			return
+		}
+		writeLeaseOrAuthError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, resp)
 }
 
 func (s *Server) Start() error                       { return s.httpServer.ListenAndServe() }
