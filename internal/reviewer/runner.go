@@ -786,9 +786,10 @@ type resumedRunContext struct {
 }
 
 type loopError struct {
-	message     string
-	kind        QueueFailureKind
-	interrupted bool
+	message             string
+	kind                QueueFailureKind
+	interrupted         bool
+	headChangeInterrupt bool
 }
 
 type holdSkipError struct{ summary string }
@@ -2406,7 +2407,13 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			} else {
 				r.logError("reviewer run failed", map[string]any{"projectId": project.ID, "loopId": loop.ID, "runId": run.ID, "queueItemId": queueItem.ID, "currentStep": derefString(run.CurrentStep), "elapsedSeconds": stepElapsedSeconds, "failureKind": string(failure.kind), "summary": failure.message})
 			}
-			failedQueue, queueErr := r.failQueueItem(ctx, queueItem, failure.kind, failure.message)
+			var failedQueue *storage.QueueItemRecord
+			var queueErr error
+			if failure.headChangeInterrupt {
+				failedQueue, queueErr = r.requeueHeadChangeInterrupt(ctx, queueItem, failure.kind, failure.message)
+			} else {
+				failedQueue, queueErr = r.failQueueItem(ctx, queueItem, failure.kind, failure.message)
+			}
 			if queueErr != nil {
 				return ProcessResult{}, queueErr
 			}
@@ -4973,12 +4980,24 @@ func (r *Runner) startReviewerHeadChangeMonitor(ctx context.Context, input stepI
 	if expectedHead == "" || r.github == nil || execution == nil || r.headChangePollInterval <= 0 {
 		return reviewerHeadChangeMonitor{}
 	}
+	seededBase := ""
+	if checkpoint.Snapshot != nil {
+		seededBase = checkpoint.Snapshot.BaseSHA
+	}
+	if seededBase == "" && checkpoint.Detail != nil {
+		seededBase = checkpoint.Detail.BaseSHA
+	}
+	headRefName := ""
+	if checkpoint.Detail != nil {
+		headRefName = checkpoint.Detail.HeadRefName
+	}
 	monitorCtx, cancel := context.WithCancel(ctx)
 	monitor := reviewerHeadChangeMonitor{cancel: cancel, done: make(chan struct{}), signal: make(chan reviewerHeadChangeSignal, 1)}
 	go func() {
 		defer close(monitor.done)
 		ticker := time.NewTicker(r.headChangePollInterval)
 		defer ticker.Stop()
+		lastObservedHead := expectedHead
 		for {
 			select {
 			case <-monitorCtx.Done():
@@ -4991,8 +5010,16 @@ func (r *Runner) startReviewerHeadChangeMonitor(ctx context.Context, input stepI
 					}
 					continue
 				}
-				if headSHA == "" || headSHA == expectedHead {
+				if headSHA == "" || headSHA == expectedHead || headSHA == lastObservedHead {
 					continue
+				}
+				if r.headAdvanceDisjointFromReview(monitorCtx, input.Project.RepoPath, seededBase, expectedHead, headSHA, headRefName) {
+					lastObservedHead = headSHA
+					r.logInfo("reviewer head changed with disjoint additive commit; keeping active run", map[string]any{"projectId": input.Project.ID, "loopId": input.Loop.ID, "runId": input.Run.ID, "repo": input.Repo, "prNumber": input.PRNumber, "executionId": executionID, "expectedHeadSha": expectedHead, "actualHeadSha": headSHA})
+					continue
+				}
+				if monitorCtx.Err() != nil {
+					return
 				}
 				reason := fmt.Sprintf("PR head changed while reviewer was running: expected %s, got %s", expectedHead, headSHA)
 				signal := reviewerHeadChangeSignal{OldHeadSHA: expectedHead, NewHeadSHA: headSHA, Reason: reason}
@@ -5010,6 +5037,16 @@ func (r *Runner) startReviewerHeadChangeMonitor(ctx context.Context, input stepI
 		}
 	}()
 	return monitor
+}
+
+func (r *Runner) headAdvanceDisjointFromReview(ctx context.Context, repoPath, baseSHA, oldHeadSHA, newHeadSHA, headRefName string) bool {
+	disjoint, err := githubinfra.HeadAdvanceDisjointFromPullRequestDiff(ctx, groupingGitPath(r), repoPath, baseSHA, oldHeadSHA, newHeadSHA, headRefName)
+	return err == nil && disjoint
+}
+
+func (r *Runner) headAdvanceIsAncestor(ctx context.Context, cwd, oldHeadSHA, newHeadSHA, headRefName string) bool {
+	ancestor, err := githubinfra.HeadAdvanceIsAncestor(ctx, groupingGitPath(r), cwd, oldHeadSHA, newHeadSHA, headRefName)
+	return err == nil && ancestor
 }
 
 func (r *Runner) appendThreadResolutionEvent(ctx context.Context, input stepInput, headSHA, decision, evidence, threadID, action, skippedReason string) {
@@ -5177,7 +5214,7 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 		if (sandboxGitHub || relatedFileGroupsConfig(r, input.Project.ID).Enabled) && strings.TrimSpace(freshDetail.HeadSHA) != strings.TrimSpace(checkpoint.Snapshot.HeadSHA) {
 			checkpoint.PendingReview = nil
 			checkpoint.ResumePolicy = "restart_from_discover"
-			return checkpoint, &loopError{message: fmt.Sprintf("PR head changed before final grouped reviewer: expected %s, got %s", checkpoint.Snapshot.HeadSHA, freshDetail.HeadSHA), kind: FailureRetryableAfterResume, interrupted: true}
+			return checkpoint, &loopError{message: fmt.Sprintf("PR head changed before final grouped reviewer: expected %s, got %s", checkpoint.Snapshot.HeadSHA, freshDetail.HeadSHA), kind: FailureRetryableAfterResume, interrupted: true, headChangeInterrupt: true}
 		}
 		if sandboxGitHub || relatedFileGroupsConfig(r, input.Project.ID).Enabled {
 			if reason := r.reviewerPublishDriftReason(ctx, input, checkpoint, freshDetail); reason != "" {
@@ -5249,7 +5286,7 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 		}
 		checkpoint.PendingReview = nil
 		checkpoint.ResumePolicy = "restart_from_discover"
-		return checkpoint, &loopError{message: headChange.Reason, kind: FailureRetryableAfterResume, interrupted: true}
+		return checkpoint, &loopError{message: headChange.Reason, kind: FailureRetryableAfterResume, interrupted: true, headChangeInterrupt: true}
 	}
 	if err != nil {
 		r.appendReviewerAgentEvent(ctx, input, "reviewer.agent.failed", "review", executionID, reviewerAgentWaitErrorPayload(err, r.now().Sub(agentStartedAt)))
@@ -5576,6 +5613,44 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 		return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 	}
 	if detail.HeadSHA != "" && pending.HeadSHA != "" && detail.HeadSHA != pending.HeadSHA {
+		reviewEvents := r.effectiveReviewEvents(input.Project.ID, input.Loop.MetadataJSON)
+		if !r.commentOnlyCompletionForProject(input.Project.ID, reviewEvents) && pending.Event == reviewEventAgentNative && normalizePRState(detail.State) == "open" {
+			cwd := input.Project.RepoPath
+			if checkpoint.Worktree != nil && strings.TrimSpace(checkpoint.Worktree.Path) != "" {
+				cwd = checkpoint.Worktree.Path
+			}
+			headRef := detail.HeadRefName
+			if headRef == "" && checkpoint.Detail != nil {
+				headRef = checkpoint.Detail.HeadRefName
+			}
+			if r.headAdvanceIsAncestor(ctx, cwd, pending.HeadSHA, detail.HeadSHA, headRef) {
+				found, err := r.verifyAgentNativeReviewMarker(ctx, input, pending.HeadSHA, pending.IdempotencyKey, cleanReviewAuthorLogin(checkpoint, detail))
+				if err != nil {
+					return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+				}
+				if found.Found && found.Event != ReviewEventApprove && normalizeCommentOnlyOutcome(found.Outcome) != "clean" {
+					pairActive, pairErr := r.isReviewFixPairActive(ctx, input.Loop)
+					if pairErr != nil {
+						return checkpoint, pairErr
+					}
+					if publishableCount := pendingNativePublishableCount(pending, !pairActive); publishableCount == 0 || nativeMustFixReviewMarkerActionable(found, publishableCount) {
+						checkpoint.PendingReview = pending.clone()
+						if checkpoint.PendingReview.ContentFingerprint == "" {
+							if fp := reviewMarkerFingerprint(found); fp != "" {
+								checkpoint.PendingReview.ContentFingerprint = fp
+							}
+						}
+						if err := r.applyVerifiedReviewSideEffects(ctx, input, checkpoint, detail, found); err != nil {
+							return checkpoint, err
+						}
+						if err := r.recordPublishedReviewProgress(ctx, input, pending, found.Event); err != nil {
+							return checkpoint, err
+						}
+						return checkpoint, nil
+					}
+				}
+			}
+		}
 		return markReviewerRunStale(checkpoint, fmt.Sprintf("PR head changed before publish: expected %s, got %s", pending.HeadSHA, detail.HeadSHA)), nil
 	}
 	if !isManualReviewerLoop(input.Loop) && domain.IsAutoLaneHeld(domain.LoopTypeReviewer, detail.Labels) {
@@ -8394,6 +8469,27 @@ func buildReviewerDedupeKey(projectID, loopID, repo string, prNumber int64) stri
 	return fmt.Sprintf("reviewer:%s:%s:%s:%d", projectID, loopID, repo, prNumber)
 }
 
+func (r *Runner) requeueHeadChangeInterrupt(ctx context.Context, queueItem storage.QueueItemRecord, kind QueueFailureKind, message string) (*storage.QueueItemRecord, error) {
+	nowISO := r.nowISO()
+	delay := r.retryBaseDelay
+	if delay <= 0 {
+		delay = defaultRetryDelay
+	}
+	if r.loopConfig.QuietPeriodSeconds > 0 {
+		quietDelay := time.Duration(r.loopConfig.QuietPeriodSeconds) * time.Second
+		if quietDelay > delay {
+			delay = quietDelay
+		}
+	}
+	retryAt := eventlog.FormatJavaScriptISOString(r.now().Add(delay))
+	// Head-change interruptions are new PR commits, not reviewer failures: do not
+	// burn queueItem.Attempts (which would exhaust MaxAttempts and pause the loop).
+	if err := r.repos.Queue.MarkRetry(ctx, storage.QueueMarkRetryInput{ID: queueItem.ID, AvailableAt: retryAt, Attempts: queueItem.Attempts, ErrorMessage: optionalString(message), ErrorKind: string(kind), UpdatedAt: nowISO}); err != nil {
+		return nil, err
+	}
+	return r.repos.Queue.GetByID(ctx, queueItem.ID)
+}
+
 func (r *Runner) failQueueItem(ctx context.Context, queueItem storage.QueueItemRecord, kind QueueFailureKind, message string) (*storage.QueueItemRecord, error) {
 	nextAttempts := queueItem.Attempts + 1
 	nowISO := r.nowISO()
@@ -8686,7 +8782,7 @@ func (r *Runner) refreshGroupedReview(ctx context.Context, input stepInput, expe
 		return freshDetail, &holdSkipError{summary: fmt.Sprintf("Reviewer stopped because %s#%d is currently held", input.Repo, input.PRNumber)}
 	}
 	if strings.TrimSpace(freshDetail.HeadSHA) != strings.TrimSpace(expectedHead) {
-		return freshDetail, &loopError{message: fmt.Sprintf("PR head changed during grouped review: expected %s, got %s", expectedHead, freshDetail.HeadSHA), kind: FailureRetryableAfterResume, interrupted: true}
+		return freshDetail, &loopError{message: fmt.Sprintf("PR head changed during grouped review: expected %s, got %s", expectedHead, freshDetail.HeadSHA), kind: FailureRetryableAfterResume, interrupted: true, headChangeInterrupt: true}
 	}
 	if reason := r.reviewerPublishDriftReason(ctx, input, input.Checkpoint, freshDetail); reason != "" {
 		return freshDetail, &loopError{message: reason, kind: FailureRetryableAfterResume, interrupted: true}
@@ -10415,7 +10511,7 @@ func reviewerAgentSideGitHubFetchContract() string {
 	return strings.Join([]string{
 		"Agent-side GitHub fetch contract: use the minimal PR seed above as the stable handoff. Do not assume PR title, body, full diff, full comment dumps, reviews, or checks from this prompt are complete or fresh.",
 		"Local checkout contract: the current working directory is Looper's prepared reviewer worktree for this PR and is the canonical local checkout for verification. Reuse this worktree for git fetch, git checkout, diff inspection, and any local validation. Do not run `gh repo clone`, `git clone`, or create any additional checkout for this PR's base or head repository unless the provided worktree is missing or unusable.",
-		"Before acting and again before final conclusions or publishing, run `gh pr view <pr-url> -R <repo> --json number,title,body,state,isDraft,baseRefName,baseRefOid,headRefName,headRefOid,url,labels` using the seeded PR URL or number plus repository, and validate `headRefOid` equals the seeded `head_sha`, `baseRefName` equals the seeded `base_ref` when present, and state/draft status match the seed. Fail fast on drift (a fast-forward of `baseRefOid` on the same `base_ref` while `headRefOid` is unchanged is not drift when the merge-base with `head_sha` is unchanged and the PR has no merge conflicts; the trusted review-submit wrapper and daemon enforce merge-base equivalence).",
+		"Before acting and again before final conclusions or publishing, run `gh pr view <pr-url> -R <repo> --json number,title,body,state,isDraft,baseRefName,baseRefOid,headRefName,headRefOid,url,labels` using the seeded PR URL or number plus repository, and validate `headRefOid` equals the seeded `head_sha`, `baseRefName` equals the seeded `base_ref` when present, and state/draft status match the seed. Fail fast on drift (a fast-forward of `baseRefOid` on the same `base_ref` with unchanged merge-base and no merge conflicts is not drift; if `headRefOid` advanced with an additive commit while reviewing, actionable inline findings on untouched files may still be submitted for the seeded `head_sha` through the trusted review-submit wrapper, while clean/APPROVE reviews always require an exact `headRefOid` match).",
 		"Inspect changes with local Git using the fixed `base_sha` and `head_sha` from the seed. Start with `git diff --name-status <base_sha>...<head_sha>`, then use `git diff <base_sha>...<head_sha> -- <path>` and read files as needed. Fetch missing commits/history before inspecting; never treat missing objects or truncated output as an empty diff. Page large file diffs and continue reviewing all changed files. A remote PR diff is not required. Run `gh pr checks <pr-url> -R <repo>` only when CI status matters.",
 		"When review feedback context matters, do not rely only on `gh pr view --comments`; collect all review feedback with pagination: `gh api repos/{owner}/{repo}/pulls/{number}/comments --paginate`, `gh api repos/{owner}/{repo}/pulls/{number}/reviews --paginate`, and `gh api repos/{owner}/{repo}/issues/{number}/comments --paginate`.",
 		"If `gh` fails for authentication, network, rate-limit, or PR drift reasons, stop and return a structured error with `type` set to one of `auth`, `network`, `rate_limit`, or `pr_drift`, plus a short `message` and any observed PR metadata. Do not proceed on stale PR data.",
@@ -10622,7 +10718,7 @@ func buildReviewPromptForPairMode(projectID string, instructionConfig config.Con
 		submitPayloadInstruction = fmt.Sprintf("When submitting through `%s review submit`, pass stdin JSON with `body` and optional `comments` entries. Each actionable comment MUST include GitHub fields `path`, `line`, `side` (`RIGHT` for new diff lines, `LEFT` for old diff lines), optional `start_line` and `start_side` for multiline ranges, `body`, plus Looper-only fields `disposition` (`must_fix` or `needs_human`), `scopeBasis`, and `scopeEvidence` (and preferably `severity`). The trusted wrapper rejects missing disposition/scope fields and rejects `follow_up` in actionable comments or the visible review body; `follow_up` stays out of the submit payload. Looper strips Looper-only fields before calling GitHub/Forgejo.", looperCLICommand)
 	}
 	idempotencyInstruction := "Idempotency requirement: before posting anything, use `gh api` to list existing PR reviews for this PR. Only treat an existing marker as satisfying this run when the review body contains the exact idempotency id and expected head SHA, and the review state matches the required outcome-specific policy for this run. If such a matching review already exists, do not post another review. Instead, rely on Looper to validate that marker after the agent exits and to reconcile clean-signal reactions/spec label transitions as needed. If the marker exists but the outcome/review-state combination does not satisfy this run, ignore it and publish the correct review for this run instead."
-	freshnessInstruction := "Before posting, use `gh` to confirm the PR is still open and the head SHA still matches the expected head SHA. If it changed, do not post a review and exit non-zero with the exact message `PR head changed before publish`."
+	freshnessInstruction := "Before posting, use `gh` to confirm the PR is still open. Clean/APPROVE reviews require the head SHA to still match the expected head SHA; if it changed, do not post a clean review and exit non-zero with the exact message `PR head changed before publish`. For actionable inline findings, submit for the seeded commit through the trusted wrapper (which allows an additive commit that did not touch commented files and rejects overlapping or force-pushed heads); if the wrapper rejects for head drift, exit non-zero with the exact message `PR head changed before publish`."
 	anchorInstruction := "Before posting, validate every inline review comment's `path`, `line`, `side`, `start_line`, and `start_side` against the local PR diff for the exact base/head SHAs. Preserve exact anchors that fit the live diff. If a must_fix location is outside the live diff's exact line, attach it to the nearest anchorable changed-file location instead of submitting an invalid inline anchor. Do not move must_fix findings into the top-level review body; the trusted wrapper rejects actionable body-only reviews, and body-only markers are not published must_fix."
 	if sandboxGitHub {
 		idempotencyInstruction = "Inspect the supplied GitHub reviews for a matching marker. Submit through the trusted wrapper, which checks live idempotency."
@@ -10635,7 +10731,7 @@ func buildReviewPromptForPairMode(projectID string, instructionConfig config.Con
 			submitPayloadInstruction = fmt.Sprintf("When submitting through `%s review submit`, pass stdin JSON with `body` and optional `comments` entries using `path`, `line`, `side` (`RIGHT` for new lines, `LEFT` for old lines), `body`, plus Looper-only `disposition` (`must_fix` or `needs_human`), `scopeBasis`, and `scopeEvidence`; the wrapper validates those fields, rejects `follow_up` in comments or the visible review body, then maps anchors to Forgejo and strips Looper-only fields before the provider call.", looperCLICommand)
 		}
 		idempotencyInstruction = "Idempotency requirement: submit only through the trusted Looper wrapper. The wrapper lists existing native Forgejo reviews and reuses an exact id/head/outcome/state marker match; after the agent exits, the runner verifies the same marker before recording publication. Never call the Forgejo review endpoint directly."
-		freshnessInstruction = "Before posting, rely on the trusted Looper wrapper to confirm the Forgejo PR is still open and the head SHA still matches. If it reports drift, exit non-zero with the exact message `PR head changed before publish`."
+		freshnessInstruction = "Before posting, rely on the trusted Looper wrapper to confirm the Forgejo PR is still open and enforce head freshness (exact head match for clean/APPROVE reviews; additive-disjoint head safety for actionable inline findings). If it reports drift, exit non-zero with the exact message `PR head changed before publish`."
 		anchorInstruction = "Before posting, validate every inline review comment against the local Git diff at the fixed PR base/head SHAs. Preserve exact changed-file anchors. If a must_fix location is not exactly on the local diff, attach it to the nearest anchorable changed-file location. Do not downgrade must_fix findings to a top-level review-body item; every must_fix must remain an inline comment."
 	}
 	if hostingKind != "" {

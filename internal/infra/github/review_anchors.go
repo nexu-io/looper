@@ -481,3 +481,195 @@ func uniqueReviewAnchorPaths(paths []string) []string {
 	sort.Strings(out)
 	return out
 }
+
+// HeadAdvanceIsAncestor reports whether oldHeadSHA is a strict or equal
+// ancestor of newHeadSHA in the local Git repository (fetching newHeadSHA from
+// origin if missing locally without mutating HEAD or the working tree).
+// Fails closed on force-pushes, missing commits, or Git errors.
+func HeadAdvanceIsAncestor(ctx context.Context, gitPath, cwd, oldHeadSHA, newHeadSHA, headRefName string) (bool, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	oldHeadSHA = strings.TrimSpace(oldHeadSHA)
+	newHeadSHA = strings.TrimSpace(newHeadSHA)
+	headRefName = strings.TrimSpace(headRefName)
+	if oldHeadSHA == "" || newHeadSHA == "" {
+		return false, nil
+	}
+	if commitSHAsMatch(oldHeadSHA, newHeadSHA) {
+		return true, nil
+	}
+	if strings.TrimSpace(cwd) == "" || !isSafeGitRev(oldHeadSHA) || !isSafeGitRev(newHeadSHA) {
+		return false, nil
+	}
+	gateway := &Gateway{gitPath: strings.TrimSpace(gitPath), cwd: strings.TrimSpace(cwd)}
+	if err := gateway.verifyLocalCommitObject(ctx, cwd, oldHeadSHA); err != nil {
+		return false, err
+	}
+	if err := gateway.ensureLocalCommit(ctx, cwd, newHeadSHA, headRefName); err != nil {
+		return false, err
+	}
+	return gateway.isCommitAncestor(ctx, cwd, oldHeadSHA, newHeadSHA)
+}
+
+// HeadAdvanceDisjointFromPaths reports whether oldHeadSHA is an ancestor of
+// newHeadSHA AND no commit in oldHeadSHA..newHeadSHA touched any path in paths
+// (including rename/copy partners). Fails closed on empty paths, force-pushes,
+// missing commits, or any path overlap.
+func HeadAdvanceDisjointFromPaths(ctx context.Context, gitPath, cwd, oldHeadSHA, newHeadSHA, headRefName string, paths []string) (bool, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	oldHeadSHA = strings.TrimSpace(oldHeadSHA)
+	newHeadSHA = strings.TrimSpace(newHeadSHA)
+	headRefName = strings.TrimSpace(headRefName)
+	if len(paths) == 0 || oldHeadSHA == "" || newHeadSHA == "" {
+		return false, nil
+	}
+	cleaned := make([]string, 0, len(paths))
+	for _, p := range paths {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			return false, nil
+		}
+		cleaned = append(cleaned, p)
+	}
+	if commitSHAsMatch(oldHeadSHA, newHeadSHA) {
+		return true, nil
+	}
+	if strings.TrimSpace(cwd) == "" || !isSafeGitRev(oldHeadSHA) || !isSafeGitRev(newHeadSHA) {
+		return false, nil
+	}
+	gateway := &Gateway{gitPath: strings.TrimSpace(gitPath), cwd: strings.TrimSpace(cwd)}
+	if err := gateway.verifyLocalCommitObject(ctx, cwd, oldHeadSHA); err != nil {
+		return false, err
+	}
+	if err := gateway.ensureLocalCommit(ctx, cwd, newHeadSHA, headRefName); err != nil {
+		return false, err
+	}
+	ancestor, err := gateway.isCommitAncestor(ctx, cwd, oldHeadSHA, newHeadSHA)
+	if err != nil || !ancestor {
+		return false, err
+	}
+	deltaPaths, err := gateway.diffTouchedPaths(ctx, cwd, oldHeadSHA+".."+newHeadSHA)
+	if err != nil {
+		return false, err
+	}
+	for _, p := range cleaned {
+		if _, touched := deltaPaths[p]; touched {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+// HeadAdvanceDisjointFromPullRequestDiff reports whether oldHeadSHA is an
+// ancestor of newHeadSHA AND the delta oldHeadSHA..newHeadSHA touches zero
+// files from the reviewed PR diff baseSHA...oldHeadSHA. Intended to run
+// against the main repository path so the shared object store can fetch
+// newHeadSHA without touching the active reviewer worktree.
+func HeadAdvanceDisjointFromPullRequestDiff(ctx context.Context, gitPath, cwd, baseSHA, oldHeadSHA, newHeadSHA, headRefName string) (bool, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	baseSHA = strings.TrimSpace(baseSHA)
+	oldHeadSHA = strings.TrimSpace(oldHeadSHA)
+	newHeadSHA = strings.TrimSpace(newHeadSHA)
+	headRefName = strings.TrimSpace(headRefName)
+	if baseSHA == "" || oldHeadSHA == "" || newHeadSHA == "" {
+		return false, nil
+	}
+	if commitSHAsMatch(oldHeadSHA, newHeadSHA) {
+		return true, nil
+	}
+	if strings.TrimSpace(cwd) == "" || !isSafeGitRev(baseSHA) || !isSafeGitRev(oldHeadSHA) || !isSafeGitRev(newHeadSHA) {
+		return false, nil
+	}
+	gateway := &Gateway{gitPath: strings.TrimSpace(gitPath), cwd: strings.TrimSpace(cwd)}
+	if err := gateway.verifyLocalCommitObject(ctx, cwd, baseSHA); err != nil {
+		return false, err
+	}
+	if err := gateway.verifyLocalCommitObject(ctx, cwd, oldHeadSHA); err != nil {
+		return false, err
+	}
+	if err := gateway.ensureLocalCommit(ctx, cwd, newHeadSHA, headRefName); err != nil {
+		return false, err
+	}
+	ancestor, err := gateway.isCommitAncestor(ctx, cwd, oldHeadSHA, newHeadSHA)
+	if err != nil || !ancestor {
+		return false, err
+	}
+	prPaths, err := gateway.diffTouchedPaths(ctx, cwd, baseSHA+"..."+oldHeadSHA)
+	if err != nil || len(prPaths) == 0 {
+		return false, err
+	}
+	deltaPaths, err := gateway.diffTouchedPaths(ctx, cwd, oldHeadSHA+".."+newHeadSHA)
+	if err != nil {
+		return false, err
+	}
+	for p := range prPaths {
+		if _, touched := deltaPaths[p]; touched {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+func (g *Gateway) isCommitAncestor(ctx context.Context, cwd, ancestorSHA, descendantSHA string) (bool, error) {
+	_, err := g.runGitForReviewAnchors(ctx, cwd, "merge-base", "--is-ancestor", ancestorSHA, descendantSHA)
+	if err == nil {
+		return true, nil
+	}
+	var cmdErr *shell.CommandExecutionError
+	if errors.As(err, &cmdErr) && cmdErr.Result.ExitCode == 1 {
+		return false, nil
+	}
+	return false, err
+}
+
+func (g *Gateway) diffTouchedPaths(ctx context.Context, cwd, revRange string) (map[string]struct{}, error) {
+	var raw string
+	err := g.readGitDiffOutput(ctx, cwd, []string{"--literal-pathspecs", "diff", "--name-status", "-z", "-M", "--no-ext-diff", "--no-textconv", "--no-color", revRange}, func(reader io.Reader) error {
+		data, readErr := io.ReadAll(reader)
+		raw = string(data)
+		return readErr
+	})
+	if err != nil {
+		return nil, err
+	}
+	return parseNameStatusZPaths(raw), nil
+}
+
+func parseNameStatusZPaths(output string) map[string]struct{} {
+	paths := map[string]struct{}{}
+	fields := strings.Split(output, "\x00")
+	for i := 0; i < len(fields); {
+		status := fields[i]
+		i++
+		if status == "" {
+			continue
+		}
+		switch status[0] {
+		case 'R', 'C':
+			if i+1 >= len(fields) {
+				return paths
+			}
+			if fields[i] != "" {
+				paths[fields[i]] = struct{}{}
+			}
+			if fields[i+1] != "" {
+				paths[fields[i+1]] = struct{}{}
+			}
+			i += 2
+		default:
+			if i >= len(fields) {
+				return paths
+			}
+			if fields[i] != "" {
+				paths[fields[i]] = struct{}{}
+			}
+			i++
+		}
+	}
+	return paths
+}

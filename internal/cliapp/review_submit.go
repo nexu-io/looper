@@ -153,7 +153,7 @@ func (gateway forgejoReviewSubmitGateway) ViewPullRequest(ctx context.Context, i
 	hasConflicts := false
 	if pr.Mergeable != nil && !*pr.Mergeable && strings.EqualFold(strings.TrimSpace(pr.State), "open") {
 		// Forgejo's mergeable=false also represents asynchronous CHECKING state
-		// right after base advances; verify actual conflicts via git merge-tree.
+		// right after pushes or base advances; verify actual conflicts via git merge-tree.
 		if gateway.localGit == nil {
 			hasConflicts = true
 		} else if conflicted, mergeErr := gateway.localGit.HasLocalMergeConflicts(ctx, input.CWD, pr.Base.SHA, pr.Base.Name, pr.Head.SHA, pr.Head.Name); mergeErr != nil {
@@ -537,13 +537,13 @@ func (r *commandRuntime) reviewSubmit(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("refresh pull request before review submit: %w", err)
 	}
-	if err := validateExpectedHeadCommit(commitID, detail.HeadSHA); err != nil {
+	if err := validateReviewSubmitHeadCommit(cmd.Context(), reviewSubmitGitPath(loaded.Config), cwd, commitID, detail, event, payload.Comments); err != nil {
 		return err
 	}
 	// Review-request publish bypass for Forgejo is derived from trusted
 	// run/loop metadata (manual loop, or enabled follow-up on a new head),
 	// never from the agent-controlled argv --reviewer-manual flag alone.
-	requestBypass, err := r.trustedReviewRequestSubmitBypass(cmd, loaded.Config, repo, prNumber, commitID)
+	requestBypass, err := r.trustedReviewRequestSubmitBypassWithComments(cmd, loaded.Config, repo, prNumber, commitID, event, payload.Comments)
 	if err != nil {
 		return err
 	}
@@ -592,7 +592,7 @@ func (r *commandRuntime) reviewSubmit(cmd *cobra.Command, args []string) error {
 	}
 
 	// Fail closed on base/head drift between anchor resolution and mutation.
-	freshLabels, err := r.validateLatestReviewerReviewSubmitPublicationWithBaseRef(cmd, gateway, loaded.Config, repo, prNumber, commitID, detail.BaseSHA, detail.BaseRefName, getBoolFlag(cmd, "reviewer-manual"), getStringFlag(cmd, "reviewer-run-id"), cwd)
+	freshLabels, err := r.validateLatestReviewerReviewSubmitPublicationWithOptions(cmd, gateway, loaded.Config, repo, prNumber, commitID, detail.BaseSHA, detail.BaseRefName, event, payload.Comments, getBoolFlag(cmd, "reviewer-manual"), getStringFlag(cmd, "reviewer-run-id"), cwd)
 	if err != nil {
 		return err
 	}
@@ -624,6 +624,10 @@ func validateForgejoReviewSubmitRequest(ctx context.Context, gateway reviewSubmi
 //     pass --reviewer-run-id; the no-flag path still resolves the current running
 //     reviewer loop for the PR when the flag is absent.
 func (r *commandRuntime) trustedReviewRequestSubmitBypass(cmd *cobra.Command, cfg config.Config, repo string, prNumber int64, headSHA string) (bool, error) {
+	return r.trustedReviewRequestSubmitBypassWithComments(cmd, cfg, repo, prNumber, headSHA, "", nil)
+}
+
+func (r *commandRuntime) trustedReviewRequestSubmitBypassWithComments(cmd *cobra.Command, cfg config.Config, repo string, prNumber int64, headSHA string, event string, comments []reviewSubmitComment) (bool, error) {
 	dbPath := strings.TrimSpace(cfg.Storage.DBPath)
 	if dbPath == "" {
 		return false, nil
@@ -655,7 +659,7 @@ func (r *commandRuntime) trustedReviewRequestSubmitBypass(cmd *cobra.Command, cf
 			if err != nil {
 				return "", err
 			}
-			return recoverReviewSubmitEngagement(cmd.Context(), gateway, cfg, loop, repo, prNumber, headSHA, cwd)
+			return recoverReviewSubmitEngagementWithComments(cmd.Context(), gateway, cfg, loop, repo, prNumber, headSHA, cwd, event, comments)
 		})
 		return previous != "" && previous != strings.TrimSpace(headSHA), err
 	}
@@ -1076,19 +1080,62 @@ func reviewSubmitGitPath(cfg config.Config) string {
 	return "git"
 }
 
+func reviewSubmitCommentPaths(comments []reviewSubmitComment) []string {
+	paths := make([]string, 0, len(comments))
+	for _, comment := range comments {
+		paths = append(paths, comment.Path)
+	}
+	return paths
+}
+
+// validateReviewSubmitHeadCommit enforces head-commit freshness. Exact head
+// match is always required for APPROVE and body-only (clean) reviews. For
+// actionable inline reviews (COMMENT/REQUEST_CHANGES with non-empty comments),
+// an additive ancestor head is permitted only when the PR is still OPEN and
+// mergeable and git proves oldHead..liveHead touched zero commented paths.
+func validateReviewSubmitHeadCommit(ctx context.Context, gitPath, cwd, expected string, detail githubinfra.PullRequestDetail, event string, comments []reviewSubmitComment) error {
+	err := validateExpectedHeadCommit(expected, detail.HeadSHA)
+	if err == nil {
+		return nil
+	}
+	if strings.EqualFold(strings.TrimSpace(event), "APPROVE") || len(comments) == 0 {
+		return err
+	}
+	if !strings.EqualFold(strings.TrimSpace(detail.State), "OPEN") {
+		return err
+	}
+	if detail.HasConflicts {
+		return err
+	}
+	disjoint, gitErr := githubinfra.HeadAdvanceDisjointFromPaths(ctx, gitPath, cwd, expected, detail.HeadSHA, detail.HeadRefName, reviewSubmitCommentPaths(comments))
+	if gitErr != nil || !disjoint {
+		return err
+	}
+	return nil
+}
+
 // validateLatestReviewerReviewSubmitPublication re-reads the PR before mutation
 // and fails closed on head/base drift plus hold labels. Refreshed labels are
 // returned so Forgejo publish authority uses the latest snapshot.
 func (r *commandRuntime) validateLatestReviewerReviewSubmitPublication(cmd *cobra.Command, gh reviewSubmitPullRequestViewer, cfg config.Config, repo string, prNumber int64, commitID string, expectedBaseSHA string, manual bool, runID string, cwd string) ([]string, error) {
-	return r.validateLatestReviewerReviewSubmitPublicationWithBaseRef(cmd, gh, cfg, repo, prNumber, commitID, expectedBaseSHA, "", manual, runID, cwd)
+	return r.validateLatestReviewerReviewSubmitPublicationWithOptions(cmd, gh, cfg, repo, prNumber, commitID, expectedBaseSHA, "", "", nil, manual, runID, cwd)
 }
 
 func (r *commandRuntime) validateLatestReviewerReviewSubmitPublicationWithBaseRef(cmd *cobra.Command, gh reviewSubmitPullRequestViewer, cfg config.Config, repo string, prNumber int64, commitID string, expectedBaseSHA string, expectedBaseRefName string, manual bool, runID string, cwd string) ([]string, error) {
+	return r.validateLatestReviewerReviewSubmitPublicationWithOptions(cmd, gh, cfg, repo, prNumber, commitID, expectedBaseSHA, expectedBaseRefName, "", nil, manual, runID, cwd)
+}
+
+func (r *commandRuntime) validateLatestReviewerReviewSubmitPublicationWithComments(cmd *cobra.Command, gh reviewSubmitPullRequestViewer, cfg config.Config, repo string, prNumber int64, commitID string, expectedBaseSHA string, event string, comments []reviewSubmitComment, manual bool, runID string, cwd string) ([]string, error) {
+	return r.validateLatestReviewerReviewSubmitPublicationWithOptions(cmd, gh, cfg, repo, prNumber, commitID, expectedBaseSHA, "", event, comments, manual, runID, cwd)
+}
+
+func (r *commandRuntime) validateLatestReviewerReviewSubmitPublicationWithOptions(cmd *cobra.Command, gh reviewSubmitPullRequestViewer, cfg config.Config, repo string, prNumber int64, commitID string, expectedBaseSHA string, expectedBaseRefName string, event string, comments []reviewSubmitComment, manual bool, runID string, cwd string) ([]string, error) {
 	detail, err := gh.ViewPullRequest(cmd.Context(), githubinfra.ViewPullRequestInput{Repo: repo, PRNumber: prNumber, CWD: cwd})
 	if err != nil {
 		return nil, fmt.Errorf("refresh pull request before review publish: %w", err)
 	}
-	if err := validateExpectedHeadCommit(commitID, detail.HeadSHA); err != nil {
+	gitPath := reviewSubmitGitPath(cfg)
+	if err := validateReviewSubmitHeadCommit(cmd.Context(), gitPath, cwd, commitID, detail, event, comments); err != nil {
 		return nil, err
 	}
 	expectedBaseRefName = strings.TrimSpace(expectedBaseRefName)
@@ -1096,12 +1143,11 @@ func (r *commandRuntime) validateLatestReviewerReviewSubmitPublicationWithBaseRe
 	if expectedBaseRefName != "" && liveBaseRefName != "" && expectedBaseRefName != liveBaseRefName {
 		return nil, fmt.Errorf("PR base branch changed before publish: expected %s, got %s", expectedBaseRefName, liveBaseRefName)
 	}
-	gitPath := reviewSubmitGitPath(cfg)
 	if err := validateExpectedBaseCommit(expectedBaseSHA, detail.BaseSHA); err != nil {
 		if detail.HasConflicts || (expectedBaseRefName != "" && liveBaseRefName == "") {
 			return nil, err
 		}
-		preserved, mbErr := githubinfra.BaseAdvancePreservesMergeBase(cmd.Context(), gitPath, cwd, expectedBaseSHA, detail.BaseSHA, commitID, liveBaseRefName)
+		preserved, mbErr := githubinfra.BaseAdvancePreservesMergeBase(cmd.Context(), gitPath, cwd, expectedBaseSHA, detail.BaseSHA, detail.HeadSHA, liveBaseRefName)
 		if mbErr != nil || !preserved {
 			return nil, err
 		}
@@ -1121,7 +1167,7 @@ func (r *commandRuntime) validateLatestReviewerReviewSubmitPublicationWithBaseRe
 		if run == nil || run.CheckpointJSON == nil {
 			return nil, fmt.Errorf("sandbox review %s has no saved PR context", runID)
 		}
-		if err := validateSandboxReviewTargetWithGit(cmd.Context(), gitPath, cwd, *run.CheckpointJSON, detail); err != nil {
+		if err := validateSandboxReviewTargetWithComments(cmd.Context(), gitPath, cwd, *run.CheckpointJSON, detail, event, comments); err != nil {
 			return nil, err
 		}
 	}
@@ -1133,10 +1179,14 @@ func (r *commandRuntime) validateLatestReviewerReviewSubmitPublicationWithBaseRe
 
 // The personal-account sandbox cannot query GitHub to repeat this check itself.
 func validateSandboxReviewTarget(checkpoint string, live githubinfra.PullRequestDetail) error {
-	return validateSandboxReviewTargetWithGit(context.Background(), "", "", checkpoint, live)
+	return validateSandboxReviewTargetWithComments(context.Background(), "", "", checkpoint, live, "", nil)
 }
 
 func validateSandboxReviewTargetWithGit(ctx context.Context, gitPath, cwd, checkpoint string, live githubinfra.PullRequestDetail) error {
+	return validateSandboxReviewTargetWithComments(ctx, gitPath, cwd, checkpoint, live, "", nil)
+}
+
+func validateSandboxReviewTargetWithComments(ctx context.Context, gitPath, cwd, checkpoint string, live githubinfra.PullRequestDetail, event string, comments []reviewSubmitComment) error {
 	var seed struct {
 		Detail *struct {
 			BaseRefName string
@@ -1150,7 +1200,7 @@ func validateSandboxReviewTargetWithGit(ctx context.Context, gitPath, cwd, check
 	if seed.Snapshot == nil || seed.Detail == nil || seed.Snapshot.BaseSHA == "" || seed.Detail.BaseRefName == "" {
 		return fmt.Errorf("sandbox review PR context is incomplete")
 	}
-	if err := validateExpectedHeadCommit(seed.Snapshot.HeadSHA, live.HeadSHA); err != nil {
+	if err := validateReviewSubmitHeadCommit(ctx, gitPath, cwd, seed.Snapshot.HeadSHA, live, event, comments); err != nil {
 		return err
 	}
 	if !strings.EqualFold(live.State, "OPEN") || live.IsDraft != seed.Detail.IsDraft || live.BaseRefName != seed.Detail.BaseRefName {
@@ -1289,6 +1339,10 @@ func reviewSubmitFollowUpHasNewHead(metadataJSON *string, headSHA string) bool {
 // Recovery never trusts submitted argv or payload markers. The caller has
 // already bound this lookup to the current running reviewer loop in storage.
 func recoverReviewSubmitEngagement(ctx context.Context, gateway reviewSubmitGateway, cfg config.Config, loop storage.LoopRecord, repo string, prNumber int64, headSHA, cwd string) (string, error) {
+	return recoverReviewSubmitEngagementWithComments(ctx, gateway, cfg, loop, repo, prNumber, headSHA, cwd, "", nil)
+}
+
+func recoverReviewSubmitEngagementWithComments(ctx context.Context, gateway reviewSubmitGateway, cfg config.Config, loop storage.LoopRecord, repo string, prNumber int64, headSHA, cwd, event string, comments []reviewSubmitComment) (string, error) {
 	login, err := gateway.GetCurrentUserLogin(ctx, cwd)
 	if err != nil {
 		return "", err
@@ -1312,7 +1366,7 @@ func recoverReviewSubmitEngagement(ctx context.Context, gateway reviewSubmitGate
 	if err != nil {
 		return "", err
 	}
-	if err := validateExpectedHeadCommit(headSHA, detail.HeadSHA); err != nil {
+	if err := validateReviewSubmitHeadCommit(ctx, reviewSubmitGitPath(cfg), cwd, headSHA, detail, event, comments); err != nil {
 		return "", err
 	}
 	matched, err := reviewSubmitProjectForRepo(cfg, repo, cwd)
