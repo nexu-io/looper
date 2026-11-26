@@ -675,7 +675,7 @@ func TestBuildReviewPromptStandaloneVsPairMode(t *testing.T) {
 	if !strings.Contains(standaloneCommentOnly, "publishes both `must_fix` and `needs_human` findings into the remote Reviewer Summary") {
 		t.Fatalf("standalone comment-only prompt missing needs_human summary publishing wording")
 	}
-	if !strings.Contains(standaloneCommentOnly, "matches the highest published finding severity") {
+	if !strings.Contains(standaloneCommentOnly, "reconciles outcome to match the highest published finding severity") {
 		t.Fatalf("standalone comment-only prompt missing published-severity outcome gate")
 	}
 }
@@ -796,17 +796,17 @@ func TestStandaloneOutcomeValidationAccountsForNeedsHumanSeverity(t *testing.T) 
 			{Title: "[P1] Clarify contract", Body: "Ambiguous breaking change.", Disposition: "needs_human", Severity: "blocking", ScopeBasis: "ambiguous_intent", ScopeEvidence: "AGENTS.md"},
 		},
 	}
-	if _, err := validateReviewerCommentOnlyCompletionWithOptions(mixedBlockingNeedsHuman, true); err != nil {
-		t.Fatalf("standalone validation rejected blocking outcome with blocking needs_human: %v", err)
+	if got, err := validateReviewerCommentOnlyCompletionWithOptions(mixedBlockingNeedsHuman, true); err != nil || got.Outcome != "blocking" {
+		t.Fatalf("standalone validation = (%#v, %v), want blocking", got, err)
 	}
-	if _, err := validateReviewerCommentOnlyCompletionWithOptions(mixedBlockingNeedsHuman, false); err == nil {
-		t.Fatal("pair validation accepted blocking outcome when only must_fix is non_blocking")
+	if got, err := validateReviewerCommentOnlyCompletionWithOptions(mixedBlockingNeedsHuman, false); err != nil || got.Outcome != "non_blocking" {
+		t.Fatalf("pair validation = (%#v, %v), want reconciled non_blocking", got, err)
 	}
 
 	wrongNonBlocking := mixedBlockingNeedsHuman
 	wrongNonBlocking.Outcome = "non_blocking"
-	if _, err := validateReviewerCommentOnlyCompletionWithOptions(wrongNonBlocking, true); err == nil {
-		t.Fatal("standalone validation accepted non_blocking outcome despite blocking needs_human")
+	if got, err := validateReviewerCommentOnlyCompletionWithOptions(wrongNonBlocking, true); err != nil || got.Outcome != "blocking" {
+		t.Fatalf("standalone validation = (%#v, %v), want reconciled blocking", got, err)
 	}
 
 	cleanWithNeedsHuman := reviewerCommentOnlyCompletion{

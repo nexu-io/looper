@@ -5399,7 +5399,7 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 		if err != nil {
 			return checkpoint, &loopError{message: fmt.Sprintf("marshal reviewer comment-only completion: %v", err), kind: FailureRetryableAfterResume}
 		}
-		cleanNoop := cleanReviewNoopSummary(result.Summary) && completion.Outcome == "clean" && !commentOnlyCompletionHasNeedsHuman(completion)
+		cleanNoop := completion.Outcome == "clean" && !commentOnlyCompletionHasNeedsHuman(completion)
 		checkpoint.PendingReview = &pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, IdempotencyKey: idempotencyKey, Event: reviewEventAgentNative, Summary: completion.Summary, Outcome: completion.Outcome, ReviewerSummaryJSON: string(payload), CleanNoop: cleanNoop}
 		checkpoint.ResumePolicy = "advance_from_checkpoint"
 		return checkpoint, nil
@@ -5409,6 +5409,13 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 	// Summary-only markers without findings stay valid; remote marker is publish authority.
 	nativeCompletion, err := parseReviewerNativeCompletionWithOptions(result, !pairActive)
 	if err != nil {
+		if found, markerErr := r.verifyAgentNativeReviewMarker(ctx, input, checkpoint.Snapshot.HeadSHA, idempotencyKey, cleanReviewAuthorLogin(checkpoint, PullRequestDetail{})); markerErr != nil {
+			return checkpoint, &loopError{message: markerErr.Error(), kind: FailureRetryableAfterResume}
+		} else if found.Found {
+			checkpoint.PendingReview = &pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, IdempotencyKey: idempotencyKey, Event: reviewEventAgentNative, Summary: result.Summary, Outcome: normalizeCommentOnlyOutcome(found.Outcome), ContentFingerprint: reviewMarkerFingerprint(found), ReviewerSummaryJSON: recoveredReviewerSummaryJSON(result)}
+			checkpoint.ResumePolicy = "advance_from_checkpoint"
+			return checkpoint, nil
+		}
 		return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 	}
 	if commentOnlyCompletionHasNeedsHuman(nativeCompletion) && pairActive {
@@ -5423,7 +5430,8 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 		nativeFindingsJSON = string(payload)
 	}
 
-	if checkpoint.ForgejoRereviewID == 0 && cleanReviewNoopSummary(result.Summary) && !commentOnlyCompletionHasNeedsHuman(nativeCompletion) {
+	isCleanNative := nativeCompletion.Outcome == "clean" || (nativeCompletion.Outcome == "" && cleanReviewNoopSummary(result.Summary))
+	if checkpoint.ForgejoRereviewID == 0 && isCleanNative && !commentOnlyCompletionHasNeedsHuman(nativeCompletion) {
 		if reviewEvents.Clean == config.ReviewerReviewEventApprove && r.reviewerAutoMergeConfigForProject(input.Project.ID).Enabled && resolvePullRequestPhase(detailLabels(checkpoint.Detail)) != "spec" {
 			checkpoint.PendingReview = &pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, IdempotencyKey: idempotencyKey, Event: reviewEventAgentNative, Summary: result.Summary, Outcome: "clean", ReviewerSummaryJSON: nativeFindingsJSON, CleanNoop: true}
 			checkpoint.ResumePolicy = "advance_from_checkpoint"
@@ -5781,7 +5789,8 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 		return checkpoint, &loopError{message: message, kind: FailureRetryableAfterResume}
 	}
 	reviewPolicy := r.effectiveReviewEvents(input.Project.ID, input.Loop.MetadataJSON)
-	if cleanReviewNoopSummary(pending.Summary) && reviewPolicy.Clean == config.ReviewerReviewEventApprove && !cleanReviewMarkerSatisfiesCleanPolicy(markerResult, cleanReviewAuthorLogin(checkpoint, detail)) {
+	isCleanPending := pending.CleanNoop || normalizeCommentOnlyOutcome(pending.Outcome) == "clean" || cleanReviewNoopSummary(pending.Summary)
+	if isCleanPending && reviewPolicy.Clean == config.ReviewerReviewEventApprove && !cleanReviewMarkerSatisfiesCleanPolicy(markerResult, cleanReviewAuthorLogin(checkpoint, detail)) {
 		return checkpoint, &loopError{message: "Reviewer agent reported a clean summary-only result, but clean review policy requires an APPROVED review marker or a self-authored clean COMMENT fallback with a valid human approval body; submit the APPROVE review through the trusted wrapper or exit non-zero", kind: FailureRetryableAfterResume}
 	}
 	if cleanApprovedReviewMarker(markerResult) || (reviewPolicy.Clean == config.ReviewerReviewEventApprove && cleanReviewMarkerSatisfiesCleanPolicy(markerResult, cleanReviewAuthorLogin(checkpoint, detail))) {
@@ -7001,12 +7010,13 @@ func validateReviewerCommentOnlyCompletion(completion reviewerCommentOnlyComplet
 
 func validateReviewerCommentOnlyCompletionWithOptions(completion reviewerCommentOnlyCompletion, includeNeedsHuman bool) (reviewerCommentOnlyCompletion, error) {
 	completion.Summary = strings.TrimSpace(completion.Summary)
-	completion.Outcome = normalizeCommentOnlyOutcome(completion.Outcome)
+	rawOutcome := strings.TrimSpace(completion.Outcome)
+	completion.Outcome = normalizeCommentOnlyOutcome(rawOutcome)
 	completion.Coverage = sanitizeReviewerCoverage(completion.Coverage)
 	if completion.Summary == "" {
 		return reviewerCommentOnlyCompletion{}, fmt.Errorf("reviewer comment-only completion summary is required")
 	}
-	if completion.Outcome == "" {
+	if rawOutcome != "" && completion.Outcome == "" {
 		return reviewerCommentOnlyCompletion{}, fmt.Errorf("reviewer comment-only completion outcome must be clean, non_blocking, or blocking")
 	}
 	seenFindingIDs := map[string]struct{}{}
@@ -7027,12 +7037,6 @@ func validateReviewerCommentOnlyCompletionWithOptions(completion reviewerComment
 		if finding.Disposition == "" {
 			return reviewerCommentOnlyCompletion{}, fmt.Errorf("reviewer comment-only finding %d requires disposition", i)
 		}
-		if finding.ScopeBasis == "" {
-			return reviewerCommentOnlyCompletion{}, fmt.Errorf("reviewer comment-only finding %d requires scopeBasis", i)
-		}
-		if finding.ScopeEvidence == "" {
-			return reviewerCommentOnlyCompletion{}, fmt.Errorf("reviewer comment-only finding %d requires scopeEvidence", i)
-		}
 		switch finding.Disposition {
 		case reviewFindingDispositionMustFix, reviewFindingDispositionFollowUp, reviewFindingDispositionNeedsHuman:
 		default:
@@ -7046,10 +7050,12 @@ func validateReviewerCommentOnlyCompletionWithOptions(completion reviewerComment
 		default:
 			return reviewerCommentOnlyCompletion{}, fmt.Errorf("reviewer comment-only finding %d has invalid severity %q", i, finding.Severity)
 		}
-		switch finding.ScopeBasis {
-		case reviewFindingScopeStatedIntent, reviewFindingScopeIntroducedRegression, reviewFindingScopeRequiredInvariant, reviewFindingScopeIndependentImprovement, reviewFindingScopeAmbiguousIntent:
-		default:
-			return reviewerCommentOnlyCompletion{}, fmt.Errorf("reviewer comment-only finding %d has invalid scopeBasis %q", i, finding.ScopeBasis)
+		if finding.ScopeBasis != "" {
+			switch finding.ScopeBasis {
+			case reviewFindingScopeStatedIntent, reviewFindingScopeIntroducedRegression, reviewFindingScopeRequiredInvariant, reviewFindingScopeIndependentImprovement, reviewFindingScopeAmbiguousIntent:
+			default:
+				return reviewerCommentOnlyCompletion{}, fmt.Errorf("reviewer comment-only finding %d has invalid scopeBasis %q", i, finding.ScopeBasis)
+			}
 		}
 		if finding.Disposition == reviewFindingDispositionMustFix || (includeNeedsHuman && finding.Disposition == reviewFindingDispositionNeedsHuman) {
 			publishableCount++
@@ -7090,22 +7096,21 @@ func validateReviewerCommentOnlyCompletionWithOptions(completion reviewerComment
 			}
 			return reviewerCommentOnlyCompletion{}, fmt.Errorf("reviewer comment-only clean completion must not include must_fix findings")
 		}
-		if !cleanReviewNoopSummary(completion.Summary) {
-			return reviewerCommentOnlyCompletion{}, fmt.Errorf("reviewer comment-only clean completion summary must start with \"No actionable findings\"")
-		}
 		return completion, nil
 	}
-	if publishableCount == 0 && !commentOnlyCompletionHasNeedsHuman(completion) {
-		return reviewerCommentOnlyCompletion{}, fmt.Errorf("reviewer comment-only actionable completion must include at least one must_fix finding")
-	}
 	if publishableCount > 0 {
-		required := requiredOutcomeForPublishableFindings(completion.Findings, includeNeedsHuman)
-		if required != "" && completion.Outcome != required {
-			if includeNeedsHuman {
-				return reviewerCommentOnlyCompletion{}, fmt.Errorf("reviewer comment-only completion outcome %q does not match highest published finding severity (want %s)", completion.Outcome, required)
-			}
-			return reviewerCommentOnlyCompletion{}, fmt.Errorf("reviewer comment-only completion outcome %q does not match highest must_fix severity (want %s)", completion.Outcome, required)
+		completion.Outcome = requiredOutcomeForPublishableFindings(completion.Findings, includeNeedsHuman)
+		return completion, nil
+	}
+	if completion.Outcome == "" {
+		if cleanReviewNoopSummary(completion.Summary) {
+			completion.Outcome = "clean"
+			return completion, nil
 		}
+		return reviewerCommentOnlyCompletion{}, fmt.Errorf("reviewer comment-only completion outcome must be clean, non_blocking, or blocking")
+	}
+	if !commentOnlyCompletionHasNeedsHuman(completion) {
+		return reviewerCommentOnlyCompletion{}, fmt.Errorf("reviewer comment-only actionable completion must include at least one must_fix finding")
 	}
 	return completion, nil
 }
@@ -10576,11 +10581,11 @@ func buildReviewPromptForPairMode(projectID string, instructionConfig config.Con
 	}
 	if commentOnlyPublish {
 		publishInstruction = "This provider is comment-only. Looper supplied the PR metadata in this prompt/context and will publish exactly one top-level PR comment from your final completion summary after re-checking local idempotency. Do not publish anything yourself or attempt native review features."
-		outcomeInstruction = "Classify every candidate finding with disposition `must_fix` | `follow_up` | `needs_human`, plus `severity`, `scopeBasis`, and `scopeEvidence`. Include all candidates in `__LOOPER_RESULT__.findings`. Looper publishes only `must_fix` findings into the remote Reviewer Summary; `follow_up` stays in the structured result only; `needs_human` parks the pair and is never posted as a change request. If there are must_fix findings, finish successfully with a concise markdown summary and set `summary`, `outcome` (`non_blocking` or `blocking`), and `findings`. Each finding object MUST contain `title`, `body`, `disposition`, `severity`, `scopeBasis`, `scopeEvidence`, and optional `files`; include `review_item_id` when the issue matches an existing Reviewer Summary item unchanged, and include `supersedes` with prior `review_item_id` values only when this finding materially replaces older items. If there are no must_fix findings and no needs_human, set `outcome` to `clean` (follow_up-only findings may remain in `findings`), and start `summary` with `No actionable findings` when there are no must_fix items. Do not include terminal logs, extra JSON payloads, or publishing commands."
+		outcomeInstruction = "Classify every candidate finding with disposition `must_fix` | `follow_up` | `needs_human` and `severity` (`blocking` | `non_blocking` | `nit`), plus optional `scopeBasis` and `scopeEvidence`. Include all candidates in `__LOOPER_RESULT__.findings`. Looper publishes only `must_fix` findings into the remote Reviewer Summary; `follow_up` stays in the structured result only; `needs_human` parks the pair and is never posted as a change request. If there are must_fix findings, finish successfully with a concise markdown summary and set `summary`, `outcome` (`non_blocking` or `blocking`; Looper reconciles it to the highest published severity), and `findings`. Each finding object MUST contain `title`, `body`, `disposition`, `severity`, and optional `scopeBasis`, `scopeEvidence`, and `files`; include `review_item_id` when the issue matches an existing Reviewer Summary item unchanged, and include `supersedes` with prior `review_item_id` values only when this finding materially replaces older items. If there are no must_fix findings and no needs_human, set `outcome` to `clean` (follow_up-only findings may remain in `findings`; any clean summary works, no literal prefix required). Do not include terminal logs, extra JSON payloads, or publishing commands."
 		if !reviewFixPairActive {
-			outcomeInstruction = "Classify every candidate finding with disposition `must_fix` | `follow_up` | `needs_human`, plus `severity`, `scopeBasis`, and `scopeEvidence`. Include all candidates in `__LOOPER_RESULT__.findings`. In standalone reviewer mode (no active Fixer), Looper publishes both `must_fix` and `needs_human` findings into the remote Reviewer Summary so the PR author sees them directly; `follow_up` stays in the structured result only. If there are must_fix or needs_human findings, finish successfully with a concise markdown summary and set `summary`, `outcome` (`non_blocking` or `blocking`), and `findings`. Each finding object MUST contain `title`, `body`, `disposition`, `severity`, `scopeBasis`, `scopeEvidence`, and optional `files`; include `review_item_id` when the issue matches an existing Reviewer Summary item unchanged, and include `supersedes` with prior `review_item_id` values only when this finding materially replaces older items. If there are no must_fix or needs_human findings, set `outcome` to `clean` (follow_up-only findings may remain in `findings`), and start `summary` with `No actionable findings`. Do not include terminal logs, extra JSON payloads, or publishing commands."
+			outcomeInstruction = "Classify every candidate finding with disposition `must_fix` | `follow_up` | `needs_human` and `severity` (`blocking` | `non_blocking` | `nit`), plus optional `scopeBasis` and `scopeEvidence`. Include all candidates in `__LOOPER_RESULT__.findings`. In standalone reviewer mode (no active Fixer), Looper publishes both `must_fix` and `needs_human` findings into the remote Reviewer Summary so the PR author sees them directly; `follow_up` stays in the structured result only. If there are must_fix or needs_human findings, finish successfully with a concise markdown summary and set `summary`, `outcome` (`non_blocking` or `blocking`; Looper reconciles it to the highest published severity), and `findings`. Each finding object MUST contain `title`, `body`, `disposition`, `severity`, and optional `scopeBasis`, `scopeEvidence`, and `files`; include `review_item_id` when the issue matches an existing Reviewer Summary item unchanged, and include `supersedes` with prior `review_item_id` values only when this finding materially replaces older items. If there are no must_fix or needs_human findings, set `outcome` to `clean` (follow_up-only findings may remain in `findings`; any clean summary works, no literal prefix required). Do not include terminal logs, extra JSON payloads, or publishing commands."
 		}
-		cleanResultCompletionInstruction = "Group findings only when they share the same root cause; keep unrelated concerns separate. Accumulate every independent in-scope must_fix before finalizing. If there is no concrete must_fix feedback, start the final summary with `No actionable findings`. Do not invent feedback."
+		cleanResultCompletionInstruction = "Group findings only when they share the same root cause; keep unrelated concerns separate. Accumulate every independent in-scope must_fix before finalizing. If there is no concrete must_fix feedback, set `outcome` to `clean` with a concise summary. Do not invent feedback."
 		fetchContract = "Provider-supplied Forgejo review context: Looper fetched PR metadata before invoking you. Use the prepared local worktree plus the supplied metadata as the review context; do not use GitHub CLI/API commands or native review/thread features."
 	}
 	if hostingKind != "" {
@@ -10695,12 +10700,12 @@ func buildReviewPromptForPairMode(projectID string, instructionConfig config.Con
 			reviewPassContract = "Review pass contract (later pass / repair frontier): complete the repair-frontier inspection before finalizing. Do not perform a full first-pass rescan of untouched original diff. Focus on unresolved prior must_fix threads, the last-reviewed-head→current-head delta, directly affected contracts/tests/lifecycle invariants, and Fixer evidence. Do not stop after the first issue within that frontier."
 		}
 		commentOnlyContract := "Comment-only publish contract: Looper will post your final completion summary as one top-level PR comment after it verifies the PR is still open, the head SHA still matches, and this head has not already been published locally. Do not publish anything yourself. Only must_fix findings become remote Reviewer Summary items; follow_up and needs_human remain in structured completion only."
-		commentOnlyDispositionContract := "Finding disposition contract: every candidate uses disposition must_fix|follow_up|needs_human, severity blocking|non_blocking|nit, scopeBasis (stated_intent|introduced_regression|required_invariant|independent_improvement|ambiguous_intent), scopeEvidence (specific repository rule, PR goal/non-goal, linked spec section, or regression evidence), plus title/body/location. must_fix becomes remote feedback; follow_up is retained only in structured completion; needs_human must not be published as a change request and parks the pair for human judgment."
-		commentOnlyFinalizationGate := "Finalization gate before completion: verify that the scoped changed files/ranges were reviewed, all observed in-scope must_fix findings are included, repeated patterns are consolidated only when they share a root cause, non-blocking/nit feedback is not escalated, every finding has disposition/scope evidence and a suggested fix, and the summary outcome matches the highest must_fix severity."
+		commentOnlyDispositionContract := "Finding disposition contract: every candidate uses disposition must_fix|follow_up|needs_human, severity blocking|non_blocking|nit, optional scopeBasis (stated_intent|introduced_regression|required_invariant|independent_improvement|ambiguous_intent) and scopeEvidence, plus title/body/location. must_fix becomes remote feedback; follow_up is retained only in structured completion; needs_human must not be published as a change request and parks the pair for human judgment."
+		commentOnlyFinalizationGate := "Finalization gate before completion: verify that the scoped changed files/ranges were reviewed, all observed in-scope must_fix findings are included, repeated patterns are consolidated only when they share a root cause, non-blocking/nit feedback is not escalated, and every finding has disposition, severity, concrete evidence, and a suggested fix (Looper reconciles outcome from published severities)."
 		if !reviewFixPairActive {
 			commentOnlyContract = "Comment-only publish contract: Looper will post your final completion summary as one top-level PR comment after it verifies the PR is still open, the head SHA still matches, and this head has not already been published locally. Do not publish anything yourself. In standalone reviewer mode (no active Fixer), both must_fix and needs_human findings become remote Reviewer Summary items so the PR author sees them; follow_up remains in structured completion only."
-			commentOnlyDispositionContract = "Finding disposition contract: every candidate uses disposition must_fix|follow_up|needs_human, severity blocking|non_blocking|nit, scopeBasis (stated_intent|introduced_regression|required_invariant|independent_improvement|ambiguous_intent), scopeEvidence (specific repository rule, PR goal/non-goal, linked spec section, or regression evidence), plus title/body/location. In standalone reviewer mode (no active Fixer), both must_fix and needs_human become remote feedback so the human PR author sees questions and ambiguities directly on the PR; follow_up is retained only in structured completion."
-			commentOnlyFinalizationGate = "Finalization gate before completion: verify that the scoped changed files/ranges were reviewed, all observed in-scope must_fix and needs_human findings are included, repeated patterns are consolidated only when they share a root cause, non-blocking/nit feedback is not escalated, every finding has disposition/scope evidence and a suggested fix, and the summary outcome matches the highest published finding severity."
+			commentOnlyDispositionContract = "Finding disposition contract: every candidate uses disposition must_fix|follow_up|needs_human, severity blocking|non_blocking|nit, optional scopeBasis (stated_intent|introduced_regression|required_invariant|independent_improvement|ambiguous_intent) and scopeEvidence, plus title/body/location. In standalone reviewer mode (no active Fixer), both must_fix and needs_human become remote feedback so the human PR author sees questions and ambiguities directly on the PR; follow_up is retained only in structured completion."
+			commentOnlyFinalizationGate = "Finalization gate before completion: verify that the scoped changed files/ranges were reviewed, all observed in-scope must_fix and needs_human findings are included, repeated patterns are consolidated only when they share a root cause, non-blocking/nit feedback is not escalated, and every finding has disposition, severity, concrete evidence, and a suggested fix (Looper reconciles outcome to match the highest published finding severity)."
 		}
 		parts = append(parts,
 			commentOnlyContract,
@@ -10713,9 +10718,9 @@ func buildReviewPromptForPairMode(projectID string, instructionConfig config.Con
 		return agent.AppendCompletionInstruction(strings.Join(parts, "\n\n")), instructionBlock
 	}
 	githubOperationContract := fmt.Sprintf("GitHub operation contract: when there are actionable findings, submit exactly one PR review for this run through the trusted Looper CLI at %s, with the review JSON on stdin. The wrapper validates inline anchors against the live PR diff before it calls GitHub; do not use PATH-based `looper`, repository-local `go run ./cmd/looper`, `gh api repos/%s/pulls/%d/reviews`, or `gh pr review` directly for the review submission.", actionableReviewSubmitCommand, repo, prNumber)
-	submitPayloadInstruction := fmt.Sprintf("When submitting through `%s review submit`, pass stdin JSON with `body` and optional `comments` entries. Each actionable comment MUST include GitHub fields `path`, `line`, `side` (`RIGHT` for new diff lines, `LEFT` for old diff lines), optional `start_line` and `start_side` for multiline ranges, `body`, plus Looper-only fields `disposition` (must be `must_fix`), `scopeBasis`, and `scopeEvidence` (and preferably `severity`). The trusted wrapper rejects missing disposition/scope fields and rejects `follow_up`/`needs_human` in actionable comments or the visible review body; those dispositions stay out of the submit payload. Looper strips Looper-only fields before calling GitHub/Forgejo.", looperCLICommand)
+	submitPayloadInstruction := fmt.Sprintf("When submitting through `%s review submit`, pass stdin JSON with `body` and optional `comments` entries. Each actionable comment MUST include GitHub fields `path`, `line`, `side` (`RIGHT` for new diff lines, `LEFT` for old diff lines), optional `start_line` and `start_side` for multiline ranges, `body`, plus Looper-only `disposition` (must be `must_fix`) and optional `severity`, `scopeBasis`, and `scopeEvidence`. The trusted wrapper rejects missing/invalid `disposition` and rejects `follow_up`/`needs_human` in actionable comments or the visible review body; those dispositions stay out of the submit payload. Looper strips Looper-only fields before calling GitHub/Forgejo.", looperCLICommand)
 	if !reviewFixPairActive {
-		submitPayloadInstruction = fmt.Sprintf("When submitting through `%s review submit`, pass stdin JSON with `body` and optional `comments` entries. Each actionable comment MUST include GitHub fields `path`, `line`, `side` (`RIGHT` for new diff lines, `LEFT` for old diff lines), optional `start_line` and `start_side` for multiline ranges, `body`, plus Looper-only fields `disposition` (`must_fix` or `needs_human`), `scopeBasis`, and `scopeEvidence` (and preferably `severity`). The trusted wrapper rejects missing disposition/scope fields and rejects `follow_up` in actionable comments or the visible review body; `follow_up` stays out of the submit payload. Looper strips Looper-only fields before calling GitHub/Forgejo.", looperCLICommand)
+		submitPayloadInstruction = fmt.Sprintf("When submitting through `%s review submit`, pass stdin JSON with `body` and optional `comments` entries. Each actionable comment MUST include GitHub fields `path`, `line`, `side` (`RIGHT` for new diff lines, `LEFT` for old diff lines), optional `start_line` and `start_side` for multiline ranges, `body`, plus Looper-only `disposition` (`must_fix` or `needs_human`) and optional `severity`, `scopeBasis`, and `scopeEvidence`. The trusted wrapper rejects missing/invalid `disposition` and rejects `follow_up` in actionable comments or the visible review body; `follow_up` stays out of the submit payload. Looper strips Looper-only fields before calling GitHub/Forgejo.", looperCLICommand)
 	}
 	idempotencyInstruction := "Idempotency requirement: before posting anything, use `gh api` to list existing PR reviews for this PR. Only treat an existing marker as satisfying this run when the review body contains the exact idempotency id and expected head SHA, and the review state matches the required outcome-specific policy for this run. If such a matching review already exists, do not post another review. Instead, rely on Looper to validate that marker after the agent exits and to reconcile clean-signal reactions/spec label transitions as needed. If the marker exists but the outcome/review-state combination does not satisfy this run, ignore it and publish the correct review for this run instead."
 	freshnessInstruction := "Before posting, use `gh` to confirm the PR is still open. Clean/APPROVE reviews require the head SHA to still match the expected head SHA; if it changed, do not post a clean review and exit non-zero with the exact message `PR head changed before publish`. For actionable inline findings, submit for the seeded commit through the trusted wrapper (which allows an additive commit that did not touch commented files and rejects overlapping or force-pushed heads); if the wrapper rejects for head drift, exit non-zero with the exact message `PR head changed before publish`."
@@ -10726,9 +10731,9 @@ func buildReviewPromptForPairMode(projectID string, instructionConfig config.Con
 	}
 	if forgejoNative {
 		githubOperationContract = fmt.Sprintf("Forgejo operation contract: submit exactly one native PR review for this run through the trusted Looper CLI at %s, with review JSON on stdin. The wrapper validates the expected head, current review request, content safety, provider capability, and idempotency marker before it calls Forgejo. Do not call the Forgejo review API directly.", actionableReviewSubmitCommand)
-		submitPayloadInstruction = fmt.Sprintf("When submitting through `%s review submit`, pass stdin JSON with `body` and optional `comments` entries using `path`, `line`, `side` (`RIGHT` for new lines, `LEFT` for old lines), `body`, plus Looper-only `disposition=must_fix`, `scopeBasis`, and `scopeEvidence`; the wrapper validates those fields, rejects `follow_up`/`needs_human` in comments or the visible review body, then maps anchors to Forgejo and strips Looper-only fields before the provider call.", looperCLICommand)
+		submitPayloadInstruction = fmt.Sprintf("When submitting through `%s review submit`, pass stdin JSON with `body` and optional `comments` entries using `path`, `line`, `side` (`RIGHT` for new lines, `LEFT` for old lines), `body`, plus Looper-only `disposition=must_fix` and optional `scopeBasis`/`scopeEvidence`; the wrapper validates `disposition`, rejects `follow_up`/`needs_human` in comments or the visible review body, then maps anchors to Forgejo and strips Looper-only fields before the provider call.", looperCLICommand)
 		if !reviewFixPairActive {
-			submitPayloadInstruction = fmt.Sprintf("When submitting through `%s review submit`, pass stdin JSON with `body` and optional `comments` entries using `path`, `line`, `side` (`RIGHT` for new lines, `LEFT` for old lines), `body`, plus Looper-only `disposition` (`must_fix` or `needs_human`), `scopeBasis`, and `scopeEvidence`; the wrapper validates those fields, rejects `follow_up` in comments or the visible review body, then maps anchors to Forgejo and strips Looper-only fields before the provider call.", looperCLICommand)
+			submitPayloadInstruction = fmt.Sprintf("When submitting through `%s review submit`, pass stdin JSON with `body` and optional `comments` entries using `path`, `line`, `side` (`RIGHT` for new lines, `LEFT` for old lines), `body`, plus Looper-only `disposition` (`must_fix` or `needs_human`) and optional `scopeBasis`/`scopeEvidence`; the wrapper validates `disposition`, rejects `follow_up` in comments or the visible review body, then maps anchors to Forgejo and strips Looper-only fields before the provider call.", looperCLICommand)
 		}
 		idempotencyInstruction = "Idempotency requirement: submit only through the trusted Looper wrapper. The wrapper lists existing native Forgejo reviews and reuses an exact id/head/outcome/state marker match; after the agent exits, the runner verifies the same marker before recording publication. Never call the Forgejo review endpoint directly."
 		freshnessInstruction = "Before posting, rely on the trusted Looper wrapper to confirm the Forgejo PR is still open and enforce head freshness (exact head match for clean/APPROVE reviews; additive-disjoint head safety for actionable inline findings). If it reports drift, exit non-zero with the exact message `PR head changed before publish`."
@@ -10747,11 +10752,11 @@ func buildReviewPromptForPairMode(projectID string, instructionConfig config.Con
 	if laterPass {
 		reviewPassContract = "Review pass contract (later pass / repair frontier): complete the repair-frontier inspection before publishing. Do not perform a full first-pass rescan of untouched original diff merely to invent ordinary P2/P3 work. Collect unresolved prior must_fix threads, the last-reviewed-head→current-head delta, directly affected call sites/contracts/tests/lifecycle invariants, and Fixer evidence for each prior finding. Do not stop after the first issue within that frontier."
 	}
-	nativeDispositionContract := "Finding disposition contract: every candidate uses disposition must_fix|follow_up|needs_human, severity blocking|non_blocking|nit, scopeBasis (stated_intent|introduced_regression|required_invariant|independent_improvement|ambiguous_intent), scopeEvidence (specific repository rule, PR goal/non-goal, linked spec section, or regression evidence), path/line, problem, why, and suggestedChange. Emit the full candidate list in `__LOOPER_RESULT__.findings` — Looper parses this JSON. Only must_fix may be submitted through `looper review submit` as remote actionable feedback. Retain follow_up in structured completion only — do not submit follow_up as review comments. For needs_human, do not submit change-request comments; include them in `__LOOPER_RESULT__.findings` so Looper can park the pair for human judgment. Actionable/blocking reviews must carry must_fix as inline comments, not body-only prose."
-	finalizationGateInstruction := "Finalization gate before submit: verify that the scoped changed files/ranges were reviewed, all observed in-scope must_fix findings are included in this publication, repeated patterns are consolidated only for a shared root cause, non-blocking/nit feedback is not escalated, every published comment has disposition=must_fix with scopeBasis/scopeEvidence plus concrete evidence and a suggested fix, and the review outcome matches the highest published severity."
+	nativeDispositionContract := "Finding disposition contract: every candidate uses disposition must_fix|follow_up|needs_human, severity blocking|non_blocking|nit, optional scopeBasis (stated_intent|introduced_regression|required_invariant|independent_improvement|ambiguous_intent) and scopeEvidence, path/line, problem, why, and suggestedChange. Emit the full candidate list in `__LOOPER_RESULT__.findings` — Looper parses this JSON. Only must_fix may be submitted through `looper review submit` as remote actionable feedback. Retain follow_up in structured completion only — do not submit follow_up as review comments. For needs_human, do not submit change-request comments; include them in `__LOOPER_RESULT__.findings` so Looper can park the pair for human judgment. Actionable/blocking reviews must carry must_fix as inline comments, not body-only prose."
+	finalizationGateInstruction := "Finalization gate before submit: verify that the scoped changed files/ranges were reviewed, all observed in-scope must_fix findings are included in this publication, repeated patterns are consolidated only for a shared root cause, non-blocking/nit feedback is not escalated, and every published comment has disposition=must_fix plus concrete evidence and a suggested fix (Looper reconciles outcome from published severities)."
 	if !reviewFixPairActive {
-		nativeDispositionContract = "Finding disposition contract: every candidate uses disposition must_fix|follow_up|needs_human, severity blocking|non_blocking|nit, scopeBasis (stated_intent|introduced_regression|required_invariant|independent_improvement|ambiguous_intent), scopeEvidence (specific repository rule, PR goal/non-goal, linked spec section, or regression evidence), path/line, problem, why, and suggestedChange. Emit the full candidate list in `__LOOPER_RESULT__.findings` — Looper parses this JSON. In standalone reviewer mode (no active Fixer), submit both must_fix and needs_human through `looper review submit` as inline review comments so the PR author sees human-judgment questions directly on the PR. Retain follow_up in structured completion only — do not submit follow_up as review comments. Actionable/blocking reviews must carry findings as inline comments, not body-only prose."
-		finalizationGateInstruction = "Finalization gate before submit: verify that the scoped changed files/ranges were reviewed, all observed in-scope must_fix and needs_human findings are included in this publication, repeated patterns are consolidated only for a shared root cause, non-blocking/nit feedback is not escalated, every published comment has disposition=must_fix or disposition=needs_human with scopeBasis/scopeEvidence plus concrete evidence and a suggested fix, and the review outcome matches the highest published severity."
+		nativeDispositionContract = "Finding disposition contract: every candidate uses disposition must_fix|follow_up|needs_human, severity blocking|non_blocking|nit, optional scopeBasis (stated_intent|introduced_regression|required_invariant|independent_improvement|ambiguous_intent) and scopeEvidence, path/line, problem, why, and suggestedChange. Emit the full candidate list in `__LOOPER_RESULT__.findings` — Looper parses this JSON. In standalone reviewer mode (no active Fixer), submit both must_fix and needs_human through `looper review submit` as inline review comments so the PR author sees human-judgment questions directly on the PR. Retain follow_up in structured completion only — do not submit follow_up as review comments. Actionable/blocking reviews must carry findings as inline comments, not body-only prose."
+		finalizationGateInstruction = "Finalization gate before submit: verify that the scoped changed files/ranges were reviewed, all observed in-scope must_fix and needs_human findings are included in this publication, repeated patterns are consolidated only for a shared root cause, non-blocking/nit feedback is not escalated, and every published comment has disposition=must_fix or disposition=needs_human plus concrete evidence and a suggested fix (Looper reconciles outcome from published severities)."
 	}
 	parts = append(parts,
 		idempotencyInstruction,
