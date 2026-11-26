@@ -150,7 +150,19 @@ func (gateway forgejoReviewSubmitGateway) ViewPullRequest(ctx context.Context, i
 	if err != nil {
 		return githubinfra.PullRequestDetail{}, err
 	}
-	return githubinfra.PullRequestDetail{Number: pr.Number, Title: pr.Title, Body: pr.Body, URL: pr.HTMLURL, State: pr.State, IsDraft: pr.IsDraft, Labels: forgeReviewSubmitLabelNames(pr.Labels), HeadRefName: pr.Head.Name, BaseRefName: pr.Base.Name, HeadSHA: pr.Head.SHA, BaseSHA: pr.Base.SHA, Author: pr.User.Login}, nil
+	hasConflicts := false
+	if pr.Mergeable != nil && !*pr.Mergeable && strings.EqualFold(strings.TrimSpace(pr.State), "open") {
+		// Forgejo's mergeable=false also represents asynchronous CHECKING state
+		// right after pushes; verify actual conflicts via git merge-tree.
+		if gateway.localGit == nil {
+			hasConflicts = true
+		} else if conflicted, mergeErr := gateway.localGit.HasLocalMergeConflicts(ctx, input.CWD, pr.Base.SHA, pr.Base.Name, pr.Head.SHA, pr.Head.Name); mergeErr != nil {
+			hasConflicts = true
+		} else {
+			hasConflicts = conflicted
+		}
+	}
+	return githubinfra.PullRequestDetail{Number: pr.Number, Title: pr.Title, Body: pr.Body, URL: pr.HTMLURL, State: pr.State, IsDraft: pr.IsDraft, Labels: forgeReviewSubmitLabelNames(pr.Labels), HeadRefName: pr.Head.Name, BaseRefName: pr.Base.Name, HeadSHA: pr.Head.SHA, BaseSHA: pr.Base.SHA, HasConflicts: hasConflicts, Author: pr.User.Login}, nil
 }
 
 func (gateway forgejoReviewSubmitGateway) GetCurrentUserLogin(ctx context.Context, _ string) (string, error) {
@@ -525,7 +537,7 @@ func (r *commandRuntime) reviewSubmit(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("refresh pull request before review submit: %w", err)
 	}
-	if err := validateExpectedHeadCommit(commitID, detail.HeadSHA); err != nil {
+	if err := validateReviewSubmitHeadCommit(cmd.Context(), reviewSubmitGitPath(loaded.Config), cwd, commitID, detail, event, payload.Comments); err != nil {
 		return err
 	}
 	// Review-request publish bypass for Forgejo is derived from trusted
@@ -575,7 +587,7 @@ func (r *commandRuntime) reviewSubmit(cmd *cobra.Command, args []string) error {
 	}
 
 	// Fail closed on base/head drift between anchor resolution and mutation.
-	freshLabels, err := r.validateLatestReviewerReviewSubmitPublication(cmd, gateway, loaded.Config, repo, prNumber, commitID, detail.BaseSHA, getBoolFlag(cmd, "reviewer-manual"), getStringFlag(cmd, "reviewer-run-id"), cwd)
+	freshLabels, err := r.validateLatestReviewerReviewSubmitPublicationWithComments(cmd, gateway, loaded.Config, repo, prNumber, commitID, detail.BaseSHA, event, payload.Comments, getBoolFlag(cmd, "reviewer-manual"), getStringFlag(cmd, "reviewer-run-id"), cwd)
 	if err != nil {
 		return err
 	}
@@ -974,15 +986,61 @@ func (r *commandRuntime) validateLatestReviewerReviewSubmitHold(cmd *cobra.Comma
 	return detail.Labels, nil
 }
 
+func reviewSubmitGitPath(cfg config.Config) string {
+	if cfg.Tools.GitPath != nil && strings.TrimSpace(*cfg.Tools.GitPath) != "" {
+		return strings.TrimSpace(*cfg.Tools.GitPath)
+	}
+	return "git"
+}
+
+func reviewSubmitCommentPaths(comments []reviewSubmitComment) []string {
+	paths := make([]string, 0, len(comments))
+	for _, comment := range comments {
+		paths = append(paths, comment.Path)
+	}
+	return paths
+}
+
+// validateReviewSubmitHeadCommit enforces head-commit freshness. Exact head
+// match is always required for APPROVE and body-only (clean) reviews. For
+// actionable inline reviews (COMMENT/REQUEST_CHANGES with non-empty comments),
+// an additive ancestor head is permitted only when the PR is still OPEN and
+// mergeable and git proves oldHead..liveHead touched zero commented paths.
+func validateReviewSubmitHeadCommit(ctx context.Context, gitPath, cwd, expected string, detail githubinfra.PullRequestDetail, event string, comments []reviewSubmitComment) error {
+	err := validateExpectedHeadCommit(expected, detail.HeadSHA)
+	if err == nil {
+		return nil
+	}
+	if strings.EqualFold(strings.TrimSpace(event), "APPROVE") || len(comments) == 0 {
+		return err
+	}
+	if !strings.EqualFold(strings.TrimSpace(detail.State), "OPEN") {
+		return err
+	}
+	if detail.HasConflicts {
+		return err
+	}
+	disjoint, gitErr := githubinfra.HeadAdvanceDisjointFromPaths(ctx, gitPath, cwd, expected, detail.HeadSHA, detail.HeadRefName, reviewSubmitCommentPaths(comments))
+	if gitErr != nil || !disjoint {
+		return err
+	}
+	return nil
+}
+
 // validateLatestReviewerReviewSubmitPublication re-reads the PR before mutation
 // and fails closed on head/base drift plus hold labels. Refreshed labels are
 // returned so Forgejo publish authority uses the latest snapshot.
 func (r *commandRuntime) validateLatestReviewerReviewSubmitPublication(cmd *cobra.Command, gh reviewSubmitPullRequestViewer, cfg config.Config, repo string, prNumber int64, commitID string, expectedBaseSHA string, manual bool, runID string, cwd string) ([]string, error) {
+	return r.validateLatestReviewerReviewSubmitPublicationWithComments(cmd, gh, cfg, repo, prNumber, commitID, expectedBaseSHA, "", nil, manual, runID, cwd)
+}
+
+func (r *commandRuntime) validateLatestReviewerReviewSubmitPublicationWithComments(cmd *cobra.Command, gh reviewSubmitPullRequestViewer, cfg config.Config, repo string, prNumber int64, commitID string, expectedBaseSHA string, event string, comments []reviewSubmitComment, manual bool, runID string, cwd string) ([]string, error) {
 	detail, err := gh.ViewPullRequest(cmd.Context(), githubinfra.ViewPullRequestInput{Repo: repo, PRNumber: prNumber, CWD: cwd})
 	if err != nil {
 		return nil, fmt.Errorf("refresh pull request before review publish: %w", err)
 	}
-	if err := validateExpectedHeadCommit(commitID, detail.HeadSHA); err != nil {
+	gitPath := reviewSubmitGitPath(cfg)
+	if err := validateReviewSubmitHeadCommit(cmd.Context(), gitPath, cwd, commitID, detail, event, comments); err != nil {
 		return nil, err
 	}
 	if err := validateExpectedBaseCommit(expectedBaseSHA, detail.BaseSHA); err != nil {
@@ -1003,7 +1061,7 @@ func (r *commandRuntime) validateLatestReviewerReviewSubmitPublication(cmd *cobr
 		if run == nil || run.CheckpointJSON == nil {
 			return nil, fmt.Errorf("sandbox review %s has no saved PR context", runID)
 		}
-		if err := validateSandboxReviewTarget(*run.CheckpointJSON, detail); err != nil {
+		if err := validateSandboxReviewTargetWithComments(cmd.Context(), gitPath, cwd, *run.CheckpointJSON, detail, event, comments); err != nil {
 			return nil, err
 		}
 	}
@@ -1015,6 +1073,10 @@ func (r *commandRuntime) validateLatestReviewerReviewSubmitPublication(cmd *cobr
 
 // The personal-account sandbox cannot query GitHub to repeat this check itself.
 func validateSandboxReviewTarget(checkpoint string, live githubinfra.PullRequestDetail) error {
+	return validateSandboxReviewTargetWithComments(context.Background(), "", "", checkpoint, live, "", nil)
+}
+
+func validateSandboxReviewTargetWithComments(ctx context.Context, gitPath, cwd, checkpoint string, live githubinfra.PullRequestDetail, event string, comments []reviewSubmitComment) error {
 	var seed struct {
 		Detail *struct {
 			BaseRefName string
@@ -1028,7 +1090,7 @@ func validateSandboxReviewTarget(checkpoint string, live githubinfra.PullRequest
 	if seed.Snapshot == nil || seed.Detail == nil || seed.Snapshot.BaseSHA == "" || seed.Detail.BaseRefName == "" {
 		return fmt.Errorf("sandbox review PR context is incomplete")
 	}
-	if err := validateExpectedHeadCommit(seed.Snapshot.HeadSHA, live.HeadSHA); err != nil {
+	if err := validateReviewSubmitHeadCommit(ctx, gitPath, cwd, seed.Snapshot.HeadSHA, live, event, comments); err != nil {
 		return err
 	}
 	if !strings.EqualFold(live.State, "OPEN") || live.IsDraft != seed.Detail.IsDraft || live.BaseRefName != seed.Detail.BaseRefName || live.BaseSHA != seed.Snapshot.BaseSHA {
