@@ -196,3 +196,62 @@ func TestHasLocalMergeConflictsDistinguishesCleanMergeFromRealConflict(t *testin
 		t.Fatalf("HasLocalMergeConflicts(conflict) = (%v, %v), want (true, nil)", conflicted, err)
 	}
 }
+
+func TestBaseAdvanceRejectsAmbiguousCrissCrossMergeBases(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	runGitForBaseDriftTest(t, dir, "init", "-b", "main")
+	runGitForBaseDriftTest(t, dir, "config", "user.name", "Test")
+	runGitForBaseDriftTest(t, dir, "config", "user.email", "test@example.com")
+
+	if err := os.WriteFile(filepath.Join(dir, "f.txt"), []byte("root\n"), 0o644); err != nil {
+		t.Fatalf("write root: %v", err)
+	}
+	runGitForBaseDriftTest(t, dir, "add", "f.txt")
+	runGitForBaseDriftTest(t, dir, "commit", "-m", "root")
+	rootSHA := runGitForBaseDriftTest(t, dir, "rev-parse", "HEAD")
+
+	// Branch A
+	runGitForBaseDriftTest(t, dir, "checkout", "-b", "a", rootSHA)
+	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("a\n"), 0o644); err != nil {
+		t.Fatalf("write a: %v", err)
+	}
+	runGitForBaseDriftTest(t, dir, "add", "a.txt")
+	runGitForBaseDriftTest(t, dir, "commit", "-m", "commit A")
+	aSHA := runGitForBaseDriftTest(t, dir, "rev-parse", "HEAD")
+
+	// Branch B
+	runGitForBaseDriftTest(t, dir, "checkout", "-b", "b", rootSHA)
+	if err := os.WriteFile(filepath.Join(dir, "b.txt"), []byte("b\n"), 0o644); err != nil {
+		t.Fatalf("write b: %v", err)
+	}
+	runGitForBaseDriftTest(t, dir, "add", "b.txt")
+	runGitForBaseDriftTest(t, dir, "commit", "-m", "commit B")
+	bSHA := runGitForBaseDriftTest(t, dir, "rev-parse", "HEAD")
+
+	// oldBase merges A and B; head merges B and A (two merge-bases: A and B).
+	runGitForBaseDriftTest(t, dir, "checkout", "-b", "old-base", aSHA)
+	runGitForBaseDriftTest(t, dir, "merge", "--no-ff", "-m", "oldBase(A,B)", bSHA)
+	oldBase := runGitForBaseDriftTest(t, dir, "rev-parse", "HEAD")
+
+	runGitForBaseDriftTest(t, dir, "checkout", "-b", "pr-head", bSHA)
+	runGitForBaseDriftTest(t, dir, "merge", "--no-ff", "-m", "head(B,A)", aSHA)
+	headSHA := runGitForBaseDriftTest(t, dir, "rev-parse", "HEAD")
+
+	// newBase advances old-base with an extra commit; merge-base --all against head still returns {A, B}.
+	runGitForBaseDriftTest(t, dir, "checkout", "old-base")
+	if err := os.WriteFile(filepath.Join(dir, "extra.txt"), []byte("extra\n"), 0o644); err != nil {
+		t.Fatalf("write extra: %v", err)
+	}
+	runGitForBaseDriftTest(t, dir, "add", "extra.txt")
+	runGitForBaseDriftTest(t, dir, "commit", "-m", "newBase")
+	newBase := runGitForBaseDriftTest(t, dir, "rev-parse", "HEAD")
+
+	preserved, err := BaseAdvancePreservesMergeBase(context.Background(), "git", dir, oldBase, newBase, headSHA, "main")
+	if err != nil {
+		t.Fatalf("BaseAdvancePreservesMergeBase() error = %v", err)
+	}
+	if preserved {
+		t.Fatal("BaseAdvancePreservesMergeBase() = true, want false for ambiguous criss-cross merge bases")
+	}
+}

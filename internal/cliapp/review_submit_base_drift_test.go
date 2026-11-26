@@ -115,6 +115,16 @@ func TestValidateLatestReviewerReviewSubmitPublicationBaseDriftSemantics(t *test
 		}
 	})
 
+	t.Run("rejects_base_branch_retarget_even_when_merge_base_matches", func(t *testing.T) {
+		gh := &reviewSubmitFakePRViewer{detail: githubinfra.PullRequestDetail{
+			Number: 42, State: "OPEN", BaseRefName: "release", HeadSHA: headSHA, BaseSHA: unrelatedNewBase,
+		}}
+		_, err := runtime.validateLatestReviewerReviewSubmitPublicationWithBaseRef(cmd, gh, config.Config{}, "acme/looper", 42, headSHA, oldBase, "main", false, "", workDir)
+		if err == nil || !strings.Contains(err.Error(), "PR base branch changed before publish") {
+			t.Fatalf("error = %v, want base branch retarget rejection", err)
+		}
+	})
+
 	t.Run("rejects_base_advance_when_merge_base_shifts", func(t *testing.T) {
 		gh := &reviewSubmitFakePRViewer{detail: githubinfra.PullRequestDetail{
 			Number: 42, State: "OPEN", BaseRefName: "main-shifted", HeadSHA: headSHA, BaseSHA: shiftedNewBase,

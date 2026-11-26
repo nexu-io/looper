@@ -587,7 +587,7 @@ func (r *commandRuntime) reviewSubmit(cmd *cobra.Command, args []string) error {
 	}
 
 	// Fail closed on base/head drift between anchor resolution and mutation.
-	freshLabels, err := r.validateLatestReviewerReviewSubmitPublication(cmd, gateway, loaded.Config, repo, prNumber, commitID, detail.BaseSHA, getBoolFlag(cmd, "reviewer-manual"), getStringFlag(cmd, "reviewer-run-id"), cwd)
+	freshLabels, err := r.validateLatestReviewerReviewSubmitPublicationWithBaseRef(cmd, gateway, loaded.Config, repo, prNumber, commitID, detail.BaseSHA, detail.BaseRefName, getBoolFlag(cmd, "reviewer-manual"), getStringFlag(cmd, "reviewer-run-id"), cwd)
 	if err != nil {
 		return err
 	}
@@ -997,6 +997,10 @@ func reviewSubmitGitPath(cfg config.Config) string {
 // and fails closed on head/base drift plus hold labels. Refreshed labels are
 // returned so Forgejo publish authority uses the latest snapshot.
 func (r *commandRuntime) validateLatestReviewerReviewSubmitPublication(cmd *cobra.Command, gh reviewSubmitPullRequestViewer, cfg config.Config, repo string, prNumber int64, commitID string, expectedBaseSHA string, manual bool, runID string, cwd string) ([]string, error) {
+	return r.validateLatestReviewerReviewSubmitPublicationWithBaseRef(cmd, gh, cfg, repo, prNumber, commitID, expectedBaseSHA, "", manual, runID, cwd)
+}
+
+func (r *commandRuntime) validateLatestReviewerReviewSubmitPublicationWithBaseRef(cmd *cobra.Command, gh reviewSubmitPullRequestViewer, cfg config.Config, repo string, prNumber int64, commitID string, expectedBaseSHA string, expectedBaseRefName string, manual bool, runID string, cwd string) ([]string, error) {
 	detail, err := gh.ViewPullRequest(cmd.Context(), githubinfra.ViewPullRequestInput{Repo: repo, PRNumber: prNumber, CWD: cwd})
 	if err != nil {
 		return nil, fmt.Errorf("refresh pull request before review publish: %w", err)
@@ -1004,12 +1008,17 @@ func (r *commandRuntime) validateLatestReviewerReviewSubmitPublication(cmd *cobr
 	if err := validateExpectedHeadCommit(commitID, detail.HeadSHA); err != nil {
 		return nil, err
 	}
+	expectedBaseRefName = strings.TrimSpace(expectedBaseRefName)
+	liveBaseRefName := strings.TrimSpace(detail.BaseRefName)
+	if expectedBaseRefName != "" && liveBaseRefName != "" && expectedBaseRefName != liveBaseRefName {
+		return nil, fmt.Errorf("PR base branch changed before publish: expected %s, got %s", expectedBaseRefName, liveBaseRefName)
+	}
 	gitPath := reviewSubmitGitPath(cfg)
 	if err := validateExpectedBaseCommit(expectedBaseSHA, detail.BaseSHA); err != nil {
-		if detail.HasConflicts {
+		if detail.HasConflicts || (expectedBaseRefName != "" && liveBaseRefName == "") {
 			return nil, err
 		}
-		preserved, mbErr := githubinfra.BaseAdvancePreservesMergeBase(cmd.Context(), gitPath, cwd, expectedBaseSHA, detail.BaseSHA, commitID, detail.BaseRefName)
+		preserved, mbErr := githubinfra.BaseAdvancePreservesMergeBase(cmd.Context(), gitPath, cwd, expectedBaseSHA, detail.BaseSHA, commitID, liveBaseRefName)
 		if mbErr != nil || !preserved {
 			return nil, err
 		}

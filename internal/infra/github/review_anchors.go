@@ -211,19 +211,14 @@ func BaseAdvancePreservesMergeBase(ctx context.Context, gitPath, cwd, oldBaseSHA
 		return false, err
 	}
 	oldMergeBases, err := gateway.sortedMergeBases(ctx, cwd, oldBaseSHA, headSHA)
-	if err != nil || len(oldMergeBases) == 0 {
+	if err != nil || len(oldMergeBases) != 1 {
 		return false, err
 	}
 	newMergeBases, err := gateway.sortedMergeBases(ctx, cwd, newBaseSHA, headSHA)
-	if err != nil || len(newMergeBases) != len(oldMergeBases) {
+	if err != nil || len(newMergeBases) != 1 {
 		return false, err
 	}
-	for i := range oldMergeBases {
-		if !strings.EqualFold(oldMergeBases[i], newMergeBases[i]) {
-			return false, nil
-		}
-	}
-	return true, nil
+	return strings.EqualFold(oldMergeBases[0], newMergeBases[0]), nil
 }
 
 func (g *Gateway) sortedMergeBases(ctx context.Context, cwd, baseSHA, headSHA string) ([]string, error) {
