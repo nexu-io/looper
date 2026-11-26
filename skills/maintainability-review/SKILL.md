@@ -47,7 +47,7 @@ Use the existing structured output and concise comment format. Include the six e
 - A real defect, broken necessary contract, or mandatory-rule violation introduced by this PR is `must_fix`; determine severity and P0–P3 priority from demonstrated impact. It may block only with concrete impact evidence.
 - A supported, in-scope maintainability issue that is safe to merge is `must_fix` with `severity=non_blocking`; publish as COMMENT through the existing controlled entry point. `must_fix` means this PR should address it, not that it blocks merging.
 - Independent refactors, unrelated historical debt, and future extensions are `follow_up`: retain them only in structured results, not in actionable remote comments or the visible review body.
-- Conflicting requirement intent or design decisions are `needs_human`: use the existing human-decision flow, not a remote modification request.
+- Conflicting requirement intent or design decisions are `needs_human`: in review-fix pair mode, use the human-decision hold flow rather than a remote modification request; in standalone reviewer mode (no active Fixer), surface them directly on the PR as `needs_human` comments so the human author sees the tradeoff.
 - Ordinary style preferences, optional simplifications, and code length alone never justify blocking. Do not inflate priority to justify a maintainability comment.
 
 The Fixer independently evaluates repository rules and PR intent. A suggested abstraction does not authorize it to expand scope.

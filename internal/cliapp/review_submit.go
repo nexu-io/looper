@@ -538,7 +538,12 @@ func (r *commandRuntime) reviewSubmit(cmd *cobra.Command, args []string) error {
 	if err := r.validateReviewerReviewSubmitHold(cmd, loaded.Config, repo, prNumber, getBoolFlag(cmd, "reviewer-manual"), getStringFlag(cmd, "reviewer-run-id"), detail.Labels); err != nil {
 		return err
 	}
-	if err := validateReviewSubmitBody(payload.Body, payload.Comments, commitID, event, policy, detail.Author); err != nil {
+	pairActive, err := reviewSubmitIsReviewFixPairActive(cmd.Context(), loaded.Config, repo, prNumber, cwd)
+	if err != nil {
+		return err
+	}
+	allowNeedsHuman := !pairActive
+	if err := validateReviewSubmitBodyWithOptions(payload.Body, payload.Comments, commitID, event, policy, detail.Author, allowNeedsHuman); err != nil {
 		// Always redact paths on pre-gate validation diagnostics: a malformed
 		// marker or APPROVE-with-comments path never reaches SubmitReview's
 		// content guard, and path may itself be secret-shaped.
@@ -547,7 +552,7 @@ func (r *commandRuntime) reviewSubmit(cmd *cobra.Command, args []string) error {
 		})
 		return err
 	}
-	if err := validateReviewSubmitCommentDispositions(payload.Comments); err != nil {
+	if err := validateReviewSubmitCommentDispositionsWithOptions(payload.Comments, allowNeedsHuman); err != nil {
 		writeReviewSubmitDiagnostic(cmd.ErrOrStderr(), "github_review_submit_validation_failed", reviewSubmitDiagnosticFields{
 			Repo: repo, PRNumber: prNumber, Event: event, CommitID: commitID, Payload: payload, Error: err.Error(), RedactPaths: true,
 		})
@@ -773,8 +778,56 @@ var reviewSubmitMarkerRE = regexp.MustCompile(`<!--\s*looper:review\s+([^>]*)-->
 var markdownHTMLCommentRE = regexp.MustCompile(`(?s)<!--.*?-->`)
 var markdownReferenceDefinitionRE = regexp.MustCompile(`(?m)^\s{0,3}\[[^\]\n]+\]:[^\n]*(?:\n[ \t]+[^\n]*)*`)
 var reviewSubmitSuppressedFindingRE = regexp.MustCompile(`(?i)\b(?:follow_up|needs_human)\b`)
+var reviewSubmitFollowUpOnlyRE = regexp.MustCompile(`(?i)\bfollow_up\b`)
+
+// reviewSubmitIsReviewFixPairActive reports whether the target PR operates as a
+// review-fix pair (Fixer auto-discovery enabled for the matched project, or an
+// active non-terminal Fixer loop exists for this PR in storage). When false
+// (standalone reviewer mode), needs_human findings may be surfaced directly on
+// the PR so human authors see them without stalling the loop.
+func reviewSubmitIsReviewFixPairActive(ctx context.Context, cfg config.Config, repo string, prNumber int64, cwd string) (bool, error) {
+	projectID := ""
+	if resolved, ok := hostingidentity.FromContext(ctx); ok {
+		projectID = strings.TrimSpace(resolved.ProjectID())
+	}
+	matched, err := reviewSubmitProjectForRepo(cfg, repo, cwd)
+	if err != nil {
+		return true, err
+	}
+	if matched != nil && projectID == "" {
+		projectID = strings.TrimSpace(matched.ID)
+	}
+	roleCfg := reviewSubmitConfigWithMatchedProject(cfg, matched)
+	if config.ProjectRoleAutoDiscoveryEnabled(roleCfg, projectID, "fixer") {
+		return true, nil
+	}
+	dbPath := strings.TrimSpace(cfg.Storage.DBPath)
+	if dbPath == "" {
+		return false, nil
+	}
+	if _, err := os.Stat(dbPath); err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return true, fmt.Errorf("check review-fix pair state: %w", err)
+	}
+	db, err := storage.OpenSQLiteDB(ctx, dbPath)
+	if err != nil {
+		return true, fmt.Errorf("check review-fix pair state: %w", err)
+	}
+	defer func() { _ = db.Close() }()
+	all, err := storage.NewRepositories(db).Loops.List(ctx)
+	if err != nil {
+		return true, fmt.Errorf("check review-fix pair state: %w", err)
+	}
+	return loops.HasActiveFixerLoopForPR(all, projectID, repo, prNumber), nil
+}
 
 func validateReviewSubmitBody(body string, comments []reviewSubmitComment, commitID string, event string, policy config.ReviewerReviewEventsConfig, authorLogin string) error {
+	return validateReviewSubmitBodyWithOptions(body, comments, commitID, event, policy, authorLogin, false)
+}
+
+func validateReviewSubmitBodyWithOptions(body string, comments []reviewSubmitComment, commitID string, event string, policy config.ReviewerReviewEventsConfig, authorLogin string, allowNeedsHuman bool) error {
 	matches := reviewSubmitMarkerRE.FindAllStringSubmatch(body, -1)
 	if len(matches) != 1 {
 		return fmt.Errorf("review body must contain exactly one well-formed looper review marker")
@@ -813,7 +866,7 @@ func validateReviewSubmitBody(body string, comments []reviewSubmitComment, commi
 		if outcome == "blocking" && policy.Blocking == config.ReviewerReviewEventRequestChanges {
 			return fmt.Errorf("review marker outcome=blocking requires REQUEST_CHANGES under effective policy")
 		}
-		// Clean COMMENT is body-only (same as APPROVE); inline comments imply must_fix.
+		// Clean COMMENT is body-only (same as APPROVE); inline comments imply actionable feedback.
 		if outcome == "clean" && len(comments) > 0 {
 			return fmt.Errorf("COMMENT reviews require clean outcome without inline comments")
 		}
@@ -822,14 +875,27 @@ func validateReviewSubmitBody(body string, comments []reviewSubmitComment, commi
 			return fmt.Errorf("actionable COMMENT reviews require at least one inline comment; body-only reviews may only be clean COMMENT/APPROVE")
 		}
 	}
-	return validateReviewSubmitBodyHasNoSuppressedFindings(body)
+	return validateReviewSubmitBodyHasNoSuppressedFindingsWithOptions(body, allowNeedsHuman)
 }
 
 // validateReviewSubmitBodyHasNoSuppressedFindings fail-closes when visible
-// review prose smuggles follow_up/needs_human findings. Spec 7.3 allows a
-// must_fix summary in the body; it does not allow suppressed dispositions.
+// review prose smuggles suppressed findings. In review-fix pair mode, both
+// follow_up and needs_human are suppressed; in standalone reviewer mode (no
+// active Fixer), only follow_up is suppressed so human judgment items can be
+// surfaced directly on the PR.
 func validateReviewSubmitBodyHasNoSuppressedFindings(body string) error {
-	if reviewSubmitSuppressedFindingRE.FindString(cleanReviewHumanBody(body)) == "" {
+	return validateReviewSubmitBodyHasNoSuppressedFindingsWithOptions(body, false)
+}
+
+func validateReviewSubmitBodyHasNoSuppressedFindingsWithOptions(body string, allowNeedsHuman bool) error {
+	visible := cleanReviewHumanBody(body)
+	if allowNeedsHuman {
+		if reviewSubmitFollowUpOnlyRE.FindString(visible) == "" {
+			return nil
+		}
+		return fmt.Errorf("review body must not include follow_up findings; only must_fix and needs_human may be published remotely in standalone reviewer mode")
+	}
+	if reviewSubmitSuppressedFindingRE.FindString(visible) == "" {
 		return nil
 	}
 	return fmt.Errorf("review body must not include follow_up or needs_human findings; only must_fix may be published remotely")
@@ -841,9 +907,13 @@ func validateReviewSubmitBodyHasNoSuppressedFindings(body string) error {
 // Authority for publishing a finding as remote review feedback is repository
 // instructions, PR intent, and spec 7.3 — not this gate. The gate fail-closes on
 // the agent's own structured disposition/scope fields so a prompt-only subset
-// cannot publish follow_up/needs_human or omit the declaration; it does not infer
-// disposition from GitHub or other infra state.
+// cannot publish suppressed dispositions or omit the declaration; it does not
+// infer disposition from GitHub or other infra state.
 func validateReviewSubmitCommentDispositions(comments []reviewSubmitComment) error {
+	return validateReviewSubmitCommentDispositionsWithOptions(comments, false)
+}
+
+func validateReviewSubmitCommentDispositionsWithOptions(comments []reviewSubmitComment, allowNeedsHuman bool) error {
 	if len(comments) == 0 {
 		return nil
 	}
@@ -852,14 +922,27 @@ func validateReviewSubmitCommentDispositions(comments []reviewSubmitComment) err
 		scopeBasis := strings.TrimSpace(comment.ScopeBasis)
 		scopeEvidence := strings.TrimSpace(comment.ScopeEvidence)
 		if disposition == "" || scopeBasis == "" || scopeEvidence == "" {
+			if allowNeedsHuman {
+				return fmt.Errorf("actionable review comment %d requires disposition=must_fix|needs_human, non-empty scopeBasis, and non-empty scopeEvidence", i)
+			}
 			return fmt.Errorf("actionable review comment %d requires disposition=must_fix, non-empty scopeBasis, and non-empty scopeEvidence", i)
 		}
 		switch disposition {
 		case reviewFindingDispositionMustFix:
 			// ok
-		case reviewFindingDispositionFollowUp, reviewFindingDispositionNeedsHuman:
+		case reviewFindingDispositionNeedsHuman:
+			if !allowNeedsHuman {
+				return fmt.Errorf("actionable review comment %d rejects disposition=%s; only must_fix may be submitted as remote feedback", i, disposition)
+			}
+		case reviewFindingDispositionFollowUp:
+			if allowNeedsHuman {
+				return fmt.Errorf("actionable review comment %d rejects disposition=%s; only must_fix or needs_human may be submitted as remote feedback", i, disposition)
+			}
 			return fmt.Errorf("actionable review comment %d rejects disposition=%s; only must_fix may be submitted as remote feedback", i, disposition)
 		default:
+			if allowNeedsHuman {
+				return fmt.Errorf("actionable review comment %d has invalid disposition %q (want must_fix or needs_human)", i, disposition)
+			}
 			return fmt.Errorf("actionable review comment %d has invalid disposition %q (want must_fix)", i, disposition)
 		}
 		switch scopeBasis {

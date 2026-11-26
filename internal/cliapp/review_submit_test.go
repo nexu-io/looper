@@ -1854,3 +1854,112 @@ func TestValidateSandboxReviewTarget(t *testing.T) {
 		})
 	}
 }
+
+func TestValidateReviewSubmitStandaloneModeAllowsNeedsHumanAndRejectsFollowUp(t *testing.T) {
+	t.Parallel()
+	needsHumanComment := []reviewSubmitComment{{
+		Body: "Does AGENTS.md require preserving this legacy route?", Path: "app.go", Line: 10, Side: "RIGHT",
+		Disposition: "needs_human", ScopeBasis: "ambiguous_intent", ScopeEvidence: "PR description omits route compatibility requirement",
+	}}
+	if err := validateReviewSubmitCommentDispositionsWithOptions(needsHumanComment, false); err == nil || !strings.Contains(err.Error(), "needs_human") {
+		t.Fatalf("pair mode validateReviewSubmitCommentDispositionsWithOptions(needs_human) = %v, want rejection", err)
+	}
+	if err := validateReviewSubmitCommentDispositionsWithOptions(needsHumanComment, true); err != nil {
+		t.Fatalf("standalone mode validateReviewSubmitCommentDispositionsWithOptions(needs_human) = %v, want nil", err)
+	}
+	missingScope := []reviewSubmitComment{{
+		Body: "Needs human", Path: "app.go", Line: 10, Side: "RIGHT",
+		Disposition: "needs_human",
+	}}
+	if err := validateReviewSubmitCommentDispositionsWithOptions(missingScope, true); err == nil {
+		t.Fatal("standalone mode accepted needs_human without scopeBasis/scopeEvidence")
+	}
+	followUpComment := []reviewSubmitComment{{
+		Body: "Nice to have", Path: "app.go", Line: 10, Side: "RIGHT",
+		Disposition: "follow_up", ScopeBasis: "independent_improvement", ScopeEvidence: "unrelated cleanup",
+	}}
+	if err := validateReviewSubmitCommentDispositionsWithOptions(followUpComment, true); err == nil || !strings.Contains(err.Error(), "follow_up") {
+		t.Fatalf("standalone mode validateReviewSubmitCommentDispositionsWithOptions(follow_up) = %v, want rejection", err)
+	}
+
+	needsHumanBody := "Human judgment required (needs_human) on route compatibility.\n<!-- looper:review id=abc head=def outcome=non_blocking -->"
+	if err := validateReviewSubmitBodyWithOptions(needsHumanBody, needsHumanComment, "def", "COMMENT", commentOnlyReviewPolicy, "octocat", false); err == nil {
+		t.Fatal("pair mode accepted needs_human in visible review body")
+	}
+	if err := validateReviewSubmitBodyWithOptions(needsHumanBody, needsHumanComment, "def", "COMMENT", commentOnlyReviewPolicy, "octocat", true); err != nil {
+		t.Fatalf("standalone mode validateReviewSubmitBodyWithOptions(needs_human) = %v, want nil", err)
+	}
+	followUpBody := "Also a follow_up cleanup.\n<!-- looper:review id=abc head=def outcome=non_blocking -->"
+	if err := validateReviewSubmitBodyWithOptions(followUpBody, needsHumanComment, "def", "COMMENT", commentOnlyReviewPolicy, "octocat", true); err == nil || !strings.Contains(err.Error(), "follow_up") {
+		t.Fatalf("standalone mode validateReviewSubmitBodyWithOptions(follow_up) = %v, want rejection", err)
+	}
+}
+
+func TestReviewSubmitIsReviewFixPairActive(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	dbPath := filepath.Join(root, "looper.sqlite")
+	coordinator, err := storage.OpenSQLiteCoordinator(context.Background(), dbPath, storage.SQLiteCoordinatorOptions{Migrations: storage.EmbeddedMigrations, BackupDir: filepath.Join(root, "backups")})
+	if err != nil {
+		t.Fatalf("OpenSQLiteCoordinator: %v", err)
+	}
+	t.Cleanup(func() { _ = coordinator.Close() })
+	if _, err := coordinator.MigrationRunner().RunPending(context.Background()); err != nil {
+		t.Fatalf("RunPending: %v", err)
+	}
+	repos := storage.NewRepositories(coordinator.DB())
+	now := "2026-11-26T10:00:00.000Z"
+	repo := "acme/looper"
+	prNumber := int64(42)
+	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "p_standalone", Name: "Standalone", RepoPath: root, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Projects.Upsert: %v", err)
+	}
+	falseVal := false
+	cfg, err := config.DefaultConfig(root)
+	if err != nil {
+		t.Fatalf("DefaultConfig: %v", err)
+	}
+	cfg.Storage.DBPath = dbPath
+	cfg.Projects = []config.ProjectRefConfig{{
+		ID: "p_standalone", Name: "Standalone", Repo: repo, RepoPath: root,
+		Roles: &config.PartialRoleConfigs{Fixer: &config.PartialFixerRoleConfig{AutoDiscovery: &falseVal}},
+	}}
+
+	// Project overrides fixer.autoDiscovery=false with no fixer loop -> standalone (false).
+	pairActive, err := reviewSubmitIsReviewFixPairActive(context.Background(), cfg, repo, prNumber, root)
+	if err != nil || pairActive {
+		t.Fatalf("standalone with no fixer loop = (%v, %v), want (false, nil)", pairActive, err)
+	}
+
+	// Historical terminated fixer loop -> still standalone (false).
+	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{
+		ID: "loop_fixer_done", Seq: 1, ProjectID: "p_standalone", Type: "fixer", TargetType: "pull_request",
+		Repo: &repo, PRNumber: &prNumber, Status: "terminated", CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("Loops.Upsert(done): %v", err)
+	}
+	pairActive, err = reviewSubmitIsReviewFixPairActive(context.Background(), cfg, repo, prNumber, root)
+	if err != nil || pairActive {
+		t.Fatalf("standalone with terminated fixer loop = (%v, %v), want (false, nil)", pairActive, err)
+	}
+
+	// Active fixer loop on same PR -> pair mode (true).
+	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{
+		ID: "loop_fixer_active", Seq: 2, ProjectID: "p_standalone", Type: "fixer", TargetType: "pull_request",
+		Repo: &repo, PRNumber: &prNumber, Status: "waiting", CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("Loops.Upsert(active): %v", err)
+	}
+	pairActive, err = reviewSubmitIsReviewFixPairActive(context.Background(), cfg, repo, prNumber, root)
+	if err != nil || !pairActive {
+		t.Fatalf("standalone config with active fixer loop = (%v, %v), want (true, nil)", pairActive, err)
+	}
+
+	// Default config (fixer.autoDiscovery=true) -> pair mode (true).
+	cfgDefault, _ := config.DefaultConfig(root)
+	cfgDefault.Storage.DBPath = filepath.Join(root, "missing.sqlite")
+	pairActive, err = reviewSubmitIsReviewFixPairActive(context.Background(), cfgDefault, "acme/other", prNumber, root)
+	if err != nil || !pairActive {
+		t.Fatalf("default config (fixer autoDiscovery=true) = (%v, %v), want (true, nil)", pairActive, err)
+	}
+}

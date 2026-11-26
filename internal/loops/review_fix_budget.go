@@ -972,6 +972,7 @@ func promotePendingReviewScopeHumanAfterBudgetRelease(ctx context.Context, repos
 			Question:    state.Question,
 			Evidence:    state.Evidence,
 			Signal:      reviewFixHandoffSignal(*fresh),
+			HeadSHA:     state.HeadSHA,
 		}); err != nil {
 			return err
 		}
