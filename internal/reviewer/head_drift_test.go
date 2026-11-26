@@ -525,3 +525,167 @@ func TestRunPublishStepStillMarksStaleOnCleanReviewWhenHeadAdvances(t *testing.T
 		t.Fatalf("result = %#v, want skipped stale on clean review when head advanced", result)
 	}
 }
+
+func TestRunPublishStepHeadAdvanceRecoveryEnforcesPairAwarePublishableCount(t *testing.T) {
+	t.Parallel()
+	const pureNeedsHumanStdout = `__LOOPER_RESULT__={"summary":"Human decision needed","outcome":"non_blocking","findings":[{"title":"[P2] Confirm API compatibility","body":"Spec and caller disagree.","disposition":"needs_human","severity":"non_blocking","scopeBasis":"ambiguous_intent","scopeEvidence":"PR description","path":"app.go","line":3}]}`
+	const mixedFindingsStdout = `__LOOPER_RESULT__={"summary":"Blocking bug plus scope question","outcome":"blocking","findings":[{"title":"[P1] Nil deref","body":"Missing nil guard.","disposition":"must_fix","severity":"blocking","scopeBasis":"introduced_regression","scopeEvidence":"diff","path":"app.go","line":3},{"title":"[P2] Confirm retry cap","body":"Unclear cap.","disposition":"needs_human","severity":"non_blocking","scopeBasis":"ambiguous_intent","scopeEvidence":"AGENTS.md","path":"app.go","line":4}]}`
+	const pairMustFixAndFollowUpStdout = `__LOOPER_RESULT__={"summary":"Blocking bug plus follow-up","outcome":"blocking","findings":[{"title":"[P1] Nil deref","body":"Missing nil guard.","disposition":"must_fix","severity":"blocking","scopeBasis":"introduced_regression","scopeEvidence":"diff","path":"app.go","line":3},{"title":"[P3] Cleanup helper","body":"Unrelated refactor.","disposition":"follow_up","severity":"nit","scopeBasis":"independent_improvement","scopeEvidence":"outside PR","path":"app.go","line":4}]}`
+
+	for _, tc := range []struct {
+		name           string
+		fixerAuto      bool
+		stdout         string
+		markerEvent    ReviewEvent
+		markerOutcome  string
+		inlineComments []string
+		wantRecovered  bool
+	}{
+		{
+			name:           "standalone_pure_needs_human_body_only_rejected",
+			fixerAuto:      false,
+			stdout:         pureNeedsHumanStdout,
+			markerEvent:    ReviewEventComment,
+			markerOutcome:  "non_blocking",
+			inlineComments: nil,
+			wantRecovered:  false,
+		},
+		{
+			name:           "standalone_pure_needs_human_with_inline_recovered",
+			fixerAuto:      false,
+			stdout:         pureNeedsHumanStdout,
+			markerEvent:    ReviewEventComment,
+			markerOutcome:  "non_blocking",
+			inlineComments: []string{"**[P2] Confirm API compatibility**"},
+			wantRecovered:  true,
+		},
+		{
+			name:           "standalone_mixed_missing_needs_human_inline_rejected",
+			fixerAuto:      false,
+			stdout:         mixedFindingsStdout,
+			markerEvent:    ReviewEventRequestChanges,
+			markerOutcome:  "blocking",
+			inlineComments: []string{"**[P1] Nil deref**"},
+			wantRecovered:  false,
+		},
+		{
+			name:           "standalone_mixed_all_publishable_inline_recovered",
+			fixerAuto:      false,
+			stdout:         mixedFindingsStdout,
+			markerEvent:    ReviewEventRequestChanges,
+			markerOutcome:  "blocking",
+			inlineComments: []string{"**[P1] Nil deref**", "**[P2] Confirm retry cap**"},
+			wantRecovered:  true,
+		},
+		{
+			name:           "pair_mode_must_fix_ignores_follow_up_count",
+			fixerAuto:      true,
+			stdout:         pairMustFixAndFollowUpStdout,
+			markerEvent:    ReviewEventRequestChanges,
+			markerOutcome:  "blocking",
+			inlineComments: []string{"**[P1] Nil deref**"},
+			wantRecovered:  true,
+		},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			_, repoDir, baseSHA, oldHead, disjointHead, _, _ := seedReviewerHeadDriftRepo(t)
+			fixture := newRunnerFixture(t)
+			ctx := context.Background()
+
+			baseBranch := "main"
+			if err := fixture.repos.Projects.Upsert(ctx, storage.ProjectRecord{
+				ID: "project_1", Name: "Looper", RepoPath: repoDir, BaseBranch: &baseBranch,
+				CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO(),
+			}); err != nil {
+				t.Fatalf("Projects.Upsert() error = %v", err)
+			}
+
+			cfg := standaloneReviewerTestConfig(t)
+			cfg.Roles.Fixer.AutoDiscovery = tc.fixerAuto
+
+			github := &syncHeadGitHubGateway{
+				fakeGitHubGateway: &fakeGitHubGateway{
+					viewHeadSHA:                     oldHead,
+					viewBaseSHA:                     baseSHA,
+					reviewRequests:                  []string{"octocat"},
+					reviewMarkerEvent:               tc.markerEvent,
+					reviewMarkerOutcome:             tc.markerOutcome,
+					reviewMarkerInlineCommentBodies: tc.inlineComments,
+				},
+				liveHead: oldHead,
+			}
+			agent := &fakeAgentExecutor{
+				results: []AgentResult{{
+					Status:      "completed",
+					Summary:     "Review finished",
+					Stdout:      tc.stdout,
+					ParseStatus: "parsed",
+				}},
+				onStart: func(AgentRunInput) {
+					github.setHead(disjointHead)
+				},
+			}
+			git := &headDriftFakeGitGateway{worktreePath: repoDir, headSHA: oldHead}
+			runner := New(Options{
+				DB:                     fixture.coordinator.DB(),
+				Repos:                  fixture.repos,
+				GitHub:                 github,
+				Git:                    git,
+				AgentExecutor:          agent,
+				Logger:                 fixture.logger,
+				Now:                    fixture.now,
+				CustomInstructions:     &cfg,
+				HeadChangePollInterval: time.Hour,
+				ReviewEvents:           config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventApprove, Blocking: config.ReviewerReviewEventRequestChanges},
+				LoopConfig:             testReviewerLoopConfig(),
+			})
+
+			repo := "acme/looper"
+			prNumber := int64(42)
+			metadata := `{"followUpdates":true,"loop":{"enabled":true}}`
+			loop := storage.LoopRecord{
+				ID: "loop_head_recovery_" + tc.name, Seq: 1, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request",
+				Repo: &repo, PRNumber: &prNumber, Status: "queued", MetadataJSON: &metadata,
+				CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO(),
+			}
+			if err := fixture.repos.Loops.Upsert(ctx, loop); err != nil {
+				t.Fatalf("Loops.Upsert() error = %v", err)
+			}
+			queue, err := runner.enqueue(ctx, enqueueInput{ProjectID: "project_1", LoopID: loop.ID, Repo: repo, PRNumber: prNumber})
+			if err != nil {
+				t.Fatalf("enqueue() error = %v", err)
+			}
+			claimed, err := fixture.repos.Queue.ClaimNextOfType(ctx, fixture.nowISO(), "reviewer-worker-1", "reviewer")
+			if err != nil || claimed == nil || claimed.ID != queue.ID {
+				t.Fatalf("ClaimNextOfType() = (%#v, %v)", claimed, err)
+			}
+
+			result, err := runner.ProcessClaimedItem(ctx, *claimed)
+			if err != nil {
+				t.Fatalf("ProcessClaimedItem() error = %v", err)
+			}
+			updatedLoop, err := fixture.repos.Loops.GetByID(ctx, loop.ID)
+			if err != nil || updatedLoop == nil {
+				t.Fatalf("Loops.GetByID() = (%#v, %v)", updatedLoop, err)
+			}
+			lastPublished, _ := stringFromAny(parseJSONObject(updatedLoop.MetadataJSON)["lastPublishedHeadSha"])
+			if tc.wantRecovered {
+				if result.Status != "success" {
+					t.Fatalf("result = %#v, want success", result)
+				}
+				if lastPublished != oldHead {
+					t.Fatalf("lastPublishedHeadSha = %q, want %q", lastPublished, oldHead)
+				}
+			} else {
+				if result.Status != "skipped" || !strings.Contains(result.Summary, "PR head changed before publish") {
+					t.Fatalf("result = %#v, want skipped stale when publishable inline comments are missing", result)
+				}
+				if lastPublished != "" {
+					t.Fatalf("lastPublishedHeadSha = %q, want empty when recovery is rejected", lastPublished)
+				}
+			}
+		})
+	}
+}

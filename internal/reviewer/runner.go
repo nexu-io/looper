@@ -5628,20 +5628,26 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 				if err != nil {
 					return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 				}
-				if found.Found && found.Event != ReviewEventApprove && normalizeCommentOnlyOutcome(found.Outcome) != "clean" && (!pendingNativeMustFixRequiresActionableMarker(pending) || nativeMustFixReviewMarkerActionable(found, pendingNativeMustFixCount(pending))) {
-					checkpoint.PendingReview = pending.clone()
-					if checkpoint.PendingReview.ContentFingerprint == "" {
-						if fp := reviewMarkerFingerprint(found); fp != "" {
-							checkpoint.PendingReview.ContentFingerprint = fp
+				if found.Found && found.Event != ReviewEventApprove && normalizeCommentOnlyOutcome(found.Outcome) != "clean" {
+					pairActive, pairErr := r.isReviewFixPairActive(ctx, input.Loop)
+					if pairErr != nil {
+						return checkpoint, pairErr
+					}
+					if publishableCount := pendingNativePublishableCount(pending, !pairActive); publishableCount == 0 || nativeMustFixReviewMarkerActionable(found, publishableCount) {
+						checkpoint.PendingReview = pending.clone()
+						if checkpoint.PendingReview.ContentFingerprint == "" {
+							if fp := reviewMarkerFingerprint(found); fp != "" {
+								checkpoint.PendingReview.ContentFingerprint = fp
+							}
 						}
+						if err := r.applyVerifiedReviewSideEffects(ctx, input, checkpoint, detail, found); err != nil {
+							return checkpoint, err
+						}
+						if err := r.recordPublishedReviewProgress(ctx, input, pending, found.Event); err != nil {
+							return checkpoint, err
+						}
+						return checkpoint, nil
 					}
-					if err := r.applyVerifiedReviewSideEffects(ctx, input, checkpoint, detail, found); err != nil {
-						return checkpoint, err
-					}
-					if err := r.recordPublishedReviewProgress(ctx, input, pending, found.Event); err != nil {
-						return checkpoint, err
-					}
-					return checkpoint, nil
 				}
 			}
 		}
