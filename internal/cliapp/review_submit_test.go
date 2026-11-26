@@ -1623,6 +1623,13 @@ func TestValidateReviewSubmitCommentDispositionsRequiresMustFixEvidence(t *testi
 	if err := validateReviewSubmitCommentDispositions(mustFix); err != nil {
 		t.Fatalf("must_fix+evidence error = %v", err)
 	}
+	mustFixMinimal := []reviewSubmitComment{{
+		Body: "Null check missing", Path: "app.go", Line: 10, Side: "RIGHT",
+		Disposition: "must_fix",
+	}}
+	if err := validateReviewSubmitCommentDispositions(mustFixMinimal); err != nil {
+		t.Fatalf("must_fix without optional scope fields error = %v", err)
+	}
 	if err := validateReviewSubmitCommentDispositions(nil); err != nil {
 		t.Fatalf("empty comments error = %v", err)
 	}
@@ -1871,8 +1878,15 @@ func TestValidateReviewSubmitStandaloneModeAllowsNeedsHumanAndRejectsFollowUp(t 
 		Body: "Needs human", Path: "app.go", Line: 10, Side: "RIGHT",
 		Disposition: "needs_human",
 	}}
-	if err := validateReviewSubmitCommentDispositionsWithOptions(missingScope, true); err == nil {
-		t.Fatal("standalone mode accepted needs_human without scopeBasis/scopeEvidence")
+	if err := validateReviewSubmitCommentDispositionsWithOptions(missingScope, true); err != nil {
+		t.Fatalf("standalone mode rejected needs_human without optional scopeBasis/scopeEvidence: %v", err)
+	}
+	invalidScope := []reviewSubmitComment{{
+		Body: "Needs human", Path: "app.go", Line: 10, Side: "RIGHT",
+		Disposition: "needs_human", ScopeBasis: "vibes",
+	}}
+	if err := validateReviewSubmitCommentDispositionsWithOptions(invalidScope, true); err == nil || !strings.Contains(err.Error(), "invalid scopeBasis") {
+		t.Fatalf("standalone mode invalid scopeBasis = %v, want rejection", err)
 	}
 	followUpComment := []reviewSubmitComment{{
 		Body: "Nice to have", Path: "app.go", Line: 10, Side: "RIGHT",

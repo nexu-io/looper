@@ -936,12 +936,11 @@ func validateReviewSubmitCommentDispositionsWithOptions(comments []reviewSubmitC
 	for i, comment := range comments {
 		disposition := strings.TrimSpace(comment.Disposition)
 		scopeBasis := strings.TrimSpace(comment.ScopeBasis)
-		scopeEvidence := strings.TrimSpace(comment.ScopeEvidence)
-		if disposition == "" || scopeBasis == "" || scopeEvidence == "" {
+		if disposition == "" {
 			if allowNeedsHuman {
-				return fmt.Errorf("actionable review comment %d requires disposition=must_fix|needs_human, non-empty scopeBasis, and non-empty scopeEvidence", i)
+				return fmt.Errorf("actionable review comment %d requires disposition=must_fix|needs_human", i)
 			}
-			return fmt.Errorf("actionable review comment %d requires disposition=must_fix, non-empty scopeBasis, and non-empty scopeEvidence", i)
+			return fmt.Errorf("actionable review comment %d requires disposition=must_fix", i)
 		}
 		switch disposition {
 		case reviewFindingDispositionMustFix:
@@ -961,11 +960,13 @@ func validateReviewSubmitCommentDispositionsWithOptions(comments []reviewSubmitC
 			}
 			return fmt.Errorf("actionable review comment %d has invalid disposition %q (want must_fix)", i, disposition)
 		}
-		switch scopeBasis {
-		case reviewFindingScopeStatedIntent, reviewFindingScopeIntroducedRegression, reviewFindingScopeRequiredInvariant, reviewFindingScopeIndependentImprovement, reviewFindingScopeAmbiguousIntent:
-			// ok
-		default:
-			return fmt.Errorf("actionable review comment %d has invalid scopeBasis %q", i, scopeBasis)
+		if scopeBasis != "" {
+			switch scopeBasis {
+			case reviewFindingScopeStatedIntent, reviewFindingScopeIntroducedRegression, reviewFindingScopeRequiredInvariant, reviewFindingScopeIndependentImprovement, reviewFindingScopeAmbiguousIntent:
+				// ok
+			default:
+				return fmt.Errorf("actionable review comment %d has invalid scopeBasis %q", i, scopeBasis)
+			}
 		}
 	}
 	return nil

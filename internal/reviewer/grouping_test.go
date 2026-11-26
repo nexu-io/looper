@@ -121,7 +121,7 @@ func TestGroupedFindingPromptSpecifiesCompletionVocabulary(t *testing.T) {
 		"must_fix", "follow_up", "needs_human",
 		"blocking", "non_blocking", "nit",
 		"stated_intent", "introduced_regression", "required_invariant", "independent_improvement", "ambiguous_intent",
-		"No actionable findings",
+		"Use outcome=clean only when there are no must_fix findings.",
 	} {
 		if !strings.Contains(prompt, want) {
 			t.Fatalf("prompt missing %q: %s", want, prompt)

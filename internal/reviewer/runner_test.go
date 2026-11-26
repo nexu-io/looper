@@ -6620,6 +6620,152 @@ func TestProcessClaimedItemRecoversMissingCompletionMarkerWhenReviewMarkerExists
 	}
 }
 
+func TestRunReviewStepRecoversPublishedMarkerWhenCompletionSchemaFails(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{
+		reviewRequests:      []string{"octocat"},
+		reviewMarkerOutcome: "non_blocking",
+	}
+	agent := &fakeAgentExecutor{results: []AgentResult{{
+		Status:      "completed",
+		ParseStatus: "parsed",
+		Summary:     "Published review",
+		Stdout:      `__LOOPER_RESULT__={"summary":"Published review","outcome":"non_blocking","findings":[{"title":"Bug","body":"Fix nil check"}]}`,
+	}}}
+	standaloneCfg, _ := config.DefaultConfig(t.TempDir())
+	standaloneCfg.Roles.Fixer.AutoDiscovery = false
+	runner := New(Options{
+		DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{},
+		AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, CustomInstructions: &standaloneCfg,
+	})
+	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	if err != nil || project == nil {
+		t.Fatalf("Projects.GetByID() = (%#v, %v), want project", project, err)
+	}
+	checkpoint, err := runner.runReviewStep(context.Background(), stepInput{
+		Project:  *project,
+		Loop:     storage.LoopRecord{ID: "loop_recover_schema_fail", ProjectID: project.ID, Type: "reviewer"},
+		Run:      storage.RunRecord{ID: "run_recover_schema_fail", LoopID: "loop_recover_schema_fail"},
+		Repo:     "acme/looper",
+		PRNumber: 42,
+		Checkpoint: reviewerCheckpoint{
+			Detail:   &checkpointDetail{HeadRefName: "feature/review-me", BaseRefName: "main", Author: "alice"},
+			Snapshot: &checkpointSnapshot{HeadSHA: "abc123"},
+			Worktree: &checkpointWorktree{Path: t.TempDir(), Branch: "pr-42-head", PreparedAt: fixture.nowISO()},
+		},
+	})
+	if err != nil {
+		t.Fatalf("runReviewStep() error = %v, want recovery from published remote review marker", err)
+	}
+	if checkpoint.PendingReview == nil || checkpoint.PendingReview.Outcome != "non_blocking" || checkpoint.ResumePolicy != "advance_from_checkpoint" {
+		t.Fatalf("checkpoint = %#v, want recovered PendingReview with non_blocking outcome", checkpoint)
+	}
+}
+
+func TestRunReviewStepPairMarkerRecoveryPreservesNeedsHumanSafety(t *testing.T) {
+	t.Parallel()
+
+	pairConfig := func(t *testing.T) *config.Config {
+		t.Helper()
+		cfg, _ := config.DefaultConfig(t.TempDir())
+		cfg.Roles.Fixer.AutoDiscovery = true
+		return &cfg
+	}
+
+	t.Run("recovers when all findings have explicit must_fix or follow_up disposition", func(t *testing.T) {
+		t.Parallel()
+		fixture := newRunnerFixture(t)
+		github := &fakeGitHubGateway{reviewRequests: []string{"octocat"}, reviewMarkerOutcome: "non_blocking"}
+		agent := &fakeAgentExecutor{results: []AgentResult{{
+			Status:      "completed",
+			ParseStatus: "parsed",
+			Summary:     "Published review",
+			Stdout:      `__LOOPER_RESULT__={"summary":"Published review","outcome":"non_blocking","findings":[{"title":"Bug","body":"Fix nil check","disposition":"must_fix"},{"title":"Later","body":"Rename helper","disposition":"follow_up"}]}`,
+		}}}
+		runner := New(Options{
+			DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{},
+			AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, CustomInstructions: pairConfig(t),
+		})
+		project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+		if err != nil || project == nil {
+			t.Fatalf("Projects.GetByID() = (%#v, %v), want project", project, err)
+		}
+		checkpoint, err := runner.runReviewStep(context.Background(), stepInput{
+			Project:  *project,
+			Loop:     storage.LoopRecord{ID: "loop_pair_recover_ok", ProjectID: project.ID, Type: "reviewer"},
+			Run:      storage.RunRecord{ID: "run_pair_recover_ok", LoopID: "loop_pair_recover_ok"},
+			Repo:     "acme/looper",
+			PRNumber: 42,
+			Checkpoint: reviewerCheckpoint{
+				Detail:   &checkpointDetail{HeadRefName: "feature/review-me", BaseRefName: "main", Author: "alice"},
+				Snapshot: &checkpointSnapshot{HeadSHA: "abc123"},
+				Worktree: &checkpointWorktree{Path: t.TempDir(), Branch: "pr-42-head", PreparedAt: fixture.nowISO()},
+			},
+		})
+		if err != nil {
+			t.Fatalf("runReviewStep() error = %v, want pair recovery without needs_human", err)
+		}
+		if checkpoint.PendingReview == nil || checkpoint.PendingReview.Outcome != "non_blocking" {
+			t.Fatalf("checkpoint = %#v, want recovered PendingReview", checkpoint)
+		}
+	})
+
+	for _, tc := range []struct {
+		name   string
+		stdout string
+	}{
+		{
+			name:   "refuses recovery when needs_human accompanies schema error",
+			stdout: `__LOOPER_RESULT__={"summary":"Mixed","outcome":"blocking","findings":[{"title":"Bug","body":"Fix nil check","disposition":"must_fix"},{"title":"Ambiguous","body":"Need human","disposition":"needs_human","severity":"blocking"}]}`,
+		},
+		{
+			name:   "refuses recovery when finding disposition is missing",
+			stdout: `__LOOPER_RESULT__={"summary":"Unlabeled","outcome":"non_blocking","findings":[{"title":"Bug","body":"Fix nil check"}]}`,
+		},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			fixture := newRunnerFixture(t)
+			github := &fakeGitHubGateway{reviewRequests: []string{"octocat"}, reviewMarkerOutcome: "non_blocking"}
+			agent := &fakeAgentExecutor{results: []AgentResult{{
+				Status:      "completed",
+				ParseStatus: "parsed",
+				Summary:     "Published review",
+				Stdout:      tc.stdout,
+			}}}
+			runner := New(Options{
+				DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{},
+				AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, CustomInstructions: pairConfig(t),
+			})
+			project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+			if err != nil || project == nil {
+				t.Fatalf("Projects.GetByID() = (%#v, %v), want project", project, err)
+			}
+			_, err = runner.runReviewStep(context.Background(), stepInput{
+				Project:  *project,
+				Loop:     storage.LoopRecord{ID: "loop_pair_no_recover", ProjectID: project.ID, Type: "reviewer"},
+				Run:      storage.RunRecord{ID: "run_pair_no_recover", LoopID: "loop_pair_no_recover"},
+				Repo:     "acme/looper",
+				PRNumber: 42,
+				Checkpoint: reviewerCheckpoint{
+					Detail:   &checkpointDetail{HeadRefName: "feature/review-me", BaseRefName: "main", Author: "alice"},
+					Snapshot: &checkpointSnapshot{HeadSHA: "abc123"},
+					Worktree: &checkpointWorktree{Path: t.TempDir(), Branch: "pr-42-head", PreparedAt: fixture.nowISO()},
+				},
+			})
+			var loopErr *loopError
+			if !errors.As(err, &loopErr) || loopErr.kind != FailureRetryableAfterResume {
+				t.Fatalf("runReviewStep() err = %v, want FailureRetryableAfterResume", err)
+			}
+			if github.reviewMarkerCalls != 0 {
+				t.Fatalf("reviewMarkerCalls = %d, want 0 (must not recover marker when needs_human safety is unverified)", github.reviewMarkerCalls)
+			}
+		})
+	}
+}
+
 func TestProcessClaimedItemRecoversMissingCompletionMarkerWithLegacyReviewMarkerID(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
@@ -9187,9 +9333,9 @@ func TestBuildReviewPromptIncludesActionableQualityContract(t *testing.T) {
 		"Looper parses this JSON",
 		"__LOOPER_RESULT__.findings",
 		"Finalization gate before submit",
-		"disposition=must_fix with scopeBasis/scopeEvidence",
+		"disposition=must_fix plus concrete evidence",
 		"rejects `follow_up`/`needs_human` in actionable comments or the visible review body",
-		"review outcome matches the highest published severity",
+		"Looper reconciles outcome from published severities",
 		"do not use PATH-based `looper`",
 		"repository-local `go run ./cmd/looper`",
 		"`gh api repos/acme/looper/pulls/42/reviews`, or `gh pr review` directly",
@@ -10884,7 +11030,15 @@ func TestValidateReviewerCommentOnlyCompletionDispositions(t *testing.T) {
 		t.Fatalf("clean with must_fix error = %v", err)
 	}
 
-	// Fail-closed: missing disposition/scope fields are rejected (no default must_fix).
+	// Clean completion does not require a literal "No actionable findings" summary prefix.
+	if cleanCustom, err := validateReviewerCommentOnlyCompletion(reviewerCommentOnlyCompletion{
+		Summary: "All changes look good and tests pass.",
+		Outcome: "clean",
+	}); err != nil || cleanCustom.Outcome != "clean" {
+		t.Fatalf("clean with custom summary = (%#v, %v), want clean", cleanCustom, err)
+	}
+
+	// Fail-closed: missing disposition/severity are rejected; optional scopeBasis/scopeEvidence may be omitted.
 	if _, err := validateReviewerCommentOnlyCompletion(reviewerCommentOnlyCompletion{
 		Summary: "Missing fields",
 		Outcome: "blocking",
@@ -10894,29 +11048,20 @@ func TestValidateReviewerCommentOnlyCompletionDispositions(t *testing.T) {
 	}); err == nil || !strings.Contains(err.Error(), "requires disposition") {
 		t.Fatalf("missing disposition error = %v", err)
 	}
-	if _, err := validateReviewerCommentOnlyCompletion(reviewerCommentOnlyCompletion{
-		Summary: "Missing scope",
+	if got, err := validateReviewerCommentOnlyCompletion(reviewerCommentOnlyCompletion{
+		Summary: "Missing optional scope",
 		Outcome: "blocking",
 		Findings: []reviewerCommentOnlyFindingResult{
-			{Title: "Bug", Body: "x", Disposition: "must_fix"},
+			{Title: "Bug", Body: "x", Disposition: "must_fix", Severity: "blocking"},
 		},
-	}); err == nil || !strings.Contains(err.Error(), "requires scopeBasis") {
-		t.Fatalf("missing scopeBasis error = %v", err)
-	}
-	if _, err := validateReviewerCommentOnlyCompletion(reviewerCommentOnlyCompletion{
-		Summary: "Missing evidence",
-		Outcome: "blocking",
-		Findings: []reviewerCommentOnlyFindingResult{
-			{Title: "Bug", Body: "x", Disposition: "must_fix", ScopeBasis: "introduced_regression"},
-		},
-	}); err == nil || !strings.Contains(err.Error(), "requires scopeEvidence") {
-		t.Fatalf("missing scopeEvidence error = %v", err)
+	}); err != nil || got.Outcome != "blocking" {
+		t.Fatalf("omitted scopeBasis/scopeEvidence = (%#v, %v), want valid blocking", got, err)
 	}
 	if _, err := validateReviewerCommentOnlyCompletion(reviewerCommentOnlyCompletion{
 		Summary: "Missing severity",
 		Outcome: "blocking",
 		Findings: []reviewerCommentOnlyFindingResult{
-			{Title: "Bug", Body: "x", Disposition: "must_fix", ScopeBasis: "introduced_regression", ScopeEvidence: "y"},
+			{Title: "Bug", Body: "x", Disposition: "must_fix"},
 		},
 	}); err == nil || !strings.Contains(err.Error(), "requires severity") {
 		t.Fatalf("missing severity error = %v", err)
@@ -10925,7 +11070,7 @@ func TestValidateReviewerCommentOnlyCompletionDispositions(t *testing.T) {
 		Summary: "Arbitrary severity",
 		Outcome: "blocking",
 		Findings: []reviewerCommentOnlyFindingResult{
-			{Title: "Bug", Body: "x", Disposition: "must_fix", Severity: "major", ScopeBasis: "introduced_regression", ScopeEvidence: "y"},
+			{Title: "Bug", Body: "x", Disposition: "must_fix", Severity: "major"},
 		},
 	}); err == nil || !strings.Contains(err.Error(), "invalid severity") {
 		t.Fatalf("arbitrary severity error = %v", err)
@@ -10934,7 +11079,7 @@ func TestValidateReviewerCommentOnlyCompletionDispositions(t *testing.T) {
 		Summary: "Unknown scopeBasis",
 		Outcome: "blocking",
 		Findings: []reviewerCommentOnlyFindingResult{
-			{Title: "Bug", Body: "x", Disposition: "must_fix", Severity: "blocking", ScopeBasis: "vibes", ScopeEvidence: "y"},
+			{Title: "Bug", Body: "x", Disposition: "must_fix", Severity: "blocking", ScopeBasis: "vibes"},
 		},
 	}); err == nil || !strings.Contains(err.Error(), "invalid scopeBasis") {
 		t.Fatalf("unknown scopeBasis error = %v", err)
@@ -10946,26 +11091,31 @@ func TestValidateReviewerCommentOnlyCompletionOutcomeMatchesHighestMustFixSeveri
 	mustFix := func(severity string) reviewerCommentOnlyFindingResult {
 		return reviewerCommentOnlyFindingResult{
 			Title: "Bug", Body: "fix it", Disposition: "must_fix", Severity: severity,
-			ScopeBasis: "introduced_regression", ScopeEvidence: "diff",
 		}
 	}
-	if _, err := validateReviewerCommentOnlyCompletion(reviewerCommentOnlyCompletion{
+	if got, err := validateReviewerCommentOnlyCompletion(reviewerCommentOnlyCompletion{
 		Summary: "Blocking issue", Outcome: "non_blocking",
 		Findings: []reviewerCommentOnlyFindingResult{mustFix("blocking")},
-	}); err == nil || !strings.Contains(err.Error(), "highest must_fix severity") {
-		t.Fatalf("blocking finding with non_blocking outcome error = %v", err)
+	}); err != nil || got.Outcome != "blocking" {
+		t.Fatalf("blocking finding with non_blocking outcome = (%#v, %v), want reconciled blocking", got, err)
 	}
-	if _, err := validateReviewerCommentOnlyCompletion(reviewerCommentOnlyCompletion{
+	if got, err := validateReviewerCommentOnlyCompletion(reviewerCommentOnlyCompletion{
 		Summary: "Nit only", Outcome: "blocking",
 		Findings: []reviewerCommentOnlyFindingResult{mustFix("nit")},
-	}); err == nil || !strings.Contains(err.Error(), "highest must_fix severity") {
-		t.Fatalf("nit finding with blocking outcome error = %v", err)
+	}); err != nil || got.Outcome != "non_blocking" {
+		t.Fatalf("nit finding with blocking outcome = (%#v, %v), want reconciled non_blocking", got, err)
 	}
-	if _, err := validateReviewerCommentOnlyCompletion(reviewerCommentOnlyCompletion{
+	if got, err := validateReviewerCommentOnlyCompletion(reviewerCommentOnlyCompletion{
 		Summary: "Non-blocking only", Outcome: "blocking",
 		Findings: []reviewerCommentOnlyFindingResult{mustFix("non_blocking")},
-	}); err == nil || !strings.Contains(err.Error(), "highest must_fix severity") {
-		t.Fatalf("non_blocking finding with blocking outcome error = %v", err)
+	}); err != nil || got.Outcome != "non_blocking" {
+		t.Fatalf("non_blocking finding with blocking outcome = (%#v, %v), want reconciled non_blocking", got, err)
+	}
+	if got, err := validateReviewerCommentOnlyCompletion(reviewerCommentOnlyCompletion{
+		Summary:  "Omitted outcome",
+		Findings: []reviewerCommentOnlyFindingResult{mustFix("blocking")},
+	}); err != nil || got.Outcome != "blocking" {
+		t.Fatalf("omitted outcome with blocking finding = (%#v, %v), want reconciled blocking", got, err)
 	}
 	if _, err := validateReviewerCommentOnlyCompletion(reviewerCommentOnlyCompletion{
 		Summary: "Blocking issue", Outcome: "blocking",
@@ -11157,8 +11307,8 @@ func TestParseReviewerNativeCompletionFindingsAndLegacy(t *testing.T) {
 	if !commentOnlyCompletionHasNeedsHuman(ok) {
 		t.Fatalf("want needs_human: %#v", ok)
 	}
-	if _, err := parseReviewerNativeCompletion(AgentResult{Stdout: `__LOOPER_RESULT__={"summary":"Blocking issue remains","outcome":"non_blocking","findings":[{"title":"Bug","body":"fix it","disposition":"must_fix","severity":"blocking","scopeBasis":"introduced_regression","scopeEvidence":"diff","path":"a.go","line":1}]}`}); err == nil || !strings.Contains(err.Error(), "highest must_fix severity") {
-		t.Fatalf("native blocking finding with non_blocking outcome error = %v, want publication-contract rejection", err)
+	if reconciled, err := parseReviewerNativeCompletion(AgentResult{Stdout: `__LOOPER_RESULT__={"summary":"Blocking issue remains","outcome":"non_blocking","findings":[{"title":"Bug","body":"fix it","disposition":"must_fix","severity":"blocking","path":"a.go","line":1}]}`}); err != nil || reconciled.Outcome != "blocking" {
+		t.Fatalf("native blocking finding with non_blocking outcome = (%#v, %v), want reconciled blocking", reconciled, err)
 	}
 
 }
