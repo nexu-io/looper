@@ -44,6 +44,12 @@ func TestStandaloneNativeNeedsHumanPublishesWithoutParking(t *testing.T) {
 			wantStatus:     "success",
 		},
 		{
+			name:           "mixed_non_blocking_must_fix_and_blocking_needs_human_accepts_blocking_outcome",
+			stdout:         `__LOOPER_RESULT__={"summary":"Non-blocking fix plus blocking scope ambiguity","outcome":"blocking","findings":[{"title":"[P2] Clarify error message","body":"Tighten wording.","disposition":"must_fix","severity":"non_blocking","scopeBasis":"stated_intent","scopeEvidence":"PR description","path":"a.go","line":4},{"title":"[P1] Confirm backwards compatibility","body":"Breaking change conflicts with AGENTS.md.","disposition":"needs_human","severity":"blocking","scopeBasis":"ambiguous_intent","scopeEvidence":"AGENTS.md","path":"b.go","line":9}]}`,
+			inlineComments: []string{"**[P2] Clarify error message**", "**[P1] Confirm backwards compatibility**"},
+			wantStatus:     "success",
+		},
+		{
 			name:           "pure_needs_human_missing_inline_comment_retries",
 			stdout:         `__LOOPER_RESULT__={"summary":"Human decision needed","outcome":"non_blocking","findings":[{"title":"[P2] Confirm API compatibility","body":"Unclear contract.","disposition":"needs_human","severity":"non_blocking","scopeBasis":"ambiguous_intent","scopeEvidence":"PR description","path":"a.go","line":10}]}`,
 			inlineComments: nil,
@@ -668,5 +674,149 @@ func TestBuildReviewPromptStandaloneVsPairMode(t *testing.T) {
 	standaloneCommentOnly, _ := buildReviewPromptForPairMode("p1", cfg, "acme/looper", 42, checkpoint, "run_1", "reviewer:l:abc123", events, false, true, "", config.ReviewerScopeChangedRanges, config.DefaultDisclosureConfig(), "codex", "", "/opt/looper/bin/looper", false, true, "", "", false)
 	if !strings.Contains(standaloneCommentOnly, "publishes both `must_fix` and `needs_human` findings into the remote Reviewer Summary") {
 		t.Fatalf("standalone comment-only prompt missing needs_human summary publishing wording")
+	}
+	if !strings.Contains(standaloneCommentOnly, "matches the highest published finding severity") {
+		t.Fatalf("standalone comment-only prompt missing published-severity outcome gate")
+	}
+}
+
+func TestForgejoUnconsumedRereviewDoesNotLoopScopeHold(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	ctx := context.Background()
+	nowISO := fixture.nowISO()
+	repo := "acme/looper"
+	prNumber := int64(42)
+	const head = "same-head"
+	const reqID1 int64 = 999
+	const reqID2 int64 = 1005
+	revMeta := `{"followUpdates":true,"loop":{"enabled":true,"iterationCount":1},"lastPublishedHeadSha":"same-head"}`
+	revLoop := storage.LoopRecord{
+		ID: "loop_forgejo_unconsumed_rereview", Seq: 320, ProjectID: "project_1", Type: "reviewer",
+		TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber,
+		Status: "running", MetadataJSON: &revMeta, CreatedAt: nowISO, UpdatedAt: nowISO,
+	}
+	if err := fixture.repos.Loops.Upsert(ctx, revLoop); err != nil {
+		t.Fatalf("upsert rev: %v", err)
+	}
+	cfg, _ := config.DefaultConfig(t.TempDir())
+	cfg.HITL.Enabled = false
+	cfg.Roles.Fixer.AutoDiscovery = true
+	cfg.Providers = []config.ProviderConfig{{ID: "fj", Kind: config.ProviderKindForgejo}}
+	cfg.Projects = []config.ProjectRefConfig{{ID: "project_1", Name: "Forgejo", Provider: "fj", Repo: repo, RepoPath: t.TempDir()}}
+
+	reviews := []map[string]any{
+		{"id": int64(500), "state": "COMMENTED", "commit": map[string]any{"oid": head}, "author": map[string]any{"login": "looper-bot"}},
+		{"id": reqID1, "state": "REQUEST_REVIEW", "author": map[string]any{"login": "looper-bot"}},
+	}
+	github := &fakeGitHubGateway{
+		currentLogin:        "looper-bot",
+		reviewRequests:      []string{"looper-bot"},
+		viewHeadSHA:         head,
+		author:              "alice",
+		reviews:             reviews,
+		reviewMarkerMissing: true,
+		reviewRequestedPullRequests: []PullRequestSummary{{
+			Number: prNumber, State: "OPEN", HeadSHA: head, Author: "alice",
+			ReviewRequests: []string{"looper-bot"}, Reviews: reviews,
+		}},
+	}
+	stdout := `__LOOPER_RESULT__={"summary":"Need human","outcome":"blocking","findings":[{"title":"Ambiguous","body":"Unclear","disposition":"needs_human","severity":"blocking","scopeBasis":"ambiguous_intent","scopeEvidence":"AGENTS.md","path":"a.go","line":1}]}`
+	runner := New(Options{
+		DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{},
+		AgentExecutor: &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "Need human", Stdout: stdout, ParseStatus: "parsed"}}},
+		Logger:        fixture.logger, Now: fixture.now, CustomInstructions: &cfg,
+		DiscoveryPolicy: DiscoveryPolicy{AutoDiscovery: true, RequireReviewRequest: true, EnableSelfReview: false},
+		LoopConfig:      testReviewerLoopConfig(),
+	})
+	project, err := fixture.repos.Projects.GetByID(ctx, "project_1")
+	if err != nil || project == nil {
+		t.Fatalf("project = (%#v, %v)", project, err)
+	}
+	// Pair-mode Forgejo re-review #999 emits pure needs_human and parks without consuming #999.
+	cp, err := runner.runReviewStep(ctx, stepInput{
+		Project: *project, Loop: revLoop, Run: storage.RunRecord{ID: "run_rereview_nh"},
+		QueueItem: storage.QueueItemRecord{PayloadJSON: stringPtr(`{"headSha":"same-head","forgejoRereviewId":999}`)},
+		Repo:      repo, PRNumber: prNumber,
+		Checkpoint: reviewerCheckpoint{
+			ForgejoRereviewID: reqID1,
+			Detail:            &checkpointDetail{HeadRefName: "feature/review-me", BaseRefName: "main", HeadSHA: head, State: "OPEN", Author: "alice", ReviewRequests: []string{"looper-bot"}},
+			Snapshot:          &checkpointSnapshot{HeadSHA: head},
+			Worktree:          &checkpointWorktree{Path: t.TempDir(), Branch: "feature/review-me", PreparedAt: nowISO},
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "review scope requires human judgment") {
+		t.Fatalf("runReviewStep() = (cp=%#v, err=%v), want scope hold skip", cp, err)
+	}
+	parked, _ := fixture.repos.Loops.GetByID(ctx, revLoop.ID)
+	if parked == nil || parked.Status != "paused" || loops.ReadReviewScopeHumanState(parked.MetadataJSON).ForgejoRereviewID != reqID1 {
+		t.Fatalf("parked = %#v, want paused with forgejoRereviewId=%d", parked, reqID1)
+	}
+
+	// Next discovery poll with the SAME unconsumed REQUEST_REVIEW #999 must NOT wake the hold.
+	res, err := runner.DiscoverPullRequests(ctx, DiscoveryInput{ProjectID: "project_1", Repo: repo})
+	if err != nil {
+		t.Fatalf("DiscoverPullRequests(same reqID): %v", err)
+	}
+	if len(res.QueueItems) != 0 {
+		t.Fatalf("QueueItems on same unconsumed REQUEST_REVIEW = %#v, want 0", res.QueueItems)
+	}
+	stillPaused, _ := fixture.repos.Loops.GetByID(ctx, revLoop.ID)
+	if stillPaused == nil || stillPaused.Status != "paused" || !loops.IsReviewScopeHumanHold(*stillPaused) {
+		t.Fatalf("loop after same reqID poll = %#v, want still paused scope hold", stillPaused)
+	}
+
+	// A strictly newer REQUEST_REVIEW #1005 DOES wake the hold and enqueue #1005.
+	newerReviews := append(append([]map[string]any(nil), reviews...), map[string]any{"id": reqID2, "state": "REQUEST_REVIEW", "author": map[string]any{"login": "looper-bot"}})
+	github.reviews = newerReviews
+	github.reviewRequestedPullRequests = []PullRequestSummary{{
+		Number: prNumber, State: "OPEN", HeadSHA: head, Author: "alice",
+		ReviewRequests: []string{"looper-bot"}, Reviews: newerReviews,
+	}}
+	res, err = runner.DiscoverPullRequests(ctx, DiscoveryInput{ProjectID: "project_1", Repo: repo})
+	if err != nil {
+		t.Fatalf("DiscoverPullRequests(newer reqID): %v", err)
+	}
+	if len(res.QueueItems) != 1 || forgejoRereviewIDFromQueue(res.QueueItems[0].PayloadJSON) != reqID2 {
+		t.Fatalf("QueueItems on newer REQUEST_REVIEW = %#v, want 1 item with reqID=%d", res.QueueItems, reqID2)
+	}
+	woken, _ := fixture.repos.Loops.GetByID(ctx, revLoop.ID)
+	if woken == nil || woken.Status != "queued" || loops.IsReviewScopeHumanHold(*woken) {
+		t.Fatalf("loop after newer reqID poll = %#v, want queued without scope hold", woken)
+	}
+}
+
+func TestStandaloneOutcomeValidationAccountsForNeedsHumanSeverity(t *testing.T) {
+	t.Parallel()
+	mixedBlockingNeedsHuman := reviewerCommentOnlyCompletion{
+		Summary: "Non-blocking must_fix plus blocking needs_human",
+		Outcome: "blocking",
+		Findings: []reviewerCommentOnlyFindingResult{
+			{Title: "[P2] Minor fix", Body: "Fix typo.", Disposition: "must_fix", Severity: "non_blocking", ScopeBasis: "stated_intent", ScopeEvidence: "diff"},
+			{Title: "[P1] Clarify contract", Body: "Ambiguous breaking change.", Disposition: "needs_human", Severity: "blocking", ScopeBasis: "ambiguous_intent", ScopeEvidence: "AGENTS.md"},
+		},
+	}
+	if _, err := validateReviewerCommentOnlyCompletionWithOptions(mixedBlockingNeedsHuman, true); err != nil {
+		t.Fatalf("standalone validation rejected blocking outcome with blocking needs_human: %v", err)
+	}
+	if _, err := validateReviewerCommentOnlyCompletionWithOptions(mixedBlockingNeedsHuman, false); err == nil {
+		t.Fatal("pair validation accepted blocking outcome when only must_fix is non_blocking")
+	}
+
+	wrongNonBlocking := mixedBlockingNeedsHuman
+	wrongNonBlocking.Outcome = "non_blocking"
+	if _, err := validateReviewerCommentOnlyCompletionWithOptions(wrongNonBlocking, true); err == nil {
+		t.Fatal("standalone validation accepted non_blocking outcome despite blocking needs_human")
+	}
+
+	cleanWithNeedsHuman := reviewerCommentOnlyCompletion{
+		Summary: "No actionable findings",
+		Outcome: "clean",
+		Findings: []reviewerCommentOnlyFindingResult{
+			{Title: "[P2] Ambiguous", Body: "Unclear.", Disposition: "needs_human", Severity: "non_blocking", ScopeBasis: "ambiguous_intent", ScopeEvidence: "spec"},
+		},
+	}
+	if _, err := validateReviewerCommentOnlyCompletionWithOptions(cleanWithNeedsHuman, true); err == nil {
+		t.Fatal("standalone validation accepted clean outcome with needs_human finding")
 	}
 }

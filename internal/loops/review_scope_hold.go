@@ -54,14 +54,15 @@ var ErrReviewScopeHumanInvalidAnswer = fmt.Errorf("review scope answer must be %
 // hold (no status/ask change). After budget Continue releases the pair, pending
 // is promoted to a real scope park.
 type ReviewScopeHumanState struct {
-	HeldBy         string `json:"heldBy,omitempty"`
-	PauseReason    string `json:"pauseReason,omitempty"`
-	HandoffEventAt string `json:"handoffEventAt,omitempty"`
-	HeadSHA        string `json:"headSha,omitempty"`
-	Question       string `json:"question,omitempty"`
-	Evidence       string `json:"evidence,omitempty"`
-	Pending        bool   `json:"pending,omitempty"`
-	PendingHITL    bool   `json:"pendingHitl,omitempty"`
+	HeldBy            string `json:"heldBy,omitempty"`
+	PauseReason       string `json:"pauseReason,omitempty"`
+	HandoffEventAt    string `json:"handoffEventAt,omitempty"`
+	HeadSHA           string `json:"headSha,omitempty"`
+	ForgejoRereviewID int64  `json:"forgejoRereviewId,omitempty"`
+	Question          string `json:"question,omitempty"`
+	Evidence          string `json:"evidence,omitempty"`
+	Pending           bool   `json:"pending,omitempty"`
+	PendingHITL       bool   `json:"pendingHitl,omitempty"`
 }
 
 func NewReviewScopeHumanAsk(role, repo string, prNumber int64, question, nowISO string) HITLAsk {
@@ -178,12 +179,13 @@ func HasPendingReviewScopeHuman(loop storage.LoopRecord) bool {
 // without changing status or writing a HITL ask. Used when budget is already the
 // primary hold so the pair never stacks two asks/reasons.
 func PersistPendingReviewScopeHumanEvidence(metadataJSON *string, question, evidence string, hitlEnabled bool) (string, error) {
-	return PersistPendingReviewScopeHumanEvidenceWithHead(metadataJSON, question, evidence, "", hitlEnabled)
+	return PersistPendingReviewScopeHumanEvidenceWithContext(metadataJSON, question, evidence, "", 0, hitlEnabled)
 }
 
-// PersistPendingReviewScopeHumanEvidenceWithHead stores needs_human evidence
-// along with the PR head SHA observed when the scope ambiguity occurred.
-func PersistPendingReviewScopeHumanEvidenceWithHead(metadataJSON *string, question, evidence, headSHA string, hitlEnabled bool) (string, error) {
+// PersistPendingReviewScopeHumanEvidenceWithContext stores needs_human evidence
+// along with the PR head SHA and optional Forgejo re-review request ID observed
+// when the scope ambiguity occurred.
+func PersistPendingReviewScopeHumanEvidenceWithContext(metadataJSON *string, question, evidence, headSHA string, forgejoRereviewID int64, hitlEnabled bool) (string, error) {
 	state := ReadReviewScopeHumanState(metadataJSON)
 	if strings.TrimSpace(state.HeldBy) != "" {
 		// Active scope hold already owns the pair; keep existing hold fields.
@@ -195,6 +197,9 @@ func PersistPendingReviewScopeHumanEvidenceWithHead(metadataJSON *string, questi
 		}
 		if h := strings.TrimSpace(headSHA); h != "" {
 			state.HeadSHA = h
+		}
+		if forgejoRereviewID > state.ForgejoRereviewID {
+			state.ForgejoRereviewID = forgejoRereviewID
 		}
 		return WriteReviewScopeHumanState(metadataJSON, state)
 	}
@@ -208,6 +213,9 @@ func PersistPendingReviewScopeHumanEvidenceWithHead(metadataJSON *string, questi
 	}
 	if h := strings.TrimSpace(headSHA); h != "" {
 		state.HeadSHA = h
+	}
+	if forgejoRereviewID > state.ForgejoRereviewID {
+		state.ForgejoRereviewID = forgejoRereviewID
 	}
 	// Pending must not look like an active sibling/required pause.
 	if state.PauseReason == ReviewScopeHumanSiblingPauseReason || state.PauseReason == ReviewScopeHumanRequiredReason {
@@ -266,7 +274,11 @@ type ParkReviewScopeHumanInput struct {
 	// HeadSHA is the PR head SHA observed when the scope hold was recorded.
 	// Used to distinguish unchanged-head polling from a fresh human push.
 	HeadSHA string
-	DB      *sql.DB
+	// ForgejoRereviewID is the Forgejo REQUEST_REVIEW ID being processed when
+	// the scope hold was recorded. Only a strictly newer request may wake the
+	// hold on an unchanged head so an unconsumed request cannot re-trigger.
+	ForgejoRereviewID int64
+	DB                *sql.DB
 }
 
 // ParkReviewScopeHuman parks the held role and pauses same-lane siblings for a
@@ -299,10 +311,18 @@ func parkReviewScopeHumanBody(ctx context.Context, repos *storage.Repositories, 
 			return held, err
 		}
 		needsUpsert := false
-		if head := strings.TrimSpace(input.HeadSHA); head != "" {
+		if head := strings.TrimSpace(input.HeadSHA); head != "" || input.ForgejoRereviewID > 0 {
 			state := ReadReviewScopeHumanState(held.MetadataJSON)
-			if strings.TrimSpace(state.HeadSHA) == "" {
+			stateChanged := false
+			if head != "" && strings.TrimSpace(state.HeadSHA) == "" {
 				state.HeadSHA = head
+				stateChanged = true
+			}
+			if input.ForgejoRereviewID > state.ForgejoRereviewID {
+				state.ForgejoRereviewID = input.ForgejoRereviewID
+				stateChanged = true
+			}
+			if stateChanged {
 				encoded, encErr := WriteReviewScopeHumanState(held.MetadataJSON, state)
 				if encErr != nil {
 					return held, encErr
@@ -354,6 +374,9 @@ func parkReviewScopeHumanBody(ctx context.Context, repos *storage.Repositories, 
 		if fallback := reviewFixBudgetHandoffHead(held); fallback != "" {
 			state.HeadSHA = fallback
 		}
+	}
+	if input.ForgejoRereviewID > state.ForgejoRereviewID {
+		state.ForgejoRereviewID = input.ForgejoRereviewID
 	}
 	// Promoting from deferred budget path: clear pending markers.
 	state.Pending = false
@@ -768,6 +791,7 @@ func releaseOneReviewScopeHumanHold(ctx context.Context, repos *storage.Reposito
 	state := ReadReviewScopeHumanState(metadata)
 	state.HeldBy = ""
 	state.HeadSHA = ""
+	state.ForgejoRereviewID = 0
 	state.Question = ""
 	state.Evidence = ""
 	state.Pending = false

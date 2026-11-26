@@ -4477,8 +4477,8 @@ func (r *Runner) parkDispositionNeedsHuman(ctx context.Context, input stepInput,
 					return err
 				}
 			}
-			encoded, encErr := loops.PersistPendingReviewScopeHumanEvidenceWithHead(
-				loop.MetadataJSON, question, message, headSHA, r.reviewFixHITLEnabled(),
+			encoded, encErr := loops.PersistPendingReviewScopeHumanEvidenceWithContext(
+				loop.MetadataJSON, question, message, headSHA, 0, r.reviewFixHITLEnabled(),
 			)
 			if encErr != nil {
 				return encErr
@@ -5270,11 +5270,11 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 			return markReviewerRunStale(checkpoint, reason), nil
 		}
 		if !commentOnlyCompletion {
-			if nativeCompletion, parseErr := parseReviewerNativeCompletion(result); parseErr == nil && commentOnlyCompletionHasNeedsHuman(nativeCompletion) {
-				pairActive, pairErr := r.isReviewFixPairActive(ctx, input.Loop)
-				if pairErr != nil {
-					return checkpoint, pairErr
-				}
+			pairActive, pairErr := r.isReviewFixPairActive(ctx, input.Loop)
+			if pairErr != nil {
+				return checkpoint, pairErr
+			}
+			if nativeCompletion, parseErr := parseReviewerNativeCompletionWithOptions(result, !pairActive); parseErr == nil && commentOnlyCompletionHasNeedsHuman(nativeCompletion) {
 				if pairActive {
 					return r.finishNativeNeedsHumanCompletion(ctx, input, checkpoint, result, nativeCompletion, idempotencyKey)
 				}
@@ -5324,41 +5324,39 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 		checkpoint.ResumePolicy = "advance_from_checkpoint"
 		return checkpoint, &loopError{message: "Reviewer agent did not report a valid completion marker after publishing review", kind: FailureRetryableAfterResume}
 	}
+	pairActive, pairErr = r.isReviewFixPairActive(ctx, input.Loop)
+	if pairErr != nil {
+		return checkpoint, pairErr
+	}
 	if commentOnlyCompletion {
-		completion, err := parseReviewerCommentOnlyCompletion(result)
+		completion, err := parseReviewerCommentOnlyCompletionWithOptions(result, !pairActive)
 		if err != nil {
 			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 		}
-		if commentOnlyCompletionHasNeedsHuman(completion) {
-			pairActive, pairErr := r.isReviewFixPairActive(ctx, input.Loop)
-			if pairErr != nil {
-				return checkpoint, pairErr
+		if commentOnlyCompletionHasNeedsHuman(completion) && pairActive {
+			// Pure needs_human: park without publishing/counting.
+			if len(publishableCommentOnlyFindings(completion.Findings)) == 0 {
+				checkpoint, blocked, freshErr := r.applyScopeParkFreshness(ctx, input, checkpoint, checkpoint.Snapshot.HeadSHA)
+				if freshErr != nil || blocked {
+					return checkpoint, freshErr
+				}
+				if err := r.parkOrDeferReviewerScopeHumanWithContext(ctx, input.Loop, completion, checkpoint.Snapshot.HeadSHA, checkpoint.ForgejoRereviewID); err != nil {
+					return checkpoint, err
+				}
+				return checkpoint, reviewerScopeOrBudgetHoldSkip(ctx, r, input.Loop)
 			}
-			if pairActive {
-				// Pure needs_human: park without publishing/counting.
-				if len(publishableCommentOnlyFindings(completion.Findings)) == 0 {
-					checkpoint, blocked, freshErr := r.applyScopeParkFreshness(ctx, input, checkpoint, checkpoint.Snapshot.HeadSHA)
-					if freshErr != nil || blocked {
-						return checkpoint, freshErr
-					}
-					if err := r.parkOrDeferReviewerScopeHuman(ctx, input.Loop, completion, checkpoint.Snapshot.HeadSHA); err != nil {
-						return checkpoint, err
-					}
-					return checkpoint, reviewerScopeOrBudgetHoldSkip(ctx, r, input.Loop)
-				}
-				// Mixed must_fix + needs_human: publish must_fix first (publish step),
-				// then apply the one-hold rule after recordPublishedReviewProgress.
-				payload, marshalErr := json.Marshal(completion)
-				if marshalErr != nil {
-					return checkpoint, &loopError{message: fmt.Sprintf("marshal reviewer comment-only completion: %v", marshalErr), kind: FailureRetryableAfterResume}
-				}
-				checkpoint.PendingReview = &pendingReviewCheckpoint{
-					HeadSHA: checkpoint.Snapshot.HeadSHA, IdempotencyKey: idempotencyKey, Event: reviewEventAgentNative,
-					Summary: completion.Summary, Outcome: completion.Outcome, ReviewerSummaryJSON: string(payload),
-				}
-				checkpoint.ResumePolicy = "advance_from_checkpoint"
-				return checkpoint, nil
+			// Mixed must_fix + needs_human: publish must_fix first (publish step),
+			// then apply the one-hold rule after recordPublishedReviewProgress.
+			payload, marshalErr := json.Marshal(completion)
+			if marshalErr != nil {
+				return checkpoint, &loopError{message: fmt.Sprintf("marshal reviewer comment-only completion: %v", marshalErr), kind: FailureRetryableAfterResume}
 			}
+			checkpoint.PendingReview = &pendingReviewCheckpoint{
+				HeadSHA: checkpoint.Snapshot.HeadSHA, IdempotencyKey: idempotencyKey, Event: reviewEventAgentNative,
+				Summary: completion.Summary, Outcome: completion.Outcome, ReviewerSummaryJSON: string(payload),
+			}
+			checkpoint.ResumePolicy = "advance_from_checkpoint"
+			return checkpoint, nil
 		}
 		payload, err := json.Marshal(completion)
 		if err != nil {
@@ -5372,18 +5370,12 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 
 	// Native path: parse __LOOPER_RESULT__ findings (same disposition contract).
 	// Summary-only markers without findings stay valid; remote marker is publish authority.
-	nativeCompletion, err := parseReviewerNativeCompletion(result)
+	nativeCompletion, err := parseReviewerNativeCompletionWithOptions(result, !pairActive)
 	if err != nil {
 		return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 	}
-	if commentOnlyCompletionHasNeedsHuman(nativeCompletion) {
-		pairActive, pairErr := r.isReviewFixPairActive(ctx, input.Loop)
-		if pairErr != nil {
-			return checkpoint, pairErr
-		}
-		if pairActive {
-			return r.finishNativeNeedsHumanCompletion(ctx, input, checkpoint, result, nativeCompletion, idempotencyKey)
-		}
+	if commentOnlyCompletionHasNeedsHuman(nativeCompletion) && pairActive {
+		return r.finishNativeNeedsHumanCompletion(ctx, input, checkpoint, result, nativeCompletion, idempotencyKey)
 	}
 	nativeFindingsJSON := ""
 	if len(nativeCompletion.Findings) > 0 || nativeCompletion.Coverage != nil {
@@ -5910,7 +5902,7 @@ func (r *Runner) finishNativeNeedsHumanCompletion(ctx context.Context, input ste
 			}
 		}
 	}
-	if err := r.parkOrDeferReviewerScopeHuman(ctx, input.Loop, nativeCompletion, checkpoint.Snapshot.HeadSHA); err != nil {
+	if err := r.parkOrDeferReviewerScopeHumanWithContext(ctx, input.Loop, nativeCompletion, checkpoint.Snapshot.HeadSHA, checkpoint.ForgejoRereviewID); err != nil {
 		return checkpoint, err
 	}
 	return checkpoint, reviewerScopeOrBudgetHoldSkip(ctx, r, input.Loop)
@@ -6529,21 +6521,21 @@ func (r *Runner) postStampedPRCommentIfMissing(ctx context.Context, input stepIn
 
 func (r *Runner) publishCommentOnlyReview(ctx context.Context, input stepInput, pending pendingReviewCheckpoint, detail PullRequestDetail) error {
 	_ = detail
-	completion, err := pendingReviewerCommentOnlyCompletion(pending)
-	if err != nil {
-		return &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
-	}
 	pairActive, pairErr := r.isReviewFixPairActive(ctx, input.Loop)
 	if pairErr != nil {
 		return pairErr
 	}
 	includeNeedsHuman := !pairActive
+	completion, err := pendingReviewerCommentOnlyCompletionWithOptions(pending, includeNeedsHuman)
+	if err != nil {
+		return &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+	}
 	// In review-fix pair mode, pure needs_human parks without publishing; mixed
 	// must_fix+needs_human publishes must_fix only and caller parks/defers scope
 	// after recordPublished. In standalone reviewer mode, needs_human is
 	// published directly to the PR summary so the human sees it.
 	if pairActive && commentOnlyCompletionHasNeedsHuman(completion) && len(publishableCommentOnlyFindings(completion.Findings)) == 0 {
-		if err := r.parkOrDeferReviewerScopeHuman(ctx, input.Loop, completion, pending.HeadSHA); err != nil {
+		if err := r.parkOrDeferReviewerScopeHumanWithContext(ctx, input.Loop, completion, pending.HeadSHA, input.Checkpoint.ForgejoRereviewID); err != nil {
 			return err
 		}
 		return reviewerScopeOrBudgetHoldSkip(ctx, r, input.Loop)
@@ -6820,17 +6812,25 @@ func reviewCompletionOutcome(result AgentResult) string {
 }
 
 func parseReviewerCommentOnlyCompletion(result AgentResult) (reviewerCommentOnlyCompletion, error) {
+	return parseReviewerCommentOnlyCompletionWithOptions(result, false)
+}
+
+func parseReviewerCommentOnlyCompletionWithOptions(result AgentResult, includeNeedsHuman bool) (reviewerCommentOnlyCompletion, error) {
 	completion, err := unmarshalReviewerCompletionMarker(result)
 	if err != nil {
 		return reviewerCommentOnlyCompletion{}, fmt.Errorf("parse reviewer comment-only completion: %w", err)
 	}
-	return validateReviewerCommentOnlyCompletion(completion)
+	return validateReviewerCommentOnlyCompletionWithOptions(completion, includeNeedsHuman)
 }
 
 // parseReviewerNativeCompletion parses __LOOPER_RESULT__ after a native review step.
 // Summary-only markers without findings remain valid (remote review marker is publish
 // authority). When findings are present, validation is fail-closed.
 func parseReviewerNativeCompletion(result AgentResult) (reviewerCommentOnlyCompletion, error) {
+	return parseReviewerNativeCompletionWithOptions(result, false)
+}
+
+func parseReviewerNativeCompletionWithOptions(result AgentResult, includeNeedsHuman bool) (reviewerCommentOnlyCompletion, error) {
 	completion, err := unmarshalReviewerCompletionMarker(result)
 	if err != nil {
 		// Native agents historically emit a parsed completion without a strict
@@ -6847,12 +6847,12 @@ func parseReviewerNativeCompletion(result AgentResult) (reviewerCommentOnlyCompl
 		return completion, nil
 	}
 	if strings.TrimSpace(completion.Outcome) == "" {
-		completion.Outcome = requiredOutcomeForMustFixFindings(completion.Findings)
+		completion.Outcome = requiredOutcomeForPublishableFindings(completion.Findings, includeNeedsHuman)
 		if completion.Outcome == "" && cleanReviewNoopSummary(completion.Summary) {
 			completion.Outcome = "clean"
 		}
 	}
-	return validateReviewerCommentOnlyCompletion(completion)
+	return validateReviewerCommentOnlyCompletionWithOptions(completion, includeNeedsHuman)
 }
 
 // Recovery accepts the already-published marker independently of optional
@@ -6902,6 +6902,10 @@ func decodeReviewerCompletionMarker(result AgentResult, target any) error {
 }
 
 func validateReviewerCommentOnlyCompletion(completion reviewerCommentOnlyCompletion) (reviewerCommentOnlyCompletion, error) {
+	return validateReviewerCommentOnlyCompletionWithOptions(completion, false)
+}
+
+func validateReviewerCommentOnlyCompletionWithOptions(completion reviewerCommentOnlyCompletion, includeNeedsHuman bool) (reviewerCommentOnlyCompletion, error) {
 	completion.Summary = strings.TrimSpace(completion.Summary)
 	completion.Outcome = normalizeCommentOnlyOutcome(completion.Outcome)
 	completion.Coverage = sanitizeReviewerCoverage(completion.Coverage)
@@ -6912,7 +6916,7 @@ func validateReviewerCommentOnlyCompletion(completion reviewerCommentOnlyComplet
 		return reviewerCommentOnlyCompletion{}, fmt.Errorf("reviewer comment-only completion outcome must be clean, non_blocking, or blocking")
 	}
 	seenFindingIDs := map[string]struct{}{}
-	mustFixCount := 0
+	publishableCount := 0
 	for i := range completion.Findings {
 		finding := &completion.Findings[i]
 		finding.ReviewItemID = strings.TrimSpace(finding.ReviewItemID)
@@ -6953,8 +6957,8 @@ func validateReviewerCommentOnlyCompletion(completion reviewerCommentOnlyComplet
 		default:
 			return reviewerCommentOnlyCompletion{}, fmt.Errorf("reviewer comment-only finding %d has invalid scopeBasis %q", i, finding.ScopeBasis)
 		}
-		if finding.Disposition == reviewFindingDispositionMustFix {
-			mustFixCount++
+		if finding.Disposition == reviewFindingDispositionMustFix || (includeNeedsHuman && finding.Disposition == reviewFindingDispositionNeedsHuman) {
+			publishableCount++
 		}
 		if finding.ReviewItemID != "" {
 			if _, exists := seenFindingIDs[finding.ReviewItemID]; exists {
@@ -6986,7 +6990,10 @@ func validateReviewerCommentOnlyCompletion(completion reviewerCommentOnlyComplet
 		finding.Supersedes = supersedes
 	}
 	if completion.Outcome == "clean" {
-		if mustFixCount != 0 {
+		if publishableCount != 0 {
+			if includeNeedsHuman {
+				return reviewerCommentOnlyCompletion{}, fmt.Errorf("reviewer comment-only clean completion must not include must_fix or needs_human findings")
+			}
 			return reviewerCommentOnlyCompletion{}, fmt.Errorf("reviewer comment-only clean completion must not include must_fix findings")
 		}
 		if !cleanReviewNoopSummary(completion.Summary) {
@@ -6994,12 +7001,15 @@ func validateReviewerCommentOnlyCompletion(completion reviewerCommentOnlyComplet
 		}
 		return completion, nil
 	}
-	if mustFixCount == 0 && !commentOnlyCompletionHasNeedsHuman(completion) {
+	if publishableCount == 0 && !commentOnlyCompletionHasNeedsHuman(completion) {
 		return reviewerCommentOnlyCompletion{}, fmt.Errorf("reviewer comment-only actionable completion must include at least one must_fix finding")
 	}
-	if mustFixCount > 0 {
-		required := requiredOutcomeForMustFixFindings(completion.Findings)
+	if publishableCount > 0 {
+		required := requiredOutcomeForPublishableFindings(completion.Findings, includeNeedsHuman)
 		if required != "" && completion.Outcome != required {
+			if includeNeedsHuman {
+				return reviewerCommentOnlyCompletion{}, fmt.Errorf("reviewer comment-only completion outcome %q does not match highest published finding severity (want %s)", completion.Outcome, required)
+			}
 			return reviewerCommentOnlyCompletion{}, fmt.Errorf("reviewer comment-only completion outcome %q does not match highest must_fix severity (want %s)", completion.Outcome, required)
 		}
 	}
@@ -7065,11 +7075,15 @@ func commentOnlyCompletionHasNeedsHuman(completion reviewerCommentOnlyCompletion
 // non_blocking/nit must_fix findings require outcome=non_blocking. Empty means no
 // must_fix findings were present.
 func requiredOutcomeForMustFixFindings(findings []reviewerCommentOnlyFindingResult) string {
+	return requiredOutcomeForPublishableFindings(findings, false)
+}
+
+// requiredOutcomeForPublishableFindings maps the highest published finding
+// severity (must_fix, plus needs_human when includeNeedsHuman is true) onto the
+// completion outcome contract.
+func requiredOutcomeForPublishableFindings(findings []reviewerCommentOnlyFindingResult, includeNeedsHuman bool) string {
 	required := ""
-	for _, finding := range findings {
-		if strings.TrimSpace(finding.Disposition) != reviewFindingDispositionMustFix {
-			continue
-		}
+	for _, finding := range publishableCommentOnlyFindingsWithOptions(findings, includeNeedsHuman) {
 		switch strings.TrimSpace(finding.Severity) {
 		case reviewFindingSeverityBlocking:
 			return "blocking"
@@ -7215,6 +7229,10 @@ func commentOnlyNeedsHumanEvidence(completion reviewerCommentOnlyCompletion) str
 }
 
 func pendingReviewerCommentOnlyCompletion(pending pendingReviewCheckpoint) (reviewerCommentOnlyCompletion, error) {
+	return pendingReviewerCommentOnlyCompletionWithOptions(pending, false)
+}
+
+func pendingReviewerCommentOnlyCompletionWithOptions(pending pendingReviewCheckpoint, includeNeedsHuman bool) (reviewerCommentOnlyCompletion, error) {
 	if strings.TrimSpace(pending.ReviewerSummaryJSON) == "" {
 		return reviewerCommentOnlyCompletion{}, fmt.Errorf("reviewer comment-only structured completion is required for publish")
 	}
@@ -7222,7 +7240,7 @@ func pendingReviewerCommentOnlyCompletion(pending pendingReviewCheckpoint) (revi
 	if err := json.Unmarshal([]byte(pending.ReviewerSummaryJSON), &completion); err != nil {
 		return reviewerCommentOnlyCompletion{}, fmt.Errorf("parse pending reviewer comment-only completion: %w", err)
 	}
-	return validateReviewerCommentOnlyCompletion(completion)
+	return validateReviewerCommentOnlyCompletionWithOptions(completion, includeNeedsHuman)
 }
 
 func reviewerSummaryPromptContext(issueComments []map[string]any) string {
@@ -9585,29 +9603,51 @@ func (r *Runner) reviewScopeHoldHeadSHA(ctx context.Context, loop storage.LoopRe
 	return ""
 }
 
+// reviewScopeHoldForgejoRereviewID resolves the Forgejo REQUEST_REVIEW ID that
+// was being processed when the scope hold was recorded, if any. Prefers durable
+// reviewScopeHuman.forgejoRereviewId and falls back to the latest run
+// checkpoint when it matches heldHead (legacy loops).
+func (r *Runner) reviewScopeHoldForgejoRereviewID(ctx context.Context, loop storage.LoopRecord, heldHead string) int64 {
+	if id := loops.ReadReviewScopeHumanState(loop.MetadataJSON).ForgejoRereviewID; id > 0 {
+		return id
+	}
+	if r.repos != nil && r.repos.Runs != nil && strings.TrimSpace(loop.ID) != "" {
+		if latestRun, err := r.repos.Runs.GetLatestByLoopID(ctx, loop.ID); err == nil && latestRun != nil {
+			cp := parseCheckpoint(latestRun.CheckpointJSON)
+			if cp.ForgejoRereviewID > 0 && (heldHead == "" || (cp.Snapshot != nil && strings.EqualFold(strings.TrimSpace(cp.Snapshot.HeadSHA), heldHead))) {
+				return cp.ForgejoRereviewID
+			}
+		}
+	}
+	return 0
+}
+
 // maybeWakeReviewScopeHumanPausedLoop releases a paused
 // review_scope_human_required loop back to waiting (without reviving stale
 // queue items or resetting budget meters) when:
 //   - the project is in standalone reviewer mode (legacy scope hold that should
 //     never have parked a standalone reviewer), OR
 //   - a new PR head SHA was pushed since the scope hold was recorded, OR
-//   - an explicit re-review request (REQUEST_REVIEW) is pending.
+//   - a strictly newer explicit re-review request (REQUEST_REVIEW) is pending.
 //
-// In review-fix pair mode on an unchanged head without an explicit re-review
-// request, it returns woke=false so polling/restarts never auto-resume.
+// In review-fix pair mode on an unchanged head without a strictly newer
+// explicit re-review request, it returns woke=false so polling/restarts and
+// unconsumed REQUEST_REVIEW entries never auto-resume.
 func (r *Runner) maybeWakeReviewScopeHumanPausedLoop(ctx context.Context, loop storage.LoopRecord, pr PullRequestSummary, rereviewID int64) (bool, storage.LoopRecord, error) {
 	pairActive, err := r.isReviewFixPairActive(ctx, loop)
 	if err != nil {
 		return false, loop, err
 	}
 	heldHead := r.reviewScopeHoldHeadSHA(ctx, loop)
+	heldRereviewID := r.reviewScopeHoldForgejoRereviewID(ctx, loop, heldHead)
 	liveHead := strings.TrimSpace(pr.HeadSHA)
 	headChanged := liveHead != "" && heldHead != "" && !strings.EqualFold(liveHead, heldHead)
+	hasNewerRereview := rereviewID != 0 && rereviewID > heldRereviewID
 	reason := ""
 	switch {
 	case headChanged:
 		reason = "new_head"
-	case rereviewID != 0:
+	case hasNewerRereview:
 		reason = "rereview_request"
 	case !pairActive:
 		reason = "standalone_reviewer_mode"
@@ -9619,15 +9659,16 @@ func (r *Runner) maybeWakeReviewScopeHumanPausedLoop(ctx context.Context, loop s
 		return false, loop, err
 	}
 	r.logInfo("reviewer scope hold released on discovery", map[string]any{
-		"projectId":   loop.ProjectID,
-		"loopId":      loop.ID,
-		"repo":        derefString(loop.Repo),
-		"prNumber":    derefInt64(loop.PRNumber),
-		"reason":      reason,
-		"heldHeadSha": heldHead,
-		"headSha":     liveHead,
-		"rereviewId":  rereviewID,
-		"pairActive":  pairActive,
+		"projectId":      loop.ProjectID,
+		"loopId":         loop.ID,
+		"repo":           derefString(loop.Repo),
+		"prNumber":       derefInt64(loop.PRNumber),
+		"reason":         reason,
+		"heldHeadSha":    heldHead,
+		"heldRereviewId": heldRereviewID,
+		"headSha":        liveHead,
+		"rereviewId":     rereviewID,
+		"pairActive":     pairActive,
 	})
 	r.appendEvent(ctx, eventInput{
 		eventType:  "loop.review_scope_human.released",
@@ -9636,11 +9677,12 @@ func (r *Runner) maybeWakeReviewScopeHumanPausedLoop(ctx context.Context, loop s
 		entityType: "loop",
 		entityID:   loop.ID,
 		payload: map[string]any{
-			"reason":      reason,
-			"heldHeadSha": heldHead,
-			"headSha":     liveHead,
-			"rereviewId":  rereviewID,
-			"pairActive":  pairActive,
+			"reason":         reason,
+			"heldHeadSha":    heldHead,
+			"heldRereviewId": heldRereviewID,
+			"headSha":        liveHead,
+			"rereviewId":     rereviewID,
+			"pairActive":     pairActive,
 		},
 	})
 	return true, released, nil
@@ -9649,11 +9691,12 @@ func (r *Runner) maybeWakeReviewScopeHumanPausedLoop(ctx context.Context, loop s
 // parkReviewerScopeHuman parks the review-fix pair for needs_human findings.
 // Does not use budget Continue/Stop refill; notify is best-effort at this site
 // because park can happen outside a claim finalization path.
-func (r *Runner) parkReviewerScopeHuman(ctx context.Context, loop storage.LoopRecord, completion reviewerCommentOnlyCompletion, headSHAs ...string) error {
-	headSHA := ""
-	if len(headSHAs) > 0 {
-		headSHA = strings.TrimSpace(headSHAs[0])
-	}
+func (r *Runner) parkReviewerScopeHuman(ctx context.Context, loop storage.LoopRecord, completion reviewerCommentOnlyCompletion) error {
+	return r.parkReviewerScopeHumanWithContext(ctx, loop, completion, "", 0)
+}
+
+func (r *Runner) parkReviewerScopeHumanWithContext(ctx context.Context, loop storage.LoopRecord, completion reviewerCommentOnlyCompletion, headSHA string, forgejoRereviewID int64) error {
+	headSHA = strings.TrimSpace(headSHA)
 	if r.repos != nil && r.repos.Loops != nil && strings.TrimSpace(loop.ID) != "" {
 		if fresh, err := r.repos.Loops.GetByID(ctx, loop.ID); err == nil && fresh != nil {
 			loop = *fresh
@@ -9663,8 +9706,9 @@ func (r *Runner) parkReviewerScopeHuman(ctx context.Context, loop storage.LoopRe
 		Held: loop, Role: "reviewer", Repo: derefString(loop.Repo), PRNumber: derefInt64(loop.PRNumber),
 		NowISO: r.nowISO(), HITLEnabled: r.reviewFixHITLEnabled(),
 		Question: commentOnlyNeedsHumanQuestion(completion), Evidence: commentOnlyNeedsHumanEvidence(completion),
-		HeadSHA: headSHA,
-		DB:      r.db,
+		HeadSHA:           headSHA,
+		ForgejoRereviewID: forgejoRereviewID,
+		DB:                r.db,
 	})
 	if err != nil {
 		return err
@@ -9676,11 +9720,12 @@ func (r *Runner) parkReviewerScopeHuman(ctx context.Context, loop storage.LoopRe
 // parkOrDeferReviewerScopeHuman applies the one-hold rule after a counted publish
 // or pure needs_human: if the loop is already budget-held, persist scope evidence
 // without stacking a second HITL ask/primary pause reason; otherwise park scope.
-func (r *Runner) parkOrDeferReviewerScopeHuman(ctx context.Context, loop storage.LoopRecord, completion reviewerCommentOnlyCompletion, headSHAs ...string) error {
-	headSHA := ""
-	if len(headSHAs) > 0 {
-		headSHA = strings.TrimSpace(headSHAs[0])
-	}
+func (r *Runner) parkOrDeferReviewerScopeHuman(ctx context.Context, loop storage.LoopRecord, completion reviewerCommentOnlyCompletion) error {
+	return r.parkOrDeferReviewerScopeHumanWithContext(ctx, loop, completion, "", 0)
+}
+
+func (r *Runner) parkOrDeferReviewerScopeHumanWithContext(ctx context.Context, loop storage.LoopRecord, completion reviewerCommentOnlyCompletion, headSHA string, forgejoRereviewID int64) error {
+	headSHA = strings.TrimSpace(headSHA)
 	if r.repos != nil && r.repos.Loops != nil && strings.TrimSpace(loop.ID) != "" {
 		fresh, err := r.repos.Loops.GetByID(ctx, loop.ID)
 		if err != nil {
@@ -9691,16 +9736,17 @@ func (r *Runner) parkOrDeferReviewerScopeHuman(ctx context.Context, loop storage
 		}
 	}
 	if loops.IsReviewFixBudgetHold(loop) {
-		return r.persistPendingReviewerScopeHuman(ctx, loop, completion, headSHA)
+		return r.persistPendingReviewerScopeHumanWithContext(ctx, loop, completion, headSHA, forgejoRereviewID)
 	}
-	return r.parkReviewerScopeHuman(ctx, loop, completion, headSHA)
+	return r.parkReviewerScopeHumanWithContext(ctx, loop, completion, headSHA, forgejoRereviewID)
 }
 
-func (r *Runner) persistPendingReviewerScopeHuman(ctx context.Context, loop storage.LoopRecord, completion reviewerCommentOnlyCompletion, headSHAs ...string) error {
-	headSHA := ""
-	if len(headSHAs) > 0 {
-		headSHA = strings.TrimSpace(headSHAs[0])
-	}
+func (r *Runner) persistPendingReviewerScopeHuman(ctx context.Context, loop storage.LoopRecord, completion reviewerCommentOnlyCompletion) error {
+	return r.persistPendingReviewerScopeHumanWithContext(ctx, loop, completion, "", 0)
+}
+
+func (r *Runner) persistPendingReviewerScopeHumanWithContext(ctx context.Context, loop storage.LoopRecord, completion reviewerCommentOnlyCompletion, headSHA string, forgejoRereviewID int64) error {
+	headSHA = strings.TrimSpace(headSHA)
 	if r.repos == nil || r.repos.Loops == nil {
 		return fmt.Errorf("persist pending review scope requires loop storage")
 	}
@@ -9728,11 +9774,12 @@ func (r *Runner) persistPendingReviewerScopeHuman(ctx context.Context, loop stor
 					return err
 				}
 			}
-			encoded, err := loops.PersistPendingReviewScopeHumanEvidenceWithHead(
+			encoded, err := loops.PersistPendingReviewScopeHumanEvidenceWithContext(
 				current.MetadataJSON,
 				commentOnlyNeedsHumanQuestion(completion),
 				commentOnlyNeedsHumanEvidence(completion),
 				headSHA,
+				forgejoRereviewID,
 				r.reviewFixHITLEnabled(),
 			)
 			if err != nil {
@@ -9775,7 +9822,7 @@ func (r *Runner) persistPendingReviewerScopeHuman(ctx context.Context, loop stor
 	}
 	live = fresh
 	if !loops.IsReviewFixBudgetHold(*live) {
-		return r.parkReviewerScopeHuman(ctx, *live, completion, headSHA)
+		return r.parkReviewerScopeHumanWithContext(ctx, *live, completion, headSHA, forgejoRereviewID)
 	}
 	return nil
 }
@@ -9785,10 +9832,6 @@ func (r *Runner) persistPendingReviewerScopeHuman(ctx context.Context, loop stor
 // parks/defers scope under the one-hold rule; in standalone reviewer mode (or
 // pure must_fix), returns nil without parking.
 func (r *Runner) afterCommentOnlyPublishMaybeParkScope(ctx context.Context, input stepInput, checkpoint reviewerCheckpoint, pending pendingReviewCheckpoint) (reviewerCheckpoint, error) {
-	completion, err := pendingReviewerCommentOnlyCompletion(pending)
-	if err != nil || !commentOnlyCompletionHasNeedsHuman(completion) {
-		return checkpoint, nil
-	}
 	pairActive, pairErr := r.isReviewFixPairActive(ctx, input.Loop)
 	if pairErr != nil {
 		return checkpoint, pairErr
@@ -9796,7 +9839,11 @@ func (r *Runner) afterCommentOnlyPublishMaybeParkScope(ctx context.Context, inpu
 	if !pairActive {
 		return checkpoint, nil
 	}
-	if err := r.parkOrDeferReviewerScopeHuman(ctx, input.Loop, completion, pending.HeadSHA); err != nil {
+	completion, err := pendingReviewerCommentOnlyCompletion(pending)
+	if err != nil || !commentOnlyCompletionHasNeedsHuman(completion) {
+		return checkpoint, nil
+	}
+	if err := r.parkOrDeferReviewerScopeHumanWithContext(ctx, input.Loop, completion, pending.HeadSHA, checkpoint.ForgejoRereviewID); err != nil {
 		return checkpoint, err
 	}
 	return checkpoint, reviewerScopeOrBudgetHoldSkip(ctx, r, input.Loop)
@@ -9808,15 +9855,15 @@ func (r *Runner) afterCommentOnlyPublishMaybeParkScope(ctx context.Context, inpu
 // obsolete findings. Returns a stale/skip checkpoint without parking when drift
 // is detected; retryable GitHub view failures surface as errors.
 func (r *Runner) recoverAlreadyPublishedScopePark(ctx context.Context, input stepInput, checkpoint reviewerCheckpoint, pending pendingReviewCheckpoint) (reviewerCheckpoint, error) {
-	completion, err := pendingReviewerCommentOnlyCompletion(pending)
-	if err != nil || !commentOnlyCompletionHasNeedsHuman(completion) {
-		return checkpoint, nil
-	}
 	pairActive, pairErr := r.isReviewFixPairActive(ctx, input.Loop)
 	if pairErr != nil {
 		return checkpoint, pairErr
 	}
 	if !pairActive {
+		return checkpoint, nil
+	}
+	completion, err := pendingReviewerCommentOnlyCompletion(pending)
+	if err != nil || !commentOnlyCompletionHasNeedsHuman(completion) {
 		return checkpoint, nil
 	}
 	staleReason, err := r.scopeParkRecoveryFreshnessBlockReason(ctx, input.Project, input.Repo, input.PRNumber, pending, checkpoint)
@@ -9875,7 +9922,7 @@ func (r *Runner) recoverPublishedNeedsHumanScopeFromLatestRun(ctx context.Contex
 		// Closed PR or new head: do not park/defer obsolete scope evidence.
 		return nil
 	}
-	return r.parkOrDeferReviewerScopeHuman(ctx, loop, completion, pending.HeadSHA)
+	return r.parkOrDeferReviewerScopeHumanWithContext(ctx, loop, completion, pending.HeadSHA, checkpoint.ForgejoRereviewID)
 }
 
 // scopeParkRecoveryFreshnessBlockReason views the live PR and returns a non-empty
@@ -10534,15 +10581,17 @@ func buildReviewPromptForPairMode(projectID string, instructionConfig config.Con
 		}
 		commentOnlyContract := "Comment-only publish contract: Looper will post your final completion summary as one top-level PR comment after it verifies the PR is still open, the head SHA still matches, and this head has not already been published locally. Do not publish anything yourself. Only must_fix findings become remote Reviewer Summary items; follow_up and needs_human remain in structured completion only."
 		commentOnlyDispositionContract := "Finding disposition contract: every candidate uses disposition must_fix|follow_up|needs_human, severity blocking|non_blocking|nit, scopeBasis (stated_intent|introduced_regression|required_invariant|independent_improvement|ambiguous_intent), scopeEvidence (specific repository rule, PR goal/non-goal, linked spec section, or regression evidence), plus title/body/location. must_fix becomes remote feedback; follow_up is retained only in structured completion; needs_human must not be published as a change request and parks the pair for human judgment."
+		commentOnlyFinalizationGate := "Finalization gate before completion: verify that the scoped changed files/ranges were reviewed, all observed in-scope must_fix findings are included, repeated patterns are consolidated only when they share a root cause, non-blocking/nit feedback is not escalated, every finding has disposition/scope evidence and a suggested fix, and the summary outcome matches the highest must_fix severity."
 		if !reviewFixPairActive {
 			commentOnlyContract = "Comment-only publish contract: Looper will post your final completion summary as one top-level PR comment after it verifies the PR is still open, the head SHA still matches, and this head has not already been published locally. Do not publish anything yourself. In standalone reviewer mode (no active Fixer), both must_fix and needs_human findings become remote Reviewer Summary items so the PR author sees them; follow_up remains in structured completion only."
 			commentOnlyDispositionContract = "Finding disposition contract: every candidate uses disposition must_fix|follow_up|needs_human, severity blocking|non_blocking|nit, scopeBasis (stated_intent|introduced_regression|required_invariant|independent_improvement|ambiguous_intent), scopeEvidence (specific repository rule, PR goal/non-goal, linked spec section, or regression evidence), plus title/body/location. In standalone reviewer mode (no active Fixer), both must_fix and needs_human become remote feedback so the human PR author sees questions and ambiguities directly on the PR; follow_up is retained only in structured completion."
+			commentOnlyFinalizationGate = "Finalization gate before completion: verify that the scoped changed files/ranges were reviewed, all observed in-scope must_fix and needs_human findings are included, repeated patterns are consolidated only when they share a root cause, non-blocking/nit feedback is not escalated, every finding has disposition/scope evidence and a suggested fix, and the summary outcome matches the highest published finding severity."
 		}
 		parts = append(parts,
 			commentOnlyContract,
 			reviewPassContract,
 			commentOnlyDispositionContract,
-			"Finalization gate before completion: verify that the scoped changed files/ranges were reviewed, all observed in-scope must_fix findings are included, repeated patterns are consolidated only when they share a root cause, non-blocking/nit feedback is not escalated, every finding has disposition/scope evidence and a suggested fix, and the summary outcome matches the highest must_fix severity.",
+			commentOnlyFinalizationGate,
 			cleanResultCompletionInstruction,
 			reviewerCoveragePromptInstruction(),
 		)
